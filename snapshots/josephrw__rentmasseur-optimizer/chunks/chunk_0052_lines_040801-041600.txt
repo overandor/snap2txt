@@ -1,0 +1,800 @@
+    conn.close()
+
+    print(f"\n{'='*60}")
+    print(f"  HYPOTHESIS {hyp['hypothesis_id']} COMPLETE")
+    print(f"  Reward: {reward:.3f} | Total: {new_reward:.3f} | Runs: {new_runs}/{hyp['max_runs']}")
+    print(f"  Status: {new_status} | Receipt: {receipt_hash}")
+    print(f"{'='*60}")
+    return 0
+
+
+def cmd_report(tenant_id: str):
+    """Generate report for a tenant."""
+    conn = _db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT status, COUNT(*) as n FROM hypotheses GROUP BY status ORDER BY status")
+    status_rows = cur.fetchall()
+
+    cur.execute("""SELECT hypothesis_id, category, claim, reward, runs_completed, status, confidence
+                   FROM hypotheses WHERE runs_completed > 0
+                   ORDER BY reward DESC LIMIT 20""")
+    top_rows = cur.fetchall()
+
+    cur.execute("SELECT COUNT(*) as n FROM hypothesis_runs WHERE tenant_id = ?", (tenant_id,))
+    total_runs = cur.fetchone()["n"]
+
+    cur.execute("SELECT COUNT(*) as n FROM hypothesis_promotions WHERE tenant_id = ?", (tenant_id,))
+    total_promotions = cur.fetchone()["n"]
+
+    print(f"\n{'='*60}")
+    print(f"  HYPOTHESIS LAB REPORT — {tenant_id}")
+    print(f"  Generated: {datetime.now(timezone.utc).isoformat()}")
+    print(f"{'='*60}\n")
+
+    print(f"Status Summary:")
+    for r in status_rows:
+        print(f"  {r['status']:<12} {r['n']:>4}")
+
+    print(f"\nTotal runs: {total_runs}")
+    print(f"Total promotions: {total_promotions}")
+
+    if top_rows:
+        print(f"\nTop 20 Tested Hypotheses:")
+        print(f"{'ID':<6} {'Category':<12} {'Status':<10} {'Reward':>8} {'Runs':>5} {'Conf':>5} Claim")
+        print(f"{'-'*6} {'-'*12} {'-'*10} {'-'*8} {'-'*5} {'-'*5} {'-'*40}")
+        for r in top_rows:
+            print(f"{r['hypothesis_id']:<6} {r['category']:<12} {r['status']:<10} {r['reward']:>8.3f} {r['runs_completed']:>5} {r['confidence']:>5.2f} {r['claim'][:50]}")
+
+    conn.close()
+
+
+def cmd_winners(tenant_id: str):
+    """Show winning hypotheses."""
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM hypotheses WHERE status = 'winner' ORDER BY reward DESC")
+    rows = cur.fetchall()
+
+    if not rows:
+        print("No winners yet.")
+        conn.close()
+        return
+
+    print(f"\n{'='*60}")
+    print(f"  WINNING HYPOTHESES — {len(rows)}")
+    print(f"{'='*60}\n")
+
+    for r in rows:
+        print(f"  {r['hypothesis_id']} [{r['category']}] reward={r['reward']:.3f} runs={r['runs_completed']}")
+        print(f"    {r['claim']}")
+        print(f"    Action: {r['action']} | Metric: {r['primary_metric']}")
+        print()
+
+    conn.close()
+
+
+def cmd_daemon(tenant_id: str, username: str, password: str, interval: int = 300):
+    """Run hypothesis lab as daemon."""
+    print(f"Starting hypothesis lab daemon (interval={interval}s, tenant={tenant_id})")
+    while True:
+        try:
+            cmd_run_next(tenant_id, username, password)
+        except Exception as e:
+            log.error(f"Run error: {e}")
+        print(f"\nSleeping {interval}s...\n")
+        time.sleep(interval)
+
+
+# ─── CLI ───────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="300-Hypothesis Growth Lab")
+    parser.add_argument("--seed-300", action="store_true", help="Seed 300 hypotheses")
+    parser.add_argument("--list", action="store_true", help="List all hypotheses")
+    parser.add_argument("--run-next", action="store_true", help="Run next best hypothesis")
+    parser.add_argument("--daemon", action="store_true", help="Run as daemon")
+    parser.add_argument("--report", action="store_true", help="Generate report")
+    parser.add_argument("--winners", action="store_true", help="Show winners")
+    parser.add_argument("--tenant", default="", help="Tenant ID")
+    parser.add_argument("--interval", type=int, default=300, help="Daemon interval (s)")
+    args = parser.parse_args()
+
+    username = os.environ.get("RENTMASSEUR_USER", os.environ.get("RM_USER", ""))
+    password = os.environ.get("RENTMASSEUR_PASS", os.environ.get("RM_PASS", ""))
+    tenant_id = args.tenant or hashlib.sha256(username.encode()).hexdigest()[:16]
+
+    if args.seed_300:
+        cmd_seed_300()
+        return
+    if args.list:
+        cmd_list()
+        return
+    if args.run_next:
+        sys.exit(cmd_run_next(tenant_id, username, password))
+        return
+    if args.daemon:
+        cmd_daemon(tenant_id, username, password, args.interval)
+        return
+    if args.report:
+        cmd_report(tenant_id)
+        return
+    if args.winners:
+        cmd_winners(tenant_id)
+        return
+
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+api_client.py:
+```
+"""
+RentMasseur API Client — bounded, production-ready HTTP client.
+
+Confirmed endpoints only. No guesswork. No spam.
+"""
+
+import json
+import logging
+import os
+import re
+import time
+from typing import Optional, Dict, Any
+
+import requests
+
+log = logging.getLogger("rm_api")
+
+BASE = "https://rentmasseur.com"
+API = f"{BASE}/api/v1"
+
+_PROXY_URL = os.environ.get("PROXY_URL", "")
+_PROXY_SECRET = os.environ.get("PROXY_SECRET", "")
+
+if _PROXY_URL:
+    _PROXY_URL = _PROXY_URL.rstrip("/")
+    API = f"{_PROXY_URL}/api/v1"
+    BASE = _PROXY_URL
+    log.info("Using proxy: %s", _PROXY_URL)
+
+
+class RentMasseurAPI:
+    """Direct API client for rentmasseur.com using confirmed endpoints."""
+
+    def __init__(self, min_request_interval: float = 2.0):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"{BASE}/settings",
+            "Origin": BASE,
+        })
+        if _PROXY_SECRET:
+            self.session.headers["X-Proxy-Secret"] = _PROXY_SECRET
+        self.csrf = None
+        self.logged_in = False
+        self.username = None
+        self.last_request = 0.0
+        self.min_request_interval = min_request_interval
+        self._read_cache = {}
+        self._cache_ttl = 15.0
+
+    def _wait(self):
+        """Respectful rate limiting between requests."""
+        elapsed = time.time() - self.last_request
+        if elapsed < self.min_request_interval:
+            time.sleep(self.min_request_interval - elapsed)
+        self.last_request = time.time()
+
+    def _get(self, path: str, params: Optional[Dict] = None) -> requests.Response:
+        self._wait()
+        return self.session.get(f"{API}{path}", params=params, timeout=15)
+
+    def _cached_get(self, path: str, cache_key: str = None) -> Dict:
+        """GET with in-memory TTL cache for read endpoints."""
+        key = cache_key or path
+        now = time.time()
+        cached = self._read_cache.get(key)
+        if cached and (now - cached[0]) < self._cache_ttl:
+            return cached[1]
+        resp = self._get(path)
+        resp.raise_for_status()
+        data = resp.json()
+        self._read_cache[key] = (now, data)
+        return data
+
+    def invalidate_cache(self, *keys: str):
+        """Invalidate specific cache keys after a mutation."""
+        for k in keys:
+            self._read_cache.pop(k, None)
+
+    def invalidate_all(self):
+        self._read_cache.clear()
+
+    def _post(self, path: str, json_data: Dict) -> requests.Response:
+        self._wait()
+        return self.session.post(f"{API}{path}", json=json_data, timeout=15)
+
+    def _put(self, path: str, json_data: Dict) -> requests.Response:
+        self._wait()
+        return self.session.put(f"{API}{path}", json=json_data, timeout=15)
+
+    def _get_csrf(self) -> str:
+        resp = self.session.get(f"{BASE}/login")
+        m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', resp.text)
+        if m:
+            self.csrf = m.group(1)
+            return self.csrf
+        for cookie in self.session.cookies:
+            if "csrf" in cookie.name.lower() or "token" in cookie.name.lower():
+                self.csrf = cookie.value
+                return self.csrf
+        return ""
+
+    def login(self, username: str, password: str) -> bool:
+        """Login via API and store bearer token."""
+        self.username = username
+        csrf = self._get_csrf()
+        self._wait()
+        resp = self.session.post(f"{API}/login", json={
+            "email": username,
+            "password": password,
+            "csrf": csrf,
+            "remember": True,
+        })
+        if resp.status_code != 200:
+            log.error("Login failed: %d %s", resp.status_code, resp.text[:200])
+            return False
+        try:
+            data = resp.json()
+        except Exception:
+            log.error("Login response not JSON (captcha/block?): %s", resp.text[:300])
+            return False
+        token = data.get("accessToken")
+        if token:
+            self.session.headers["Authorization"] = f"Bearer {token}"
+        self.logged_in = True
+        log.info("Login OK as %s", username)
+        return True
+
+    def load_cookies(self, cookies: list):
+        """Load cookies from a saved session (e.g. from Selenium)."""
+        for c in cookies:
+            self.session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
+        self.logged_in = True
+
+    # ------------------------------------------------------------------
+    # Confirmed read endpoints
+    # ------------------------------------------------------------------
+
+    def get_dashboard(self) -> Dict:
+        return self._cached_get("/account/dashboard", "dashboard")
+
+    def get_availability(self) -> Dict:
+        return self._cached_get("/account/dashboard/availability", "availability")
+
+    def set_availability(self, option: int = 1, duration: int = 5) -> Dict:
+        """
+        Set availability.
+        option: 0=Not Set, 1=Available, 2=Not Available
+        duration: index from timePeriods (0=1h, 1=2h, ..., 5=6h)
+        """
+        resp = self._put("/account/dashboard/availability", {"option": option, "duration": duration})
+        resp.raise_for_status()
+        self.invalidate_cache("availability")
+        return resp.json()
+
+    def get_ad_statistics(self) -> Dict:
+        return self._cached_get("/account/dashboard/ad-statistics", "ad_statistics")
+
+    def get_keeponline(self) -> Dict:
+        return self._cached_get("/account/keeponline", "keeponline")
+
+    def get_about(self) -> Dict:
+        return self._cached_get("/settings/about", "about")
+
+    def get_mailbox(self, page: int = 1, folder: int = 1, sort: int = 1) -> Dict:
+        resp = self._get("/mailbox", params={"page": page, "folder": folder, "sort": sort})
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_blogs(self, page: int = 1) -> Dict:
+        resp = self._get("/blogs", params={"page": page})
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Confirmed write endpoints
+    # ------------------------------------------------------------------
+
+    def set_visibility(self, visible: bool) -> Dict:
+        resp = self._put("/settings/visibility", {"isAdHidden": not visible})
+        resp.raise_for_status()
+        self.invalidate_cache("keeponline", "dashboard")
+        return resp.json()
+
+    def set_sms_alerts(self, enabled: bool) -> Dict:
+        resp = self._put("/settings/sms", {"sms": enabled})
+        resp.raise_for_status()
+        self.invalidate_cache("dashboard")
+        return resp.json()
+
+    def set_track_actions(self, enabled: bool) -> Dict:
+        resp = self._put("/settings/track-actions", {"trackActions": enabled})
+        resp.raise_for_status()
+        self.invalidate_cache("dashboard")
+        return resp.json()
+
+    def set_about(self, headline: str, description: str) -> Dict:
+        resp = self._put("/settings/about", {"headline": headline, "description": description})
+        resp.raise_for_status()
+        self.invalidate_cache("about")
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": "ok", "raw": resp.text[:500]}
+
+    # ------------------------------------------------------------------
+    # Blog endpoints
+    # ------------------------------------------------------------------
+
+    def get_blog(self, blog_id: str) -> Dict:
+        resp = self._get(f"/blogs/{blog_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    def create_blog(self, title: str, body: str, tags: list = None) -> Dict:
+        payload = {"title": title, "body": body}
+        if tags:
+            payload["tags"] = tags
+        resp = self._post("/blogs", payload)
+        resp.raise_for_status()
+        self.invalidate_cache("blogs")
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": "ok", "raw": resp.text[:500]}
+
+    def update_blog(self, blog_id: str, title: str = None, body: str = None) -> Dict:
+        payload = {}
+        if title:
+            payload["title"] = title
+        if body:
+            payload["body"] = body
+        resp = self._put(f"/blogs/{blog_id}", payload)
+        resp.raise_for_status()
+        self.invalidate_cache("blogs")
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": "ok", "raw": resp.text[:500]}
+
+    def delete_blog(self, blog_id: str) -> Dict:
+        self._wait()
+        resp = self.session.delete(f"{API}/blogs/{blog_id}", timeout=15)
+        resp.raise_for_status()
+        self.invalidate_cache("blogs")
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": "ok", "raw": resp.text[:500]}
+
+    # ------------------------------------------------------------------
+    # Search (confirmed working 2026-07-09)
+    # ------------------------------------------------------------------
+
+    def search_masseurs(self, city: str = "manhattan-ny", page: int = 1) -> Dict:
+        resp = self._post("/search", {"searchCity": city, "page": page, "skipUsers": "0"})
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Profile visit (read-only profile fetch)
+    # ------------------------------------------------------------------
+
+    def visit_profile(self, username: str) -> Dict:
+        self._wait()
+        resp = self.session.get(f"{API}/profile/{username}", timeout=15)
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": "visited", "username": username, "http": resp.status_code}
+
+    def get_profile(self, username: str) -> Dict:
+        return self._cached_get(f"/profile/{username}", f"profile_{username}")
+
+    # ------------------------------------------------------------------
+    # Audit — verify all endpoints are live
+    # ------------------------------------------------------------------
+
+    def audit_endpoints(self) -> Dict:
+        """Test all confirmed endpoints and return status report."""
+        results = {}
+        tests = [
+            ("dashboard", lambda: self.get_dashboard()),
+            ("availability", lambda: self.get_availability()),
+            ("ad_statistics", lambda: self.get_ad_statistics()),
+            ("keeponline", lambda: self.get_keeponline()),
+            ("about", lambda: self.get_about()),
+            ("mailbox", lambda: self.get_mailbox()),
+            ("search", lambda: self.search_masseurs()),
+        ]
+        for name, fn in tests:
+            try:
+                fn()
+                results[name] = "OK"
+            except Exception as e:
+                results[name] = f"FAIL: {e}"
+        return results
+
+    # ------------------------------------------------------------------
+    # Messaging
+    # ------------------------------------------------------------------
+
+    def send_message(self, username: str, message: str) -> Dict:
+        resp = self._post("/mailbox/send", {"username": username, "message": message})
+        resp.raise_for_status()
+        self.invalidate_cache("mailbox")
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": "ok", "raw": resp.text[:500]}
+
+    def get_conversation(self, username: str, page: int = 1) -> Dict:
+        resp = self._get(f"/mailbox/conversation/{username}", params={"page": page})
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Search (read-only)
+    # ------------------------------------------------------------------
+
+    def search(self, city: str = "manhattan-ny", available_only: bool = False,
+               page: int = 1, skip: int = 0) -> Dict:
+        body = {"searchCity": city, "page": page, "skipUsers": str(skip)}
+        if available_only:
+            body["available"] = 1
+        resp = self._post("/search", body)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Full status
+    # ------------------------------------------------------------------
+
+    def full_status(self) -> Dict:
+        return {
+            "dashboard": self.get_dashboard(),
+            "availability": self.get_availability(),
+            "stats": self.get_ad_statistics(),
+            "keeponline": self.get_keeponline(),
+            "about": self.get_about(),
+            "interview": self.get_interview(),
+        }
+
+```
+
+traffic_analyzer.py:
+```
+"""
+Traffic Analyzer — compare snapshots, detect drops, compute conversion rates.
+"""
+
+import logging
+from typing import List, Dict
+
+from .db import get_latest_traffic_snapshot
+
+log = logging.getLogger("profileops.analyzer")
+
+
+def conversion_rate(views: int, clicks: int) -> float:
+    if not views:
+        return 0.0
+    return round(clicks / views, 4)
+
+
+def compare_snapshots(current: Dict, previous: Dict) -> Dict:
+    """Compare two snapshots and return deltas."""
+    delta_views = (current.get("profile_views") or 0) - (previous.get("profile_views") or 0)
+    delta_clicks = (current.get("contact_clicks") or 0) - (previous.get("contact_clicks") or 0)
+    current_rate = conversion_rate(current.get("profile_views") or 0, current.get("contact_clicks") or 0)
+    previous_rate = conversion_rate(previous.get("profile_views") or 0, previous.get("contact_clicks") or 0)
+    return {
+        "delta_views": delta_views,
+        "delta_clicks": delta_clicks,
+        "previous_rate": previous_rate,
+        "current_rate": current_rate,
+        "rate_delta": round(current_rate - previous_rate, 4),
+    }
+
+
+def analyze_trend(hours: int = 24) -> Dict:
+    """Analyze traffic trend over last N hours."""
+    rows = get_latest_traffic_snapshot(limit=100)
+    if len(rows) < 2:
+        return {"status": "insufficient_data"}
+    current = rows[0]
+    # Find snapshot closest to N hours ago
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    baseline = rows[-1]
+    for row in rows[1:]:
+        ts = datetime.fromisoformat(row["created_at"])
+        if (now - ts).total_seconds() <= hours * 3600:
+            baseline = row
+            break
+
+    comparison = compare_snapshots(current, baseline)
+    return {
+        "status": "ok",
+        "hours": hours,
+        "current": {
+            "views": current.get("profile_views"),
+            "contacts": current.get("contact_clicks"),
+            "rate": conversion_rate(current.get("profile_views") or 0, current.get("contact_clicks") or 0),
+        },
+        "baseline": {
+            "views": baseline.get("profile_views"),
+            "contacts": baseline.get("contact_clicks"),
+            "rate": conversion_rate(baseline.get("profile_views") or 0, baseline.get("contact_clicks") or 0),
+        },
+        "comparison": comparison,
+        "alert": comparison["delta_views"] < 0 or comparison["rate_delta"] < -0.01,
+    }
+
+
+def detect_drop() -> Dict:
+    """Detect if views or contact rate dropped significantly."""
+    trend = analyze_trend(hours=24)
+    if trend["status"] != "ok":
+        return trend
+    if trend["alert"]:
+        log.warning("Traffic drop detected: %s", trend["comparison"])
+    return trend
+
+```
+
+bio_ml.cpp:
+```
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <random>
+#include <cmath>
+#include <algorithm>
+#include <chrono>
+#include <unordered_map>
+#include <numeric>
+#include <iomanip>
+
+// ---------------------------------------------------------------------------
+// JSON parsing helpers (minimal)
+// ---------------------------------------------------------------------------
+
+std::string json_unescape(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char next = s[i+1];
+            if (next == 'n') out += '\n';
+            else if (next == 't') out += '\t';
+            else if (next == 'r') out += '\r';
+            else out += next;
+            i++;
+        } else if (s[i] != '"') {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+std::string extract_json_string(const std::string& line, const std::string& key) {
+    size_t pos = line.find("\"" + key + "\":");
+    if (pos == std::string::npos) return "";
+    pos = line.find("\"", pos + key.size() + 3);
+    if (pos == std::string::npos) return "";
+    size_t end = pos + 1;
+    while (end < line.size() && (line[end] != '"' || line[end-1] == '\\')) end++;
+    return json_unescape(line.substr(pos + 1, end - pos - 1));
+}
+
+// ---------------------------------------------------------------------------
+// Feature extraction
+// ---------------------------------------------------------------------------
+
+const std::vector<std::string> local_areas = {
+    "manhattan", "chelsea", "midtown", "hell's kitchen", "upper west side",
+    "upper east side", "tribeca", "soho", "west village", "east village",
+    "financial district", "flatiron", "gramercy", "murray hill", "nomad", "nyc", "new york"
+};
+
+const std::vector<std::string> service_words = {
+    "deep tissue", "sports", "recovery", "massage", "bodywork", "relief",
+    "therapy", "knots", "tension", "pressure", "shoulder", "back", "hip",
+    "neck", "glute", "stress", "desk", "travel", "athlete", "professional"
+};
+
+const std::vector<std::string> cta_words = {
+    "message", "text", "email", "book", "call", "contact", "dm", "schedule", "reach out"
+};
+
+const std::vector<std::string> trust_words = {
+    "professional", "clean", "private", "respect", "discreet", "boundaries", "communication"
+};
+
+const std::vector<std::string> humor_words = {
+    "wolf", "robot", "concrete", "phone cord", "group chat", "screaming", "dramatic", "hostile", "no fluff", "feather", "magic", "gps"
+};
+
+std::string to_lower(const std::string& s) {
+    std::string r = s;
+    std::transform(r.begin(), r.end(), r.begin(), ::tolower);
+    return r;
+}
+
+std::vector<std::string> tokenize(const std::string& text) {
+    std::vector<std::string> tokens;
+    std::string cur;
+    for (char c : text) {
+        if (std::isalpha(static_cast<unsigned char>(c)) || c == '\'') {
+            cur += std::tolower(c);
+        } else if (!cur.empty()) {
+            tokens.push_back(cur);
+            cur.clear();
+        }
+    }
+    if (!cur.empty()) tokens.push_back(cur);
+    return tokens;
+}
+
+std::vector<std::string> split_sentences(const std::string& text) {
+    std::vector<std::string> sents;
+    std::string cur;
+    for (char c : text) {
+        cur += c;
+        if (c == '.' || c == '!' || c == '?') {
+            if (!cur.empty()) {
+                sents.push_back(cur);
+                cur.clear();
+            }
+        }
+    }
+    if (!cur.empty()) sents.push_back(cur);
+    return sents;
+}
+
+int syllable_count(const std::string& word) {
+    std::string w = to_lower(word);
+    std::string vowels = "aeiouy";
+    int count = 0;
+    bool prev_vowel = false;
+    for (char c : w) {
+        bool is_vowel = vowels.find(c) != std::string::npos;
+        if (is_vowel && !prev_vowel) count++;
+        prev_vowel = is_vowel;
+    }
+    if (w.size() > 1 && w.back() == 'e') count--;
+    return std::max(1, count);
+}
+
+std::vector<double> extract_features(const std::string& headline, const std::string& description) {
+    std::string text = to_lower(headline + " " + description);
+    auto words = tokenize(text);
+    auto sentences = split_sentences(description);
+
+    double headline_len = headline.size() / 100.0;
+    double desc_len = description.size() / 500.0;
+    double word_count = words.size() / 100.0;
+    double avg_sentence_len = 0;
+    for (const auto& s : sentences) avg_sentence_len += tokenize(s).size();
+    avg_sentence_len = (avg_sentence_len / std::max(1, (int)sentences.size())) / 30.0;
+    double paragraph_count = std::min(5.0, (double)std::count(description.begin(), description.end(), '\n') + 1) / 5.0;
+
+    double local_score = 0, service_score = 0, cta_score = 0, trust_score = 0, humor_score = 0;
+    for (const auto& a : local_areas) if (text.find(a) != std::string::npos) local_score += 1.0;
+    for (const auto& a : service_words) if (text.find(a) != std::string::npos) service_score += 1.0;
+    for (const auto& a : cta_words) if (text.find(a) != std::string::npos) cta_score += 1.0;
+    for (const auto& a : trust_words) if (text.find(a) != std::string::npos) trust_score += 1.0;
+    for (const auto& a : humor_words) if (text.find(a) != std::string::npos) humor_score += 1.0;
+    local_score /= local_areas.size();
+    service_score /= service_words.size();
+    cta_score /= cta_words.size();
+    trust_score /= trust_words.size();
+    humor_score = std::min(1.0, humor_score / 3.0);
+
+    // Readability
+    double readability;
+    if (description.size() >= 50 && description.size() <= 300) readability = 1.0;
+    else if (description.size() < 50) readability = 0.5;
+    else readability = std::max(0.3, 1.0 - (description.size() - 300.0) / 500.0);
+
+    // Speech score
+    double avg_word_len = 0, avg_syllables = 0;
+    for (const auto& w : words) { avg_word_len += w.size(); avg_syllables += syllable_count(w); }
+    avg_word_len /= std::max(1, (int)words.size());
+    avg_syllables /= std::max(1, (int)words.size());
+    double simple_ratio = 0;
+    for (const auto& w : words) if (w.size() <= 6 && w.find('\'') == std::string::npos) simple_ratio += 1.0;
+    simple_ratio /= std::max(1, (int)words.size());
+    double speech_score = (1 - std::min(avg_word_len / 8.0, 1.0)) * 0.3
+                        + (1 - std::min(avg_syllables / 2.5, 1.0)) * 0.3
+                        + (1 - std::min(avg_sentence_len * 30.0 / 20.0, 1.0)) * 0.25
+                        + simple_ratio * 0.15;
+
+    return {headline_len, desc_len, word_count, avg_sentence_len, paragraph_count,
+            (double)std::count(text.begin(), text.end(), '?') / 2.0,
+            (double)std::count(text.begin(), text.end(), '!') / 2.0,
+            local_score, service_score, cta_score, trust_score, humor_score, readability, speech_score};
+}
+
+int feature_count() { return 14; }
+
+// ---------------------------------------------------------------------------
+// Heuristic scoring (to produce synthetic labels)
+// ---------------------------------------------------------------------------
+
+std::vector<double> heuristic_score(const std::string& headline, const std::string& description) {
+    std::string text = to_lower(headline + " " + description);
+    double risk = 0;
+    if (text.find("cure") != std::string::npos || text.find("medical") != std::string::npos || text.find("heal") != std::string::npos) risk += 0.4;
+    if (text.find("guarantee") != std::string::npos || text.find("100%") != std::string::npos) risk += 0.5;
+    if (text.find("sex") != std::string::npos || text.find("escort") != std::string::npos) risk += 1.0;
+    if (text.find("fake") != std::string::npos) risk += 1.0;
+    double pos = 0, neg = 0;
+    std::vector<std::string> pos_words = {"better", "relief", "recover", "strong", "calm", "clean", "professional", "help", "good", "best", "real", "focus"};
+    std::vector<std::string> neg_words = {"hurt", "pain", "stress", "tight", "bad", "dramatic", "tension", "stiff", "tired"};
+    for (const auto& w : pos_words) if (text.find(w) != std::string::npos) pos++;
+    for (const auto& w : neg_words) if (text.find(w) != std::string::npos) neg++;
+    double sentiment = (pos + neg) > 0 ? pos / (pos + neg) : 0.5;
+    double cta = (text.find("message") != std::string::npos || text.find("text") != std::string::npos || text.find("email") != std::string::npos || text.find("book") != std::string::npos) ? 1.0 : 0.0;
+    double local = (text.find("manhattan") != std::string::npos) ? 1.0 : 0.0;
+    double clarity = (description.size() >= 50 && description.size() <= 300) ? 1.0 : 0.7;
+    double composite = (1 - risk) * 0.35 + sentiment * 0.25 + cta * 0.15 + local * 0.15 + clarity * 0.1;
+    return {
+        std::min(0.08, composite * 0.08 + 0.01),
+        std::min(0.05, composite * 0.05 + 0.005),
+        std::min(0.03, composite * 0.03 + 0.003)
+    };
+}
+
+// ---------------------------------------------------------------------------
+// MLP with backpropagation
+// ---------------------------------------------------------------------------
+
+struct MLP {
+    int input_size, hidden_size, output_size;
+    std::vector<std::vector<double>> W1, W2;
+    std::vector<double> b1, b2;
+    std::vector<std::vector<double>> mW1, vW1, mW2, vW2;
+    std::vector<double> mb1, vb1, mb2, vb2;
+    int t = 0;
+    double dropout;
+
+    MLP(int in_s, int hid_s, int out_s, double seed, double drop = 0.2)
+        : input_size(in_s), hidden_size(hid_s), output_size(out_s), dropout(drop) {
+        std::mt19937 rng((unsigned)seed);
+        std::normal_distribution<double> dist(0.0, 1.0);
+        W1.resize(input_size, std::vector<double>(hidden_size));
+        mW1.resize(input_size, std::vector<double>(hidden_size, 0.0));
+        vW1.resize(input_size, std::vector<double>(hidden_size, 0.0));
+        for (int i = 0; i < input_size; i++)
+            for (int j = 0; j < hidden_size; j++)
+                W1[i][j] = dist(rng) * std::sqrt(2.0 / input_size);
+        b1.resize(hidden_size, 0.0);
+        mb1.resize(hidden_size, 0.0);
+        vb1.resize(hidden_size, 0.0);
+        W2.resize(hidden_size, std::vector<double>(output_size));
+        mW2.resize(hidden_size, std::vector<double>(output_size, 0.0));
+        vW2.resize(hidden_size, std::vector<double>(output_size, 0.0));
+        for (int i = 0; i < hidden_size; i++)

@@ -1,0 +1,800 @@
+        "content_type": body.get("content_type", "bio"),
+        "candidate_id": body.get("candidate_id", ""),
+        "bio_file": body.get("bio_file", ""),
+        "reason": body.get("reason", ""),
+    }
+    append_jsonl(EXPERIMENTS_FILE, exp)
+    receipt_path = write_receipt("experiment_start", f"Experiment {exp['id']} started with {exp['bio_file'] or exp['candidate_id']}", exp)
+    return {"status": "GREEN_REAL", "experiment": exp, "receipt_path": receipt_path}
+
+
+@app.post("/api/experiments/stop")
+def experiment_stop(request: Request, x_admin_token: Optional[str] = Header(None)):
+    require_admin(x_admin_token)
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        body = {}
+
+    exp_id = body.get("experiment_id", "")
+    result = body.get("result", "")
+    experiments = get_experiments()
+    stopped = None
+    for e in experiments:
+        if e.get("status") == "live" and (not exp_id or e.get("id") == exp_id):
+            e["status"] = "stopped"
+            e["stopped_at"] = datetime.now(timezone.utc).isoformat()
+            e["result"] = result
+            stopped = e
+
+    if stopped:
+        receipt_path = write_receipt("experiment_stop", f"Experiment {stopped['id']} stopped: {result}", stopped)
+        return {"status": "GREEN_REAL", "stopped": stopped, "receipt_path": receipt_path}
+    return {"status": "GRAY_NO_DATA", "message": "No active experiment to stop"}
+
+
+@app.get("/api/decision")
+def decision_gate():
+    """Production gate: KEEP_CURRENT, TEST_NEW_BIO, TEST_NEW_PHOTO, TEST_NEW_PRICE, TEST_NEW_INTERVIEW, BLOCK_NO_SIGNAL, or NEEDS_HUMAN_APPROVAL."""
+    metrics = get_latest_metrics()
+    active_exp = get_active_experiment()
+    content = get_content_ledger()
+    bio_files = list(BIOS_DIR.glob("*.txt")) if BIOS_DIR.exists() else []
+    candidates = get_candidates()
+
+    # No metrics = blocked
+    if not metrics:
+        decision = "BLOCK_NO_SIGNAL"
+        reason = "No metrics ingested. Cannot make decision without real data."
+        gate_info = None
+    elif active_exp:
+        # Check experiment gate — minimum exposure window
+        exp_events = get_events_for_experiment(active_exp.get("id", ""))
+        gate_info = check_experiment_gate(active_exp, exp_events, metrics)
+
+        if not gate_info["can_decide"]:
+            decision = "KEEP_CURRENT"
+            reason = gate_info["block_reason"]
+        elif not gate_info["has_downstream_signal"]:
+            decision = "KEEP_CURRENT"
+            reason = gate_info["block_reason"]
+        else:
+            # Has enough exposure + downstream signal — can declare winner
+            decision = "KEEP_CURRENT"
+            reason = f"Experiment has {gate_info['downstream_signals']} downstream signals and {gate_info['views']} views. Reward={gate_info['reward']}. Ready for comparison — stop experiment to evaluate."
+            gate_info["ready_for_evaluation"] = True
+    elif content or bio_files or candidates:
+        # No active experiment, candidates available
+        # Pick what to test based on what content types are available
+        content_types_available = set(c.get("type", "bio") for c in content)
+        if "bio" in content_types_available or bio_files:
+            decision = "TEST_NEW_BIO"
+            reason = "Bio candidates available and no active experiment. Start testing a new bio."
+        elif "photo" in content_types_available:
+            decision = "TEST_NEW_PHOTO"
+            reason = "Photo candidates available. Start testing a new photo."
+        elif "price" in content_types_available:
+            decision = "TEST_NEW_PRICE"
+            reason = "Price candidates available. Start testing a new price."
+        elif "interview" in content_types_available:
+            decision = "TEST_NEW_INTERVIEW"
+            reason = "Interview candidates available. Start testing a new interview."
+        else:
+            decision = "TEST_NEW_BIO"
+            reason = "Candidates available. Start testing."
+        gate_info = None
+    else:
+        decision = "BLOCK_NO_SIGNAL"
+        reason = "No candidates available. Generate candidates via pipeline first."
+        gate_info = None
+
+    # Log decision to decision ledger
+    decision_record = {
+        "id": str(uuid.uuid4())[:12],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "decision": decision,
+        "reason": reason,
+        "active_experiment_id": active_exp.get("id") if active_exp else None,
+        "gate_info": gate_info,
+    }
+    append_jsonl(DECISION_LEDGER_FILE, decision_record)
+
+    return {
+        "status": "GREEN_REAL",
+        "decision": decision,
+        "reason": reason,
+        "active_experiment": active_exp,
+        "gate": gate_info,
+        "candidates_available": len(candidates) + len(bio_files) + len(content),
+        "metrics_available": bool(metrics),
+    }
+
+
+@app.get("/api/jobs")
+def jobs_list(limit: int = 20):
+    return {"status": "GREEN_REAL", "jobs": list_jobs(limit)}
+
+
+@app.get("/api/jobs/{job_id}")
+def job_detail(job_id: str):
+    j = get_job(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="Job not found")
+    label = status_label(j.get("exit_code"))
+    if j["status"] == "running":
+        label = "YELLOW_RUNNING"
+    j["status_label"] = label
+    return j
+
+
+@app.get("/api/jobs/{job_id}/receipt")
+def job_receipt(job_id: str):
+    j = get_job(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="Job not found")
+    receipt_path = j.get("receipt_path", "")
+    if receipt_path and Path(receipt_path).exists():
+        return json.loads(Path(receipt_path).read_text())
+    return {"status": "GRAY_NO_DATA", "job_id": job_id, "message": "No receipt for this job"}
+
+
+@app.post("/api/run/pipeline")
+def run_pipeline(request: Request, x_admin_token: Optional[str] = Header(None)):
+    require_admin(x_admin_token)
+    cmd = ["python3", "production_pipeline.py"]
+    input_hash = hashlib.sha256(json.dumps({}, sort_keys=True).encode()).hexdigest()[:16]
+    job = create_job(" ".join(cmd), input_hash)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=str(APP_DIR))
+        output_files = [str(p) for p in (APP_DIR / "pipeline_output").glob("*")] if (APP_DIR / "pipeline_output").exists() else []
+        receipt_path = write_receipt("run_pipeline", "Full production pipeline", {
+            "job_id": job["job_id"], "exit_code": r.returncode,
+        })
+        update_job(job["job_id"], r.returncode, r.stdout, r.stderr, output_files, receipt_path)
+    except subprocess.TimeoutExpired:
+        update_job(job["job_id"], -1, "", "timeout after 600s", [])
+    except Exception as e:
+        update_job(job["job_id"], -1, "", str(e), [])
+    return get_job(job["job_id"])
+
+
+@app.post("/api/run/availability")
+def run_availability(x_admin_token: Optional[str] = Header(None)):
+    require_admin(x_admin_token)
+    receipt_path = write_receipt("availability_blocked", "Automated availability disabled — captcha/anti-bot", {
+        "reason": "Automated login hits CrowdSec captcha. Use manual approved path.",
+    })
+    return JSONResponse({
+        "status": "BLACK_DISABLED",
+        "label": "blocked_unsafe_automation",
+        "reason": "Automated availability login is blocked. This endpoint will not launch automation.",
+        "receipt_path": receipt_path,
+    }, status_code=403)
+
+
+@app.post("/api/ci/trigger")
+def ci_trigger(request: Request, x_admin_token: Optional[str] = Header(None)):
+    require_admin(x_admin_token)
+    if not GITHUB_TOKEN:
+        return JSONResponse({"status": "BLACK_DISABLED", "label": "no_github_token", "message": "GITHUB_TOKEN not configured."})
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        body = {}
+    workflow = body.get("workflow", "rentmasseur-optimizer.yml")
+    ref = body.get("ref", "main")
+    import requests
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{workflow}/dispatches"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    try:
+        r = requests.post(url, headers=headers, json={"ref": ref}, timeout=30)
+        if r.status_code == 204:
+            receipt_path = write_receipt("ci_trigger", f"Triggered {workflow} on {ref}", {"workflow": workflow, "ref": ref, "repo": GITHUB_REPO})
+            return {"status": "GREEN_REAL", "workflow": workflow, "ref": ref, "receipt_path": receipt_path}
+        return JSONResponse({"status": "RED_FAILED", "status_code": r.status_code, "response": r.text[:500]}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"status": "RED_FAILED", "error": str(e)}, status_code=500)
+
+
+@app.get("/api/receipts")
+def receipts_list():
+    receipt_files = sorted(RECEIPTS_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+    receipts = []
+    for f in receipt_files[:50]:
+        try:
+            receipts.append(json.loads(f.read_text()))
+        except Exception:
+            pass
+    return {"status": "GREEN_REAL", "count": len(receipts), "receipts": receipts}
+
+
+@app.get("/api/audit/files")
+def audit_files():
+    results = []
+    for f in sorted(APP_DIR.rglob("*")):
+        if f.is_dir() or ".git" in str(f) or "__pycache__" in str(f):
+            continue
+        rel = str(f.relative_to(APP_DIR))
+        entry = {"file": rel, "size_bytes": f.stat().st_size}
+        if f.suffix == ".py":
+            content = f.read_text()
+            entry["compiled"] = True
+            entry["called"] = any(fn in content for fn in ["@app.", "def ", "class "])
+            entry["writes_output"] = any(kw in content for kw in ["write_text", "open(", "json.dump", "sqlite3", "append_jsonl"])
+            entry["has_receipt"] = "write_receipt" in content
+            entry["mock"] = "mock" in content.lower() and "no mock" not in content.lower()
+            entry["label"] = "mock" if entry["mock"] else ("real" if entry["called"] else "dead")
+        elif f.suffix in (".jsonl", ".json"):
+            entry["label"] = "real_data" if f.stat().st_size > 0 else "empty"
+        elif f.suffix == ".txt":
+            entry["label"] = "real_data" if f.stat().st_size > 0 else "empty"
+        else:
+            entry["label"] = "config"
+        results.append(entry)
+    return {"status": "GREEN_REAL", "files_audited": len(results), "files": results}
+
+
+# ─── UI: Revenue OS Dashboard ───
+
+UI_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RentMasseur Revenue OS</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'SF Mono',monospace;background:#0a0a0f;color:#c0c0d0}
+.header{background:#0d0d15;padding:20px 30px;border-bottom:1px solid #1a1a2a}
+.header h1{color:#e0e0e0;font-size:15px;text-transform:uppercase;letter-spacing:3px}
+.header .sub{color:#555;font-size:11px;margin-top:4px}
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:15px;max-width:1600px;margin:0 auto}
+.panel{background:#0d0d15;border:1px solid #1a1a2a;border-radius:6px;overflow:hidden}
+.panel-h{padding:10px 14px;border-bottom:1px solid #1a1a2a;font-size:11px;font-weight:bold;text-transform:uppercase;letter-spacing:1px;color:#777}
+.panel-b{padding:14px;font-size:12px;line-height:1.6}
+.badge{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:bold}
+.badge.GREEN_REAL{background:#0a2a0a;color:#4caf50;border:1px solid #1a3a1a}
+.badge.YELLOW_RUNNING{background:#2a2a0a;color:#ffc107;border:1px solid #3a3a1a}
+.badge.RED_FAILED{background:#2a0a0a;color:#f44336;border:1px solid #3a1a1a}
+.badge.GRAY_NO_DATA{background:#0a0a0a;color:#555;border:1px solid #222}
+.badge.BLACK_DISABLED{background:#1a0505;color:#ff4444;border:1px solid #2a0a0a}
+table{width:100%;border-collapse:collapse;font-size:10px}
+th{text-align:left;padding:4px 5px;color:#555;border-bottom:1px solid #1a1a2a}
+td{padding:4px 5px;border-bottom:1px solid #0f0f18}
+.mr{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #0f0f18}
+.ml{color:#777}.mv{color:#e0e0e0;font-weight:bold}
+.missing{color:#555;font-style:italic}
+pre{background:#050508;padding:8px;border-radius:4px;overflow-x:auto;font-size:10px;color:#6a9f5a;max-height:160px;overflow-y:auto}
+.full{grid-column:span 3}
+.wide{grid-column:span 2}
+.funnel{display:flex;gap:3px;flex-wrap:wrap;margin-top:8px}
+.funnel-step{padding:3px 6px;border-radius:3px;font-size:9px;background:#111}
+.funnel-step.has{background:#0a2a0a;color:#4caf50}
+.funnel-step.empty{background:#0a0a0a;color:#333}
+.mission-status{font-size:18px;font-weight:bold;padding:8px 0}
+.mission-status.BOOKING_CONFIRMED{color:#4caf50}
+.mission-status.LEADS_ACTIVE{color:#ffc107}
+.mission-status.PROSPECTS_FOUND{color:#80a0ff}
+.mission-status.NO_PROSPECTS{color:#555}
+.gate-pass{color:#4caf50}.gate-fail{color:#f44336}
+.warning{background:#1a0a0a;border:1px solid #2a0a0a;padding:6px 10px;border-radius:4px;color:#f44336;font-size:10px;margin-top:4px}
+.mode-badge{display:inline-block;padding:3px 10px;border-radius:3px;font-size:11px;font-weight:bold}
+.mode-0{background:#0a0a1a;color:#555;border:1px solid #222}
+.mode-1{background:#0a1a0a;color:#4caf50;border:1px solid #1a3a1a}
+.mode-2{background:#0a1a1a;color:#80a0ff;border:1px solid #1a2a3a}
+.mode-3{background:#1a1a0a;color:#ffc107;border:1px solid #3a3a1a}
+.mode-4{background:#2a0a0a;color:#f44336;border:1px solid #3a1a1a}
+</style>
+</head>
+<body>
+<div class="header">
+<h1>RM-PRI — RentMasseur Profile Revenue Intelligence</h1>
+<div class="sub">Mission: one paying client per day, or prove exactly why it failed today. | <span id="rm-pri-version">v0.1</span> | <span id="control-mode-badge"></span></div>
+</div>
+<div class="grid">
+
+<div class="panel full">
+<div class="panel-h">Mission Control — Instrument Panel</div>
+<div class="panel-b" id="mission">Loading...</div>
+</div>
+
+<div class="panel">
+<div class="panel-h">Control Mode</div>
+<div class="panel-b" id="cmode">Loading...</div>
+</div>
+
+<div class="panel">
+<div class="panel-h">Test Phase</div>
+<div class="panel-b" id="tphase">Loading...</div>
+</div>
+
+<div class="panel">
+<div class="panel-h">Decision Gate</div>
+<div class="panel-b" id="decision">Loading...</div>
+</div>
+
+<div class="panel wide">
+<div class="panel-h">Prospect Ledger</div>
+<div class="panel-b" id="prospects">Loading...</div>
+</div>
+
+<div class="panel">
+<div class="panel-h">Content Ledger</div>
+<div class="panel-b" id="content">Loading...</div>
+</div>
+
+<div class="panel">
+<div class="panel-h">Event Ledger</div>
+<div class="panel-b" id="events">Loading...</div>
+</div>
+
+<div class="panel">
+<div class="panel-h">Experiment Ledger</div>
+<div class="panel-b" id="experiments">Loading...</div>
+</div>
+
+<div class="panel">
+<div class="panel-h">Job Ledger</div>
+<div class="panel-b" id="jobs">Loading...</div>
+</div>
+
+<div class="panel">
+<div class="panel-h">Revenue Proof</div>
+<div class="panel-b" id="revenue">Loading...</div>
+</div>
+
+<div class="panel full">
+<div class="panel-h">RevenueOps — Profile Stats Snapshot</div>
+<div class="panel-b" id="rev-stats">Loading...</div>
+</div>
+
+<div class="panel wide">
+<div class="panel-h">RevenueOps — Bio Candidates</div>
+<div class="panel-b" id="rev-bios">Loading...</div>
+</div>
+
+<div class="panel">
+<div class="panel-h">RevenueOps — Experiment</div>
+<div class="panel-b" id="rev-exp">Loading...</div>
+</div>
+
+<div class="panel">
+<div class="panel-h">RevenueOps — Interview</div>
+<div class="panel-b" id="rev-interview">Loading...</div>
+</div>
+
+<div class="panel">
+<div class="panel-h">RevenueOps — Blog</div>
+<div class="panel-b" id="rev-blog">Loading...</div>
+</div>
+
+<div class="panel full">
+<div class="panel-h">RevenueOps — Receipt Chain</div>
+<div class="panel-b" id="rev-receipts">Loading...</div>
+</div>
+
+</div>
+<script>
+async function api(p){try{const r=await fetch(p);return await r.json()}catch(e){return null}}
+function badge(s){return `<span class="badge ${s}">${s}</span>`}
+
+async function load(){
+// Mission Control
+const d=await api('/api/daily-proof');
+if(d){
+  const f=d.funnel||{};
+  const steps=['discovered','qualified','contacted','viewed','clicked','messaged','conversation','appointment','paid'];
+  let funnel='<div class="funnel">';
+  steps.forEach(s=>{const v=f[s]||0;funnel+=`<span class="funnel-step ${v>0?'has':'empty'}">${s}: ${v}</span>`});
+  funnel+='</div>';
+  document.getElementById('mission').innerHTML=`
+    <div class="mission-status ${d.mission_status}">${d.mission_status}</div>
+    <div class="mr"><span class="ml">Date</span><span class="mv">${d.date}</span></div>
+    <div class="mr"><span class="ml">Verified revenue</span><span class="mv">$${d.verified_revenue||0}</span></div>
+    <div class="mr"><span class="ml">Content versions</span><span class="mv">${d.content_versions||0}</span></div>
+    <div class="mr"><span class="ml">Events recorded</span><span class="mv">${d.events_recorded||0}</span></div>
+    <div class="mr"><span class="ml">Total reward</span><span class="mv">${d.total_reward||0}</span></div>
+    <div class="mr"><span class="ml">Jobs today</span><span class="mv">${d.jobs_today||0}</span></div>
+    <div class="mr"><span class="ml">RM-PRI Version</span><span class="mv">${d.rm_pri_version||'v0.1'}</span></div>
+    <div class="mr"><span class="ml">Control Mode</span><span class="mv">${d.control_mode_name||'read_only'}</span></div>
+    <div class="mr"><span class="ml">Next best action</span><span class="mv" style="font-size:10px">${d.next_best_action}</span></div>
+    ${funnel}
+  `;
+  if(d.rm_pri_version)document.getElementById('rm-pri-version').textContent=d.rm_pri_version;
+  if(d.control_mode_name)document.getElementById('control-mode-badge').innerHTML=`<span class="mode-badge mode-${d.control_mode}">${d.control_mode_name}</span>`;
+}
+
+// Control Mode
+const cm=await api('/api/control-mode');
+if(cm){
+  let h=`<span class="mode-badge mode-${cm.current_mode}">Mode ${cm.current_mode}: ${cm.mode_name}</span>`;
+  if(cm.mode4_unlock_check){
+    h+=`<div style="margin-top:8px"><b>Mode 4 Unlock:</b></div>`;
+    h+=`<div class="mr"><span class="ml">Experiments</span><span class="mv">${cm.mode4_unlock_check.experiment_count}/${cm.mode4_unlock_check.min_experiments?20:'?'}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Rollback tested</span><span class="${cm.mode4_unlock_check.rollback_tested?'gate-pass':'gate-fail'}">${cm.mode4_unlock_check.rollback_tested?'YES':'NO'}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Can unlock</span><span class="${cm.mode4_unlock_check.can_unlock?'gate-pass':'gate-fail'}">${cm.mode4_unlock_check.can_unlock?'YES':'NO'}</span></div>`;
+  }
+  if(cm.current_mode<2){h+=`<div class="warning">DO NOT APPLY: Mode < 2. No profile mutations allowed.</div>`}
+  document.getElementById('cmode').innerHTML=h;
+}
+
+// Test Phase
+const tp=await api('/api/test-phase');
+if(tp){
+  let h=`<b>Phase: ${tp.phase}</b> (day ${tp.day})`;
+  h+=`<div style="margin-top:6px;color:#888;font-size:11px">${tp.reason}</div>`;
+  if(tp.freeze&&tp.freeze.length){h+=`<div style="margin-top:6px"><b>Frozen:</b> ${tp.freeze.join(', ')}</div>`}
+  document.getElementById('tphase').innerHTML=h;
+}
+
+// Prospects
+const p=await api('/api/prospects');
+if(p){
+  if(p.status==='GRAY_NO_DATA'){
+    document.getElementById('prospects').innerHTML=`${badge('GRAY_NO_DATA')}<div class="missing" style="margin-top:8px">NO PROSPECTS</div>`;
+  }else{
+    let h=`${badge('GREEN_REAL')} ${p.count} prospects`;
+    h+='<table style="margin-top:8px"><tr><th>ID</th><th>Stage</th><th>Source</th><th>Time</th></tr>';
+    (p.prospects||[]).slice(0,8).forEach(x=>{h+=`<tr><td>${x.id}</td><td>${x.stage}</td><td>${x.source||'—'}</td><td>${(x.timestamp||'').substring(0,16)}</td></tr>`});
+    h+='</table>';
+    document.getElementById('prospects').innerHTML=h;
+  }
+}
+
+// Decision Gate
+const dg=await api('/api/decision');
+if(dg){
+  let h=`${badge('GREEN_REAL')} <b>${dg.decision}</b>`;
+  h+=`<div style="margin-top:6px;color:#888;font-size:11px">${dg.reason}</div>`;
+  if(dg.gate){
+    const g=dg.gate;
+    h+=`<div style="margin-top:8px"><b>Experiment Gate:</b></div>`;
+    h+=`<div class="mr"><span class="ml">Elapsed</span><span class="mv">${g.elapsed_hours}h</span></div>`;
+    h+=`<div class="mr"><span class="ml">Views</span><span class="mv">${g.views}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Downstream signals</span><span class="mv">${g.downstream_signals}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Reward</span><span class="mv">${g.reward}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Min 6h</span><span class="${g.min_hours_met?'gate-pass':'gate-fail'}">${g.min_hours_met?'PASS':'FAIL'}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Min 25 views</span><span class="${g.min_views_met?'gate-pass':'gate-fail'}">${g.min_views_met?'PASS':'FAIL'}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Has signal</span><span class="${g.has_downstream_signal?'gate-pass':'gate-fail'}">${g.has_downstream_signal?'YES':'NO'}</span></div>`;
+  }
+  h+=`<div style="margin-top:6px"><b>Candidates:</b> ${dg.candidates_available} | <b>Metrics:</b> ${dg.metrics_available?'yes':'no'}</div>`;
+  document.getElementById('decision').innerHTML=h;
+}
+
+// Content Ledger
+const c=await api('/api/content');
+if(c){
+  if(c.status==='GRAY_NO_DATA'){
+    document.getElementById('content').innerHTML=`${badge('GRAY_NO_DATA')}<div class="missing" style="margin-top:8px">NO CONTENT VERSIONS</div>`;
+  }else{
+    let h=`${badge('GREEN_REAL')} ${c.count} versions`;
+    h+='<table style="margin-top:8px"><tr><th>ID</th><th>Type</th><th>Label</th><th>Time</th></tr>';
+    (c.content||[]).slice(0,8).forEach(x=>{h+=`<tr><td>${x.id}</td><td>${x.type}</td><td>${x.label||'—'}</td><td>${(x.timestamp||'').substring(0,16)}</td></tr>`});
+    h+='</table>';
+    document.getElementById('content').innerHTML=h;
+  }
+}
+
+// Events
+const ev=await api('/api/events');
+if(ev){
+  if(ev.status==='GRAY_NO_DATA'){
+    document.getElementById('events').innerHTML=`${badge('GRAY_NO_DATA')}<div class="missing" style="margin-top:8px">NO EVENTS</div>`;
+  }else{
+    let h=`${badge('GREEN_REAL')} ${ev.count} events | Reward: ${ev.reward}`;
+    h+='<table style="margin-top:8px"><tr><th>Type</th><th>Content</th><th>Reward</th><th>Time</th></tr>';
+    (ev.events||[]).slice(0,8).forEach(x=>{h+=`<tr><td>${x.event_type}</td><td>${x.content_id||'—'}</td><td>${x.reward}</td><td>${(x.timestamp||'').substring(0,16)}</td></tr>`});
+    h+='</table>';
+    document.getElementById('events').innerHTML=h;
+  }
+}
+
+// Experiments
+const e=await api('/api/experiments');
+if(e){
+  if(e.status==='GRAY_NO_DATA'){
+    document.getElementById('experiments').innerHTML=`${badge('GRAY_NO_DATA')}<div class="missing" style="margin-top:8px">NO EXPERIMENTS</div>`;
+  }else{
+    let h=`${badge('GREEN_REAL')} ${e.count} experiments`;
+    h+='<table style="margin-top:8px"><tr><th>ID</th><th>Status</th><th>Candidate</th><th>Started</th></tr>';
+    (e.experiments||[]).slice(0,8).forEach(x=>{h+=`<tr><td>${x.id}</td><td>${badge(x.status==='live'?'GREEN_REAL':'GRAY_NO_DATA')}</td><td>${x.bio_file||x.candidate_id||'—'}</td><td>${(x.started_at||'').substring(0,16)}</td></tr>`});
+    h+='</table>';
+    document.getElementById('experiments').innerHTML=h;
+  }
+}
+
+// Jobs
+const j=await api('/api/jobs');
+if(j){
+  let h=`${badge('GREEN_REAL')} ${j.jobs.length} jobs`;
+  if(j.jobs.length){
+    h+='<table style="margin-top:8px"><tr><th>ID</th><th>Command</th><th>Status</th><th>Exit</th></tr>';
+    j.jobs.slice(0,8).forEach(x=>{
+      const sl=x.status==='success'?'GREEN_REAL':x.status==='failed'?'RED_FAILED':'YELLOW_RUNNING';
+      h+=`<tr><td>${x.job_id}</td><td>${(x.command||'').substring(0,25)}</td><td>${badge(sl)}</td><td>${x.exit_code!=null?x.exit_code:'—'}</td></tr>`;
+    });
+    h+='</table>';
+  }else{
+    h+='<div class="missing" style="margin-top:8px">No jobs. Admin token required.</div>';
+  }
+  document.getElementById('jobs').innerHTML=h;
+}
+
+// Revenue Proof
+if(d){
+  let h=`${badge(d.verified_revenue>0?'GREEN_REAL':'GRAY_NO_DATA')}`;
+  h+='<div style="margin-top:8px">';
+  h+=`<div class="mr"><span class="ml">Verified revenue</span><span class="mv">$${d.verified_revenue||0}</span></div>`;
+  h+=`<div class="mr"><span class="ml">Confirmed bookings</span><span class="mv">${d.funnel?.paid||0}</span></div>`;
+  h+=`<div class="mr"><span class="ml">Appointments</span><span class="mv">${d.funnel?.appointment||0}</span></div>`;
+  h+='</div>';
+  if(!d.verified_revenue){h+='<div class="missing" style="margin-top:8px">Unverified. No estimates.</div>'}
+  document.getElementById('revenue').innerHTML=h;
+}
+// RevenueOps — Stats Snapshot
+const rs=await api('/api/metrics/history');
+if(rs){
+  const rows=rs.metrics||[];
+  if(rows.length===0){
+    document.getElementById('rev-stats').innerHTML=`${badge('GRAY_NO_DATA')}<div class="missing" style="margin-top:8px">No metrics ingested yet. POST to /api/metrics/ingest to seed baseline.</div>`;
+  }else{
+    const latest=rows[rows.length-1];
+    const ctr=latest.contact_click_rate||((latest.contact_clicks||0)/Math.max(latest.profile_views||1,1)*100).toFixed(2);
+    let h=`${badge('GREEN_REAL')} ${rows.length} metric entries`;
+    h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px">';
+    h+=`<div class="mr"><span class="ml">Date</span><span class="mv">${latest.date||'—'}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Bio ID</span><span class="mv">${latest.bio_id||'—'}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Profile Views</span><span class="mv">${latest.profile_views||0}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Contact Clicks</span><span class="mv">${latest.contact_clicks||0}</span></div>`;
+    h+=`<div class="mr"><span class="ml">CTR</span><span class="mv" style="color:#4caf50">${(ctr*100).toFixed(2)}%</span></div>`;
+    h+=`<div class="mr"><span class="ml">New Visits</span><span class="mv">${latest.new_visits||0}</span></div>`;
+    h+=`<div class="mr"><span class="ml">New Emails</span><span class="mv">${latest.new_emails||0}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Available</span><span class="mv">${latest.availability_state?'YES':'NO'}</span></div>`;
+    h+='</div>';
+    if(rows.length>1){
+      h+='<div style="margin-top:10px"><b>History:</b></div>';
+      h+='<table style="margin-top:4px"><tr><th>Date</th><th>Bio</th><th>Views</th><th>Clicks</th><th>CTR</th><th>Emails</th></tr>';
+      rows.slice(-10).forEach(r=>{
+        const c=(r.contact_click_rate||((r.contact_clicks||0)/Math.max(r.profile_views||1,1))).toFixed(4);
+        h+=`<tr><td>${r.date||'—'}</td><td>${(r.bio_id||'—').substring(0,20)}</td><td>${r.profile_views||0}</td><td>${r.contact_clicks||0}</td><td>${(c*100).toFixed(2)}%</td><td>${r.new_emails||0}</td></tr>`;
+      });
+      h+='</table>';
+    }
+    document.getElementById('rev-stats').innerHTML=h;
+  }
+}
+
+// RevenueOps — Bio Candidates
+const rb=await api('/api/candidates');
+if(rb){
+  const fb=rb.file_bios||[];
+  const cb=rb.candidates||[];
+  if(fb.length===0&&cb.length===0){
+    document.getElementById('rev-bios').innerHTML=`${badge('GRAY_NO_DATA')}<div class="missing" style="margin-top:8px">No candidates loaded.</div>`;
+  }else{
+    let h=`${badge('GREEN_REAL')} ${fb.length} file bios, ${cb.length} JSON candidates`;
+    h+='<div style="margin-top:10px">';
+    fb.forEach(b=>{
+      const name=b.name||b.bio_id||'unknown';
+      const status=b.status||'candidate';
+      const sb=status==='approved_for_test'?'GREEN_REAL':'GRAY_NO_DATA';
+      h+=`<div style="margin-bottom:12px;padding:8px;border:1px solid #1a1a2a;border-radius:4px">`;
+      h+=`<div style="display:flex;justify-content:space-between"><b>${name}</b>${badge(sb)}</div>`;
+      if(b.headline)h+=`<div style="color:#888;margin-top:4px;font-size:11px">${b.headline}</div>`;
+      if(b.description){
+        const desc=b.description.substring(0,200);
+        h+=`<pre style="margin-top:6px;max-height:120px">${desc}${b.description.length>200?'...':''}</pre>`;
+      }
+      if(b.safety){
+        h+=`<div style="margin-top:4px;font-size:10px;color:#555">secret:${b.safety.contains_secret?'YES':'no'} token:${b.safety.uses_session_token?'YES':'no'} approval:${b.safety.manual_approval_required?'required':'not required'}</div>`;
+      }
+      h+='</div>';
+    });
+    h+='</div>';
+    document.getElementById('rev-bios').innerHTML=h;
+  }
+}
+
+// RevenueOps — Experiment
+const re=await api('/api/experiments/current');
+if(re){
+  if(!re.experiment&&!re.bio_id){
+    document.getElementById('rev-exp').innerHTML=`${badge('GRAY_NO_DATA')}<div class="missing" style="margin-top:8px">No active experiment.</div>`;
+  }else{
+    const exp=re.experiment||re;
+    let h=`${badge(exp.status==='running'?'YELLOW_RUNNING':'GREEN_REAL')} <b>${exp.experiment_id||exp.bio_id||'—'}</b>`;
+    h+=`<div class="mr"><span class="ml">Status</span><span class="mv">${exp.status||'—'}</span></div>`;
+    h+=`<div class="mr"><span class="ml">Bio</span><span class="mv">${exp.bio_id||'—'}</span></div>`;
+    if(exp.started_at)h+=`<div class="mr"><span class="ml">Started</span><span class="mv">${exp.started_at.substring(0,16)}</span></div>`;
+    if(exp.baseline_ctr)h+=`<div class="mr"><span class="ml">Baseline CTR</span><span class="mv">${(exp.baseline_ctr*100).toFixed(2)}%</span></div>`;
+    if(exp.winner)h+=`<div class="mr"><span class="ml">Winner</span><span class="mv" style="color:#4caf50">${exp.winner}</span></div>`;
+    document.getElementById('rev-exp').innerHTML=h;
+  }
+}
+
+// RevenueOps — Decision
+const rd=await api('/api/decision/latest');
+if(rd){
+  const dec=rd.decision||rd;
+  let h=`${badge(dec.status||'GRAY_NO_DATA')} <b>${dec.status||'NONE'}</b>`;
+  if(dec.reason)h+=`<div style="margin-top:6px;color:#888;font-size:11px">${dec.reason}</div>`;
+  if(dec.metrics_count!==undefined)h+=`<div class="mr"><span class="ml">Metrics</span><span class="mv">${dec.metrics_count}</span></div>`;
+  if(dec.candidates_count!==undefined)h+=`<div class="mr"><span class="ml">Candidates</span><span class="mv">${dec.candidates_count}</span></div>`;
+  if(dec.active_experiment!==undefined)h+=`<div class="mr"><span class="ml">Active exp</span><span class="mv">${dec.active_experiment?'YES':'NO'}</span></div>`;
+  document.getElementById('rev-exp').innerHTML+=h;
+}
+
+// RevenueOps — Interview
+const ri=await api('/api/content?type=interview');
+if(ri){
+  if(ri.status==='GRAY_NO_DATA'||(ri.content||[]).length===0){
+    document.getElementById('rev-interview').innerHTML=`${badge('GRAY_NO_DATA')}<div class="missing" style="margin-top:8px">No interview variants.</div>`;
+  }else{
+    let h=`${badge('GREEN_REAL')} ${ri.count} variants`;
+    h+='<table style="margin-top:6px"><tr><th>ID</th><th>Label</th><th>Time</th></tr>';
+    (ri.content||[]).slice(0,5).forEach(x=>{h+=`<tr><td>${x.id}</td><td>${x.label||'—'}</td><td>${(x.timestamp||'').substring(0,16)}</td></tr>`});
+    h+='</table>';
+    document.getElementById('rev-interview').innerHTML=h;
+  }
+}
+
+// RevenueOps — Blog
+const rbl=await api('/api/content?type=blog');
+if(rbl){
+  if(rbl.status==='GRAY_NO_DATA'||(rbl.content||[]).length===0){
+    document.getElementById('rev-blog').innerHTML=`${badge('GRAY_NO_DATA')}<div class="missing" style="margin-top:8px">No blog variants.</div>`;
+  }else{
+    let h=`${badge('GREEN_REAL')} ${rbl.count} variants`;
+    h+='<table style="margin-top:6px"><tr><th>ID</th><th>Label</th><th>Time</th></tr>';
+    (rbl.content||[]).slice(0,5).forEach(x=>{h+=`<tr><td>${x.id}</td><td>${x.label||'—'}</td><td>${(x.timestamp||'').substring(0,16)}</td></tr>`});
+    h+='</table>';
+    document.getElementById('rev-blog').innerHTML=h;
+  }
+}
+
+// RevenueOps — Receipts
+const rr=await api('/api/receipts/latest');
+if(rr){
+  const receipts=rr.receipts||[];
+  if(receipts.length===0){
+    document.getElementById('rev-receipts').innerHTML=`${badge('GRAY_NO_DATA')}<div class="missing" style="margin-top:8px">No receipts.</div>`;
+  }else{
+    let h=`${badge('GREEN_REAL')} ${receipts.length} receipts`;
+    if(rr.chain_valid!==undefined)h+=` | Chain valid: <span class="${rr.chain_valid?'gate-pass':'gate-fail'}">${rr.chain_valid?'YES':'NO'}</span>`;
+    h+='<table style="margin-top:8px"><tr><th>#</th><th>Action</th><th>Description</th><th>Hash</th><th>Time</th></tr>';
+    receipts.slice(-15).forEach(r=>{
+      h+=`<tr><td>${r.index}</td><td>${r.action||'—'}</td><td>${(r.description||'').substring(0,40)}</td><td style="font-size:9px;color:#555">${(r.hash||'').substring(0,16)}...</td><td>${(r.timestamp||'').substring(0,16)}</td></tr>`;
+    });
+    h+='</table>';
+    document.getElementById('rev-receipts').innerHTML=h;
+  }
+}
+
+}
+load();setInterval(load,10000);
+</script>
+</body>
+</html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def ui():
+    return UI_HTML
+
+
+# ─── RevenueOps Endpoints ───
+
+REVENUE_OPS_DB = APP_DIR / "revenue_ops.db"
+
+
+@app.get("/api/decision/latest")
+def api_decision_latest():
+    """Get the latest decision from the strict decision engine."""
+    return _rev_latest_decision(db_path=REVENUE_OPS_DB)
+
+
+@app.get("/api/experiments/current")
+def api_experiments_current():
+    """Get all experiments."""
+    return {"experiments": _rev_experiments(db_path=REVENUE_OPS_DB)}
+
+
+@app.post("/api/experiments/start")
+def api_experiments_start(payload: dict):
+    """Start a new experiment. Only bio/headline changes. Everything else frozen."""
+    bio_id = payload.get("bio_id", "")
+    variant_class = payload.get("variant_class", "")
+    before_views = int(payload.get("before_views", 0))
+    before_clicks = int(payload.get("before_contact_clicks", 0))
+    before_emails = int(payload.get("before_emails", 0))
+    if not bio_id:
+        raise HTTPException(status_code=400, detail="bio_id required")
+    result = _rev_start_exp(bio_id, variant_class, before_views, before_clicks, before_emails, db_path=REVENUE_OPS_DB)
+    write_receipt("experiment_start_api", result)
+    return result
+
+
+@app.post("/api/experiments/close")
+def api_experiments_close(payload: dict):
+    """Close an experiment with after metrics."""
+    exp_id = payload.get("experiment_id", "")
+    after_views = int(payload.get("after_views", 0))
+    after_clicks = int(payload.get("after_contact_clicks", 0))
+    after_emails = int(payload.get("after_emails", 0))
+    if not exp_id:
+        raise HTTPException(status_code=400, detail="experiment_id required")
+    result = _rev_close_exp(exp_id, after_views, after_clicks, after_emails, db_path=REVENUE_OPS_DB)
+    write_receipt("experiment_close_api", result)
+    return result
+
+
+@app.get("/api/metrics/history")
+def api_metrics_history(limit: int = 30):
+    """Get metrics history."""
+    return {"metrics": _rev_metrics_history(limit, db_path=REVENUE_OPS_DB)}
+
+
+@app.get("/api/candidates")
+def api_candidates_current():
+    """Get current bio candidates for testing."""
+    cands_file = BIOS_DIR / "current_candidates.json"
+    if cands_file.exists():
+        return json.loads(cands_file.read_text())
+    return {"candidates": [], "message": "No candidates file found."}
+
+
+@app.get("/api/evidence-packet/latest")
+def api_evidence_packet_latest():
+    """Generate and return the latest daily evidence packet from local traffic data."""
+    traffic_db = os.getenv("RM_TRAFFIC_DB", str(APP_DIR.parent / "rm_traffic" / "profileops.db"))
+    if not Path(traffic_db).exists():
+        return {"error": "traffic db not found", "path": traffic_db}
+    packet = _rev_packet(traffic_db, db_path=REVENUE_OPS_DB)
+    return packet
+
+
+@app.get("/api/receipts/latest")
+def api_receipts_latest():
+    """Get the latest receipt from the RevenueOps chain."""
+    conn = sqlite3.connect(str(REVENUE_OPS_DB))
+    row = conn.execute(
+        "SELECT receipt_hash, prev_hash, action, data_json, created_at "
+        "FROM receipt_chain ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"receipt": None}
+    return {"receipt": {"hash": row[0], "prev_hash": row[1], "action": row[2],
+                        "data": json.loads(row[3]), "created_at": row[4]}}
+
+
+@app.get("/api/receipts/verify")
+def api_receipts_verify():
+    """Verify the RevenueOps receipt chain integrity."""
+    valid = _rev_verify_chain(db_path=REVENUE_OPS_DB)
+    return {"chain_valid": valid}
+
+
+@app.get("/api/decision-states")
+def api_decision_states():
+    """List all valid decision states."""
+    return {"states": DECISION_STATES}
+
+
+# ===== Direct API Automation Endpoints =====
+# Uses RentMasseurAPI directly — no Selenium, no browser, no captcha fighting.
+# Concurrent profile visits, direct blog/interview/bio posting via confirmed API.
+
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+EXTENSION_REPO = os.getenv("EXTENSION_REPO", os.path.expanduser("~/Downloads/MEMBRA::SURFACE=BUILD@LIVE/02_AI_Agents/rentmasseur-extension"))
+RM_TRAFFIC_PATH = os.getenv("RM_TRAFFIC_PATH", os.path.expanduser("~/Downloads/windsurf-smoke"))
+
+
+def _get_api_client():
+    """Create a logged-in RentMasseurAPI client."""
+    import sys
+    sys.path.insert(0, RM_TRAFFIC_PATH)
+    from rm_traffic.api_client import RentMasseurAPI

@@ -1,0 +1,800 @@
+
+collect.js:
+```
+/*
+ * Vercel Serverless Function: /api/collect
+ * Collects metrics from the RentMasseur Chrome extension or any client
+ * and forwards them to the Hugging Face Space OS backend.
+ */
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
+  const HF_TOKEN = process.env.HF_TOKEN || '';
+
+  try {
+    const payload = req.body;
+    const enriched = {
+      ...payload,
+      source: 'vercel',
+      vercel_region: process.env.VERCEL_REGION || 'unknown',
+      collected_at: new Date().toISOString(),
+    };
+
+    // Forward to HF Space
+    if (HF_SPACE_URL) {
+      await fetch(`${HF_SPACE_URL}/api/os/ingest`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(HF_TOKEN ? { Authorization: `Bearer ${HF_TOKEN}` } : {}),
+        },
+        body: JSON.stringify(enriched),
+      });
+    }
+
+    // Also store in Vercel KV or just return
+    return res.status(200).json({
+      status: 'collected',
+      payload: enriched,
+      hf_forwarded: Boolean(HF_SPACE_URL),
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+```
+
+report.js:
+```
+/*
+ * Vercel Serverless Function: /api/report
+ * Returns the full RentMasseur OS report from the HF Space backend.
+ */
+
+export default async function handler(req, res) {
+  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
+  try {
+    if (!HF_SPACE_URL) {
+      return res.status(200).json({ note: 'HF_SPACE_URL not set' });
+    }
+    const resp = await fetch(`${HF_SPACE_URL}/api/os/report`);
+    const data = await resp.json();
+    return res.status(200).json(data);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+```
+
+auto-bio-update.yml:
+```
+name: Auto Bio Updater
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-bio:
+    runs-on: ubuntu-latest
+    env:
+      RENTMASSEUR_USERNAME: ${{ secrets.RENTMASSEUR_USERNAME }}
+      RENTMASSEUR_PASSWORD: ${{ secrets.RENTMASSEUR_PASSWORD }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GROQ_MODEL: llama-3.3-70b-versatile
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Chrome and ChromeDriver
+        run: |
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list'
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+          CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+' | head -1)
+          DRIVER_VERSION=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_VERSION%%.*}")
+          wget -q "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip"
+          unzip -q chromedriver-linux64.zip
+          sudo mv chromedriver-linux64/chromedriver /usr/local/bin/chromedriver
+          sudo chmod +x /usr/local/bin/chromedriver
+
+      - name: Generate fresh content
+        run: |
+          python3 content_generator.py --bios-only
+
+      - name: Update profile bio
+        run: |
+          python3 auto_bio_updater.py --headless true
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bio-update-debug
+          path: debug/
+          retention-days: 7
+
+```
+
+deploy-hf-space.yml:
+```
+name: Deploy to Hugging Face Space
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 */12 * * *'  # Redeploy every 12 hours with new data
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_SPACE_NAME: ${{ secrets.HF_SPACE_NAME }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure HF credentials
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Clone existing HF space
+        run: |
+          rm -rf hf-space
+          git clone https://hf_user:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE_NAME} hf-space || true
+
+      - name: Sync files to HF space (no secrets in repo)
+        run: |
+          rm -rf hf-space/*
+          rsync -av --exclude='hf-space' --exclude='.git' --exclude='.env' --exclude='debug' --exclude='.github' . hf-space/
+          rm -rf hf-space/.git
+          rm -rf hf-space/.env
+          rm -rf hf-space/debug
+          rm -rf hf-space/.github
+          # No .env file pushed. Secrets are set via HF Spaces API.
+
+      - name: Set HF Space secrets via API (no secrets in git)
+        run: |
+          for KEY_VAL in \
+            "RENTMASSEUR_USERNAME=${{ secrets.RENTMASSEUR_USERNAME }}" \
+            "RENTMASSEUR_PASSWORD=${{ secrets.RENTMASSEUR_PASSWORD }}" \
+            "GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}" \
+            "GROQ_MODEL=llama-3.3-70b-versatile" \
+            "HF_SPACE_NAME=${HF_SPACE_NAME}" \
+            "GH_TOKEN=${{ secrets.GH_PAT }}" \
+            "GH_REPO=overandor/rentmasseur-extension"; do
+            KEY="${KEY_VAL%%=*}"
+            VAL="${KEY_VAL#*=}"
+            echo "Setting HF Space secret: $KEY"
+            curl -s -X POST \
+              "https://huggingface.co/api/spaces/${HF_SPACE_NAME}/secrets" \
+              -H "Authorization: Bearer ${HF_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"key\":\"$KEY\",\"value\":\"$VAL\"}" || true
+          done
+
+      - name: Push to HF space (no .env, no .github, no secrets)
+        run: |
+          cd hf-space
+          rm -f .gitignore
+          rm -rf .git
+          git init
+          git checkout -b main
+          git add -A
+          git commit -m "Auto-deploy from GitHub Actions $(date -u +%Y-%m-%d-%H:%M:%S)"
+          git push https://hf_user:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE_NAME} main --force
+
+      - name: Write deploy receipt
+        run: |
+          mkdir -p receipts
+          cat > receipts/deploy_$(date -u +%Y%m%d_%H%M%S).json <<EOF
+          {
+            "action": "deploy-hf-space",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "${{ github.sha }}",
+            "space": "${HF_SPACE_NAME}",
+            "secrets_pushed_to_git": false,
+            "secrets_set_via_api": true,
+            "status": "pending_verification"
+          }
+          EOF
+          git add receipts/ || true
+          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" commit -m "Deploy receipt $(date -u +%Y-%m-%d-%H:%M)" || true
+          git push || true
+
+      - name: Verify HF Space health (hard pass/fail with retries)
+        run: |
+          # Derive public HF Space URL from HF_SPACE_NAME (owner/space -> owner-space.hf.space)
+          SPACE_URL=$(echo "${HF_SPACE_NAME}" | sed 's|/|-|g')
+          HEALTH_URL="https://${SPACE_URL}.hf.space/api/health"
+          echo "HF Space: ${HF_SPACE_NAME}"
+          echo "Health URL: ${HEALTH_URL}"
+
+          # Wait for HF Docker build + startup (can take 60-180s)
+          sleep 90
+
+          for i in 1 2 3 4 5; do
+            echo "Health check attempt $i..."
+            HEALTH=$(curl -s -o /tmp/health_response -w "%{http_code}" --max-time 30 "${HEALTH_URL}")
+            echo "HF Space health endpoint: $HEALTH"
+            if [ "$HEALTH" == "200" ]; then
+              echo "PASS: HF Space is live and healthy"
+              cat /tmp/health_response
+              exit 0
+            fi
+            echo "Response body:"
+            cat /tmp/health_response || true
+            echo "Waiting 60s before retry..."
+            sleep 60
+          done
+
+          echo "FAIL: HF Space health endpoint did not return 200 after 5 attempts"
+          exit 1
+
+```
+
+weekly-report.yml:
+```
+name: Weekly Report
+
+on:
+  schedule:
+    - cron: '0 10 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  weekly-report:
+    runs-on: ubuntu-latest
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GROQ_MODEL: llama-3.3-70b-versatile
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate weekly report
+        run: |
+          python3 weekly_report.py
+
+      - name: Commit and push report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add content/weekly_report_*.md
+          if git diff --cached --quiet; then
+            echo "No report to commit"
+          else
+            git commit -m "Weekly report $(date -u +%Y-%m-%d)"
+            git push
+          fi
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-report
+          path: content/weekly_report_*.md
+          retention-days: 90
+
+```
+
+master-rotator.yml:
+```
+name: RentMasseur Master Rotator
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no profile changes)'
+        required: false
+        default: 'true'
+      components:
+        description: 'Comma-separated: bio,photo,price,interview,blog,all'
+        required: false
+        default: 'all'
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RENTMASSEUR_USERNAME: ${{ secrets.RENTMASSEUR_USERNAME }}
+      RENTMASSEUR_PASSWORD: ${{ secrets.RENTMASSEUR_PASSWORD }}
+      REBRANDLY_LINK: ${{ secrets.REBRANDLY_LINK }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GROQ_MODEL: llama-3.3-70b-versatile
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Build production control loop (C++)
+        run: |
+          g++ -O3 -std=c++17 -Wall -Wextra -pedantic production_control_loop.cpp -o production_control_loop
+
+      - name: Preflight gate — production control loop
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.dry_run || 'true' }}" = "true" ]; then
+            echo "Dry run: using placeholder link for proof-only preflight. No profile changes allowed."
+            REBRANDLY_LINK="https://rebrand.ly/dry-run-placeholder" ./production_control_loop --preflight
+          else
+            ./production_control_loop --preflight
+          fi
+
+      - name: Collect RL stats
+        run: |
+          python3 rl_feedback.py || true
+
+      - name: Generate fresh content
+        run: |
+          python3 content_generator.py || true
+          python3 interview_rotator.py || true
+          python3 blog_rotator.py || true
+
+      - name: Run full rotation in proof mode
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.dry_run || 'true' }}" = "true" ]; then
+            python3 orchestrator.py --all --dry-run || true
+          else
+            python3 orchestrator.py --all
+          fi
+
+      - name: Production gate — evaluate candidates or block safely
+        run: |
+          set -euo pipefail
+          mkdir -p content/decisions
+          if [ -f content/live_metrics.json ] && [ -f content/candidates.tsv ]; then
+            ./production_control_loop \
+              --evaluate \
+              --metrics content/live_metrics.json \
+              --candidates content/candidates.tsv \
+              --ledger content/experiment_ledger.jsonl \
+              --decision content/decisions/latest_decision.json
+          else
+            cat > content/decisions/latest_decision.json <<DECISION
+          {
+            "status": "blocked_missing_real_inputs",
+            "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+            "live_update_allowed": false,
+            "dry_run": "${{ github.event.inputs.dry_run || 'true' }}",
+            "run_id": "${{ github.run_id }}"
+          }
+          DECISION
+          fi
+          echo "=== Production gate decision ==="
+          cat content/decisions/latest_decision.json
+
+      - name: Live availability step guard
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.dry_run || 'true' }}" = "true" ]; then
+            echo "Dry run: live account availability step skipped."
+            exit 0
+          fi
+          echo "Live account step disabled unless a clean manual path is approved."
+          exit 0
+
+      - name: Write proof file (what it saw, chose, changed, won/lost)
+        run: |
+          mkdir -p receipts
+          cat > receipts/rotation_$(date -u +%Y%m%d_%H%M%S).json <<PROOF
+          {
+            "action": "master-rotator",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "run_id": "${{ github.run_id }}",
+            "dry_run": "${{ github.event.inputs.dry_run || 'true' }}",
+            "components": "${{ github.event.inputs.components || 'all' }}",
+            "preflight_passed": true,
+            "gate_decision": $(cat content/decisions/latest_decision.json 2>/dev/null || echo '{}'),
+            "availability_step": "skipped_in_dry_run_or_disabled_for_platform_safety",
+            "content_changed": "$(git status --porcelain | tr '\n' ' ')",
+            "status": "completed"
+          }
+          PROOF
+          echo "=== Proof file written ==="
+          cat receipts/rotation_*.json | tail -40
+
+      - name: Commit and push state + content + proof
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add content/ || true
+          git add receipts/ || true
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "Autonomous rotation proof: bio/photo/price/interview/blog + gate $(date -u +%Y-%m-%d-%H:%M)"
+            git push
+          else
+            echo "No changes to commit"
+          fi
+
+      - name: Upload debug artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rotation-debug
+          path: |
+            debug/
+            content/decisions/
+            receipts/
+          retention-days: 7
+
+```
+
+availability.yml:
+```
+name: RentMasseur Availability Check
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      mock:
+        description: 'Use mock data instead of live scrape'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run availability checker
+        run: |
+          if [ "${{ github.event.inputs.mock }}" == "true" ]; then
+            python3 checker.py --mock --output availability.json
+          else
+            python3 checker.py --output availability.json
+          fi
+
+      - name: Commit and push updated availability
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain availability.json)" ]; then
+            git add availability.json
+            git commit -m "Update availability.json [skip ci]"
+            git push
+          else
+            echo "No availability changes to commit"
+          fi
+
+```
+
+availability-keeper.yml:
+```
+name: RentMasseur Metrics & Availability Keeper
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      manual_metrics:
+        description: 'JSON metrics from manual dashboard read (paste JSON)'
+        required: false
+        default: ''
+
+jobs:
+  collect-metrics:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RENTMASSEUR_USERNAME: ${{ secrets.RENTMASSEUR_USERNAME }}
+      RENTMASSEUR_PASSWORD: ${{ secrets.RENTMASSEUR_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Chrome and ChromeDriver
+        run: |
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list'
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+          CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+' | head -1)
+          DRIVER_VERSION=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_VERSION%%.*}")
+          wget -q "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip"
+          unzip -q chromedriver-linux64.zip
+          sudo mv chromedriver-linux64/chromedriver /usr/local/bin/chromedriver
+          sudo chmod +x /usr/local/bin/chromedriver
+
+      - name: Keep availability 24/7
+        continue-on-error: true
+        run: |
+          python3 rentmasseur_availability.py --headless true || echo "Availability keeper failed (possibly CAPTCHA) - will retry next run"
+
+      - name: Ingest manual metrics if provided
+        if: ${{ github.event.inputs.manual_metrics != '' }}
+        run: |
+          mkdir -p content
+          echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source\":\"manual_upload\",\"body\":${{ github.event.inputs.manual_metrics }}}" >> content/metrics_ingest.jsonl
+          echo "Manual metrics ingested."
+
+      - name: Fetch metrics from HF Space
+        run: |
+          mkdir -p content
+          curl -s "https://josephrw-rentmasseur-optimizer.hf.space/api/report" -o content/hf_report.json || true
+          echo "HF Space report fetched."
+
+      - name: Process metrics and update state
+        run: |
+          python3 metrics_collector.py --process
+
+      - name: Write proof file
+        run: |
+          python3 metrics_collector.py --proof
+
+      - name: Commit and push state + proof
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add content/ || true
+          git add availability.json || true
+          git add receipts/ || true
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "Metrics + availability keeper: $(date -u +%Y-%m-%d-%H:%M)"
+            git push
+          else
+            echo "No changes to commit"
+          fi
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-debug
+          path: |
+            content/
+            receipts/
+          retention-days: 7
+
+```
+
+daily-content.yml:
+```
+name: Daily Content Generator
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate-content:
+    runs-on: ubuntu-latest
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GROQ_MODEL: llama-3.3-70b-versatile
+      RENTMASSEUR_USERNAME: ${{ secrets.RENTMASSEUR_USERNAME }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate daily content (bios, blog posts, interview questions + mass analysis)
+        run: |
+          python3 content_generator.py
+
+      - name: Generate social media posts
+        run: |
+          python3 social_media_generator.py
+
+      - name: Generate email templates
+        run: |
+          python3 email_templates.py
+
+      - name: Generate SEO keywords
+        run: |
+          python3 seo_keywords.py
+
+      - name: Commit and push generated content
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add content/
+          if git diff --cached --quiet; then
+            echo "No new content to commit"
+          else
+            git commit -m "Daily content: bios, blogs, questions, social, emails, SEO + mass analysis $(date -u +%Y-%m-%d)"
+            git push
+          fi
+
+      - name: Upload content artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-content
+          path: content/
+          retention-days: 30
+
+```
+
+ci.yml:
+```
+name: RM RevenueOps CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile all Python
+        run: python3 -m compileall server.py rm_revenue_engine/ rm_pri/
+
+      - name: Secret scan
+        run: |
+          if grep -RInE "RENTMASSEUR_PASSWORD|RM_PASSWORD|GROQ_API_KEY|OPENROUTER|hf_[A-Za-z0-9]{30,}|Bearer\s+[A-Za-z0-9]{20,}|Lola369" . \
+            --exclude-dir=.git --exclude-dir=.github --exclude="*.pyc" --exclude-dir=__pycache__ --exclude-dir=private_secrets_quarantine \
+            --exclude=".dockerignore" --exclude=".gitignore"; then
+            echo "SECRETS FOUND — FAILING BUILD"
+            exit 1
+          else
+            echo "No secrets detected"
+          fi
+
+      - name: Check Dockerfile exists
+        run: test -f Dockerfile && echo "Dockerfile OK" || (echo "MISSING Dockerfile" && exit 1)
+
+      - name: Check .dockerignore exists
+        run: test -f .dockerignore && echo ".dockerignore OK" || (echo "MISSING .dockerignore" && exit 1)
+
+      - name: API smoke tests
+        run: |
+          python3 -c "
+          from fastapi.testclient import TestClient
+          from server import app
+          c = TestClient(app)
+
+          # Health
+          r = c.get('/api/health')
+          assert r.status_code == 200, f'health failed: {r.status_code}'
+          print('PASS: /api/health')
+
+          # Decision states
+          r = c.get('/api/decision-states')
+          assert r.status_code == 200
+          states = r.json()['states']
+          assert 'BLOCK_NO_SIGNAL' in states
+          assert 'KEEP_CURRENT' in states
+          assert 'WINNER_FOUND' in states
+          print(f'PASS: /api/decision-states ({len(states)} states)')
+
+          # Candidates
+          r = c.get('/api/candidates')
+          assert r.status_code == 200
+          print(f'PASS: /api/candidates')
+
+          # Metrics ingest
+          r = c.post('/api/metrics/ingest', json={
+              'date': '2026-06-26',
+              'bio_id': 'ci_test',
+              'profile_views': 500,
+              'contact_clicks': 30,
+              'new_visits': 10,
+              'new_emails': 2,
+              'availability_state': True,
+              'profile_visible': True,
+          })
+          assert r.status_code == 200, f'ingest failed: {r.status_code} {r.text}'
+          decision = r.json()['decision']['status']
+          print(f'PASS: /api/metrics/ingest -> {decision}')
+
+          # Decision latest
+          r = c.get('/api/decision/latest')
+          assert r.status_code == 200
+          print('PASS: /api/decision/latest')
+
+          # Experiments
+          r = c.get('/api/experiments/current')
+          assert r.status_code == 200
+          print('PASS: /api/experiments/current')
+
+          # Metrics history
+          r = c.get('/api/metrics/history')
+          assert r.status_code == 200
+          print('PASS: /api/metrics/history')

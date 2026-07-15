@@ -1,0 +1,800 @@
+
+def action_view_profile(cap):
+    """View a masseur profile."""
+    cap.mark()
+    cap.driver.get(f"{BASE_URL}/ArmyMike")
+    time.sleep(4)
+    return "view_profile", cap.capture_new()
+
+
+def action_load_mailbox(cap):
+    """Load mailbox."""
+    cap.mark()
+    cap.driver.get(f"{BASE_URL}/settings/mailbox")
+    time.sleep(4)
+    dismiss_popups(cap.driver)
+    return "load_mailbox", cap.capture_new()
+
+
+def action_get_stats(cap):
+    """Scroll to stats section to trigger stats API."""
+    cap.driver.get(f"{BASE_URL}/settings")
+    time.sleep(4)
+    dismiss_popups(cap.driver)
+    cap.mark()
+    # Scroll to bottom to trigger lazy stats loading
+    cap.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(5)
+    return "load_stats", cap.capture_new()
+
+
+# ---------------------------------------------------------------------------
+# Process captured calls into clean API spec
+# ---------------------------------------------------------------------------
+
+def clean_url(url):
+    """Remove base URL prefix, keep path + query."""
+    if url.startswith(BASE_URL):
+        return url[len(BASE_URL):]
+    if url.startswith("https://rentmasseur.com"):
+        return url[len("https://rentmasseur.com"):]
+    return url
+
+
+def is_api_call(entry):
+    """Filter out static assets, JS chunks, images."""
+    url = entry.get("url", "").lower()
+    if not url:
+        return False
+    if any(url.endswith(ext) for ext in [
+        ".js", ".css", ".png", ".jpg", ".jpeg", ".svg", ".gif",
+        ".woff", ".woff2", ".ico", ".webp", ".map",
+    ]):
+        return False
+    if "/_next/static/" in url:
+        return False
+    if "/images/" in url:
+        return False
+    if "google" in url or "gstatic" in url or "cloudflare" in url:
+        return False
+    if "fonts." in url:
+        return False
+    return True
+
+
+def parse_response(resp_text):
+    """Try to parse response as JSON, return structured data."""
+    if not resp_text:
+        return None
+    try:
+        data = json.loads(resp_text)
+        if isinstance(data, dict):
+            return {"keys": list(data.keys())[:20], "sample": json.dumps(data, default=str)[:1000]}
+        if isinstance(data, list) and data:
+            if isinstance(data[0], dict):
+                return {"type": "array", "count": len(data), "item_keys": list(data[0].keys())[:15]}
+            return {"type": "array", "count": len(data)}
+        return {"type": type(data).__name__, "value": str(data)[:200]}
+    except (json.JSONDecodeError, TypeError):
+        return {"raw": resp_text[:300]}
+
+
+def parse_body(body_text):
+    """Parse request body."""
+    if not body_text:
+        return None
+    try:
+        return json.loads(body_text)
+    except (json.JSONDecodeError, TypeError):
+        return body_text[:300]
+
+
+def build_api_map(action_results):
+    """Build the action → API mapping."""
+    api_map = OrderedDict()
+
+    for action_name, calls in action_results:
+        api_calls = []
+        for call in calls:
+            if not is_api_call(call):
+                continue
+
+            url = call.get("url", "")
+            method = (call.get("method") or "GET").upper()
+            clean = clean_url(url)
+
+            api_call = {
+                "method": method,
+                "path": clean,
+                "full_url": url,
+                "request_body": parse_body(call.get("body")),
+                "request_headers": call.get("headers", {}),
+                "response_status": call.get("status"),
+                "response": parse_response(call.get("response")),
+            }
+            api_calls.append(api_call)
+
+        api_map[action_name] = {
+            "action": action_name,
+            "api_calls": api_calls,
+            "call_count": len(api_calls),
+        }
+
+    return api_map
+
+
+def write_output(api_map):
+    """Write JSON + readable summary."""
+    # JSON
+    with open(CAPTURE_FILE, "w") as f:
+        json.dump(api_map, f, indent=2, default=str)
+
+    # Console summary
+    print(f"\n{'='*60}")
+    print(f"  ACTION → API ENDPOINT MAP")
+    print(f"{'='*60}\n")
+
+    for action_name, data in api_map.items():
+        calls = data["api_calls"]
+        print(f"  [{action_name}] — {len(calls)} API calls")
+        for c in calls:
+            status = c.get("response_status") or "?"
+            body = ""
+            if c.get("request_body"):
+                body = f" body={json.dumps(c['request_body'], default=str)[:60]}"
+            resp = ""
+            if c.get("response") and isinstance(c["response"], dict):
+                if "keys" in c["response"]:
+                    resp = f" → {c['response']['keys'][:5]}"
+                elif "type" in c["response"]:
+                    resp = f" → {c['response']['type']}"
+            print(f"    {c['method']:6s} {status} {c['path'][:60]}{body}{resp}")
+        print()
+
+    print(f"  Output: {CAPTURE_FILE}")
+    print(f"  Total actions: {len(api_map)}")
+    total = sum(d["call_count"] for d in api_map.values())
+    print(f"  Total API calls captured: {total}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def run():
+    log.info("=== Action → API Capture ===")
+    driver = create_driver()
+    cap = ActionCapture(driver)
+
+    try:
+        if not login(driver):
+            log.error("Login failed")
+            return
+
+        # Install interceptor AFTER login
+        cap.install()
+        # Navigate to settings to reload with interceptor active
+        driver.get(f"{BASE_URL}/settings")
+        time.sleep(3)
+
+        # Run all actions
+        actions = [
+            action_load_settings,
+            action_open_availability_modal,
+            action_set_availability,
+            action_toggle_visibility,
+            action_toggle_sms,
+            action_toggle_track_actions,
+            action_search_city,
+            action_search_available,
+            action_load_more,
+            action_view_profile,
+            action_load_mailbox,
+            action_get_stats,
+        ]
+
+        results = []
+        for action_fn in actions:
+            log.info("Running: %s", action_fn.__name__)
+            try:
+                name, calls = action_fn(cap)
+                api_calls = [c for c in calls if is_api_call(c)]
+                log.info("  → %d API calls captured", len(api_calls))
+                results.append((name, calls))
+            except Exception as e:
+                log.error("  FAILED: %s", e)
+
+        # Build and write output
+        api_map = build_api_map(results)
+        write_output(api_map)
+
+    except Exception as e:
+        log.error("Fatal: %s", e)
+        import traceback
+        traceback.print_exc()
+    finally:
+        driver.quit()
+        log.info("Done")
+
+
+if __name__ == "__main__":
+    run()
+
+```
+
+probe.py:
+```
+import requests, re, json
+
+s = requests.Session()
+s.headers.update({
+    'User-Agent': 'Mozilla/5.0',
+    'Accept': 'application/json,text/plain,*/*',
+    'Referer': 'https://rentmasseur.com/settings',
+    'Origin': 'https://rentmasseur.com',
+})
+
+r = s.get('https://rentmasseur.com/login')
+m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', r.text)
+csrf = m.group(1) if m else ''
+r = s.post('https://rentmasseur.com/api/v1/login', json={
+    'email': 'karpathianwolf', 'password': 'os.environ.get("RM_PASSWORD", "")', 'csrf': csrf, 'remember': True
+})
+token = r.json().get('accessToken', '')
+s.headers['Authorization'] = f'Bearer {token}'
+print('Login OK')
+
+# UNHIDE
+r = s.put('https://rentmasseur.com/api/v1/settings/visibility', json={'isAdHidden': False})
+print('UNHIDE:', r.status_code, r.text[:200])
+
+# Probe endpoints
+endpoints = [
+    ('GET', '/api/v1/account/interview'),
+    ('GET', '/api/v1/account/blog'),
+    ('GET', '/api/v1/account/profile'),
+    ('GET', '/api/v1/account/bio'),
+    ('GET', '/api/v1/account/about'),
+    ('GET', '/api/v1/account/travels'),
+    ('GET', '/api/v1/account/photos'),
+    ('GET', '/api/v1/account/reviews'),
+    ('GET', '/api/v1/account/membership'),
+    ('GET', '/api/v1/account/sponsor'),
+    ('GET', '/api/v1/settings/profile'),
+    ('GET', '/api/v1/settings/bio'),
+    ('GET', '/api/v1/settings/about'),
+    ('GET', '/api/v1/settings/interview'),
+    ('GET', '/api/v1/settings/blog'),
+    ('GET', '/api/v1/account/dashboard/interview'),
+    ('GET', '/api/v1/account/dashboard/blog'),
+    ('GET', '/api/v1/account/dashboard/profile'),
+    ('GET', '/api/v1/account/dashboard/bio'),
+    ('GET', '/api/v1/account/dashboard/about'),
+    ('GET', '/api/v1/blog'),
+    ('GET', '/api/v1/interview'),
+    ('GET', '/api/v1/profile'),
+    ('PUT', '/api/v1/settings/profile'),
+    ('PUT', '/api/v1/settings/bio'),
+    ('PUT', '/api/v1/settings/about'),
+    ('PUT', '/api/v1/settings/interview'),
+    ('PUT', '/api/v1/settings/blog'),
+    ('PUT', '/api/v1/account/profile'),
+    ('PUT', '/api/v1/account/interview'),
+    ('PUT', '/api/v1/account/blog'),
+    ('POST', '/api/v1/account/blog'),
+    ('POST', '/api/v1/account/interview'),
+    ('POST', '/api/v1/account/profile'),
+    ('POST', '/api/v1/blog'),
+    ('POST', '/api/v1/interview'),
+    ('GET', '/api/v1/account/dashboard/membership'),
+    ('GET', '/api/v1/account/dashboard/sponsor'),
+    ('GET', '/api/v1/account/dashboard/advertise'),
+    ('GET', '/api/v1/account/dashboard/travels'),
+    ('GET', '/api/v1/account/dashboard/photos'),
+    ('GET', '/api/v1/account/dashboard/reviews'),
+    ('GET', '/api/v1/account/dashboard/blog'),
+    ('GET', '/api/v1/account/dashboard/interview'),
+    ('GET', '/api/v1/account/dashboard/certificates'),
+    ('GET', '/api/v1/account/dashboard/massages'),
+    ('GET', '/api/v1/account/certificates'),
+    ('GET', '/api/v1/account/massages'),
+    ('GET', '/api/v1/settings/certificates'),
+    ('GET', '/api/v1/settings/massages'),
+    ('GET', '/api/v1/settings/travels'),
+    ('GET', '/api/v1/settings/reviews'),
+    ('GET', '/api/v1/settings/membership'),
+    ('GET', '/api/v1/settings/sponsor'),
+    ('GET', '/api/v1/settings/advertise'),
+]
+
+for method, path in endpoints:
+    url = f'https://rentmasseur.com{path}'
+    try:
+        if method == 'GET':
+            r = s.get(url, timeout=5)
+        elif method == 'POST':
+            r = s.post(url, json={}, timeout=5)
+        elif method == 'PUT':
+            r = s.put(url, json={}, timeout=5)
+        if r.status_code != 404:
+            body = r.text[:150].replace('\n', ' ')
+            print(f'{method:4s} {r.status_code} {path:55s} {body}')
+    except Exception as e:
+        print(f'{method:4s} ERR {path:55s} {str(e)[:80]}')
+
+```
+
+engagement_engine.py:
+```
+"""
+RentMasseur Engagement Engine — automated reciprocal visits + messaging + LLM CI/CD.
+
+What it does:
+  1. Scrapes "Who Saw Me" page via Selenium to get usernames of clients who visited you
+  2. Visits every NY profile found in search (reciprocal visibility)
+  3. Visits back every client who visited your profile (reciprocal engagement)
+  4. Sends LLM-generated personalized messages to clients who visited you
+  5. Runs on a CI/CD schedule with receipts, metrics, and screenshot proof for every action
+  6. Verify/reconfirm protocol: after each visit, re-navigates to confirm the profile loaded; after each message, checks for confirmation
+  7. Respects rate limits, deduplicates, and tracks all engagement state in SQLite
+
+What it does NOT do:
+  - Spam (max 1 message per user per 24h, configurable)
+  - Fake reviews or testimonials
+  - Bypass CAPTCHA or platform protections
+  - Send messages without LLM-generated personalized content
+  - Exceed rate limits
+
+Usage:
+    python3 -m rm_traffic.engagement_engine --once          # single cycle
+    python3 -m rm_traffic.engagement_engine --daemon         # continuous loop
+    python3 -m rm_traffic.engagement_engine --visit-only     # only reciprocal visits
+    python3 -m rm_traffic.engagement_engine --message-only   # only send messages
+    python3 -m rm_traffic.engagement_engine --stats          # print engagement stats
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import re
+import signal
+import sqlite3
+import sys
+import threading
+import time
+import traceback
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+
+# ---------------------------------------------------------------------------
+# .env loading
+# ---------------------------------------------------------------------------
+ENV_PATH = Path(__file__).parent.parent / ".env"
+if ENV_PATH.exists():
+    for line in open(ENV_PATH):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+os.environ.setdefault("RM_USER", os.environ.get("RENTMASSEUR_USER", ""))
+os.environ.setdefault("RM_PASS", os.environ.get("RENTMASSEUR_PASS", ""))
+
+from .api_client import RentMasseurAPI
+from .auth import AuthSession
+from .llm_client import generate_with_fallback
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+BASE_URL = "https://rentmasseur.com"
+API_URL = f"{BASE_URL}/api/v1"
+DB_PATH = Path(__file__).parent / "engagement.db"
+LOG_PATH = Path(__file__).parent / "engagement.log"
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+SCREENSHOT_DIR = DATA_DIR / "screenshots"
+SCREENSHOT_DIR.mkdir(exist_ok=True)
+
+USERNAME = os.environ.get("RM_USER", "karpathianwolf")
+PASSWORD = os.environ.get("RM_PASS", "")
+CHROME_PROFILE = "/tmp/rm_engagement_chrome"
+
+# Intervals
+CYCLE_INTERVAL = 30 * 60          # 30 min between cycles
+VISIT_INTERVAL = 2 * 60 * 60      # visit profiles every 2h
+MESSAGE_INTERVAL = 4 * 60 * 60    # message cycle every 4h
+STATS_INTERVAL = 15 * 60          # stats every 15 min
+CYCLE_TIMEOUT = 180               # max seconds per cycle
+
+# Rate limits
+MIN_REQUEST_INTERVAL = 2.0        # 2s between API calls
+MAX_VISITS_PER_CYCLE = 50         # max profiles to visit per cycle
+MAX_MESSAGES_PER_CYCLE = 20       # max messages per cycle
+MESSAGE_COOLDOWN_HOURS = 24       # don't re-message same user within 24h
+VISIT_COOLDOWN_HOURS = 6          # don't re-visit same profile within 6h
+
+# Search cities for NY
+NY_CITIES = [
+    "manhattan-ny",
+    "brooklyn-ny",
+    "queens-ny",
+    "bronx-ny",
+    "staten-island-ny",
+    "long-island-ny",
+    "westchester-ny",
+]
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] │  %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("engagement")
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+def db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def init_db():
+    conn = db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS visitors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        username TEXT NOT NULL,
+        source TEXT DEFAULT 'who_saw_me',
+        visited_back INTEGER DEFAULT 0,
+        messaged INTEGER DEFAULT 0,
+        last_visited_ts TEXT,
+        last_messaged_ts TEXT,
+        UNIQUE(username)
+    );
+    CREATE TABLE IF NOT EXISTS visits_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        target_username TEXT NOT NULL,
+        source TEXT NOT NULL,
+        status INTEGER,
+        bytes INTEGER,
+        success INTEGER DEFAULT 1,
+        detail TEXT,
+        screenshot_path TEXT
+    );
+    CREATE TABLE IF NOT EXISTS messages_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        target_username TEXT NOT NULL,
+        subject TEXT,
+        body TEXT,
+        llm_provider TEXT,
+        llm_model TEXT,
+        success INTEGER DEFAULT 1,
+        status_code INTEGER,
+        detail TEXT,
+        message_hash TEXT,
+        screenshot_path TEXT
+    );
+    CREATE TABLE IF NOT EXISTS receipts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        action TEXT NOT NULL,
+        success INTEGER DEFAULT 1,
+        detail TEXT,
+        payload TEXT
+    );
+    CREATE TABLE IF NOT EXISTS stats_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        total_visitors INTEGER,
+        new_visitors INTEGER,
+        visited_back INTEGER,
+        messaged INTEGER,
+        profiles_searched INTEGER,
+        errors INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_visitors_username ON visitors(username);
+    CREATE INDEX IF NOT EXISTS idx_visits_ts ON visits_log(ts);
+    CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages_log(ts);
+    CREATE INDEX IF NOT EXISTS idx_receipts_ts ON receipts(ts);
+    """)
+    conn.commit()
+    conn.close()
+    log.info("DB initialized at %s", DB_PATH)
+
+def write_receipt(action: str, success: bool = True, detail: str = "", payload: dict = None):
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    conn.execute(
+        "INSERT INTO receipts (ts, action, success, detail, payload) VALUES (?, ?, ?, ?, ?)",
+        (ts, action, int(success), detail, json.dumps(payload or {}, ensure_ascii=False))
+    )
+    conn.commit()
+    conn.close()
+
+def record_visitor(username: str, source: str = "who_saw_me") -> bool:
+    """Record a visitor. Returns True if new."""
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO visitors (ts, username, source) VALUES (?, ?, ?)",
+            (ts, username, source)
+        )
+        new = conn.total_changes > 0
+        conn.commit()
+        return new
+    finally:
+        conn.close()
+
+def get_visitors_to_message(limit: int = MAX_MESSAGES_PER_CYCLE) -> List[dict]:
+    """Get visitors who haven't been messaged in the cooldown period."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=MESSAGE_COOLDOWN_HOURS)).isoformat()
+    conn = db()
+    rows = conn.execute(
+        """SELECT * FROM visitors
+           WHERE (last_messaged_ts IS NULL OR last_messaged_ts < ?)
+           ORDER BY ts DESC LIMIT ?""",
+        (cutoff, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_profiles_to_visit(limit: int = MAX_VISITS_PER_CYCLE) -> List[dict]:
+    """Get visitors who haven't been visited back in the cooldown period."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=VISIT_COOLDOWN_HOURS)).isoformat()
+    conn = db()
+    rows = conn.execute(
+        """SELECT * FROM visitors
+           WHERE (last_visited_ts IS NULL OR last_visited_ts < ?)
+           AND visited_back = 0
+           ORDER BY ts DESC LIMIT ?""",
+        (cutoff, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def mark_visited_back(username: str, status: int, bytes_recv: int, success: bool, detail: str = "", screenshot_path: str = ""):
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    conn.execute(
+        "UPDATE visitors SET visited_back = 1, last_visited_ts = ? WHERE username = ?",
+        (ts, username)
+    )
+    conn.execute(
+        "INSERT INTO visits_log (ts, target_username, source, status, bytes, success, detail, screenshot_path) VALUES (?, ?, 'reciprocal', ?, ?, ?, ?, ?)",
+        (ts, username, status, bytes_recv, int(success), detail, screenshot_path)
+    )
+    conn.commit()
+    conn.close()
+
+def mark_messaged(username: str, subject: str, body: str, provider: str, model: str,
+                  success: bool, status_code: int = 0, detail: str = "", screenshot_path: str = ""):
+    ts = datetime.now(timezone.utc).isoformat()
+    msg_hash = hashlib.sha256(f"{username}:{body}".encode()).hexdigest()[:16]
+    conn = db()
+    conn.execute(
+        "UPDATE visitors SET messaged = 1, last_messaged_ts = ? WHERE username = ?",
+        (ts, username)
+    )
+    conn.execute(
+        """INSERT INTO messages_log (ts, target_username, subject, body, llm_provider, llm_model, success, status_code, detail, message_hash, screenshot_path)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (ts, username, subject, body, provider, model, int(success), status_code, detail, msg_hash, screenshot_path)
+    )
+    conn.commit()
+    conn.close()
+
+def log_search_visit(username: str, status: int, bytes_recv: int, success: bool, detail: str = "", screenshot_path: str = ""):
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    conn.execute(
+        "INSERT INTO visits_log (ts, target_username, source, status, bytes, success, detail, screenshot_path) VALUES (?, ?, 'search_ny', ?, ?, ?, ?, ?)",
+        (ts, username, status, bytes_recv, int(success), detail, screenshot_path)
+    )
+    conn.commit()
+    conn.close()
+
+def record_stats(total_visitors, new_visitors, visited_back, messaged, profiles_searched, errors):
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    conn.execute(
+        "INSERT INTO stats_log (ts, total_visitors, new_visitors, visited_back, messaged, profiles_searched, errors) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (ts, total_visitors, new_visitors, visited_back, messaged, profiles_searched, errors)
+    )
+    conn.commit()
+    conn.close()
+
+# ---------------------------------------------------------------------------
+# Browser (Selenium) — for scraping "Who Saw Me" and sending messages
+# ---------------------------------------------------------------------------
+
+class EngagementBrowser:
+    """Selenium browser for scraping visitors, visiting profiles, and composing messages."""
+
+    def __init__(self):
+        self.driver = None
+        self.logged_in = False
+        self.last_login = 0
+
+    def start(self):
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+
+        opts = Options()
+        opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument(f"--user-data-dir={CHROME_PROFILE}")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        self.driver = webdriver.Chrome(options=opts)
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+        log.info("Browser started (profile: %s)", CHROME_PROFILE)
+
+    def stop(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+        self.driver = None
+        self.logged_in = False
+        log.info("Browser stopped")
+
+    def _dismiss_popups(self):
+        time.sleep(1)
+        from selenium.webdriver.common.by import By
+        for xpath in [
+            "//button[contains(text(),'Not now')]",
+            "//button[contains(text(),'Accept all')]",
+            "//button[contains(text(),'Close')]",
+            "//*[contains(@aria-label,'Close')]",
+        ]:
+            try:
+                for el in self.driver.find_elements(By.XPATH, xpath):
+                    if el.is_displayed():
+                        self.driver.execute_script("arguments[0].click()", el)
+                        time.sleep(0.3)
+            except Exception:
+                pass
+
+    def login(self, force=False):
+        from selenium.webdriver.common.by import By
+
+        if self.logged_in and not force and (time.time() - self.last_login < 3600):
+            return True
+        if not self.driver:
+            self.start()
+
+        log.info("Logging in as %s...", USERNAME)
+        self.driver.get(f"{BASE_URL}/login")
+        time.sleep(4)
+        self._dismiss_popups()
+
+        email = None
+        pwd = None
+        for inp in self.driver.find_elements(By.CSS_SELECTOR, "input"):
+            itype = (inp.get_attribute("type") or "").lower()
+            iname = (inp.get_attribute("name") or "").lower()
+            if itype == "email" or "email" in iname or "user" in iname:
+                if inp.is_displayed():
+                    email = inp
+            if itype == "password" and inp.is_displayed():
+                pwd = inp
+
+        if not email or not pwd:
+            log.error("Login fields not found")
+            return False
+
+        email.clear()
+        email.send_keys(USERNAME)
+        pwd.clear()
+        pwd.send_keys(PASSWORD)
+        time.sleep(0.3)
+
+        clicked = False
+        for by, sel in [
+            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.XPATH, "//button[contains(text(),'LOG')]"),
+            (By.XPATH, "//button[contains(text(),'Log')]"),
+            (By.CSS_SELECTOR, "form button"),
+        ]:
+            for el in self.driver.find_elements(by, sel):
+                if el.is_displayed():
+                    self.driver.execute_script("arguments[0].click()", el)
+                    clicked = True
+                    break
+            if clicked:
+                break
+
+        if not clicked:
+            log.error("Login button not found")
+            return False
+
+        time.sleep(6)
+        self._dismiss_popups()
+
+        if "/login" in self.driver.current_url:
+            log.error("Login failed — still on login page")
+            return False
+
+        self.logged_in = True
+        self.last_login = time.time()
+        log.info("Login successful. URL: %s", self.driver.current_url)
+        return True
+
+    def ensure_session(self):
+        if not self.driver:
+            return self.login()
+        try:
+            self.driver.get(f"{BASE_URL}/settings")
+            time.sleep(3)
+            if "/login" in self.driver.current_url:
+                log.info("Session expired, re-logging in...")
+                return self.login(force=True)
+            return True
+        except Exception as e:
+            log.warning("Session check failed: %s", e)
+            return self.login(force=True)
+
+    def scrape_who_saw_me(self) -> List[str]:
+        """Scrape the 'Who Saw Me' page to get usernames of visitors."""
+        from selenium.webdriver.common.by import By
+
+        if not self.ensure_session():
+            log.error("Cannot scrape visitors — not logged in")
+            return []
+
+        log.info("Scraping 'Who Saw Me' page...")
+        self.driver.get(f"{BASE_URL}/settings")
+        time.sleep(5)
+        self._dismiss_popups()
+
+        # Look for "Who Saw Me" link/section
+        body_text = self.driver.find_element(By.TAG_NAME, "body").text
+
+        # Try to find visitor usernames from the page
+        # The page may show visitor cards or a list
+        visitors = set()
+
+        # Method 1: Look for profile links
+        for el in self.driver.find_elements(By.CSS_SELECTOR, "a[href]"):
+            href = el.get_attribute("href") or ""
+            if href.startswith(f"{BASE_URL}/") and not any(x in href for x in [
+                "login", "settings", "search", "blog", "reviews", "interviews",
+                "available", "find-massage", "live-cams", "sitemap", "advertise",
+                "mailbox", "static", "_next", "images", "api",
+            ]):
+                parts = href.replace(f"{BASE_URL}/", "").split("/")
+                if parts and parts[0] and len(parts) == 1:
+                    uname = parts[0]
+                    if uname.lower() != USERNAME.lower():
+                        visitors.add(uname)
+
+        # Method 2: Parse __NEXT_DATA__ or embedded JSON
+        try:
+            page_source = self.driver.page_source
+            # Look for usernames in JSON data

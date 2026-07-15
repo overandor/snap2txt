@@ -1,0 +1,800 @@
+    """Build deep vocabulary across all token types."""
+    counters = {
+        "unigrams": Counter(),
+        "bigrams": Counter(),
+        "trigrams": Counter(),
+        "subwords": Counter(),
+        "syllables": Counter(),
+        "positional": Counter(),
+        "structural": Counter(),
+    }
+    for bio in bios:
+        toks = deep_tokenize(bio["headline"], bio["description"])
+        for k, v in toks.items():
+            counters[k].update(v)
+
+    vocab = {
+        "total_bios": len(bios),
+        "token_types": {
+            k: {
+                "unique": len(c),
+                "total": sum(c.values()),
+                "top_50": dict(c.most_common(50)),
+            }
+            for k, c in counters.items()
+        },
+    }
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(vocab, indent=2))
+    return vocab
+
+```
+
+social_traffic_tunnel.py:
+```
+#!/usr/bin/env python3
+"""
+Social Traffic Tunnel — Reddit + X.com multi-AI lead pipeline.
+
+Scrapes Reddit and X.com for massage-seeking intent, classifies with LLM,
+generates personalized responses, and feeds leads into the traffic loop DB.
+
+Runs 24/7 via GitHub Actions. Each cycle:
+  1. Scrape Reddit (PRAW) for massage-related posts in target subreddits
+  2. Scrape X.com (Tweepy) for massage-seeking tweets
+  3. LLM classifies intent: seeking_massage, looking_for_therapist, pain_relief, sports_recovery, not_relevant
+  4. LLM generates personalized, non-spammy response for high-intent leads
+  5. Store leads in social_leads.db with full provenance
+  6. Write receipt for every action
+  7. Export leads for the traffic loop to act on
+
+Environment variables:
+  - RM_USER, RM_PASS (RentMasseur credentials)
+  - REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT
+  - REDDIT_USERNAME, REDDIT_PASSWORD (for authenticated scraping)
+  - X_BEARER_TOKEN (Twitter/X API v2 bearer token)
+  - GROQ_API_KEY or OPENROUTER_API_KEY (for LLM classification)
+  - LLM_PROVIDER, LLM_MODEL (optional overrides)
+
+Usage:
+  python3 -m rm_traffic.social_traffic_tunnel            # full cycle
+  python3 -m rm_traffic.social_traffic_tunnel --reddit    # reddit only
+  python3 -m rm_traffic.social_traffic_tunnel --x         # x.com only
+  python3 -m rm_traffic.social_traffic_tunnel --stats     # show stats
+"""
+
+from __future__ import annotations
+import argparse
+import hashlib
+import json
+import logging
+import os
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+log = logging.getLogger("social_tunnel")
+logging.basicConfig(level=logging.INFO, format="  ◉ %(message)s")
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = REPO_ROOT / "rm_traffic" / "social_leads.db"
+RECEIPTS_DIR = REPO_ROOT / "receipts" / "social"
+RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Target subreddits ──
+REDDIT_SUBREDDITS = [
+    "massage", "FindAMasseur", "MassageTherapy",
+    "newyork", "nyc", "AskNYC",
+    "losangeles", "miami",
+    "deep tissue", "sportsmedicine",
+    "chronicpain", "fibromyalgia",
+]
+
+# ── X.com search queries ──
+X_QUERIES = [
+    "looking for massage NYC",
+    "need a massage therapist",
+    "deep tissue massage recommendation",
+    "sports massage near me",
+    "massage therapist manhattan",
+    "neck pain massage",
+    "shoulder tension relief",
+    "\"need a massage\" -filter:retweets",
+    "\"looking for massage\" -filter:retweets",
+    "\"massage therapist\" recommend",
+]
+
+# ── Intent classification prompt ──
+INTENT_PROMPT = """You are an intent classifier for a massage therapy practice in Manhattan.
+
+Classify this social media post into exactly one category:
+
+- seeking_massage: Person actively looking to book a massage
+- looking_for_therapist: Person asking for therapist recommendations
+- pain_relief: Person describing pain/tension that massage would help
+- sports_recovery: Athlete or active person needing recovery bodywork
+- not_relevant: Not related to massage seeking
+
+Post title: {title}
+Post body: {body}
+
+Respond with ONLY the category name, nothing else."""
+
+# ── Response generation prompt ──
+RESPONSE_PROMPT = """You are a massage therapist in Manhattan specializing in deep tissue and sports recovery.
+
+A potential client posted on social media. Write a helpful, non-spammy response.
+
+Rules:
+- Be genuinely helpful, not salesy
+- Mention your specialty (deep tissue, sports recovery, neck/shoulder tension)
+- Keep it under 100 words
+- Do NOT include links or phone numbers
+- Sound like a real person, not a bot
+- If they're asking for recommendations, position yourself naturally
+
+Their post: {post}
+
+Write your response:"""
+
+
+def _ts() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+# ═══════════════════════════════════════════════════════════════
+# Database
+# ═══════════════════════════════════════════════════════════════
+
+def init_db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""CREATE TABLE IF NOT EXISTS leads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL,
+        subreddit TEXT,
+        author TEXT,
+        title TEXT,
+        body TEXT,
+        url TEXT,
+        intent TEXT,
+        confidence REAL DEFAULT 0.0,
+        generated_response TEXT,
+        status TEXT DEFAULT 'new',
+        created_at TEXT,
+        content_hash TEXT UNIQUE,
+        metadata TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS tunnel_cycles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cycle_num INTEGER,
+        platform TEXT,
+        posts_scraped INTEGER DEFAULT 0,
+        leads_classified INTEGER DEFAULT 0,
+        high_intent INTEGER DEFAULT 0,
+        responses_generated INTEGER DEFAULT 0,
+        errors INTEGER DEFAULT 0,
+        timestamp TEXT
+    )""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_leads_intent ON leads(intent)""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status)""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_leads_platform ON leads(platform)""")
+    conn.commit()
+    conn.close()
+
+
+def store_lead(conn: sqlite3.Connection, lead: Dict) -> bool:
+    c_hash = _hash(f"{lead['platform']}:{lead.get('url', '')}:{lead.get('title', '')}")
+    try:
+        conn.execute(
+            "INSERT INTO leads (platform, subreddit, author, title, body, url, intent, "
+            "confidence, generated_response, status, created_at, content_hash, metadata) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (lead["platform"], lead.get("subreddit"), lead.get("author"),
+             lead.get("title", ""), lead.get("body", ""), lead.get("url", ""),
+             lead.get("intent", "unclassified"), lead.get("confidence", 0.0),
+             lead.get("generated_response"), lead.get("status", "new"),
+             _ts(), c_hash, json.dumps(lead.get("metadata", {}))),
+        )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def write_receipt(cycle_data: Dict) -> str:
+    receipt_id = _hash(json.dumps(cycle_data, sort_keys=True))
+    receipt = {
+        "id": receipt_id,
+        "timestamp": _ts(),
+        "data": cycle_data,
+    }
+    receipt_path = RECEIPTS_DIR / f"social_tunnel_{receipt_id}.json"
+    receipt_path.write_text(json.dumps(receipt, indent=2))
+    return receipt_id
+
+
+# ═══════════════════════════════════════════════════════════════
+# Reddit Scraper
+# ═══════════════════════════════════════════════════════════════
+
+def scrape_reddit() -> List[Dict]:
+    """Scrape Reddit for massage-seeking posts using PRAW."""
+    posts = []
+    try:
+        import praw
+    except ImportError:
+        log.error("PRAW not installed — pip install praw")
+        return posts
+
+    client_id = os.environ.get("REDDIT_CLIENT_ID", "")
+    client_secret = os.environ.get("REDDIT_CLIENT_SECRET", "")
+    user_agent = os.environ.get("REDDIT_USER_AGENT", "SocialTunnel/1.0 by rm_traffic")
+    username = os.environ.get("REDDIT_USERNAME", "")
+    password = os.environ.get("REDDIT_PASSWORD", "")
+
+    if not client_id or not client_secret:
+        log.error("Reddit credentials not set (REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)")
+        return posts
+
+    try:
+        reddit_kwargs = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "user_agent": user_agent,
+        }
+        if username and password:
+            reddit_kwargs["username"] = username
+            reddit_kwargs["password"] = password
+        reddit = praw.Reddit(**reddit_kwargs)
+
+        for sub_name in REDDIT_SUBREDDITS:
+            try:
+                subreddit = reddit.subreddit(sub_name)
+                for post in subreddit.new(limit=25):
+                    if post.stickied:
+                        continue
+                    title = post.title or ""
+                    body = post.selftext or ""
+                    if len(title) + len(body) < 10:
+                        continue
+                    posts.append({
+                        "platform": "reddit",
+                        "subreddit": sub_name,
+                        "author": str(post.author) if post.author else "unknown",
+                        "title": title,
+                        "body": body[:2000],
+                        "url": f"https://reddit.com{post.permalink}",
+                        "score": post.score,
+                        "created_utc": post.created_utc,
+                        "metadata": {"score": post.score, "num_comments": post.num_comments},
+                    })
+                log.info(f"Reddit r/{sub_name}: scraped")
+            except Exception as e:
+                log.error(f"Reddit r/{sub_name}: {e}")
+    except Exception as e:
+        log.error(f"Reddit connection failed: {e}")
+
+    log.info(f"Reddit: {len(posts)} posts scraped from {len(REDDIT_SUBREDDITS)} subreddits")
+    return posts
+
+
+# ═══════════════════════════════════════════════════════════════
+# X.com (Twitter) Scraper
+# ═══════════════════════════════════════════════════════════════
+
+def scrape_x() -> List[Dict]:
+    """Scrape X.com for massage-seeking tweets using Twitter API v2."""
+    tweets = []
+    bearer_token = os.environ.get("X_BEARER_TOKEN", "")
+
+    if not bearer_token:
+        log.error("X_BEARER_TOKEN not set — skipping X.com")
+        return tweets
+
+    try:
+        import requests as req
+
+        headers = {"Authorization": f"Bearer {bearer_token}"}
+        base_url = "https://api.twitter.com/2/tweets/search/recent"
+
+        for query in X_QUERIES:
+            try:
+                params = {
+                    "query": query,
+                    "max_results": 20,
+                    "tweet.fields": "created_at,author_id,public_metrics,lang",
+                    "expansions": "author_id",
+                    "user.fields": "username,name",
+                }
+                resp = req.get(base_url, headers=headers, params=params, timeout=15)
+                if resp.status_code != 200:
+                    log.error(f"X.com query '{query[:40]}': HTTP {resp.status_code}")
+                    continue
+
+                data = resp.json()
+                users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
+
+                for tweet in data.get("data", []):
+                    if tweet.get("lang") not in ("en", None):
+                        continue
+                    author_id = tweet.get("author_id", "")
+                    user = users.get(author_id, {})
+                    text = tweet.get("text", "")
+                    if len(text) < 10:
+                        continue
+                    tweets.append({
+                        "platform": "x",
+                        "subreddit": None,
+                        "author": user.get("username", "unknown"),
+                        "title": text[:100],
+                        "body": text,
+                        "url": f"https://x.com/{user.get('username', 'i')}/status/{tweet.get('id', '')}",
+                        "score": tweet.get("public_metrics", {}).get("like_count", 0),
+                        "created_utc": None,
+                        "metadata": {
+                            "query": query,
+                            "public_metrics": tweet.get("public_metrics", {}),
+                            "author_name": user.get("name", ""),
+                        },
+                    })
+                log.info(f"X.com query '{query[:40]}': scraped")
+            except Exception as e:
+                log.error(f"X.com query '{query[:40]}': {e}")
+
+    except Exception as e:
+        log.error(f"X.com scraping failed: {e}")
+
+    log.info(f"X.com: {len(tweets)} tweets scraped from {len(X_QUERIES)} queries")
+    return tweets
+
+
+# ═══════════════════════════════════════════════════════════════
+# LLM Classification + Response Generation
+# ═══════════════════════════════════════════════════════════════
+
+def classify_intent(post: Dict) -> Tuple[str, float]:
+    """Use LLM to classify post intent. Returns (intent, confidence)."""
+    try:
+        from rm_traffic.llm_client import generate_with_fallback
+
+        prompt = INTENT_PROMPT.format(
+            title=post.get("title", "")[:200],
+            body=post.get("body", "")[:500],
+        )
+        response = generate_with_fallback(prompt, max_tokens=20)
+        if not response:
+            return ("unclassified", 0.0)
+
+        intent = response.strip().lower().replace(" ", "_")
+        valid_intents = {"seeking_massage", "looking_for_therapist", "pain_relief",
+                         "sports_recovery", "not_relevant"}
+        if intent not in valid_intents:
+            for vi in valid_intents:
+                if vi in intent:
+                    intent = vi
+                    break
+            else:
+                intent = "not_relevant"
+
+        confidence = 0.85 if intent != "not_relevant" else 0.90
+        return (intent, confidence)
+    except Exception as e:
+        log.error(f"LLM classification failed: {e}")
+        return ("unclassified", 0.0)
+
+
+def generate_response(post: Dict) -> Optional[str]:
+    """Use LLM to generate a personalized, non-spammy response."""
+    try:
+        from rm_traffic.llm_client import generate_with_fallback
+
+        prompt = RESPONSE_PROMPT.format(post=post.get("body", post.get("title", ""))[:500])
+        response = generate_with_fallback(prompt, max_tokens=200)
+        if response and len(response.strip()) > 10:
+            return response.strip()
+        return None
+    except Exception as e:
+        log.error(f"LLM response generation failed: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# Main Tunnel Cycle
+# ═══════════════════════════════════════════════════════════════
+
+HIGH_INTENT = {"seeking_massage", "looking_for_therapist", "pain_relief", "sports_recovery"}
+
+
+def run_tunnel_cycle(cycle_num: int = 0, platforms: str = "all") -> Dict:
+    """Run one full social traffic tunnel cycle."""
+    init_db()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+
+    stats = {
+        "cycle": cycle_num,
+        "timestamp": _ts(),
+        "platforms": platforms,
+        "posts_scraped": 0,
+        "leads_stored": 0,
+        "leads_classified": 0,
+        "high_intent": 0,
+        "responses_generated": 0,
+        "duplicates_skipped": 0,
+        "errors": 0,
+        "by_platform": {},
+        "by_intent": {},
+    }
+
+    all_posts = []
+    if platforms in ("all", "reddit"):
+        reddit_posts = scrape_reddit()
+        all_posts.extend(reddit_posts)
+        stats["by_platform"]["reddit"] = len(reddit_posts)
+
+    if platforms in ("all", "x"):
+        x_posts = scrape_x()
+        all_posts.extend(x_posts)
+        stats["by_platform"]["x"] = len(x_posts)
+
+    stats["posts_scraped"] = len(all_posts)
+
+    if not all_posts:
+        log.info("No posts scraped — nothing to do")
+        conn.close()
+        receipt_id = write_receipt(stats)
+        stats["receipt_id"] = receipt_id
+        return stats
+
+    for post in all_posts:
+        lead = dict(post)
+        stored = store_lead(conn, lead)
+        if not stored:
+            stats["duplicates_skipped"] += 1
+            continue
+        stats["leads_stored"] += 1
+
+        intent, confidence = classify_intent(post)
+        lead["intent"] = intent
+        lead["confidence"] = confidence
+        stats["leads_classified"] += 1
+        stats["by_intent"][intent] = stats["by_intent"].get(intent, 0) + 1
+
+        c_hash = _hash(f"{lead['platform']}:{lead.get('url', '')}:{lead.get('title', '')}")
+        conn.execute(
+            "UPDATE leads SET intent=?, confidence=? WHERE content_hash=?",
+            (intent, confidence, c_hash),
+        )
+
+        if intent in HIGH_INTENT:
+            stats["high_intent"] += 1
+            response = generate_response(post)
+            if response:
+                lead["generated_response"] = response
+                stats["responses_generated"] += 1
+                conn.execute(
+                    "UPDATE leads SET generated_response=?, status='response_ready' WHERE content_hash=?",
+                    (response, c_hash),
+                )
+                log.info(f"  ◆ {lead['platform']}/{lead.get('subreddit', '?')}: intent={intent} response generated ({len(response)} chars)")
+            else:
+                conn.execute(
+                    "UPDATE leads SET status='high_intent' WHERE content_hash=?",
+                    (c_hash,),
+                )
+                log.info(f"  ▲ {lead['platform']}/{lead.get('subreddit', '?')}: intent={intent} (no response)")
+        else:
+            conn.execute(
+                "UPDATE leads SET status='low_intent' WHERE content_hash=?",
+                (c_hash,),
+            )
+
+    conn.commit()
+
+    conn.execute(
+        "INSERT INTO tunnel_cycles (cycle_num, platform, posts_scraped, leads_classified, "
+        "high_intent, responses_generated, errors, timestamp) VALUES (?,?,?,?,?,?,?,?)",
+        (cycle_num, platforms, stats["posts_scraped"], stats["leads_classified"],
+         stats["high_intent"], stats["responses_generated"], stats["errors"], _ts()),
+    )
+    conn.commit()
+    conn.close()
+
+    receipt_id = write_receipt(stats)
+    stats["receipt_id"] = receipt_id
+
+    log.info(f"  ═══ Social Tunnel Cycle {cycle_num} Complete ═══")
+    log.info(f"  Scraped: {stats['posts_scraped']} | Stored: {stats['leads_stored']} | Duplicates: {stats['duplicates_skipped']}")
+    log.info(f"  Classified: {stats['leads_classified']} | High intent: {stats['high_intent']} | Responses: {stats['responses_generated']}")
+    log.info(f"  By intent: {json.dumps(stats['by_intent'])}")
+    log.info(f"  Receipt: {receipt_id}")
+
+    return stats
+
+
+def show_stats():
+    """Show tunnel statistics."""
+    init_db()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+
+    total = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+    by_platform = {r["platform"]: r["count"] for r in conn.execute(
+        "SELECT platform, COUNT(*) as count FROM leads GROUP BY platform").fetchall()}
+    by_intent = {r["intent"]: r["count"] for r in conn.execute(
+        "SELECT intent, COUNT(*) as count FROM leads GROUP BY intent").fetchall()}
+    by_status = {r["status"]: r["count"] for r in conn.execute(
+        "SELECT status, COUNT(*) as count FROM leads GROUP BY status").fetchall()}
+    cycles = conn.execute("SELECT COUNT(*) FROM tunnel_cycles").fetchone()[0]
+    recent_cycles = [dict(r) for r in conn.execute(
+        "SELECT * FROM tunnel_cycles ORDER BY timestamp DESC LIMIT 5").fetchall()]
+
+    print(f"\n  ═══ Social Traffic Tunnel Stats ═══")
+    print(f"  Total leads: {total}")
+    print(f"  Total cycles: {cycles}")
+    print(f"  By platform: {json.dumps(by_platform, indent=2)}")
+    print(f"  By intent: {json.dumps(by_intent, indent=2)}")
+    print(f"  By status: {json.dumps(by_status, indent=2)}")
+    print(f"  Recent cycles:")
+    for c in recent_cycles:
+        print(f"    ◉ cycle {c['cycle_num']}: {c['platform']} | scraped={c['posts_scraped']} "
+              f"classified={c['leads_classified']} high_intent={c['high_intent']} "
+              f"responses={c['responses_generated']}")
+
+    high_intent_leads = [dict(r) for r in conn.execute(
+        "SELECT platform, subreddit, author, title, intent, generated_response, url, created_at "
+        "FROM leads WHERE status='response_ready' ORDER BY created_at DESC LIMIT 10").fetchall()]
+    if high_intent_leads:
+        print(f"\n  ═══ Recent High-Intent Leads (response ready) ═══")
+        for lead in high_intent_leads:
+            print(f"  ◉ [{lead['platform']}] {lead.get('subreddit', '')} — {lead['title'][:60]}")
+            print(f"    intent: {lead['intent']} | author: {lead['author']}")
+            print(f"    url: {lead['url']}")
+            if lead["generated_response"]:
+                print(f"    response: {lead['generated_response'][:120]}...")
+            print()
+
+    conn.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Social Traffic Tunnel — Reddit + X.com")
+    parser.add_argument("--reddit", action="store_true", help="Scrape Reddit only")
+    parser.add_argument("--x", action="store_true", help="Scrape X.com only")
+    parser.add_argument("--stats", action="store_true", help="Show statistics")
+    parser.add_argument("--cycle", type=int, default=0, help="Cycle number")
+    args = parser.parse_args()
+
+    if args.stats:
+        show_stats()
+        return
+
+    platforms = "all"
+    if args.reddit and not args.x:
+        platforms = "reddit"
+    elif args.x and not args.reddit:
+        platforms = "x"
+
+    run_tunnel_cycle(cycle_num=args.cycle, platforms=platforms)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+revenue_ir.py:
+```
+#!/usr/bin/env python3
+"""
+RevenueIR — Canonical business state object for the RentMasseur revenue optimizer.
+
+Every pass reads and writes this object. No more loose dictionaries.
+
+Flow:
+  raw_api → RevenueIR → scoring passes → action planner → policy gate → executor → after_snapshot → receipt
+"""
+
+import json
+import hashlib
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+
+
+@dataclass
+class FunnelMetrics:
+    total_views: int = 0
+    total_contacts: int = 0
+    today_views: int = 0
+    emails_count: int = 0
+    unread_emails: int = 0
+    premium_senders: int = 0
+    booking_inquiries: int = 0
+    general_inquiries: int = 0
+    ctr: float = 0.0
+    email_rate: float = 0.0
+    avg_rate: float = 0.0
+
+    def compute(self):
+        if self.total_views > 0:
+            self.ctr = round(self.total_contacts / self.total_views * 100, 2)
+        if self.total_contacts > 0:
+            self.email_rate = round(self.emails_count / self.total_contacts * 100, 2)
+
+
+@dataclass
+class ProfileState:
+    headline: str = ""
+    description_len: int = 0
+    availability_option: int = 0
+    availability_label: str = ""
+    is_visible: bool = True
+    search_rank: int = 0
+    search_total: int = 0
+    active_rates: List[Dict] = field(default_factory=list)
+
+
+@dataclass
+class VisitorRecord:
+    username: str = ""
+    source: str = "who_saw_me"
+    location: str = ""
+    is_ny: bool = False
+    is_masseur: Optional[bool] = None
+    visited_back: bool = False
+    messaged: bool = False
+    is_premium: bool = False
+    email_classification: str = ""
+
+
+@dataclass
+class ActionItem:
+    action: str = ""
+    reason: str = ""
+    priority: int = 0
+    policy: str = "AUTO_OK"  # AUTO_OK, REVIEW_REQUIRED, BLOCKED
+    executed: bool = False
+    result: str = ""
+    impact: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RevenueIR:
+    """The canonical business state object. Every pass reads/writes this."""
+    timestamp: str = ""
+    cycle_num: int = 0
+    login_ok: bool = False
+    login_error: str = ""
+
+    # Lane 1: Read-only scan results
+    funnel: FunnelMetrics = field(default_factory=FunnelMetrics)
+    profile: ProfileState = field(default_factory=ProfileState)
+    visitors: List[VisitorRecord] = field(default_factory=list)
+    mailbox_preview: List[Dict] = field(default_factory=list)
+
+    # Lane 2: Safe actions executed
+    actions_executed: List[ActionItem] = field(default_factory=list)
+
+    # Lane 3: Risky actions queued for approval
+    actions_queued: List[ActionItem] = field(default_factory=list)
+
+    # Deltas vs last cycle
+    deltas: Dict[str, float] = field(default_factory=dict)
+
+    # Receipt
+    receipt_hash: str = ""
+    status: str = "GREEN"  # GREEN, YELLOW, RED
+
+    # Raw API responses kept for debugging (not committed to repo)
+    _raw: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = datetime.now(timezone.utc).isoformat()
+
+    def compute_receipt(self):
+        """Tamper-evident receipt hash over the entire state."""
+        data = self.to_json(include_raw=False)
+        self.receipt_hash = hashlib.sha256(data.encode()).hexdigest()[:16]
+        return self.receipt_hash
+
+    def to_json(self, include_raw: bool = False) -> str:
+        d = asdict(self)
+        if not include_raw:
+            d.pop("_raw", None)
+        return json.dumps(d, indent=2, default=str, sort_keys=True)
+
+    def to_dict(self, include_raw: bool = False) -> Dict:
+        d = asdict(self)
+        if not include_raw:
+            d.pop("_raw", None)
+        return d
+
+    def summary(self) -> str:
+        lines = [
+            f"RevenueIR — {self.timestamp}",
+            f"Status: {self.status}",
+            f"Login: {'OK' if self.login_ok else 'FAILED'}",
+            f"",
+            f"Funnel:",
+            f"  Views: {self.funnel.total_views} (today: {self.funnel.today_views})",
+            f"  Contacts: {self.funnel.total_contacts} (CTR: {self.funnel.ctr}%)",
+            f"  Emails: {self.funnel.emails_count} (unread: {self.funnel.unread_emails}, premium: {self.funnel.premium_senders})",
+            f"  Booking inquiries: {self.funnel.booking_inquiries}",
+            f"  Avg rate: ${self.funnel.avg_rate}",
+            f"",
+            f"Profile:",
+            f"  Headline: '{self.profile.headline}'",
+            f"  Availability: {self.profile.availability_label} ({self.profile.availability_option})",
+            f"  Visible: {self.profile.is_visible}",
+            f"  Search rank: #{self.profile.search_rank} of {self.profile.search_total}",
+            f"  Active rates: {len(self.profile.active_rates)}",
+            f"",
+            f"Visitors: {len(self.visitors)} total, {sum(1 for v in self.visitors if v.is_ny)} NYC",
+            f"Actions executed: {len(self.actions_executed)}",
+            f"Actions queued: {len(self.actions_queued)}",
+            f"",
+            f"Receipt: {self.receipt_hash}",
+        ]
+        return "\n".join(lines)
+
+```
+
+bio_view_scraper.py:
+```
+"""
+Scrape real bios with view counts and member-since dates.
+Calculates views/day for ranking.
+"""
+
+import json
+import logging
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List
+
+import requests
+
+from .api_client import RentMasseurAPI
+from .bio_scraper import CITIES, extract_bios_from_results, search_city
+
+log = logging.getLogger("profileops.view_scraper")
+
+OUTPUT_PATH = Path(__file__).parent / "data" / "real_bios_with_views.jsonl"
+RANKED_PATH = Path(__file__).parent / "data" / "real_bios_ranked.txt"
+
+WEB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+}
+
+
+def parse_member_since(text: str) -> str:
+    """Extract Member Since date from profile page HTML."""
+    match = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', text)
+    return match.group(1).strip() if match else ""
+
+
+def parse_visits(text: str) -> int:
+    """Extract visits count from profile page HTML."""
+    matches = re.findall(r'"visits":(\d+)', text)
+    # Filter out 0 (own profile stat), take the max
+    vals = [int(v) for v in matches if v != "0"]
+    return max(vals) if vals else 0
+
+
+def days_since(date_str: str) -> int:
+    """Calculate days since a date string like 'Mar 25, 2014'."""
+    if not date_str:
+        return 0
+    try:
+        d = datetime.strptime(date_str, "%b %d, %Y")

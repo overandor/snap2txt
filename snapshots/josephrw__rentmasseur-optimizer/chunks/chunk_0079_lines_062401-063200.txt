@@ -1,0 +1,800 @@
+import logging
+import random
+import time
+from typing import Dict, List, Tuple
+
+from .bio_generator import (
+    _generate_headline, _generate_description, _score_variant, _sentiment_score,
+    HEADLINE_TEMPLATES, HOOKS, SPECIALTIES, CLIENTS, STYLES, PROOFS, CTAS,
+)
+from .bio_features import feature_vector
+from .bio_predictor import predict_performance, train_predictor, MLP
+from .db import upsert_content_variant, write_receipt
+
+log = logging.getLogger("profileops.evolver")
+
+
+def _crossover(parent1: Dict, parent2: Dict) -> Dict:
+    """Create child by combining headline from one parent and desc from another."""
+    return {
+        "headline": parent1["headline"],
+        "description": parent2["description"],
+    }
+
+
+def _mutate_headline(headline: str) -> str:
+    """Mutate a headline."""
+    return _generate_headline()
+
+
+def _mutate_description(description: str) -> str:
+    """Mutate a description by swapping a random paragraph."""
+    parts = {
+        "hook": random.choice(HOOKS),
+        "specialty": random.choice(SPECIALTIES),
+        "client": random.choice(CLIENTS),
+        "style": random.choice(STYLES),
+        "proof": random.choice(PROOFS),
+        "cta": random.choice(CTAS),
+    }
+    return random.choice([
+        f"{parts['hook']}\n\n{parts['specialty']}\n\n{parts['client']}\n\n{parts['style']}\n\n{parts['cta']}",
+        f"{parts['hook']}\n\n{parts['style']}\n\n{parts['specialty']}\n\n{parts['proof']}\n\n{parts['cta']}",
+    ])
+
+
+def _mutate(bio: Dict, mutation_rate: float = 0.3) -> Dict:
+    headline = bio["headline"]
+    description = bio["description"]
+    if random.random() < mutation_rate:
+        headline = _mutate_headline(headline)
+    if random.random() < mutation_rate:
+        description = _mutate_description(description)
+    return {"headline": headline, "description": description}
+
+
+def _fitness(bio: Dict, model: MLP = None, speech_weight: float = 0.5) -> float:
+    """Fitness = weighted sum of predicted CTR, email, phone, sentiment, speech, minus risk."""
+    from .bio_features import extract_features
+    scores = _score_variant(bio["headline"], bio["description"])
+    pred = predict_performance(bio["headline"], bio["description"], model)
+    features = extract_features(bio["headline"], bio["description"])
+    risk_penalty = max(0, scores["headline_risk"], scores["bio_risk"]) * 0.5
+    # Weighted: CTR, email, phone, sentiment, speech-friendliness
+    fitness = (
+        pred["ctr"] * 3.0
+        + pred["email"] * 2.0
+        + pred["phone"] * 1.5
+        + scores["sentiment"]["score"] * 0.5
+        + features["speech_score"] * speech_weight
+        - risk_penalty
+    )
+    return fitness
+
+
+def _tournament_select(population: List[Dict], fitnesses: List[float], k: int = 3) -> Dict:
+    selected = random.sample(list(zip(population, fitnesses)), min(k, len(population)))
+    selected.sort(key=lambda x: x[1], reverse=True)
+    return selected[0][0]
+
+
+def evolve(population: List[Dict], generations: int = 50, population_size: int = 100,
+           elite_size: int = 10, mutation_rate: float = 0.3,
+           model: MLP = None) -> List[Dict]:
+    """Run genetic algorithm to optimize bios."""
+    log.info("Starting GA: %d generations, pop=%d", generations, population_size)
+
+    # If population is too small, seed with more random
+    while len(population) < population_size:
+        population.append({"headline": _generate_headline(), "description": _generate_description()})
+
+    for gen in range(generations):
+        # Evaluate fitness
+        fitnesses = [_fitness(bio, model) for bio in population]
+
+        # Sort by fitness
+        ranked = sorted(zip(population, fitnesses), key=lambda x: x[1], reverse=True)
+        log.info("Gen %d: best fitness=%.4f", gen, ranked[0][1])
+
+        # Elites
+        elites = [bio for bio, _ in ranked[:elite_size]]
+
+        # Create next generation
+        next_pop = elites[:]
+        while len(next_pop) < population_size:
+            parent1 = _tournament_select(population, fitnesses)
+            parent2 = _tournament_select(population, fitnesses)
+            child = _crossover(parent1, parent2)
+            child = _mutate(child, mutation_rate)
+            next_pop.append(child)
+
+        population = next_pop
+
+    # Final evaluation
+    fitnesses = [_fitness(bio, model) for bio in population]
+    ranked = sorted(zip(population, fitnesses), key=lambda x: x[1], reverse=True)
+    return [bio for bio, _ in ranked[:elite_size]]
+
+
+def run_evolution(initial_bios: List[Dict] = None, generations: int = 50,
+                  population_size: int = 100, elite_size: int = 10,
+                  top_n: int = 10) -> List[Dict]:
+    """Full GA pipeline: train predictor, evolve, save top elites."""
+    if initial_bios is None:
+        from .bio_generator import generate_bios
+        initial_bios = generate_bios(count=population_size, top_n=population_size)
+
+    # Train predictor on initial population
+    model = train_predictor(initial_bios, epochs=300)
+
+    # Run GA
+    elites = evolve(initial_bios, generations=generations, population_size=population_size,
+                    elite_size=elite_size, model=model)
+
+    # Save elites
+    batch_id = f"ga_{int(time.time())}"
+    saved_ids = []
+    for i, bio in enumerate(elites):
+        variant_id = f"{batch_id}_{i:03d}"
+        pred = predict_performance(bio["headline"], bio["description"], model)
+        scores = _score_variant(bio["headline"], bio["description"])
+        upsert_content_variant(
+            variant_id, "bio",
+            headline=bio["headline"],
+            description=bio["description"],
+            hypothesis=f"GA elite. CTR={pred['ctr']}, email={pred['email']}, phone={pred['phone']}, fitness={_fitness(bio, model):.4f}",
+            status="draft"
+        )
+        saved_ids.append(variant_id)
+
+    write_receipt(
+        "ga_evolution_v1",
+        "run_evolution",
+        {"generations": generations, "population_size": population_size},
+        {"elites_saved": len(saved_ids), "top_fitness": _fitness(elites[0], model) if elites else 0},
+        verified=True,
+    )
+    log.info("GA evolution complete. Saved %d elites.", len(saved_ids))
+    return saved_ids
+
+```
+
+score_bios.py:
+```
+import json, re, requests
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+h = {"User-Agent": "Mozilla/5.0"}
+
+def fv(u):
+    try:
+        r = requests.get(f"https://rentmasseur.com/{u}", headers=h, timeout=10)
+        if r.status_code != 200:
+            return 0, "", 0
+        m = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
+        ms = m.group(1).strip() if m else ""
+        vs = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
+        v = max(vs) if vs else 0
+        d = 0
+        if ms:
+            try:
+                d = max(1, (datetime.now() - datetime.strptime(ms, "%b %d, %Y")).days)
+            except:
+                pass
+        return v, ms, d
+    except:
+        return 0, "", 0
+
+bios = [json.loads(l) for l in open("rm_traffic/data/real_bios.jsonl")]
+us = [b["username"] for b in bios]
+print(f"Fetching {len(us)} profiles...")
+res = dict(zip(us, ThreadPoolExecutor(max_workers=10).map(fv, us)))
+
+for b in bios:
+    v, ms, d = res.get(b["username"], (0, "", 0))
+    b["visits"] = v
+    b["member_since"] = ms
+    b["days_online"] = d
+    b["views_per_day"] = v / d if d > 0 else 0
+
+# Save with views
+out = Path("rm_traffic/data/real_bios_with_views.jsonl")
+out.parent.mkdir(parents=True, exist_ok=True)
+with open(out, "w") as f:
+    for b in bios:
+        f.write(json.dumps(b, default=str) + "\n")
+
+# Rank
+bios.sort(key=lambda b: b.get("views_per_day", 0), reverse=True)
+
+print(f"\n{'#':>3} {'Username':<18} {'City':<14} {'Visits':>7} {'Days':>5} {'V/Day':>7} {'R':>2} {'Rev':>3}")
+print("-" * 70)
+for i, b in enumerate(bios):
+    r = float(b.get("ratingAverage", 0) or 0)
+    print(f"{i+1:>3} {b['username']:<18} {b['city']:<14} {b['visits']:>7} {b['days_online']:>5} {b['views_per_day']:>7.1f} {r:>2} {b.get('reviewsCount',0):>3}")
+
+# Save ranked report
+ranked_path = Path("rm_traffic/data/real_bios_ranked.txt")
+with open(ranked_path, "w") as f:
+    for i, b in enumerate(bios):
+        r = float(b.get("ratingAverage", 0) or 0)
+        vpd = b.get("views_per_day", 0)
+        f.write(f"#{i+1} | {b['username']} | {b['city']} | visits={b['visits']} | days={b['days_online']} | views/day={vpd:.1f} | rating={r} | reviews={b.get('reviewsCount',0)}\n")
+        f.write(f"  Headline: {b['headline']}\n")
+        desc = b["description"].replace("\n", " | ")[:500]
+        f.write(f"  Desc: {desc}\n")
+        f.write(f"  Services: {b.get('services', [])}\n")
+        f.write(f"  Member since: {b.get('member_since', 'N/A')}\n")
+        f.write(f"  Gold: {b.get('isGold', 0)} | Avail: {b.get('isAvailable', 0)} | Certified: {b.get('isCertified', 0)}\n\n")
+
+print(f"\nSaved to {out} and {ranked_path}")
+
+```
+
+stats_collector.py:
+```
+"""
+Stats Collector — traffic snapshots every cycle.
+
+Confirmed endpoints:
+    GET /api/v1/account/dashboard
+    GET /api/v1/account/dashboard/ad-statistics
+    GET /api/v1/account/keeponline
+    GET /api/v1/settings/about
+"""
+
+import logging
+
+from .db import write_receipt, write_traffic_snapshot
+from .api_client import RentMasseurAPI
+
+log = logging.getLogger("profileops.stats")
+
+
+def collect_snapshot(api: RentMasseurAPI) -> dict:
+    """Collect a single traffic snapshot and store it."""
+    dashboard = api.get_dashboard()
+    stats = api.get_ad_statistics()
+    keep = api.get_keeponline()
+    about = api.get_about()
+
+    prof_stats = stats.get("profileStatistics", {}) or {}
+    assets = about.get("userProps", {}).get("assets", {})
+    availability = dashboard.get("userSetting", {}).get("availability", {})
+
+    snapshot = {
+        "profile_views": prof_stats.get("totalPageViews"),
+        "contact_clicks": prof_stats.get("totalContactClicks"),
+        "new_visits": keep.get("newVisits"),
+        "new_emails": keep.get("newEmails"),
+        "is_hidden": int(bool(keep.get("isAdHidden", 0))),
+        "is_available": int(availability.get("available", 0)),
+        "availability_valid_to": availability.get("validTo"),
+        "headline": assets.get("headline"),
+        "description_len": len(assets.get("description", "")),
+    }
+
+    write_traffic_snapshot(snapshot)
+    write_receipt(
+        "traffic_snapshot_v1",
+        "collect_snapshot",
+        {},
+        snapshot,
+        verified=True,
+    )
+
+    log.info("Snapshot: views=%s contacts=%s visits=%s emails=%s hidden=%s",
+             snapshot["profile_views"], snapshot["contact_clicks"],
+             snapshot["new_visits"], snapshot["new_emails"], snapshot["is_hidden"])
+    return snapshot
+
+
+def calculate_conversion_rate(views: int, clicks: int) -> float:
+    if not views:
+        return 0.0
+    return round(clicks / views, 4)
+
+
+def compare_to_baseline(current: dict, baseline: dict) -> dict:
+    """Compare current snapshot to baseline and return deltas."""
+    if not baseline:
+        return {"delta_views": 0, "delta_clicks": 0, "delta_rate": 0.0}
+    return {
+        "delta_views": (current.get("profile_views") or 0) - (baseline.get("profile_views") or 0),
+        "delta_clicks": (current.get("contact_clicks") or 0) - (baseline.get("contact_clicks") or 0),
+        "baseline_rate": calculate_conversion_rate(
+            baseline.get("profile_views") or 0, baseline.get("contact_clicks") or 0
+        ),
+        "current_rate": calculate_conversion_rate(
+            current.get("profile_views") or 0, current.get("contact_clicks") or 0
+        ),
+    }
+
+```
+
+transformers_llm.js:
+```
+#!/usr/bin/env node
+/**
+ * Transformers.js local LLM — runs entirely in Node.js, no API keys needed.
+ *
+ * Usage:
+ *   echo "Your prompt here" | node rm_traffic/transformers_llm.js
+ *   echo "Your prompt here" | node rm_traffic/transformers_llm.js --model Xenova/Phi-3.5-mini-instruct
+ *   echo "Your prompt here" | node rm_traffic/transformers_llm.js --max-tokens 500
+ *
+ * Reads prompt from stdin, writes generated text to stdout.
+ * First run downloads model (~2GB cached in ~/.cache/huggingface).
+ */
+
+const { pipeline, env } = require("@huggingface/transformers");
+
+// Allow local models, disable remote loading errors on first run
+env.allowLocalModels = false;
+
+async function main() {
+  const args = process.argv.slice(2);
+  let modelName = "Xenova/Qwen2.5-0.5B-Instruct";
+  let maxTokens = 800;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--model" && args[i + 1]) {
+      modelName = args[i + 1];
+      i++;
+    } else if (args[i] === "--max-tokens" && args[i + 1]) {
+      maxTokens = parseInt(args[i + 1], 10);
+      i++;
+    }
+  }
+
+  // Read prompt from stdin
+  const chunks = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(chunk);
+  }
+  const prompt = Buffer.concat(chunks).toString("utf-8").trim();
+
+  if (!prompt) {
+    console.error("ERROR: No prompt provided on stdin");
+    process.exit(1);
+  }
+
+  try {
+    process.stderr.write(`[transformers.js] Loading model: ${modelName}\n`);
+    const t0 = Date.now();
+
+    const pipe = await pipeline("text-generation", modelName, {
+      device: "cpu",
+    });
+
+    process.stderr.write(`[transformers.js] Model loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s\n`);
+
+    const messages = [
+      { role: "system", content: "You are a helpful assistant for a massage therapist optimization system. Be concise and direct." },
+      { role: "user", content: prompt },
+    ];
+
+    const t1 = Date.now();
+    const output = await pipe(messages, {
+      max_new_tokens: maxTokens,
+      temperature: 0.75,
+      do_sample: true,
+    });
+
+    const elapsed = ((Date.now() - t1) / 1000).toFixed(1);
+    process.stderr.write(`[transformers.js] Generated in ${elapsed}s\n`);
+
+    // Extract text from output
+    let text = "";
+    if (Array.isArray(output) && output.length > 0) {
+      const msg = output[0].generated_text;
+      if (Array.isArray(msg)) {
+        // Chat format: [{role, content}, ...]
+        const last = msg[msg.length - 1];
+        text = last?.content || "";
+      } else if (typeof msg === "string") {
+        text = msg;
+      } else {
+        text = JSON.stringify(msg);
+      }
+    } else if (typeof output === "string") {
+      text = output;
+    } else {
+      text = JSON.stringify(output);
+    }
+
+    // Write only the generated text to stdout (clean for Python to consume)
+    process.stdout.write(text.trim());
+  } catch (err) {
+    process.stderr.write(`[transformers.js] ERROR: ${err.message}\n`);
+    process.exit(1);
+  }
+}
+
+main();
+
+```
+
+action_to_api.py:
+```
+"""
+Selenium Action → API Endpoint Capture
+
+Performs real actions on rentmasseur.com via Selenium, captures the exact
+API calls each action triggers, and outputs a clean API mapping:
+
+  action_name → method, url, headers, body, response
+
+This is the bridge: Selenium does the clicking, we capture the network traffic,
+and produce a callable API spec you can use without Selenium.
+"""
+
+import json
+import os
+import re
+import time
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from collections import OrderedDict
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import (
+    NoSuchElementException, StaleElementReferenceException, WebDriverException,
+)
+
+BASE_URL = "https://rentmasseur.com"
+USERNAME = "karpathianwolf"
+PASSWORD = os.environ.get("RM_PASSWORD", "")
+CHROME_PROFILE = "/tmp/rm_action_api"
+OUT = Path(__file__).parent
+CAPTURE_FILE = OUT / "action_api_map.json"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("action_api")
+
+# ---------------------------------------------------------------------------
+# CDP Network Capture — uses Performance Log + CDP to grab all requests
+# ---------------------------------------------------------------------------
+
+INTERCEPT_SCRIPT = r"""
+(function() {
+    window.__net = [];
+    const origFetch = window.fetch;
+    window.fetch = function(input, init) {
+        const url = typeof input === 'string' ? input : (input?.url || String(input));
+        const method = (init?.method) || (typeof input === 'object' ? input?.method : 'GET') || 'GET';
+        const body = init?.body || null;
+        const headers = {};
+        if (init?.headers) {
+            if (init.headers instanceof Headers) {
+                init.headers.forEach((v,k) => headers[k] = v);
+            } else {
+                Object.assign(headers, init.headers);
+            }
+        }
+        const entry = { type: 'fetch', url, method, body: body ? String(body).substring(0,3000) : null, headers, ts: Date.now() };
+        window.__net.push(entry);
+        return origFetch.apply(this, arguments).then(resp => {
+            entry.status = resp.status;
+            const clone = resp.clone();
+            clone.text().then(t => { entry.response = t.substring(0,5000); }).catch(()=>{});
+            return resp;
+        });
+    };
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+    const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this.__net = { type: 'xhr', url, method, body: null, headers: {}, ts: Date.now() };
+        return origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.setRequestHeader = function(k, v) {
+        if (this.__net) this.__net.headers[k] = v;
+        return origSetHeader.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function(body) {
+        if (this.__net) {
+            this.__net.body = body ? String(body).substring(0,3000) : null;
+            window.__net.push(this.__net);
+            this.addEventListener('load', function() {
+                this.__net.status = this.status;
+                this.__net.response = this.responseText.substring(0,5000);
+            });
+        }
+        return origSend.apply(this, arguments);
+    };
+})();
+"""
+
+
+class ActionCapture:
+    """Run a Selenium action and capture the API calls it triggered."""
+
+    def __init__(self, driver):
+        self.driver = driver
+        self._marker = 0
+        self._installed = False
+
+    def install(self):
+        """Install interceptor AFTER login to avoid breaking login page JS."""
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": INTERCEPT_SCRIPT
+        })
+        self._installed = True
+        log.info("Network interceptor installed")
+
+    def _get_net(self):
+        try:
+            return self.driver.execute_script(
+                "return (window.__net || []).slice();"
+            ) or []
+        except WebDriverException:
+            return []
+
+    def mark(self):
+        """Set a marker — call before an action to know which calls are new."""
+        self._marker = len(self._get_net())
+        return self._marker
+
+    def capture_new(self):
+        """Get all network entries since last mark."""
+        all_net = self._get_net()
+        new = all_net[self._marker:]
+        self._marker = len(all_net)
+        return new
+
+    def capture_all(self):
+        return self._get_net()
+
+
+# ---------------------------------------------------------------------------
+# Browser setup
+# ---------------------------------------------------------------------------
+
+def create_driver():
+    opts = Options()
+    opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument(f"--user-data-dir={CHROME_PROFILE}")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    return webdriver.Chrome(options=opts)
+
+
+def dismiss_popups(driver):
+    time.sleep(1)
+    # First remove any overlay dialogs via JS
+    try:
+        driver.execute_script("""
+            document.querySelectorAll('.DialogOverlay, [class*="overlay"]').forEach(e => e.remove());
+        """)
+    except Exception:
+        pass
+    for xpath in [
+        "//button[contains(text(),'Not now')]",
+        "//button[contains(text(),'Accept all')]",
+        "//button[contains(text(),'Close')]",
+        "//*[contains(@aria-label,'Close')]",
+    ]:
+        try:
+            for el in driver.find_elements(By.XPATH, xpath):
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(0.5)
+        except Exception:
+            pass
+
+
+def login(driver):
+    log.info("Logging in...")
+    driver.get(f"{BASE_URL}/login")
+    time.sleep(4)
+    dismiss_popups(driver)
+
+    for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
+        itype = (inp.get_attribute("type") or "").lower()
+        iname = (inp.get_attribute("name") or "").lower()
+        if (itype == "email" or "email" in iname or "user" in iname) and inp.is_displayed():
+            inp.clear()
+            inp.send_keys(USERNAME)
+        if itype == "password" and inp.is_displayed():
+            inp.clear()
+            inp.send_keys(PASSWORD)
+
+    time.sleep(0.3)
+    for by, sel in [
+        (By.CSS_SELECTOR, "button[type='submit']"),
+        (By.XPATH, "//button[contains(text(),'LOG')]"),
+        (By.XPATH, "//button[contains(text(),'Log')]"),
+        (By.CSS_SELECTOR, "form button"),
+    ]:
+        for el in driver.find_elements(by, sel):
+            if el.is_displayed():
+                driver.execute_script("arguments[0].click();", el)
+                time.sleep(6)
+                break
+        else:
+            continue
+        break
+
+    dismiss_popups(driver)
+    ok = "/login" not in driver.current_url
+    log.info("Login: %s", "OK" if ok else "FAILED")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Actions — each returns (action_name, captured_api_calls)
+# ---------------------------------------------------------------------------
+
+def action_load_settings(cap):
+    """Load settings dashboard."""
+    cap.mark()
+    cap.driver.get(f"{BASE_URL}/settings")
+    time.sleep(5)
+    dismiss_popups(cap.driver)
+    return "load_settings", cap.capture_new()
+
+
+def action_open_availability_modal(cap):
+    """Open the availability modal."""
+    cap.driver.get(f"{BASE_URL}/settings?availability=1")
+    time.sleep(5)
+    dismiss_popups(cap.driver)
+    cap.mark()
+    try:
+        panel = cap.driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
+        panel.click()
+        time.sleep(3)
+    except Exception:
+        pass
+    return "open_availability_modal", cap.capture_new()
+
+
+def action_set_availability(cap):
+    """Set availability to Available with 1 hour duration."""
+    driver = cap.driver
+    driver.get(f"{BASE_URL}/settings?availability=1")
+    time.sleep(5)
+    dismiss_popups(driver)
+
+    # Open modal
+    try:
+        panel = driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
+        panel.click()
+        time.sleep(2)
+    except Exception:
+        pass
+
+    cap.mark()
+
+    # Select "Available"
+    for by, sel in [
+        (By.XPATH, "//label[contains(text(),'Available')]"),
+        (By.XPATH, "//*[contains(text(),'Available') and not(contains(text(),'Not')) and not(contains(text(),'Status'))]"),
+        (By.CSS_SELECTOR, "input[type='radio']"),
+    ]:
+        try:
+            els = driver.find_elements(by, sel)
+            for el in els:
+                if el.is_displayed():
+                    el.click()
+                    time.sleep(0.5)
+                    break
+        except Exception:
+            pass
+
+    # Select duration 1 Hour
+    from selenium.webdriver.support.ui import Select
+    for sel_el in driver.find_elements(By.CSS_SELECTOR, "select"):
+        try:
+            s = Select(sel_el)
+            if "1 Hour" in [o.text for o in s.options]:
+                s.select_by_visible_text("1 Hour")
+                time.sleep(0.3)
+                break
+        except Exception:
+            pass
+
+    # Click SET
+    for by, sel in [
+        (By.XPATH, "//button[contains(text(),'SET')]"),
+        (By.XPATH, "//button[contains(text(),'Set')]"),
+    ]:
+        for el in driver.find_elements(by, sel):
+            if el.is_displayed():
+                el.click()
+                time.sleep(3)
+                break
+
+    return "set_availability", cap.capture_new()
+
+
+def action_toggle_visibility(cap):
+    """Toggle profile visibility."""
+    cap.driver.get(f"{BASE_URL}/settings")
+    time.sleep(4)
+    dismiss_popups(cap.driver)
+    cap.mark()
+    try:
+        vis = cap.driver.find_element(By.CSS_SELECTOR, "#visibility")
+        vis.click()
+        time.sleep(3)
+    except Exception:
+        pass
+    return "toggle_visibility", cap.capture_new()
+
+
+def action_toggle_sms(cap):
+    """Toggle SMS alerts."""
+    cap.driver.get(f"{BASE_URL}/settings")
+    time.sleep(4)
+    dismiss_popups(cap.driver)
+    cap.mark()
+    try:
+        sms = cap.driver.find_element(By.CSS_SELECTOR, "#sms")
+        sms.click()
+        time.sleep(3)
+    except Exception:
+        pass
+    return "toggle_sms_alerts", cap.capture_new()
+
+
+def action_toggle_track_actions(cap):
+    """Toggle track actions."""
+    cap.driver.get(f"{BASE_URL}/settings")
+    time.sleep(4)
+    dismiss_popups(cap.driver)
+    cap.mark()
+    try:
+        track = cap.driver.find_element(By.CSS_SELECTOR, "#trackActions")
+        track.click()
+        time.sleep(3)
+    except Exception:
+        pass
+    return "toggle_track_actions", cap.capture_new()
+
+
+def action_search_city(cap):
+    """Search masseurs in a city."""
+    cap.mark()
+    cap.driver.get(f"{BASE_URL}/gay-massage/manhattan-ny/")
+    time.sleep(5)
+    dismiss_popups(cap.driver)
+    # Scroll to trigger lazy load
+    cap.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(3)
+    return "search_city", cap.capture_new()
+
+
+def action_search_available(cap):
+    """Search available-now masseurs."""
+    cap.mark()
+    cap.driver.get(f"{BASE_URL}/gay-massage/manhattan-ny/?available=1")
+    time.sleep(5)
+    dismiss_popups(cap.driver)
+    return "search_available_now", cap.capture_new()
+
+
+def action_load_more(cap):
+    """Click 'Load more' on search results."""
+    cap.driver.get(f"{BASE_URL}/gay-massage/manhattan-ny/")
+    time.sleep(4)
+    dismiss_popups(cap.driver)
+    cap.mark()
+    try:
+        btn = cap.driver.find_element(By.XPATH, "//button[contains(text(),'Load more')]")
+        btn.click()
+        time.sleep(3)
+    except Exception:
+        pass
+    return "load_more_results", cap.capture_new()
+

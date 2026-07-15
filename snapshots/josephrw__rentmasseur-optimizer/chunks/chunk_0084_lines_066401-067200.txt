@@ -1,0 +1,800 @@
+    r2 = s.put('https://rentmasseur.com/api/v1/settings/about', json=p)
+    print(f'PUT #{i} keys={list(p.keys())}: {r2.status_code} {r2.text[:150]}')
+    if r2.status_code == 200:
+        print('SUCCESS')
+        break
+
+# Also try POST
+r3 = s.post('https://rentmasseur.com/api/v1/settings/about', json={'headline': h, 'description': desc})
+print(f'POST: {r3.status_code} {r3.text[:150]}')
+
+# Try PATCH
+r4 = s.patch('https://rentmasseur.com/api/v1/settings/about', json={'headline': h, 'description': desc})
+print(f'PATCH: {r4.status_code} {r4.text[:150]}')
+
+```
+
+revenue_overclock_ai.py:
+```
+"""
+RM Revenue Overclock AI Layer — the proprietary AI control layer.
+
+Sits above every RM module and decides what action is most likely to
+increase real contact actions, calls, inquiries, and booked sessions.
+
+Does NOT replace profileops.py, availability_keeper.py, service.py, or roi_algorithm.py.
+It ORCHESTRATES them.
+
+5 Engines:
+  1. Traffic State Engine     — reads live RM metrics into TrafficState
+  2. Revenue Pressure Engine  — scores how urgently the account needs action
+  3. Action Selection Engine  — contextual bandit with ROA scoring
+  4. Client Intent Engine     — local Ollama intent classifier
+  5. Proof + ROI Engine       — tamper-evident receipts with metric deltas
+
+CLI:
+  python3 -m rm_traffic.revenue_overclock_ai --once --tenant <id>
+  python3 -m rm_traffic.revenue_overclock_ai --daemon
+  python3 -m rm_traffic.revenue_overclock_ai --report --tenant <id>
+  python3 -m rm_traffic.revenue_overclock_ai --explain-last --tenant <id>
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Optional
+
+# .env loading
+ENV_PATH = Path(__file__).parent.parent / ".env"
+if ENV_PATH.exists():
+    for line in open(ENV_PATH):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+from .api_client import RentMasseurAPI
+from .state_engine import collect_state, TrafficState
+from .action_bandit import select_action, record_outcome, ActionOutcome, explain_last_action, ACTIONS
+from .intent_engine import classify_mailbox
+from .reward_engine import compute_delta, compute_reward, delta_to_dict, is_measurement_valid
+from .receipts import write_receipt, Receipt, get_recent_receipts, verify_chain
+
+log = logging.getLogger("overclock_ai")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+# ─── Action executors ──────────────────────────────────────────────
+
+def execute_action(action: str, api: RentMasseurAPI, state: TrafficState,
+                   tenant_id: str = "") -> Dict:
+    """Execute the selected action. Returns {error, result}."""
+    result = {"error": "", "result": {}}
+
+    try:
+        if action == "refresh_availability":
+            if state.available_status != "Available" or state.availability_seconds_left < 3600:
+                api.set_availability(option=1, duration=5)
+                api.invalidate_cache("availability")
+                result["result"] = {"set_to": "Available", "duration": "6h"}
+                log.info("  ◆ Set availability to Available (6h)")
+            else:
+                result["result"] = {"already_available": True}
+                log.info("  ◉ Already available — no action needed")
+
+        elif action == "ensure_visible":
+            if state.profile_hidden:
+                # Try to unhide via dashboard API
+                try:
+                    api._post("/account/dashboard/hide", {"hide": False})
+                    result["result"] = {"unhid": True}
+                    log.info("  ◆ Unhid profile")
+                except Exception:
+                    result["result"] = {"note": "visibility API not available — manual check needed"}
+                    log.warning("  ⟁ Could not unhide profile via API")
+            else:
+                result["result"] = {"already_visible": True}
+
+        elif action == "check_search_rank":
+            results = api.search_masseurs(city="manhattan-ny", page=1)
+            users = results.get("users", [])
+            result["result"] = {"total_results": len(users), "rank": state.search_rank}
+
+        elif action == "mailbox_intent_scan":
+            mailbox = api.get_mailbox(page=1, folder=1, sort=1)
+            emails = mailbox.get("emails", [])
+            classified = classify_mailbox(emails)
+            result["result"] = {
+                "total": len(emails),
+                "classified": len(classified),
+                "booking_ready": sum(1 for c in classified if c["classification"] == "booking_now"),
+                "high_value": sum(1 for c in classified if c["classification"] == "high_value_repeat"),
+            }
+
+        elif action == "reply_draft_queue":
+            mailbox = api.get_mailbox(page=1, folder=1, sort=1)
+            emails = mailbox.get("emails", [])
+            from .reply_drafter import draft_mailbox_replies, format_drafts_summary
+            phone = os.environ.get("RM_PHONE", "")
+            ctx = {"rate": "$200", "phone": phone, "location": "Manhattan incall"}
+            drafts = draft_mailbox_replies(emails, ctx)
+            print(format_drafts_summary(drafts))
+            result["result"] = {
+                "drafts_queued": len([d for d in drafts if d.risk_level != "blocked"]),
+                "blocked": len([d for d in drafts if d.risk_level == "blocked"]),
+                "needs_approval": len([d for d in drafts if d.needs_human_approval]),
+                "auto_ok": len([d for d in drafts if not d.needs_human_approval and d.risk_level != "blocked"]),
+                "classifications": [d.intent_class for d in drafts if d.risk_level != "blocked"],
+                "sample_draft": drafts[0].reply_text[:100] if drafts else "",
+            }
+
+        elif action == "visitor_revisit":
+            from .visitor_revisit_engine import build_revisit_queue, write_revisit_queue, format_queue_summary
+            queue = build_revisit_queue(api, state, tenant_id)
+            filepath = write_revisit_queue(queue)
+            print(format_queue_summary(queue))
+            p0 = len([c for c in queue if c.urgency == "P0_revisit_now"])
+            p1 = len([c for c in queue if c.urgency == "P1_reengage_today"])
+            warm = len([c for c in queue if c.urgency == "WARM_observe"])
+            ignored = len([c for c in queue if c.urgency == "IGNORE"])
+            drafts_queued = len([c for c in queue if c.draft_text and c.approval_required])
+            result["result"] = {
+                "total_contacts": len(queue),
+                "p0_revisit_now": p0,
+                "p1_reengage_today": p1,
+                "warm_observe": warm,
+                "ignored": ignored,
+                "drafts_queued": drafts_queued,
+                "needs_approval": drafts_queued,
+                "auto_ok": 0,  # all approval-gated
+                "csv_path": filepath,
+            }
+
+        elif action == "city_rank_scan":
+            results = api.search_masseurs(city="manhattan-ny", page=1)
+            result["result"] = {"search_total": len(results.get("users", []))}
+
+        elif action == "headline_variant_test":
+            result["result"] = {"note": "headline test requires manual approval — draft only"}
+            result["error"] = "manual_approval_required"
+
+        elif action == "bio_variant_test":
+            result["result"] = {"note": "bio test requires manual approval — draft only"}
+            result["error"] = "manual_approval_required"
+
+        elif action == "photo_order_test":
+            result["result"] = {"note": "photo test requires manual approval — draft only"}
+            result["error"] = "manual_approval_required"
+
+        elif action == "rate_position_test":
+            result["result"] = {"note": "rate test requires manual approval — draft only"}
+            result["error"] = "manual_approval_required"
+
+        elif action == "traffic_report":
+            result["result"] = {"report_generated": True}
+
+        elif action == "do_nothing":
+            result["result"] = {"reason": "no high-value action available"}
+
+        else:
+            result["error"] = f"unknown action: {action}"
+
+    except Exception as e:
+        result["error"] = str(e)
+        log.error(f"  ⟁ Action error: {e}")
+
+    return result
+
+
+# ─── Main cycle ────────────────────────────────────────────────────
+
+def run_cycle(tenant_id: str = "", username: str = "", password: str = "") -> Dict:
+    """Run one overclock cycle: state → pressure → bandit → execute → measure → receipt."""
+    print(f"\n{'='*60}")
+    print(f"  RM REVENUE OVERCLOCK AI — {tenant_id or 'default'}")
+    print(f"  {datetime.now(timezone.utc).isoformat()}")
+    print(f"{'='*60}\n")
+
+    # Login
+    api = RentMasseurAPI(min_request_interval=2.0)
+    if not api.login(username, password):
+        print("🔴 Login failed")
+        return {"error": "login_failed", "tenant_id": tenant_id}
+
+    print("[STATE] Collecting traffic state from verified endpoints...")
+
+    # 1. Collect state BEFORE
+    state_before = collect_state(api, tenant_id)
+    print(f"  ◉ State hash: {state_before.state_hash}")
+    print(f"  ◉ Revenue pressure: {state_before.revenue_pressure}")
+    print(f"  ◉ Pressure components: {json.dumps(state_before.pressure_components)}")
+
+    # 2. Select action via bandit
+    print("\n[BANDIT] Selecting action via contextual bandit (ROA)...")
+    action, roa_scores = select_action(state_before, tenant_id)
+
+    # Show top 3 ROA scores
+    sorted_roa = sorted(roa_scores.items(), key=lambda x: -x[1])[:5]
+    for a, score in sorted_roa:
+        marker = "◆" if a == action else " "
+        print(f"  {marker} {a}: ROA={score:.3f}")
+
+    print(f"\n  → Selected: {action}")
+
+    # 3. Execute action
+    print(f"\n[EXEC] Executing {action}...")
+    exec_result = execute_action(action, api, state_before, tenant_id)
+    error = exec_result.get("error", "")
+    if error:
+        print(f"  ⟁ Error: {error}")
+    else:
+        print(f"  ◉ Result: {json.dumps(exec_result.get('result', {}))}")
+
+    # 4. Collect state AFTER
+    print("\n[MEASURE] Collecting state after action...")
+    time.sleep(2)  # brief pause for API to reflect changes
+    api.invalidate_cache()  # clear all caches
+    state_after = collect_state(api, tenant_id)
+    print(f"  ◉ State hash: {state_after.state_hash}")
+    if not state_after.measurement_valid:
+        print(f"  ⟁ MEASUREMENT INVALID: {state_after.endpoint_error_count} endpoint errors")
+        print(f"  ⟁ Errors: {state_after.endpoint_errors}")
+
+    # 5. Compute reward
+    print("\n[REWARD] Computing metric delta and reward...")
+    measurement_valid = is_measurement_valid(state_before, state_after)
+    delta = compute_delta(state_before, state_after)
+
+    # For reply_draft_queue and visitor_revisit, pass action_result for draft-quality-based reward
+    action_result = exec_result.get("result", {}) if action in ("reply_draft_queue", "visitor_revisit") else None
+    reward = compute_reward(delta, action, error,
+                             measurement_valid=measurement_valid,
+                             action_result=action_result)
+    print(f"  ◉ Delta: {json.dumps(delta_to_dict(delta))}")
+    print(f"  ◉ Reward: {reward:.3f}")
+    if not measurement_valid:
+        print(f"  ⟁ MEASUREMENT INVALID — reward=0.0, bandit NOT updated")
+
+    # 6. Record outcome for bandit learning (skip if measurement invalid)
+    if measurement_valid:
+        outcome = ActionOutcome(
+            action=action,
+            reward=reward,
+            metric_delta=delta_to_dict(delta),
+            state_before_hash=state_before.state_hash,
+            state_after_hash=state_after.state_hash,
+            error=error,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        record_outcome(outcome, tenant_id)
+        print(f"  ◉ Recorded: {action} reward={reward:.3f}")
+    else:
+        print(f"  ⟁ SKIPPED bandit update — measurement invalid")
+
+    # 7. Write tamper-evident receipt
+    receipt_reason = f"ROA-selected: pressure={state_before.revenue_pressure:.3f}"
+    if not measurement_valid:
+        receipt_reason = f"measurement_invalid_after_snapshot_403: {state_after.endpoint_error_count} errors"
+
+    receipt = Receipt(
+        tenant_id=tenant_id,
+        state_before_hash=state_before.state_hash,
+        state_after_hash=state_after.state_hash,
+        action=action,
+        reason=receipt_reason,
+        model_used="contextual_bandit_v1",
+        metric_delta=delta_to_dict(delta),
+        reward=reward,
+        error=error if measurement_valid else "measurement_invalid",
+        revenue_estimate=reward * 50.0,
+    )
+    receipt_hash = write_receipt(receipt)
+
+    # Summary
+    print(f"\n{'='*60}")
+    print(f"  CYCLE COMPLETE")
+    print(f"  Action: {action}")
+    print(f"  Reward: {reward:.3f}")
+    print(f"  Receipt: {receipt_hash}")
+    print(f"  State: {state_before.state_hash} → {state_after.state_hash}")
+    print(f"  Pressure: {state_before.revenue_pressure:.3f} → {state_after.revenue_pressure:.3f}")
+    print(f"{'='*60}\n")
+
+    return {
+        "tenant_id": tenant_id,
+        "action": action,
+        "reward": reward,
+        "receipt_hash": receipt_hash,
+        "state_before": state_before.state_hash,
+        "state_after": state_after.state_hash,
+        "pressure_before": state_before.revenue_pressure,
+        "pressure_after": state_after.revenue_pressure,
+        "delta": delta_to_dict(delta),
+        "error": error,
+    }
+
+
+def run_report(tenant_id: str = "") -> str:
+    """Generate a text report of recent cycles."""
+    receipts = get_recent_receipts(tenant_id, limit=20)
+    chain_valid = verify_chain(tenant_id)
+
+    lines = [
+        f"RM Revenue Overclock AI — Report for {tenant_id or 'default'}",
+        f"Generated: {datetime.now(timezone.utc).isoformat()}",
+        f"Receipt chain: {'✅ VALID' if chain_valid else '❌ TAMPERED'}",
+        f"",
+        f"Recent Actions ({len(receipts)}):",
+        f"{'Time':<28} {'Action':<25} {'Reward':>8} {'Receipt':<10}",
+        f"{'-'*28} {'-'*25} {'-'*8} {'-'*10}",
+    ]
+
+    for r in receipts:
+        ts = r["timestamp"][:19]
+        lines.append(f"{ts:<28} {r['action']:<25} {r['reward']:>8.3f} {r['receipt_hash']:<10}")
+
+    # Action stats
+    from .action_bandit import get_action_stats, _db as bandit_db
+    stats = get_action_stats(bandit_db(), tenant_id)
+    lines.append(f"\nAction Statistics:")
+    lines.append(f"{'Action':<25} {'Runs':>5} {'Avg Reward':>10} {'Win Rate':>9} {'Confidence':>10}")
+    lines.append(f"{'-'*25} {'-'*5} {'-'*10} {'-'*9} {'-'*10}")
+    for action in ACTIONS:
+        s = stats.get(action, {})
+        if s.get("n", 0) > 0:
+            lines.append(f"{action:<25} {s['n']:>5} {s['avg_reward']:>10.3f} {s['win_rate']:>9.1%} {s['confidence']:>10.3f}")
+
+    report = "\n".join(lines)
+    print(report)
+    return report
+
+
+# ─── CLI ───────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="RM Revenue Overclock AI Layer")
+    parser.add_argument("--once", action="store_true", help="Run one cycle")
+    parser.add_argument("--daemon", action="store_true", help="Run as daemon (continuous)")
+    parser.add_argument("--report", action="store_true", help="Generate report")
+    parser.add_argument("--explain-last", action="store_true", help="Explain last action")
+    parser.add_argument("--tenant", default="", help="Tenant ID")
+    parser.add_argument("--interval", type=int, default=300, help="Daemon interval (seconds)")
+    args = parser.parse_args()
+
+    username = os.environ.get("RENTMASSEUR_USER", os.environ.get("RM_USER", ""))
+    password = os.environ.get("RENTMASSEUR_PASS", os.environ.get("RM_PASS", ""))
+
+    tenant_id = args.tenant or hashlib.sha256(username.encode()).hexdigest()[:16]
+
+    if args.report:
+        run_report(tenant_id)
+        return
+
+    if args.explain_last:
+        print(explain_last_action(tenant_id))
+        return
+
+    if args.once:
+        result = run_cycle(tenant_id, username, password)
+        if result.get("error") == "login_failed":
+            sys.exit(2)
+        sys.exit(0)
+
+    if args.daemon:
+        print(f"Starting daemon mode (interval={args.interval}s, tenant={tenant_id})")
+        while True:
+            try:
+                run_cycle(tenant_id, username, password)
+            except Exception as e:
+                log.error(f"Cycle error: {e}")
+            print(f"Sleeping {args.interval}s...")
+            time.sleep(args.interval)
+
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+service.py:
+```
+"""
+RM Traffic Service — unified multi-tenant optimization pipeline.
+
+Consolidates 5 overlapping systems into one service:
+  - profileops.py  (visibility, availability, stats)
+  - fortress.py    (hardened login, identity rotation, rate limiting)
+  - traffic_loop.py (30-function optimization loop)
+  - money_loop.py   (revenue funnel + LLM optimizer)
+  - engagement_engine.py (Selenium visits + messaging)
+
+Single API client. Single DB for ROI. Per-tenant credentials.
+Orchestrated cycle: collect → prioritize → execute → measure → report.
+
+Usage:
+    python3 -m rm_traffic.service --once --tenant <tenant_id>
+    python3 -m rm_traffic.service --daemon
+    python3 -m rm_traffic.service --register --username <rm_username> --display-name "John Doe"
+    python3 -m rm_traffic.service --report --tenant <tenant_id>
+    python3 -m rm_traffic.service --list-tenants
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+
+# .env loading
+ENV_PATH = Path(__file__).parent.parent / ".env"
+if ENV_PATH.exists():
+    for line in open(ENV_PATH):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+from .api_client import RentMasseurAPI
+from .auth import AuthSession
+from .llm_client import generate_with_fallback
+from . import roi_algorithm as roi
+
+log = logging.getLogger("rm_service")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+SERVICE_DB = Path(__file__).parent / "service.db"
+NY_CITIES = [
+    "manhattan-ny", "brooklyn-ny", "queens-ny",
+    "bronx-ny", "staten-island-ny", "long-island-ny", "westchester-ny",
+]
+
+# Valid actions the orchestrator can execute
+VALID_ACTIONS = {
+    "refresh_availability", "ensure_visible", "send_messages",
+    "visit_profiles", "update_bio", "check_search_rank",
+    "multi_city_rank", "engagement_stats", "sms_alerts",
+    "track_actions", "adjust_rates",
+}
+
+
+def _sdb():
+    conn = sqlite3.connect(str(SERVICE_DB))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_db():
+    conn = _sdb()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS service_cycles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant_id TEXT NOT NULL,
+        ts TEXT NOT NULL,
+        cycle_num INTEGER,
+        actions_executed INTEGER,
+        actions_passed INTEGER,
+        llm_calls INTEGER,
+        views_before INTEGER,
+        views_after INTEGER,
+        contacts_before INTEGER,
+        contacts_after INTEGER,
+        emails_before INTEGER,
+        emails_after INTEGER,
+        search_rank_before INTEGER,
+        search_rank_after INTEGER,
+        receipt_hash TEXT
+    );
+    CREATE TABLE IF NOT EXISTS tenant_credentials (
+        tenant_id TEXT PRIMARY KEY,
+        rm_username TEXT NOT NULL,
+        rm_password_encrypted TEXT NOT NULL,
+        session_json TEXT,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cycles_tenant ON service_cycles(tenant_id, ts);
+    """)
+    conn.commit()
+    conn.close()
+    roi.init_db()
+
+
+# ---------------------------------------------------------------------------
+# Credential Storage (simple obfuscation — not plaintext at rest)
+# ---------------------------------------------------------------------------
+
+_OBF_KEY = os.environ.get("RM_SERVICE_KEY", "rm_traffic_service_v1")
+
+
+def _obfuscate(text: str) -> str:
+    return hashlib.sha256((_OBF_KEY + text).encode()).hexdigest()[:8] + "|" + text[::-1]
+
+
+def _deobfuscate(stored: str) -> str:
+    parts = stored.split("|", 1)
+    if len(parts) != 2:
+        return ""
+    return parts[1][::-1]
+
+
+def store_credentials(tenant_id: str, rm_username: str, rm_password: str):
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = _sdb()
+    conn.execute(
+        "INSERT OR REPLACE INTO tenant_credentials (tenant_id, rm_username, rm_password_encrypted, updated_at) VALUES (?, ?, ?, ?)",
+        (tenant_id, rm_username, _obfuscate(rm_password), ts)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_credentials(tenant_id: str) -> Optional[Dict]:
+    conn = _sdb()
+    row = conn.execute("SELECT * FROM tenant_credentials WHERE tenant_id = ?", (tenant_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"username": row["rm_username"], "password": _deobfuscate(row["rm_password_encrypted"])}
+
+
+# ---------------------------------------------------------------------------
+# API Session Per Tenant
+# ---------------------------------------------------------------------------
+
+def get_api_for_tenant(tenant_id: str) -> Optional[RentMasseurAPI]:
+    """Create an authenticated API session for a specific tenant."""
+    creds = get_credentials(tenant_id)
+    if not creds:
+        log.error("No credentials for tenant %s", tenant_id)
+        return None
+
+    tenant = roi.get_tenant(tenant_id)
+    if not tenant:
+        log.error("Tenant %s not found", tenant_id)
+        return None
+
+    api = RentMasseurAPI(min_request_interval=2.0)
+    session_file = str(Path(__file__).parent / f"session_{tenant_id}.json")
+    auth = AuthSession(api, session_file=session_file)
+
+    if not auth.login(creds["username"], creds["password"]):
+        log.error("Login failed for tenant %s (%s)", tenant_id, creds["username"])
+        return None
+
+    return api
+
+
+# ---------------------------------------------------------------------------
+# Metric Collection (unified — replaces 5 duplicate implementations)
+# ---------------------------------------------------------------------------
+
+def collect_metrics(api: RentMasseurAPI, tenant_id: str) -> Dict:
+    """Collect all traffic metrics in one pass. Replaces duplicate code in 5 files."""
+    metrics: Dict = {"ts": datetime.now(timezone.utc).isoformat()}
+
+    try:
+        stats = api.get_ad_statistics()
+        prof = stats.get("profileStatistics", {}) or {}
+        visits = prof.get("visits", []) or []
+        metrics["views"] = prof.get("totalPageViews", 0)
+        metrics["contact_clicks"] = prof.get("totalContactClicks", 0)
+    except Exception as e:
+        log.warning("Stats collection failed: %s", e)
+        metrics["views"] = 0
+        metrics["contact_clicks"] = 0
+
+    try:
+        mb = api.get_mailbox(page=1, folder=1, sort=1)
+        emails = mb.get("emails", []) or []
+        metrics["emails_count"] = len(emails)
+        metrics["unread_emails"] = sum(1 for e in emails if e.get("unread"))
+        metrics["premium_senders"] = sum(
+            1 for e in emails
+            if e.get("userCard", {}).get("isGold") or e.get("userCard", {}).get("isPremium")
+        )
+        # Classify emails
+        booking = 0
+        inquiry = 0
+        for e in emails:
+            preview = (e.get("lastMessage", "") or "").lower()
+            if any(w in preview for w in ["book", "appointment", "session", "today", "tomorrow", "available", "schedule"]):
+                booking += 1
+            elif any(w in preview for w in ["price", "rate", "how much", "where", "location", "incall", "outcall"]):
+                inquiry += 1
+        metrics["booking_emails"] = booking
+        metrics["inquiry_emails"] = inquiry
+    except Exception as e:
+        log.warning("Mailbox collection failed: %s", e)
+        metrics["emails_count"] = 0
+        metrics["unread_emails"] = 0
+        metrics["booking_emails"] = 0
+        metrics["inquiry_emails"] = 0
+        metrics["premium_senders"] = 0
+
+    try:
+        about = api.get_about()
+        assets = about.get("userProps", {}).get("assets", {})
+        metrics["headline"] = assets.get("headline", "")
+    except Exception:
+        metrics["headline"] = ""
+
+    try:
+        avail = api.get_availability()
+        metrics["availability_option"] = avail.get("option", 0)
+    except Exception:
+        metrics["availability_option"] = 0
+
+    try:
+        keep = api.get_keeponline()
+        metrics["is_hidden"] = int(bool(keep.get("isAdHidden", 0)))
+    except Exception:
+        metrics["is_hidden"] = 0
+
+    try:
+        tenant = roi.get_tenant(tenant_id)
+        city = tenant.get("city", "manhattan-ny") if tenant else "manhattan-ny"
+        search = api.search(city=city, available_only=False, page=1)
+        results = search.get("results", []) or search.get("data", []) or search.get("users", []) or []
+        metrics["search_rank"] = _find_rank(results, creds_username=None, tenant=tenant)
+        metrics["search_total"] = len(results)
+    except Exception:
+        metrics["search_rank"] = 0
+        metrics["search_total"] = 0
+
+    try:
+        avail_search = api.search(city=city, available_only=True, page=1)
+        a_results = avail_search.get("results", []) or avail_search.get("data", []) or []
+        metrics["available_rank"] = _find_rank(a_results, creds_username=None, tenant=tenant)
+        metrics["available_total"] = len(a_results)
+    except Exception:
+        metrics["available_rank"] = 0
+        metrics["available_total"] = 0
+
+    # Record into ROI daily metrics
+    roi.record_daily_metrics(tenant_id, metrics)
+
+    return metrics
+
+
+def _find_rank(results: List, creds_username: str = None, tenant: Dict = None) -> int:
+    username = (creds_username or "").lower()
+    if tenant:
+        username = tenant.get("username", "").lower()
+    if not username:
+        return 0
+    for i, r in enumerate(results):
+        name = (r.get("username") or r.get("name") or "").lower()
+        if username in name or name in username:
+            return i + 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Action Executors (unified — one implementation per action)
+# ---------------------------------------------------------------------------
+
+def exec_refresh_availability(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    avail = api.get_availability()
+    option = avail.get("option", 0)
+    if option != 1:
+        api.set_availability(option=1, duration=5)
+        roi.log_action(tenant_id, cycle, "refresh_availability", "visibility", True,
+                       "set to Available", before, {"availability": 1})
+        return {"executed": True, "detail": "set to Available"}
+    roi.log_action(tenant_id, cycle, "refresh_availability", "visibility", False,
+                   "already available", before, {"availability": 1})
+    return {"executed": False, "detail": "already available"}
+
+
+def exec_ensure_visible(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    if before.get("is_hidden", 0):
+        api.set_visibility(True)
+        roi.log_action(tenant_id, cycle, "ensure_visible", "visibility", True,
+                       "unhidden profile", before, {"is_hidden": 0})
+        return {"executed": True, "detail": "profile unhidden"}
+    roi.log_action(tenant_id, cycle, "ensure_visible", "visibility", False,
+                   "already visible", before, {"is_hidden": 0})
+    return {"executed": False, "detail": "already visible"}
+
+
+def exec_send_messages(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        from .engagement_engine import get_visitors_to_message, mark_messaged, generate_message_for_visitor, EngagementBrowser
+        visitors = get_visitors_to_message(limit=3)
+        if not visitors:
+            roi.log_action(tenant_id, cycle, "send_messages", "engagement", False,
+                           "no visitors to message", before, before)
+            return {"executed": False, "detail": "no visitors to message"}
+        browser = EngagementBrowser()
+        browser.start()
+        try:
+            browser.login()
+            sent = 0
+            for v in visitors:
+                uname = v["username"]
+                subject, body, provider, model = generate_message_for_visitor(uname)
+                ok, status_code, detail, screenshot = browser.send_message(uname, subject, body)
+                mark_messaged(uname, subject, body, provider, model, ok, status_code, detail, screenshot_path=screenshot)
+                if ok:
+                    sent += 1
+                time.sleep(3)
+            roi.log_action(tenant_id, cycle, "send_messages", "engagement", sent > 0,
+                           f"sent {sent}/{len(visitors)}", before, {"messages_sent": sent})
+            return {"executed": sent > 0, "detail": f"sent {sent}/{len(visitors)} messages"}
+        finally:
+            browser.stop()
+    except Exception as e:
+        roi.log_action(tenant_id, cycle, "send_messages", "engagement", False, str(e)[:100], before, before)
+        return {"executed": False, "detail": f"error: {e}"}
+
+
+def exec_visit_profiles(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        from .engagement_engine import get_profiles_to_visit, mark_visited_back, EngagementBrowser
+        profiles = get_profiles_to_visit(limit=5)
+        if not profiles:
+            roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", False,
+                           "no profiles to visit", before, before)
+            return {"executed": False, "detail": "no profiles to visit"}
+        browser = EngagementBrowser()
+        browser.start()
+        try:
+            browser.login()
+            visited = 0
+            for p in profiles:
+                uname = p["username"]
+                status, bytes_recv, ok, screenshot = browser.visit_profile(uname)
+                mark_visited_back(uname, status, bytes_recv, ok, screenshot_path=screenshot)
+                if ok:
+                    visited += 1
+                time.sleep(2)
+            roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", visited > 0,
+                           f"visited {visited}/{len(profiles)}", before, {"profiles_visited": visited})
+            return {"executed": visited > 0, "detail": f"visited {visited}/{len(profiles)}"}
+        finally:
+            browser.stop()
+    except Exception as e:
+        roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", False, str(e)[:100], before, before)
+        return {"executed": False, "detail": f"error: {e}"}
+
+
+def exec_update_bio(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        about = api.get_about()
+        assets = about.get("userProps", {}).get("assets", {})
+        current_h = assets.get("headline", "")
+        current_d = assets.get("description", "")
+        ctr = (before.get("contact_clicks", 0) / max(before.get("views", 1), 1)) * 100
+        prompt = f"""Current headline: "{current_h}"
+CTR: {ctr:.1f}% (benchmark: 5-8%)
+Views: {before.get('views', 0)}, Contacts: {before.get('contact_clicks', 0)}
+Generate a new headline that would increase CTR. Reply with ONLY the headline (max 80 chars)."""
+        new_h = generate_with_fallback(prompt, max_tokens=100)
+        if new_h:
+            new_h = new_h.strip().strip('"').strip("'")[:80]
+            if new_h and new_h != current_h:
+                api.set_about(new_h, current_d)
+                roi.log_action(tenant_id, cycle, "update_bio", "bio", True,
+                               f"headline: {current_h[:30]} → {new_h[:30]}", before, {"headline": new_h})
+                return {"executed": True, "detail": f"headline updated to: {new_h[:40]}"}

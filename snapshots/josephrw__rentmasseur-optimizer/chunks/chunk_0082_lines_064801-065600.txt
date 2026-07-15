@@ -1,0 +1,800 @@
+  reward = 5.0 * booking_intent_delta
+         + 3.0 * contact_click_delta
+         + 2.0 * email_delta
+         + 1.0 * view_delta
+         - 2.0 * error_penalty
+         - 3.0 * compliance_risk
+         - 1.0 * excessive_mutation_penalty
+"""
+
+import json
+import logging
+import math
+import os
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+log = logging.getLogger("action_bandit")
+
+BANDIT_DB = Path(__file__).parent / "overclock_bandit.db"
+
+# All action arms
+ACTIONS = [
+    "refresh_availability",
+    "ensure_visible",
+    "check_search_rank",
+    "mailbox_intent_scan",
+    "reply_draft_queue",
+    "visitor_revisit",
+    "headline_variant_test",
+    "bio_variant_test",
+    "photo_order_test",
+    "rate_position_test",
+    "city_rank_scan",
+    "traffic_report",
+    "do_nothing",
+]
+
+# Actions that mutate the profile (need mutation cost)
+MUTATION_ACTIONS = {
+    "headline_variant_test",
+    "bio_variant_test",
+    "photo_order_test",
+    "rate_position_test",
+}
+
+# Actions that are always safe (no platform risk)
+SAFE_ACTIONS = {
+    "refresh_availability",
+    "ensure_visible",
+    "check_search_rank",
+    "mailbox_intent_scan",
+    "reply_draft_queue",
+    "visitor_revisit",
+    "city_rank_scan",
+    "traffic_report",
+    "do_nothing",
+}
+
+
+@dataclass
+class ActionOutcome:
+    action: str
+    reward: float
+    metric_delta: Dict[str, float] = field(default_factory=dict)
+    timestamp: str = ""
+    state_before_hash: str = ""
+    state_after_hash: str = ""
+    error: str = ""
+
+
+def _db():
+    conn = sqlite3.connect(str(BANDIT_DB))
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS action_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant_id TEXT,
+        action TEXT,
+        reward REAL,
+        metric_delta TEXT,
+        state_before_hash TEXT,
+        state_after_hash TEXT,
+        error TEXT,
+        timestamp TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_action ON action_history(action);
+    CREATE INDEX IF NOT EXISTS idx_tenant ON action_history(tenant_id);
+    """)
+    conn.commit()
+    return conn
+
+
+def get_action_stats(conn: sqlite3.Connection, tenant_id: str = "") -> Dict[str, Dict]:
+    """Get per-action stats: count, avg_reward, confidence."""
+    cur = conn.cursor()
+    stats = {}
+    for action in ACTIONS:
+        cur.execute(
+            "SELECT COUNT(*) as n, AVG(reward) as avg_r, "
+            "SUM(CASE WHEN reward > 0 THEN 1 ELSE 0 END) as wins "
+            f"FROM action_history WHERE action = ? AND tenant_id = ?",
+            (action, tenant_id)
+        )
+        row = cur.fetchone()
+        n = row["n"] or 0
+        avg_r = row["avg_r"] or 0.0
+        wins = row["wins"] or 0
+        # Wilson score interval lower bound as confidence
+        if n > 0:
+            z = 1.96
+            p = wins / n
+            denominator = 1 + z * z / n
+            center = (p + z * z / (2 * n)) / denominator
+            margin = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n) / denominator
+            confidence = max(0, center - margin)
+        else:
+            confidence = 0.0
+        stats[action] = {
+            "n": n,
+            "avg_reward": round(avg_r, 3),
+            "win_rate": round(wins / n, 3) if n > 0 else 0.0,
+            "confidence": round(confidence, 3),
+        }
+    return stats
+
+
+def compute_roa(action: str, state, stats: Dict) -> float:
+    """
+    ROA = Revenue Overclock Advantage
+
+    ROA = expected_revenue_lift × confidence × attribution_weight × repeatability
+          − compliance_risk − mutation_cost − platform_error_risk
+    """
+    s = stats.get(action, {"avg_reward": 0, "confidence": 0, "n": 0})
+
+    # Expected revenue lift: use avg reward as base, adjust for current state
+    expected_lift = s["avg_reward"]
+
+    # State-based adjustments
+    pressure = state.revenue_pressure
+
+    if action == "refresh_availability":
+        if state.available_status != "Available":
+            expected_lift = 2.0  # high value when not available
+        elif state.availability_seconds_left < 3600:
+            expected_lift = 1.0  # medium value when expiring
+        else:
+            expected_lift = 0.1  # low value when already available
+
+    elif action == "ensure_visible":
+        expected_lift = 2.0 if state.profile_hidden else 0.1
+
+    elif action == "mailbox_intent_scan":
+        expected_lift = 0.5 + (state.mailbox_intent_score * 2.0)
+
+    elif action == "reply_draft_queue":
+        expected_lift = 1.0 + (state.mailbox_intent_score * 3.0)
+
+    elif action == "check_search_rank":
+        expected_lift = 0.3
+
+    elif action == "city_rank_scan":
+        expected_lift = 0.3
+
+    elif action == "headline_variant_test":
+        # Only valuable when contact rate is low
+        expected_lift = max(0, (5.0 - state.contact_rate) / 5.0) * 1.5
+
+    elif action == "bio_variant_test":
+        expected_lift = max(0, (5.0 - state.contact_rate) / 5.0) * 1.0
+
+    elif action == "rate_position_test":
+        expected_lift = 0.2  # risky, low default
+
+    elif action == "photo_order_test":
+        expected_lift = 0.3
+
+    elif action == "traffic_report":
+        expected_lift = 0.2
+
+    elif action == "do_nothing":
+        expected_lift = 0.0
+
+    # Confidence from bandit history
+    confidence = s["confidence"] if s["n"] >= 3 else 0.3  # default low confidence
+
+    # Attribution weight: safe actions have higher attribution reliability
+    attribution_weight = 0.9 if action in SAFE_ACTIONS else 0.6
+
+    # Repeatability: can we do this again and again?
+    repeatability = 0.8 if action in SAFE_ACTIONS else 0.4
+
+    # Compliance risk
+    compliance_risk = 0.0 if action in SAFE_ACTIONS else 0.3
+
+    # Mutation cost: penalize frequent profile changes
+    mutation_cost = 0.5 if action in MUTATION_ACTIONS else 0.0
+
+    # Platform error risk
+    platform_error_risk = 0.1 if action in SAFE_ACTIONS else 0.2
+
+    roa = (
+        expected_lift * confidence * attribution_weight * repeatability
+        - compliance_risk
+        - mutation_cost
+        - platform_error_risk
+    )
+
+    return round(roa, 3)
+
+
+def select_action(state, tenant_id: str = "") -> Tuple[str, Dict[str, float]]:
+    """
+    Select best action using contextual bandit.
+
+    Returns (action_name, roa_scores).
+    """
+    conn = _db()
+    stats = get_action_stats(conn, tenant_id)
+
+    roa_scores = {}
+    for action in ACTIONS:
+        roa_scores[action] = compute_roa(action, state, stats)
+
+    conn.close()
+
+    # argmax ROA
+    best = max(roa_scores, key=roa_scores.get)
+    return best, roa_scores
+
+
+def record_outcome(outcome: ActionOutcome, tenant_id: str = ""):
+    """Record action outcome for bandit learning."""
+    conn = _db()
+    conn.execute(
+        "INSERT INTO action_history (tenant_id, action, reward, metric_delta, state_before_hash, state_after_hash, error, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (tenant_id, outcome.action, outcome.reward,
+         json.dumps(outcome.metric_delta),
+         outcome.state_before_hash, outcome.state_after_hash,
+         outcome.error, outcome.timestamp or datetime.now(timezone.utc).isoformat())
+    )
+    conn.commit()
+    conn.close()
+    log.info(f"  ◉ Recorded: {outcome.action} reward={outcome.reward:.3f}")
+
+
+def explain_last_action(tenant_id: str = "") -> str:
+    """Explain the last action taken and why."""
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM action_history WHERE tenant_id = ? ORDER BY id DESC LIMIT 1",
+        (tenant_id,)
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return "No actions recorded yet."
+
+    stats = get_action_stats(_db(), tenant_id)
+    action = row["action"]
+    s = stats.get(action, {})
+
+    return (
+        f"Last action: {action}\n"
+        f"  Reward: {row['reward']:.3f}\n"
+        f"  Metric delta: {row['metric_delta']}\n"
+        f"  Error: {row['error'] or 'none'}\n"
+        f"  Timestamp: {row['timestamp']}\n"
+        f"  History: {s['n']} runs, avg_reward={s['avg_reward']:.3f}, win_rate={s['win_rate']:.1%}\n"
+        f"  Confidence: {s['confidence']:.3f}"
+    )
+
+```
+
+cli.py:
+```
+"""
+RM ProfileOps CLI — run modes and manage approved drafts.
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+
+from .db import init_db, get_variant_history, get_conn
+from .api_client import RentMasseurAPI
+from .auth import AuthSession, get_credential
+from .content_optimizer import apply_bio_variant, draft_bio_variant
+from .daemon import ProfileOpsDaemon
+from .execution_engine import execute_visibility
+from .state import snapshot_state, save_snapshot
+from .approval_queue import approve_draft, list_pending, list_approved
+from .endpoint_registry import seed_registry
+from .cdp_discovery import run_discovery
+from .search_rank import check_all_search_ranks
+from .reports import generate_report, save_report, print_report
+from .blog_agent import generate_blog_drafts, save_blog_drafts_to_disk
+from .interview_agent import generate_interview_drafts, monitor_interview
+from .bio_generator import run_generation
+from .bio_evolver import run_evolution
+from .stats_dashboard import generate_dashboard
+from .bio_tokenizer import build_vocab, save_vocab, load_vocab, tokenize
+from .bio_appraiser import full_appraisal
+from .bio_ml_trainer import full_training_pipeline, k_fold_cv, walk_forward_validation
+
+# AGI orchestrator
+from rm_agi.orchestrator import RMAGIOrchestrator, CPPEngine, ReceiptLedger
+
+# RM-PRI (Profile Revenue Intelligence)
+from rm_agi.rm_pri import (
+    validate_corpus as pri_validate_corpus,
+    validate_enriched as pri_validate_enriched,
+    enrich_bios as pri_enrich_bios,
+    rank_by_views_per_day as pri_rank_views,
+    atomize_bios as pri_atomize_bios,
+    compute_lift as pri_compute_lift,
+    ReceiptLedger as PRIReceiptLedger,
+    RAW_PATH, ENRICHED_PATH, RANKED_PATH,
+)
+
+REQUIRED_FIELDS_CLI = ["id", "username", "city", "headline", "description",
+                       "ratingAverage", "reviewsCount", "isGold", "isAvailable", "isCertified"]
+
+
+def _api_login(args):
+    api = RentMasseurAPI()
+    auth = AuthSession(api, session_file=args.session)
+    if not auth.login():
+        print("Login failed")
+        sys.exit(1)
+    return api
+
+
+def cmd_status(args):
+    init_db()
+    api = _api_login(args)
+    state = snapshot_state(api)
+    save_snapshot(state)
+    keep = state.get("keeponline", {})
+    avail = state.get("availability", {})
+    about = state.get("about", {})
+    assets = about.get("userProps", {}).get("assets", {})
+    stats = state.get("stats", {}).get("profileStatistics", {})
+    dashboard = state.get("dashboard", {})
+    print(json.dumps({
+        "timestamp": state["timestamp"],
+        "visible": not bool(keep.get("isAdHidden", 0)),
+        "available": avail.get("selected", "unknown"),
+        "availability_minutes_left": max(0, int(avail.get("countdown", 0) - __import__('time').time()) // 60),
+        "views": stats.get("totalPageViews"),
+        "contact_clicks": stats.get("totalContactClicks"),
+        "new_visits": keep.get("newVisits"),
+        "new_emails": keep.get("newEmails"),
+        "online_bookmarks": dashboard.get("onlineBookmarks"),
+        "headline": assets.get("headline"),
+        "description_len": len(assets.get("description", "")),
+    }, indent=2, default=str))
+
+
+def cmd_snapshot(args):
+    init_db()
+    api = _api_login(args)
+    state = snapshot_state(api)
+    path = save_snapshot(state)
+    print(f"Snapshot saved: {path}")
+
+
+def cmd_unhide(args):
+    init_db()
+    api = _api_login(args)
+    result = execute_visibility(api, True)
+    print(json.dumps(result, indent=2, default=str))
+
+
+def cmd_draft_bio(args):
+    init_db()
+    api = _api_login(args)
+    variant = draft_bio_variant(api)
+    print(json.dumps(variant, indent=2, default=str))
+
+
+def cmd_draft_blog(args):
+    init_db()
+    drafts = generate_blog_drafts(count=args.count)
+    save_blog_drafts_to_disk(drafts)
+    print(json.dumps(drafts, indent=2, default=str))
+
+
+def cmd_draft_interview(args):
+    init_db()
+    api = _api_login(args)
+    status = monitor_interview(api)
+    drafts = generate_interview_drafts()
+    print(json.dumps({"status": status, "drafts": drafts}, indent=2, default=str))
+
+
+def cmd_generate_bios(args):
+    init_db()
+    ids = run_generation(count=args.count, top_n=args.top_n)
+    print(f"Generated {len(ids)} bio variants")
+    print("Top 3:")
+    for vid in ids[:3]:
+        print(f"  {vid}")
+
+
+def cmd_evolve_bios(args):
+    init_db()
+    from .bio_generator import generate_bios
+    initial = generate_bios(count=args.population, top_n=args.population)
+    ids = run_evolution(initial_bios=initial, generations=args.generations,
+                        population_size=args.population, elite_size=args.elites, top_n=args.elites)
+    print(f"Evolution complete. Saved {len(ids)} elite variants.")
+    print("Top 3:")
+    for vid in ids[:3]:
+        print(f"  {vid}")
+
+
+def cmd_dashboard(args):
+    init_db()
+    path = generate_dashboard()
+    print(f"Dashboard generated: {path}")
+
+
+def cmd_tokenize(args):
+    init_db()
+    conn = get_conn()
+    rows = conn.execute("SELECT headline, description FROM content_variants WHERE kind='bio'").fetchall()
+    conn.close()
+    bios = [{"headline": r[0], "description": r[1]} for r in rows]
+    vocab = build_vocab(bios, min_freq=args.min_freq)
+    path = Path("rm_traffic/data/models/vocab.json")
+    save_vocab(vocab, path)
+    print(f"Vocabulary: {vocab['unique_tokens']} unique tokens, {vocab['total_tokens']} total")
+    print(f"Saved to: {path}")
+    print("Top 20 tokens:")
+    for token, freq in list(vocab["token_freq"].items())[:20]:
+        print(f"  {token}: {freq}")
+
+
+def cmd_approve(args):
+    init_db()
+    approve_draft(args.variant_id)
+    print(f"Approved {args.variant_id}")
+
+
+def cmd_apply(args):
+    init_db()
+    api = _api_login(args)
+    ok = apply_bio_variant(api, args.variant_id)
+    print("Applied" if ok else "Failed")
+
+
+def cmd_list_drafts(args):
+    init_db()
+    if args.status == "pending":
+        drafts = list_pending(args.kind)
+    elif args.status == "approved":
+        drafts = list_approved(args.kind)
+    else:
+        drafts = get_variant_history(args.kind, limit=args.limit)
+    for d in drafts:
+        print(f"{d['variant_id']} | {d['status']:18s} | {d['headline'][:50] if d['headline'] else 'N/A'}")
+
+
+def cmd_discover(args):
+    init_db()
+    seed_registry()
+    result = run_discovery(args.target)
+    print(json.dumps(result, indent=2, default=str))
+
+
+def cmd_rank_check(args):
+    init_db()
+    api = _api_login(args)
+    ranks = check_all_search_ranks(api, args.username)
+    print(json.dumps(ranks, indent=2, default=str))
+
+
+def cmd_report(args):
+    init_db()
+    api = _api_login(args)
+    state = snapshot_state(api)
+    ranks = check_all_search_ranks(api, args.username)
+    report = generate_report(args.username, state, ranks)
+    path = save_report(report)
+    print(report)
+    print(f"\nReport saved: {path}")
+
+
+# ─── AGI Commands ───
+
+def cmd_agi_inspect(args):
+    """Show real corpus stats from C++ engine."""
+    engine = CPPEngine()
+    bios = args.bios or "rm_traffic/data/real_bios.jsonl"
+    print(engine.inspect(bios))
+
+def cmd_agi_train(args):
+    """Train model on real data using C++ engine."""
+    engine = CPPEngine()
+    bios = args.bios or "rm_traffic/data/real_bios.jsonl"
+    print(engine.train(bios, label=args.label, cv=args.cv,
+                       walk_forward=args.walk_forward, epochs=args.epochs,
+                       lr=args.lr, hidden=args.hidden))
+
+def cmd_agi_pipeline(args):
+    """Run full AGI pipeline: train → generate → score → evolve → select."""
+    agi = RMAGIOrchestrator()
+    bios = args.bios or "rm_traffic/data/real_bios.jsonl"
+    agi.run_pipeline(bios, count=args.count, label=args.label,
+                     generations=args.generations, top=args.top)
+
+def cmd_agi_import(args):
+    """Import top candidates into approval queue."""
+    agi = RMAGIOrchestrator()
+    from pathlib import Path
+    path = Path(args.path) if args.path else None
+    count = agi.import_winners(path)
+    print(f"Imported {count} candidates into approval queue")
+
+def cmd_agi_list_drafts(args):
+    """List AGI draft candidates."""
+    agi = RMAGIOrchestrator()
+    if args.status == "pending":
+        drafts = agi.queue.list_pending()
+    elif args.status == "approved":
+        drafts = agi.queue.list_approved()
+    else:
+        drafts = agi.queue.list_pending() + agi.queue.list_approved()
+    for d in drafts:
+        rank = d.get("rank", "?")
+        score = d.get("score", 0)
+        risk = d.get("risk", 0)
+        status = d.get("status", "?")
+        headline = d.get("headline", "N/A")[:50]
+        print(f"  #{rank} score={score:.4f} risk={risk:.4f} [{status}] {headline}")
+
+def cmd_agi_approve(args):
+    """Approve an AGI candidate."""
+    agi = RMAGIOrchestrator()
+    result = agi.approve(args.variant_id)
+    if result:
+        print(f"Approved: {result.get('headline', args.variant_id)}")
+    else:
+        print(f"Not found: {args.variant_id}")
+
+def cmd_agi_receipts(args):
+    """Show receipt ledger."""
+    agi = RMAGIOrchestrator()
+    print(agi.receipt_report())
+    if args.verbose:
+        for e in agi.ledger.entries[-10:]:
+            print(f"  [{e['index']}] {e['action']}: {e['description']}")
+
+def cmd_agi_experiments(args):
+    """List experiment results."""
+    agi = RMAGIOrchestrator()
+    exps = agi.experiments.list_experiments()
+    if not exps:
+        print("No experiments yet.")
+        return
+    for e in exps[-10:]:
+        label = e.get("result_label", "running")
+        ctr_lift = e.get("ctr_lift", 0)
+        print(f"  {e['experiment_id']} variant={e['variant_id']} result={label} ctr_lift={ctr_lift:.4f}")
+
+def cmd_agi_dashboard(args):
+    """Show AGI control panel."""
+    agi = RMAGIOrchestrator()
+    data = agi.dashboard_data()
+    print("RENTMASSEUR AGI CONTROL PANEL")
+    print("=" * 60)
+    if "account" in data:
+        acct = data["account"]
+        print(f"ACCOUNT:")
+        print(f"  Visible:      {acct.get('visible', '?')}")
+        print(f"  Available:    {acct.get('is_available', '?')}")
+        print(f"  Gold:         {acct.get('is_gold', '?')}")
+        print(f"  Headline:     {acct.get('headline', '?')[:50]}")
+        print(f"  Bio length:   {acct.get('description_len', '?')} chars")
+        print(f"  Views:        {acct.get('profile_views', '?')}")
+        print(f"  Contact clicks: {acct.get('contact_clicks', '?')}")
+        print(f"  CTR:          {acct.get('contact_click_rate', 0):.4f}")
+    print(f"\nCORPUS & MODEL:")
+    print(f"  Pending drafts:  {data['pending_count']}")
+    print(f"  Approved drafts: {data['approved_count']}")
+    print(f"\nRECEIPTS:")
+    r = data["receipts"]
+    print(f"  Total: {r['total_receipts']}  Valid: {r['chain_valid']}  Last: {r['last_action']}")
+    if data["experiments"]:
+        print(f"\nRECENT EXPERIMENTS:")
+        for e in data["experiments"]:
+            print(f"  {e['experiment_id']} → {e.get('result_label', 'running')}")
+
+
+# ─── RM-PRI Commands (honest naming) ───
+
+def cmd_validate_corpus(args):
+    """Gate 1: validate corpus schema."""
+    path = Path(args.path) if args.path else RAW_PATH
+    result = pri_validate_corpus(path)
+    print(f"CORPUS VALIDATION: {path}")
+    print(f"  Total rows:  {result['total']}")
+    print(f"  Valid:       {result['valid']}")
+    print(f"  Invalid:     {result['invalid']}")
+    print(f"  PASS:        {result['pass']}")
+    if result["errors"]:
+        print(f"  Errors ({len(result['errors'])}):")
+        for e in result["errors"][:5]:
+            print(f"    {e}")
+    print(f"\nField completeness:")
+    for f in REQUIRED_FIELDS_CLI:
+        p = result["fields_present"][f]
+        t = result["total"]
+        print(f"  {f:20s} {p}/{t} ({100*p/t:.1f}%)")
+
+    if args.check_enriched:
+        print(f"\nENRICHED VALIDATION:")
+        er = pri_validate_enriched(ENRICHED_PATH)
+        if "error" in er:
+            print(f"  {er['error']}")
+        else:
+            print(f"  Total:              {er['total']}")
+            print(f"  Has views_per_day:  {er['has_views_per_day']}")
+            print(f"  Missing:            {er['missing_views_per_day']}")
+            print(f"  PASS:               {er['pass']}")
+
+def cmd_enrich_views(args):
+    """Gate 2: enrich bios with public visits/member-since."""
+    inp = Path(args.input) if args.input else RAW_PATH
+    out = Path(args.output) if args.output else ENRICHED_PATH
+    result = pri_enrich_bios(inp, out, workers=args.workers, rate_limit=args.rate_limit)
+    print(f"\nENRICHMENT RESULT:")
+    print(f"  Total:    {result['total']}")
+    print(f"  Enriched: {result['enriched']}")
+    print(f"  Failed:   {result['failed']}")
+    if result.get("captcha"):
+        print(f"  BLOCKED:  CrowdSec captcha active")
+        print(f"  Next:     Wait for ban to clear, then re-run this command")
+    else:
+        print(f"  Output:   {out}")
+
+def cmd_rank_real(args):
+    """Rank real bios by views_per_day."""
+    inp = Path(args.input) if args.input else ENRICHED_PATH
+    out = Path(args.output) if args.output else RANKED_PATH
+    result = pri_rank_views(inp, out)
+    if "error" in result:
+        print(f"ERROR: {result['error']}")
+    else:
+        print(f"Ranked {result['ranked_bios']}/{result['total_bios']} bios by views/day")
+        print(f"Output: {result['output']}")
+        if result.get("top_5"):
+            print(f"\nTop 5 by views/day:")
+            for i, b in enumerate(result["top_5"], 1):
+                print(f"  #{i} {b['username']} — {b['views_per_day']:.1f} v/day — {b['headline'][:50]}")
+
+def cmd_atomize_bios(args):
+    """Extract structural atoms from bios."""
+    inp = Path(args.input) if args.input else RAW_PATH
+    out = Path(args.output) if args.output else Path("rm_traffic/data/bio_atoms.jsonl")
+    result = pri_atomize_bios(inp, out)
+    print(f"Atomized {result['atomized']} bios")
+    print(f"Output: {result['output']}")
+
+def cmd_pri_status(args):
+    """Show honest system status — what stage we're at."""
+    print("RM-PRI STATUS — RentMasseur Profile Revenue Intelligence")
+    print("=" * 60)
+
+    # Stage 1: corpus
+    v = pri_validate_corpus(RAW_PATH)
+    print(f"\nStage 1: Real Corpus")
+    print(f"  Rows: {v['total']}  Valid: {v['valid']}  PASS: {v['pass']}")
+
+    # Stage 2: enrichment
+    e = pri_validate_enriched(ENRICHED_PATH)
+    print(f"\nStage 2: Views/Day Enrichment")
+    if "error" in e:
+        print(f"  STATUS: NOT STARTED — {e['error']}")
+        print(f"  BLOCKER: CrowdSec captcha on rentmasseur.com")
+        print(f"  NEXT: Run 'enrich-views' when ban clears")
+    else:
+        print(f"  Total: {e['total']}  Has v/day: {e['has_views_per_day']}  PASS: {e['pass']}")
+
+    # Stage 3: dashboard
+    print(f"\nStage 3: Dashboard Time Series")
+    print(f"  STATUS: NOT STARTED — requires API access")
+    print(f"  NEXT: Run 'snapshot' when API is accessible")
+
+    # Stage 4: experiments
+    print(f"\nStage 4: Live Experiment Labels")
+    print(f"  STATUS: NOT STARTED — requires approved variant + apply + measure")
+
+    # Stage 5: online learning
+    print(f"\nStage 5: Validated Online Learner")
+    print(f"  STATUS: NOT STARTED — requires stages 2-4")
+
+    # Receipts
+    ledger = PRIReceiptLedger()
+    s = ledger.summary()
+    print(f"\nReceipts: {s['total']} total, chain valid: {s['valid']}")
+
+    print(f"\nHONEST ASSESSMENT:")
+    print(f"  This is Stage 1: real corpus loaded.")
+    print(f"  Not AGI. Not revenue oracle. Not CTR predictor.")
+    print(f"  It is a real market corpus + language analysis foundation.")
+    print(f"  Next real step: enrich with public visits/member-since.")
+
+
+def cmd_audit(args):
+    init_db()
+    seed_registry()
+    d = ProfileOpsDaemon(mode="audit", city=args.city, session_file=args.session)
+    d.run()
+
+
+def cmd_guard(args):
+    init_db()
+    seed_registry()
+    d = ProfileOpsDaemon(mode="guard", city=args.city, session_file=args.session)
+    d.run()
+
+
+def cmd_draft(args):
+    init_db()
+    seed_registry()
+    d = ProfileOpsDaemon(mode="draft", city=args.city, session_file=args.session)
+    d.run()
+
+
+def cmd_daemon(args):
+    init_db()
+    seed_registry()
+    mode = "execute" if args.execute_approved else "safe"
+    d = ProfileOpsDaemon(mode=mode, city=args.city, session_file=args.session)
+    d.run()
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    parser = argparse.ArgumentParser(description="RM ProfileOps CLI")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("status", help="Read-only profile status")
+    p.add_argument("--city", default="manhattan-ny")
+    p.add_argument("--session", default="rm_traffic/session.json")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("snapshot", help="Save profile state snapshot")
+    p.add_argument("--session", default="rm_traffic/session.json")
+    p.set_defaults(func=cmd_snapshot)
+
+    p = sub.add_parser("unhide", help="Ensure profile is visible")
+    p.add_argument("--session", default="rm_traffic/session.json")
+    p.set_defaults(func=cmd_unhide)
+
+    p = sub.add_parser("draft-bio", help="Generate a bio draft")
+    p.add_argument("--session", default="rm_traffic/session.json")
+    p.set_defaults(func=cmd_draft_bio)
+
+    p = sub.add_parser("draft-blog", help="Generate blog drafts")
+    p.add_argument("--count", type=int, default=1)
+    p.set_defaults(func=cmd_draft_blog)
+
+    p = sub.add_parser("draft-interview", help="Generate interview drafts")
+    p.add_argument("--session", default="rm_traffic/session.json")
+    p.set_defaults(func=cmd_draft_interview)
+
+    p = sub.add_parser("generate-bios", help="Generate many bio variants with scoring")
+    p.add_argument("--count", type=int, default=1000)
+    p.add_argument("--top-n", type=int, default=100)
+    p.set_defaults(func=cmd_generate_bios)
+
+    p = sub.add_parser("evolve-bios", help="Run GA to optimize bios for CTR/email/phone")
+    p.add_argument("--population", type=int, default=100)
+    p.add_argument("--generations", type=int, default=50)
+    p.add_argument("--elites", type=int, default=10)
+    p.set_defaults(func=cmd_evolve_bios)
+
+    p = sub.add_parser("dashboard", help="Generate HTML stats dashboard")
+    p.set_defaults(func=cmd_dashboard)
+
+    p = sub.add_parser("tokenize", help="Build vocabulary from all bio drafts")
+    p.add_argument("--min-freq", type=int, default=2)
+    p.set_defaults(func=cmd_tokenize)
+
+    p = sub.add_parser("approve", help="Approve a draft variant")
+    p.add_argument("variant_id")
+    p.set_defaults(func=cmd_approve)

@@ -1,0 +1,800 @@
+        self.auto_approve = auto_approve
+
+    def approve(self, action: str, detail: str) -> bool:
+        if action not in self.RISKY_ACTIONS:
+            return True
+        if self.auto_approve:
+            log.warning("AUTO-APPROVED risky action: %s", action)
+            return True
+        print(f"\nRISKY ACTION REQUESTED: {action}")
+        print(f"Detail: {detail}")
+        ans = input("Approve? (yes/no): ").strip().lower()
+        return ans in ("yes", "y", "approve")
+
+# ---------------------------------------------------------------------------
+# Multi-LLM Bio Writer
+# ---------------------------------------------------------------------------
+
+from rm_traffic.llm_client import LLMClient, generate_with_fallback
+from rm_traffic.llm_bio_writer import build_prompt, parse_llm_output
+
+def generate_bio_with_analysis(api: FortressAPI, stats_history: list, city: str) -> Optional[Dict]:
+    """Pull live data and generate a bio with LLM."""
+    try:
+        status = api.full_status()
+        about = status.get("about", {})
+        assets = about.get("userProps", {}).get("assets", {})
+        current_headline = assets.get("headline", "")
+        current_desc = assets.get("description", "")
+        prompt = build_prompt(status, stats_history, current_headline, current_desc, city)
+        provider = os.environ.get("LLM_PROVIDER")
+        model = os.environ.get("LLM_MODEL")
+        if provider:
+            client = LLMClient(provider, model)
+            response = client.generate(prompt, 1200)
+        else:
+            response = generate_with_fallback(prompt, 1200)
+        if not response:
+            return None
+        return parse_llm_output(response)
+    except Exception as e:
+        log.error("LLM bio generation failed: %s", e)
+        return None
+
+# ---------------------------------------------------------------------------
+# Fortress Engine
+# ---------------------------------------------------------------------------
+
+class Fortress:
+    """Main fortress engine."""
+
+    def __init__(self, username: str, password: str, city: str = "manhattan-ny", auto_approve: bool = False):
+        self.username = username
+        self.password = password
+        self.city = city
+        self.identity = IdentityManager()
+        self.api = FortressAPI(self.identity)
+        self.governor = SafetyGovernor(auto_approve)
+        self.running = True
+        self.last_visibility = 0
+        self.last_avail = 0
+        self.last_stats = 0
+        self.last_bio = 0
+        self.last_dashboard = 0
+        self.last_health = 0
+        self.stats_history = []
+
+    def login(self) -> bool:
+        ok = self.api.login(self.username, self.password)
+        receipt("login", ok, f"Fortress login via {self.api.login_method}")
+        return ok
+
+    def ensure_visible(self):
+        try:
+            self.api.ensure_session()
+            keep = self.api.get("/account/keeponline").json()
+            if keep.get("isAdHidden"):
+                before = {"isAdHidden": True}
+                self.api.put("/settings/visibility", {"isAdHidden": False})
+                receipt("ensure_visible", True, "Profile hidden, now shown", before, {"isAdHidden": False})
+                record_alert("critical", "visibility", "Profile was hidden. Auto-shown.")
+        except Exception as e:
+            receipt("ensure_visible", False, str(e))
+            log.error("Visibility guard failed: %s", e)
+
+    def ensure_available(self):
+        try:
+            self.api.ensure_session()
+            avail = self.api.get("/account/dashboard/availability").json()
+            selected = avail.get("selected", "")
+            countdown = avail.get("countdown", 0)
+            remaining = max(0, int(countdown - time.time()))
+            log.info("Availability: %s (%ds remaining)", selected, remaining)
+            if selected != "Available" or remaining < AVAIL_REFRESH_THRESHOLD:
+                record_alert("warning", "availability", f"Availability needs refresh: {selected}, {remaining}s left")
+            else:
+                receipt("ensure_available", True, f"Availability OK: {selected}, {remaining}s left")
+        except Exception as e:
+            receipt("ensure_available", False, str(e))
+
+    def collect_stats(self):
+        try:
+            self.api.ensure_session()
+            start = time.time()
+            dash = self.api.get("/account/dashboard").json()
+            stats = self.api.get("/account/dashboard/ad-statistics").json()
+            keep = self.api.get("/account/keeponline").json()
+            about = self.api.get("/settings/about").json()
+            latency = (time.time() - start) * 1000
+
+            prof = stats.get("profileStatistics", {}) or {}
+            assets = about.get("userProps", {}).get("assets", {})
+            us = dash.get("userSetting", {})
+
+            record_stats(
+                login_method=self.api.login_method,
+                latency_ms=latency,
+                views=prof.get("totalPageViews"),
+                contact_clicks=prof.get("totalContactClicks"),
+                visits=keep.get("newVisits"),
+                bookmarks=dash.get("onlineBookmarks"),
+                new_emails=keep.get("newEmails"),
+                is_ad_hidden=keep.get("isAdHidden"),
+                available=us.get("availability", {}).get("available"),
+                availability_remaining=str(us.get("availability", {}).get("validTo", "")),
+                headline=assets.get("headline"),
+                description_len=len(assets.get("description", "")),
+                city=self.city,
+            )
+
+            # Update history
+            conn = db()
+            self.stats_history = [dict(r) for r in conn.execute(
+                "SELECT ts, views, contact_clicks, visits FROM stats ORDER BY ts DESC LIMIT 14"
+            ).fetchall()]
+            conn.close()
+
+            log.info("Stats collected: views=%s contacts=%s visits=%s (%.0fms)",
+                     prof.get("totalPageViews"), prof.get("totalContactClicks"),
+                     keep.get("newVisits"), latency)
+            receipt("collect_stats", True, f"Stats collected in {latency:.0f}ms")
+        except Exception as e:
+            receipt("collect_stats", False, str(e))
+            log.error("Stats collection failed: %s", e)
+
+    def bio_experiment(self, auto_apply: bool = False):
+        try:
+            # Daily limit
+            conn = db()
+            row = conn.execute("SELECT ts FROM bio_versions WHERE applied=1 ORDER BY ts DESC LIMIT 1").fetchone()
+            conn.close()
+            if row and datetime.now(timezone.utc) - datetime.fromisoformat(row["ts"]) < timedelta(days=1):
+                log.info("Bio experiment skipped: within 24h cooldown")
+                return
+
+            suggestion = generate_bio_with_analysis(self.api, self.stats_history, self.city)
+            if not suggestion:
+                log.error("Bio suggestion failed")
+                return
+
+            stats = self.api.get("/account/dashboard/ad-statistics").json()
+            prof = stats.get("profileStatistics", {}) or {}
+            views_before = prof.get("totalPageViews")
+            contacts_before = prof.get("totalContactClicks")
+
+            provider = os.environ.get("LLM_PROVIDER", "fallback")
+            conn = db()
+            conn.execute(
+                "INSERT INTO bio_versions (ts, headline, description, reason, applied, views_before, contacts_before, llm_provider) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (datetime.now(timezone.utc).isoformat(), suggestion["headline"],
+                 suggestion["bio"], "fortress_llm", 0, views_before, contacts_before, provider)
+            )
+            conn.commit()
+            conn.close()
+
+            log.info("Bio drafted: %s", suggestion["headline"])
+            if auto_apply:
+                if self.governor.approve("apply_bio", suggestion["headline"]):
+                    about = self.api.get("/settings/about").json()
+                    assets = about.get("userProps", {}).get("assets", {})
+                    before = {"headline": assets.get("headline"), "description": assets.get("description")}
+                    self.api.put("/settings/about", {"headline": suggestion["headline"], "description": suggestion["bio"]})
+                    after = {"headline": suggestion["headline"], "description": suggestion["bio"][:200]}
+                    conn = db()
+                    conn.execute("UPDATE bio_versions SET applied=1 WHERE ts=(SELECT ts FROM bio_versions ORDER BY ts DESC LIMIT 1)")
+                    conn.commit()
+                    conn.close()
+                    receipt("apply_bio", True, f"Applied LLM bio: {suggestion['headline']}", before, after)
+                else:
+                    log.info("Bio application rejected by governor")
+            else:
+                receipt("draft_bio", True, f"Drafted bio: {suggestion['headline']}")
+        except Exception as e:
+            receipt("bio_experiment", False, str(e))
+            log.error("Bio experiment failed: %s", e)
+
+    def health_check(self):
+        try:
+            self.api.ensure_session()
+            resp = self.api.get("/account/dashboard")
+            if resp.status_code == 200:
+                receipt("health_check", True, "Session healthy")
+            else:
+                record_alert("error", "health", f"Dashboard returned {resp.status_code}")
+        except Exception as e:
+            record_alert("error", "health", str(e))
+
+    def cycle(self):
+        now = time.time()
+        if now - self.last_visibility >= VISIBILITY_CHECK_INTERVAL:
+            self.ensure_visible()
+            self.last_visibility = now
+        if now - self.last_avail >= AVAIL_CHECK_INTERVAL:
+            self.ensure_available()
+            self.last_avail = now
+        if now - self.last_stats >= STATS_INTERVAL:
+            self.collect_stats()
+            self.last_stats = now
+        if now - self.last_bio >= BIO_EXPERIMENT_INTERVAL:
+            self.bio_experiment(auto_apply=False)
+            self.last_bio = now
+        if now - self.last_health >= HEALTH_CHECK_INTERVAL:
+            self.health_check()
+            self.last_health = now
+        if now - self.last_dashboard >= DASHBOARD_INTERVAL:
+            self.print_dashboard()
+            self.last_dashboard = now
+
+    def print_dashboard(self):
+        try:
+            self.api.ensure_session()
+            dash = self.api.get("/account/dashboard").json()
+            stats = self.api.get("/account/dashboard/ad-statistics").json()
+            keep = self.api.get("/account/keeponline").json()
+            about = self.api.get("/settings/about").json()
+            prof = stats.get("profileStatistics", {}) or {}
+            assets = about.get("userProps", {}).get("assets", {})
+            us = dash.get("userSetting", {})
+            print(f"\n{'='*60}")
+            print(f"  FORTRESS DASHBOARD")
+            print(f"{'='*60}")
+            print(f"  Time: {datetime.now(timezone.utc).isoformat()[:19]} UTC")
+            print(f"  User: {self.username}")
+            print(f"  Login: {self.api.login_method}")
+            print(f"  Visibility: {'HIDDEN' if keep.get('isAdHidden') else 'SHOWN'}")
+            print(f"  Availability: {us.get('availability', {}).get('message', 'N/A')}")
+            print(f"  Views: {prof.get('totalPageViews', 'N/A')}")
+            print(f"  Contacts: {prof.get('totalContactClicks', 'N/A')}")
+            print(f"  Visits: {keep.get('newVisits', 'N/A')}")
+            print(f"  Emails: {keep.get('newEmails', 'N/A')}")
+            print(f"  Bookmarks: {dash.get('onlineBookmarks', 'N/A')}")
+            print(f"  Headline: {assets.get('headline', 'N/A')}")
+            print(f"  Bio: {len(assets.get('description', ''))} chars")
+            print(f"  Rate interval: {self.api.rate_limiter.current_interval:.1f}s")
+            print(f"{'='*60}\n")
+        except Exception as e:
+            log.error("Dashboard print failed: %s", e)
+
+    def run_once(self):
+        if not self.login():
+            print("Login failed")
+            return
+        self.print_dashboard()
+        self.ensure_visible()
+        self.ensure_available()
+        self.collect_stats()
+        self.bio_experiment(auto_apply=False)
+
+    def run_daemon(self):
+        log.info("=== FORTRESS daemon starting ===")
+        if not self.login():
+            log.error("Initial login failed")
+            return
+        self.print_dashboard()
+        while self.running:
+            try:
+                self.cycle()
+            except KeyboardInterrupt:
+                log.info("Shutdown")
+                self.running = False
+                break
+            except Exception as e:
+                log.error("Cycle error: %s", e)
+                receipt("daemon_cycle", False, str(e))
+                time.sleep(60)
+            time.sleep(60)
+        log.info("Fortress stopped")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="FORTRESS — RentMasseur Profile Automation Fortress")
+    parser.add_argument("--daemon", action="store_true")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--suggest-bio", action="store_true")
+    parser.add_argument("--apply-bio", action="store_true", help="Apply latest drafted bio (requires approval)")
+    parser.add_argument("--history", action="store_true")
+    parser.add_argument("--city", default="manhattan-ny")
+    parser.add_argument("--auto-approve", action="store_true", help="Auto-approve risky actions (use with caution)")
+    args = parser.parse_args()
+
+    init_db()
+    username = os.environ.get("RM_USER") or get_credential("RM_USER", prompt_if_missing=True)
+    password = os.environ.get("RM_PASS") or get_credential("RM_PASS", prompt_if_missing=True)
+    if not username or not password:
+        print("Credentials required")
+        sys.exit(1)
+
+    fortress = Fortress(username, password, city=args.city, auto_approve=args.auto_approve)
+
+    if args.status:
+        if not fortress.login(): sys.exit(1)
+        fortress.print_dashboard()
+    elif args.once:
+        fortress.run_once()
+    elif args.suggest_bio:
+        if not fortress.login(): sys.exit(1)
+        fortress.bio_experiment(auto_apply=False)
+    elif args.apply_bio:
+        if not fortress.login(): sys.exit(1)
+        fortress.bio_experiment(auto_apply=True)
+    elif args.history:
+        conn = db()
+        for r in conn.execute("SELECT * FROM receipts ORDER BY ts DESC LIMIT 20"):
+            print(f"{r['ts'][:19]} | {'OK' if r['success'] else 'FAIL'} | {r['action']} | {r['detail'][:60]}")
+        conn.close()
+    elif args.daemon:
+        fortress.run_daemon()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+reply_drafter.py:
+```
+"""
+LLM Reply Drafter — template-first reply drafting for client messages.
+
+Template is canonical. LLM is optional polish only (local, 8s timeout).
+Uses local-only providers for private client text:
+  template canonical → local Ollama/Transformers optional polish → template retained if invalid.
+No Groq. No OpenRouter. No cloud fallback.
+
+Drafts replies, does NOT auto-send. Human approval required for first contact.
+Ready-for-fast-approval only for repeat/opt-in clients with valid templates.
+
+Reply structure (always):
+  - availability
+  - location / incall-outcall boundary
+  - rate clarity
+  - session length
+  - professional tone
+  - one next-step question
+  - no spammy pressure
+  - no weird sexual escalation
+"""
+
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+from .intent_engine import classify, IntentResult
+
+# Local-only LLM imports — NO cloud providers for private client text
+try:
+    from .llm_client import LLMClient
+    _HAS_LLM = True
+except ImportError:
+    _HAS_LLM = False
+
+log = logging.getLogger("reply_drafter")
+
+# Reply classes
+REPLY_BOOKING_NOW = "booking_now_reply"
+REPLY_PRICE_QUESTION = "price_question_reply"
+REPLY_LOCATION_QUESTION = "location_question_reply"
+REPLY_REPEAT_CLIENT = "repeat_client_reply"
+REPLY_INQUIRY = "inquiry_reply"
+REPLY_FOLLOW_UP = "follow_up_reply"
+REPLY_CLOSE_LOOP = "close_loop_reply"
+REPLY_AVAILABILITY_QUESTION = "availability_reply"
+REPLY_HIGH_VALUE_REPEAT = "high_value_repeat_reply"
+REPLY_NONE = "none"
+
+# Risk levels
+RISK_SAFE = "safe"
+RISK_REVIEW = "review"
+RISK_BLOCKED = "blocked"
+
+
+@dataclass
+class DraftReply:
+    username: str = ""
+    intent_class: str = ""
+    confidence: float = 0.0
+    booking_probability: float = 0.0
+    reply_text: str = ""
+    reply_class: str = ""
+    risk_level: str = RISK_SAFE
+    needs_human_approval: bool = True
+    reason: str = ""
+    suggested_time_slots: List[str] = field(default_factory=list)
+    error: str = ""
+
+
+def _build_polish_prompt(template_text: str, message: str, intent: IntentResult, context: Dict) -> str:
+    """Build LLM prompt for polishing an existing template draft.
+    The model rewrites the template for clarity — it does NOT generate from scratch."""
+    username = context.get("username", "")
+    is_repeat = intent.classification in ("repeat_client", "high_value_repeat")
+
+    prompt = f"""Rewrite this existing draft only for clarity. Do not add facts. Do not change rates, location, session length, phone, or availability. Return one reply only.
+
+Existing draft:
+"{template_text}"
+
+Client message: "{message[:300]}"
+Client username: {username}
+Intent: {intent.classification}
+Is repeat client: {is_repeat}
+
+Rules:
+- Rewrite the existing draft for clarity and warmth only
+- Do NOT add new facts, rates, locations, or availability not in the existing draft
+- Do NOT change the rate, location, session length, or phone number
+- Keep it under 80 words
+- End with exactly ONE next-step question
+- Professional tone, first person singular (I/my, not we/us/our)
+- No sexual language, no innuendo
+- Return only the rewritten reply text, nothing else
+
+Rewritten reply:"""
+
+    return prompt
+
+
+def _clean_llm_output(text: str) -> str:
+    """Clean LLM output — remove quotes, markdown, extra whitespace."""
+    if not text:
+        return ""
+    text = text.strip()
+    # Remove surrounding quotes
+    if text.startswith('"') and text.endswith('"'):
+        text = text[1:-1]
+    # Remove markdown
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    # Remove any "Reply:" prefix
+    text = re.sub(r'^(Reply|Response|Message):\s*', '', text, flags=re.IGNORECASE)
+    # Normalize whitespace
+    text = ' '.join(text.split())
+    return text.strip()
+
+
+def _template_fallback(intent: IntentResult, context: Dict) -> str:
+    """Fixed template fallback when LLM is unavailable."""
+    rate = context.get("rate", "$200")
+    phone = context.get("phone", "")
+    cls = intent.classification
+
+    if cls == "booking_now":
+        return (
+            f"Yes — I'm available today. I have openings at 7:30 or 9 PM. "
+            f"Manhattan incall, {rate} for 60 min. "
+            f"Which time works for you? Text {phone} to confirm."
+        )
+
+    if cls == "price_question":
+        return (
+            f"Rate is {rate} for 60 min, $280 for 90 min, $360 for 120 min. "
+            f"Manhattan incall. What duration and time work for you? "
+            f"Text {phone} to book."
+        )
+
+    if cls == "availability_question":
+        return (
+            f"I'm available today and this week. "
+            f"Manhattan incall, {rate} for 60 min. "
+            f"What day and time work for you? Text {phone} to schedule."
+        )
+
+    if cls == "location_question":
+        return (
+            f"I'm based in Manhattan — private incall space. "
+            f"Outcall available within Manhattan for additional travel fee. "
+            f"Rate is {rate}. Text {phone} for faster booking."
+        )
+
+    if cls in ("repeat_client", "high_value_repeat"):
+        return (
+            f"Great to hear from you again! "
+            f"I have openings today. Same location in Manhattan. "
+            f"Text {phone} to confirm your time."
+        )
+
+    if cls == "ghosted_lead":
+        return (
+            f"Hi — following up. I'm available this week if you'd like to book. "
+            f"Manhattan incall, {rate} for 60 min. "
+            f"Text {phone} to schedule."
+        )
+
+    return (
+        f"Hi! Thanks for your interest. "
+        f"I offer deep tissue and sports recovery massage in Manhattan. "
+        f"Rate is {rate} for 60 min. "
+        f"What questions can I answer? Text {phone} for faster response."
+    )
+
+
+def _determine_reply_class(intent: IntentResult) -> str:
+    """Map intent classification to reply class."""
+    mapping = {
+        "booking_now": REPLY_BOOKING_NOW,
+        "price_question": REPLY_PRICE_QUESTION,
+        "availability_question": REPLY_AVAILABILITY_QUESTION,
+        "location_question": REPLY_LOCATION_QUESTION,
+        "repeat_client": REPLY_REPEAT_CLIENT,
+        "high_value_repeat": REPLY_HIGH_VALUE_REPEAT,
+        "ghosted_lead": REPLY_FOLLOW_UP,
+        "do_not_contact": REPLY_NONE,
+        "spam": REPLY_NONE,
+        "unknown": REPLY_INQUIRY,
+    }
+    return mapping.get(intent.classification, REPLY_INQUIRY)
+
+
+def _determine_risk(intent: IntentResult, is_first_contact: bool = True) -> str:
+    """Determine risk level for the reply."""
+    if intent.classification in ("do_not_contact", "spam"):
+        return RISK_BLOCKED
+    if "unsafe" in (intent.risk_flags or []):
+        return RISK_BLOCKED
+    if "opt_out" in (intent.risk_flags or []):
+        return RISK_BLOCKED
+    if is_first_contact:
+        return RISK_REVIEW
+    return RISK_SAFE
+
+
+def validate_reply_text(text: str, context: Dict = None) -> Tuple[bool, str]:
+    """Validate reply text against quality and safety rules.
+    Returns (is_valid, reason)."""
+    if not text or not text.strip():
+        return False, "empty_text"
+
+    if context is None:
+        context = {}
+
+    text_lower = text.lower()
+    word_count = len(text.split())
+
+    # ─── Reject: bad pronouns (first person plural = wrong voice) ───
+    if re.search(r'\b(we|us|our)\b', text_lower):
+        return False, "first_person_plural_detected"
+
+    # ─── Reject: "app" reference ───
+    if re.search(r'\bapp\b', text_lower):
+        return False, "app_reference_detected"
+
+    # ─── Reject: known bad phrases ───
+    bad_phrases = ["sorry to hear", "reaching out to us", "last-minute app",
+                   "thank you for reaching out"]
+    if any(p in text_lower for p in bad_phrases):
+        return False, f"bad_phrase_detected"
+
+    # ─── Reject: sexual/innuendo terms ───
+    sexual_kw = ["sexual", "erotic", "sensual", "nude", "naked", "happy ending",
+                 "full service", "extras", "menu", "gfe", "bb", "bareback"]
+    if any(kw in text_lower for kw in sexual_kw):
+        return False, "sexual_innuendo_detected"
+
+    # ─── Reject: phone number when not allowed ───
+    allow_phone = os.environ.get("ALLOW_PHONE_IN_DRAFT", "false").lower() == "true"
+    if not allow_phone:
+        phone_in_context = context.get("phone", "")
+        # Check for raw phone numbers (not the word "text")
+        if re.search(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', text):
+            return False, "raw_phone_in_draft_not_allowed"
+        if phone_in_context and phone_in_context in text and not allow_phone:
+            return False, "phone_in_draft_not_allowed"
+
+    # ─── Reject: over 80 words ───
+    if word_count > 80:
+        return False, f"too_many_words ({word_count})"
+
+    # ─── Reject: no question mark (no next-step question) ───
+    if "?" not in text:
+        return False, "no_next_step_question"
+
+    # ─── Reject: multiple questions (rule is one next-step question) ───
+    question_count = text.count("?")
+    if question_count > 2:  # allow up to 2 for compound questions like "What time and duration?"
+        return False, f"too_many_questions ({question_count})"
+
+    # ─── Reject: missing rate (for booking/price/location intents) ───
+    rate = context.get("rate", "$200")
+    intent_class = context.get("intent_class", "")
+    if intent_class in ("booking_now", "price_question", "location_question", "availability_question"):
+        if rate and rate not in text:
+            return False, "missing_rate"
+
+    # ─── Reject: missing location ───
+    location = context.get("location", "Manhattan")
+    if location and location.lower() not in text_lower and "manhattan" not in text_lower:
+        return False, "missing_location"
+
+    # ─── Reject: missing session length ───
+    if intent_class in ("booking_now", "price_question"):
+        if not re.search(r'\b(60|90|120)\s*min', text_lower) and "min" not in text_lower:
+            return False, "missing_session_length"
+
+    return True, "valid"
+
+
+def _try_local_llm_polish(template_text: str, message: str, intent: IntentResult,
+                            context: Dict, timeout_seconds: int = 8) -> Optional[str]:
+    """Try local-only LLM (Ollama or Transformers.js) for light polish.
+    Rewrites the existing template — does NOT generate from scratch.
+    NO cloud providers. Returns None if unavailable or too slow."""
+    if not _HAS_LLM:
+        return None
+
+    import threading
+
+    prompt = _build_polish_prompt(template_text, message, intent, context)
+
+    result = [None]
+    def _call():
+        try:
+            # Try Ollama only (local), then Transformers.js (local)
+            # NO Groq, NO OpenRouter — private client text stays local
+            for provider, model in [("ollama", "llama3.2"), ("transformers", None)]:
+                try:
+                    client = LLMClient(provider=provider, model=model)
+                    resp = client.generate(prompt, max_tokens=150)
+                    if resp and len(resp) > 20:
+                        result[0] = resp
+                        return
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    t.join(timeout=timeout_seconds)
+
+    if t.is_alive():
+        log.info(f"  ⟁ Local LLM timed out ({timeout_seconds}s) — using template")
+        return None
+
+    return result[0]
+
+
+def draft_reply(message: str, context: Dict = None) -> DraftReply:
+    """
+    Generate a template-first draft reply for a client message.
+
+    Template is canonical. LLM is optional polish only (local, 8s timeout).
+    No cloud providers ever called on private client text.
+    All first-contact drafts are approval-gated.
+
+    Args:
+        message: The client's message text
+        context: Dict with username, is_premium, rate, phone, location, is_first_contact
+
+    Returns:
+        DraftReply with reply_text, risk_level, needs_human_approval
+    """
+    if context is None:
+        context = {}
+
+    # Classify intent
+    intent = classify(message, context.get("username", ""))
+
+    # Build draft
+    draft = DraftReply(
+        username=context.get("username", ""),
+        intent_class=intent.classification,
+        confidence=intent.confidence,
+        booking_probability=intent.booking_probability,
+        reply_class=_determine_reply_class(intent),
+        risk_level=_determine_risk(intent, context.get("is_first_contact", True)),
+        reason=f"Intent: {intent.classification} (conf={intent.confidence:.2f})",
+    )
+
+    # Blocked — no reply
+    if draft.risk_level == RISK_BLOCKED:
+        draft.reply_text = ""
+        draft.needs_human_approval = False
+        draft.reason = f"BLOCKED: {intent.classification} with risk flags {intent.risk_flags}"
+        return draft
+
+    # ─── Template first (canonical) ───
+    draft.reply_text = _template_fallback(intent, context)
+    draft.reason += " | template-canonical"
+    log.info(f"  ◉ Template reply for {draft.username}: {draft.reply_text[:80]}...")
+
+    # ─── Optional local LLM polish (8s timeout, no cloud) ───
+    polished = _try_local_llm_polish(draft.reply_text, message, intent, context, timeout_seconds=8)
+    if polished:
+        cleaned = _clean_llm_output(polished)
+        # Validate polished output against strict quality rules
+        validation_context = {**context, "intent_class": intent.classification}
+        is_valid, reject_reason = validate_reply_text(cleaned, validation_context)
+        if is_valid:
+            draft.reply_text = cleaned
+            draft.reason += " | llm-polished"
+            log.info(f"  ◉ Polished reply for {draft.username}: {draft.reply_text[:80]}...")
+        else:
+            draft.reason += f" | llm-polish-rejected:{reject_reason}"
+            log.info(f"  ⟁ LLM polish rejected ({reject_reason}) — keeping template")
+
+    # Approval gate — all first contact needs approval
+    is_repeat = intent.classification in ("repeat_client", "high_value_repeat")
+    if is_repeat and not context.get("is_first_contact", True):
+        draft.needs_human_approval = False
+    else:
+        draft.needs_human_approval = True
+
+    # Suggested time slots for booking intent
+    if intent.classification in ("booking_now", "high_value_repeat"):
+        draft.suggested_time_slots = ["7:30 PM", "9:00 PM", "Tomorrow 12:00 PM"]
+
+    return draft
+
+
+def draft_mailbox_replies(emails: List[Dict], context: Dict = None) -> List[DraftReply]:
+    """
+    Generate draft replies for all mailbox conversations.
+
+    Args:
+        emails: List of email dicts from api.get_mailbox()
+        context: Base context (rate, phone, location)
+
+    Returns:
+        List of DraftReply objects
+    """
+    if context is None:
+        context = {}
+
+    drafts = []
+    for email in emails:
+        uc = email.get("userCard", {})
+        msg = email.get("lastMessage", "")
+        username = uc.get("username", "")
+
+        email_context = {
+            **context,
+            "username": username,
+            "is_premium": bool(uc.get("isPremium", 0)),
+            "is_first_contact": not bool(email.get("lastMessage", "")),
+        }
+
+        draft = draft_reply(msg, email_context)
+        drafts.append(draft)
+
+    return drafts
+
+
+def format_drafts_summary(drafts: List[DraftReply]) -> str:
+    """Format drafts for display."""
+    lines = [f"\n{'='*60}", f"  REPLY DRAFT QUEUE — {len(drafts)} drafts", f"{'='*60}\n"]
+
+    for d in drafts:
+        if d.risk_level == RISK_BLOCKED:
+            lines.append(f"  🚫 {d.username} [{d.intent_class}] — BLOCKED")
+            lines.append(f"     {d.reason}")
+            continue
+
+        approval = "🔒 approval" if d.needs_human_approval else "⚡ ready_for_fast_approval"
+        lines.append(f"  ◉ {d.username} [{d.intent_class}] conf={d.confidence:.2f} {approval}")
+        lines.append(f"    Reply: \"{d.reply_text[:120]}\"")
+        if d.suggested_time_slots:
+            lines.append(f"    Slots: {', '.join(d.suggested_time_slots)}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+```
+
+llm_client.py:
+```
+"""
+Multi-provider LLM client — Transformers.js (local), Ollama, Groq, OpenRouter.
+
+Providers (tried in order by generate_with_fallback):
+  1. transformers — local Node.js model via @huggingface/transformers (FREE, no API key)

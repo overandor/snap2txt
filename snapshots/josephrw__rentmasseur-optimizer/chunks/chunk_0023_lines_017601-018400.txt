@@ -1,0 +1,800 @@
+
+def create_job(command: str, input_hash: str = "") -> dict:
+    job_id = str(uuid.uuid4())[:12]
+    ts = datetime.now(timezone.utc).isoformat()
+    git_sha = ""
+    try:
+        git_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5
+        ).stdout.strip()[:12]
+    except Exception:
+        pass
+    conn = db_conn()
+    conn.execute(
+        "INSERT INTO jobs (job_id, command, input_hash, start_time, status, git_sha, hf_space) VALUES (?, ?, ?, ?, 'running', ?, ?)",
+        (job_id, command, input_hash, ts, git_sha, HF_SPACE),
+    )
+    conn.commit()
+    conn.close()
+    return {"job_id": job_id, "command": command, "start_time": ts, "status": "running", "git_sha": git_sha}
+
+
+def update_job(job_id: str, exit_code: int, stdout: str, stderr: str, output_files: list, receipt_path: str = ""):
+    ts = datetime.now(timezone.utc).isoformat()
+    status = "success" if exit_code == 0 else "failed"
+    conn = db_conn()
+    conn.execute(
+        "UPDATE jobs SET end_time=?, exit_code=?, stdout_tail=?, stderr_tail=?, output_files=?, status=?, receipt_path=? WHERE job_id=?",
+        (ts, exit_code, stdout[-2000:], stderr[-2000:], json.dumps(output_files), status, receipt_path, job_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_job(job_id: str) -> Optional[dict]:
+    conn = db_conn()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    if d.get("output_files"):
+        d["output_files"] = json.loads(d["output_files"])
+    return d
+
+
+def list_jobs(limit: int = 20) -> list:
+    conn = db_conn()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM jobs ORDER BY start_time DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ─── Auth ───
+
+def require_admin(x_admin_token: Optional[str] = Header(None)):
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="ADMIN_TOKEN not configured — mutation endpoints disabled")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+    return True
+
+
+def status_label(exit_code: Optional[int], has_data: bool = True, blocked: bool = False) -> str:
+    if blocked:
+        return "BLACK_DISABLED"
+    if exit_code is None:
+        return "YELLOW_RUNNING"
+    if exit_code == 0 and has_data:
+        return "GREEN_REAL"
+    if exit_code == 0 and not has_data:
+        return "GRAY_NO_DATA"
+    return "RED_FAILED"
+
+
+# ─── RM-PRI Scoring Stages ───
+
+import math
+
+def stage1_review_strength(rec: dict, features: dict = None) -> float:
+    """Stage 1: ReviewStrengthScore — available from raw corpus."""
+    reviews = rec.get("reviewsCount", 0) or 0
+    rating = float(rec.get("ratingAverage", 0) or 0)
+    is_gold = 1 if rec.get("isGold") else 0
+    is_avail = 1 if rec.get("isAvailable") else 0
+    is_cert = 1 if rec.get("isCertified") else 0
+    trust = (features or {}).get("trust_score", 0)
+    cta = (features or {}).get("cta_score", 0)
+    risk = (features or {}).get("risk_score", 0)
+    return math.log(1 + reviews) + 0.20 * rating + 0.40 * is_gold + 0.25 * is_avail + 0.50 * is_cert + 0.20 * trust + 0.15 * cta - 0.30 * risk
+
+def stage2_market_demand(rec: dict, features: dict = None) -> Optional[float]:
+    """Stage 2: MarketDemandScore — requires public_visits + member_since."""
+    visits = rec.get("public_visits")
+    days = rec.get("days_online")
+    if visits is None or days is None or days == 0:
+        return None
+    vpd = visits / days
+    reviews = rec.get("reviewsCount", 0) or 0
+    rpd = reviews / days
+    rating = float(rec.get("ratingAverage", 0) or 0) / 5.0
+    is_gold = 1 if rec.get("isGold") else 0
+    is_avail = 1 if rec.get("isAvailable") else 0
+    trust = (features or {}).get("trust_score", 0)
+    cta = (features or {}).get("cta_score", 0)
+    risk = (features or {}).get("risk_score", 0)
+    return 0.50 * min(vpd / 100, 1.0) + 0.20 * min(rpd / 0.1, 1.0) + 0.10 * rating + 0.05 * is_gold + 0.05 * is_avail + 0.05 * trust + 0.05 * cta - 0.20 * risk
+
+def stage3_profile_conversion(before: dict, after: dict, features: dict = None) -> Optional[dict]:
+    """Stage 3: ProfileConversionScore — requires dashboard before/after."""
+    views = after.get("profile_views", 0) or 0
+    clicks = after.get("contact_clicks", 0) or 0
+    emails = after.get("new_emails", 0) or 0
+    avail_hours = after.get("available_hours", 0) or 0
+    if views == 0:
+        return None
+    ctr = clicks / views
+    er = emails / views
+    cph = clicks / avail_hours if avail_hours > 0 else 0
+    rank_lift = (before.get("rank_position", 0) or 0) - (after.get("rank_position", 0) or 0)
+    risk = (features or {}).get("risk_score", 0)
+    score = 0.45 * ctr + 0.25 * er + 0.20 * cph + 0.10 * rank_lift - 0.30 * risk
+    return {"contact_click_rate": round(ctr, 6), "email_rate": round(er, 6), "contacts_per_hour": round(cph, 4), "rank_lift": rank_lift, "score": round(score, 4)}
+
+def stage4_profit_bio(before: dict, after: dict, features: dict = None) -> Optional[dict]:
+    """Stage 4: ProfitBioScore — requires bookings/revenue."""
+    v_lift = (after.get("profile_views", 0) or 0) - (before.get("profile_views", 0) or 0)
+    c_lift = (after.get("contact_clicks", 0) or 0) - (before.get("contact_clicks", 0) or 0)
+    e_lift = (after.get("new_emails", 0) or 0) - (before.get("new_emails", 0) or 0)
+    p_lift = (after.get("phone_clicks", 0) or 0) - (before.get("phone_clicks", 0) or 0)
+    novelty = (features or {}).get("novelty_score", 0)
+    speech = (features or {}).get("speech_score", 0)
+    risk = (features or {}).get("risk_score", 0)
+    score = 0.30 * v_lift + 0.25 * c_lift + 0.20 * e_lift + 0.15 * p_lift + 0.05 * novelty + 0.05 * speech - 0.30 * risk
+    return {"views_lift": v_lift, "contact_lift": c_lift, "email_lift": e_lift, "phone_lift": p_lift, "score": round(score, 4)}
+
+
+def check_mode4_unlock() -> dict:
+    """Check if Mode 4 (fully automatic) can be enabled."""
+    experiments = get_experiments()
+    completed = [e for e in experiments if e.get("status") not in ("live",)]
+    checks = {
+        "min_experiments": len(completed) >= MODE4_REQUIREMENTS["min_experiments"],
+        "rollback_tested": any(e.get("rollback_tested") for e in completed),
+        "experiment_count": len(completed),
+    }
+    checks["all_met"] = all(v is True for k, v in checks.items() if k != "experiment_count")
+    checks["can_unlock"] = checks["all_met"]
+    return checks
+
+
+# ─── Content Ledger ───
+
+def get_content_ledger() -> list:
+    return read_jsonl(CONTENT_LEDGER_FILE)
+
+def get_content_by_id(content_id: str) -> Optional[dict]:
+    for c in get_content_ledger():
+        if c.get("id") == content_id:
+            return c
+    return None
+
+def get_content_by_type(content_type: str) -> list:
+    return [c for c in get_content_ledger() if c.get("type") == content_type]
+
+
+# ─── Event Ledger ───
+
+def get_events() -> list:
+    return read_jsonl(EVENT_LEDGER_FILE)
+
+def get_events_for_content(content_id: str) -> list:
+    return [e for e in get_events() if e.get("content_id") == content_id]
+
+def get_events_for_experiment(experiment_id: str) -> list:
+    return [e for e in get_events() if e.get("experiment_id") == experiment_id]
+
+
+def compute_reward(events: list) -> int:
+    total = 0
+    for e in events:
+        etype = e.get("event_type", "")
+        total += RL_REWARD.get(etype, 0)
+    return total
+
+
+# ─── Decision Ledger ───
+
+def get_decisions() -> list:
+    return read_jsonl(DECISION_LEDGER_FILE)
+
+
+def check_experiment_gate(experiment: dict, events: list, metrics: dict) -> dict:
+    """Evidence-gated experiment check. No rotation without minimum exposure + signal."""
+    started_at = experiment.get("started_at", "")
+    if started_at:
+        try:
+            start = datetime.fromisoformat(started_at)
+            elapsed_hours = (datetime.now(timezone.utc) - start).total_seconds() / 3600
+        except Exception:
+            elapsed_hours = 0
+    else:
+        elapsed_hours = 0
+
+    views = len([e for e in events if e.get("event_type") == "profile_view"])
+    downstream_signals = [e for e in events if e.get("event_type") in (
+        "contact_click", "email_click", "phone_click", "message_received",
+        "booking_request", "confirmed_booking", "paid_client"
+    )]
+
+    gate = {
+        "elapsed_hours": round(elapsed_hours, 1),
+        "views": views,
+        "downstream_signals": len(downstream_signals),
+        "min_hours_met": elapsed_hours >= MIN_EXPOSURE_HOURS,
+        "min_views_met": views >= MIN_VIEWS_FOR_DECISION,
+        "has_downstream_signal": len(downstream_signals) > 0,
+        "can_decide": elapsed_hours >= MIN_EXPOSURE_HOURS and views >= MIN_VIEWS_FOR_DECISION,
+        "reward": compute_reward(events),
+    }
+
+    if not gate["min_hours_met"]:
+        gate["block_reason"] = f"Experiment live for {gate['elapsed_hours']}h — minimum {MIN_EXPOSURE_HOURS}h required. KEEP_CURRENT."
+    elif not gate["min_views_met"]:
+        gate["block_reason"] = f"Only {views} views — minimum {MIN_VIEWS_FOR_DECISION} required. KEEP_CURRENT."
+    elif not gate["has_downstream_signal"]:
+        gate["block_reason"] = "No downstream signal (click/message/booking). Cannot declare winner. KEEP_CURRENT."
+    else:
+        gate["block_reason"] = None
+
+    return gate
+
+
+def get_current_test_phase() -> dict:
+    """Determine which content type is being tested this week based on experiment history."""
+    experiments = get_experiments()
+    if not experiments:
+        return {"phase": "bio", "day": 1, "reason": "No experiments yet. Start with bio test.", "freeze": ["photo", "price", "interview", "blog"]}
+
+    # Count completed experiments by type
+    completed = [e for e in experiments if e.get("status") != "live"]
+    current = [e for e in experiments if e.get("status") == "live"]
+
+    if current:
+        active = current[-1]
+        ctype = active.get("content_type", "bio")
+        return {
+            "phase": ctype,
+            "day": len([e for e in completed if e.get("content_type") == ctype]) + 1,
+            "reason": f"Active {ctype} experiment running. Freeze all other variables.",
+            "freeze": [t for t in TEST_SEQUENCE if t != ctype],
+            "experiment_id": active.get("id"),
+        }
+
+    # Determine next phase based on sequence
+    type_counts = {}
+    for e in completed:
+        t = e.get("content_type", "bio")
+        type_counts[t] = type_counts.get(t, 0) + 1
+
+    for t in TEST_SEQUENCE:
+        if type_counts.get(t, 0) < TEST_PHASE_DAYS.get(t, 1):
+            return {
+                "phase": t,
+                "day": type_counts.get(t, 0) + 1,
+                "reason": f"Test {t} (day {type_counts.get(t, 0) + 1} of {TEST_PHASE_DAYS.get(t, 1)}). Freeze all other variables.",
+                "freeze": [x for x in TEST_SEQUENCE if x != t],
+            }
+
+    # All phases complete — weekly decision
+    return {
+        "phase": "weekly_decision",
+        "day": WEEKLY_DECISION_DAY,
+        "reason": "All test phases complete. Pick winners based on reward data.",
+        "freeze": [],
+    }
+
+
+# ─── Prospect Helpers ───
+
+def get_prospects() -> list:
+    return read_jsonl(PROSPECTS_FILE)
+
+
+def get_current_prospects() -> dict:
+    """Return prospects grouped by current stage."""
+    prospects = get_prospects()
+    by_stage = {}
+    for p in prospects:
+        stage = p.get("stage", "unknown")
+        by_stage.setdefault(stage, []).append(p)
+    return by_stage
+
+
+def get_metrics() -> list:
+    return read_jsonl(METRICS_FILE)
+
+
+def get_latest_metrics() -> dict:
+    metrics = get_metrics()
+    return metrics[-1] if metrics else {}
+
+
+def get_candidates() -> list:
+    return read_jsonl(CANDIDATES_FILE)
+
+
+def get_experiments() -> list:
+    return read_jsonl(EXPERIMENTS_FILE)
+
+
+def get_active_experiment() -> Optional[dict]:
+    experiments = get_experiments()
+    for e in reversed(experiments):
+        if e.get("status") == "live":
+            return e
+    return None
+
+
+# ─── Daily Revenue Proof ───
+
+def build_daily_proof() -> dict:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prospects = get_prospects()
+    metrics = get_latest_metrics()
+    experiments = get_experiments()
+    jobs = list_jobs(50)
+    active_exp = get_active_experiment()
+
+    # Count prospects by stage
+    by_stage = {}
+    for p in prospects:
+        s = p.get("stage", "unknown")
+        by_stage[s] = by_stage.get(s, 0) + 1
+
+    paid_today = by_stage.get("paid", 0)
+    appointments = by_stage.get("appointment", 0)
+    conversations = by_stage.get("conversation", 0)
+    messaged = by_stage.get("messaged", 0)
+    clicked = by_stage.get("clicked", 0)
+    viewed = by_stage.get("viewed", 0)
+    contacted = by_stage.get("contacted", 0)
+    qualified = by_stage.get("qualified", 0)
+    discovered = by_stage.get("discovered", 0)
+
+    # Determine mission status
+    if paid_today > 0:
+        mission_status = "BOOKING_CONFIRMED"
+    elif appointments > 0 or conversations > 0:
+        mission_status = "LEADS_ACTIVE"
+    elif discovered > 0 or qualified > 0:
+        mission_status = "PROSPECTS_FOUND"
+    else:
+        mission_status = "NO_PROSPECTS"
+
+    # Last success/failure
+    last_success = None
+    last_failure = None
+    for j in jobs:
+        if j["status"] == "success" and not last_success:
+            last_success = {"job_id": j["job_id"], "command": j["command"], "end_time": j["end_time"]}
+        if j["status"] == "failed" and not last_failure:
+            last_failure = {"job_id": j["job_id"], "command": j["command"], "exit_code": j["exit_code"]}
+
+    proof = {
+        "date": today,
+        "mission": "one_paying_client_per_day",
+        "mission_status": mission_status,
+        "rm_pri_version": "v0.1 — Real Bio Corpus Analyzer",
+        "control_mode": CURRENT_CONTROL_MODE,
+        "control_mode_name": CONTROL_MODES[CURRENT_CONTROL_MODE],
+        "funnel": {
+            "discovered": discovered,
+            "qualified": qualified,
+            "contacted": contacted,
+            "viewed": viewed,
+            "clicked": clicked,
+            "messaged": messaged,
+            "conversation": conversations,
+            "appointment": appointments,
+            "paid": paid_today,
+        },
+        "active_experiment": {
+            "candidate_id": active_exp.get("candidate_id"),
+            "bio_file": active_exp.get("bio_file"),
+            "started_at": active_exp.get("started_at"),
+        } if active_exp else None,
+        "content_versions": len(get_content_ledger()),
+        "events_recorded": len(get_events()),
+        "total_reward": compute_reward(get_events()),
+        "metrics": metrics if metrics else None,
+        "jobs_today": len([j for j in jobs if j.get("start_time", "").startswith(today)]),
+        "last_success": last_success,
+        "last_failure": last_failure,
+        "verified_revenue": metrics.get("verified_revenue", 0) if metrics else 0,
+        "next_best_action": _next_best_action(mission_status, by_stage),
+    }
+    return proof
+
+
+def _next_best_action(mission_status: str, by_stage: dict) -> str:
+    if mission_status == "NO_PROSPECTS":
+        return "Ingest metrics and discover prospects. POST /api/metrics/ingest with real daily data."
+    if mission_status == "PROSPECTS_FOUND":
+        return "Qualify and contact prospects. Move them from discovered → qualified → contacted."
+    if mission_status == "LEADS_ACTIVE":
+        return "Follow up on active conversations. Push toward appointment."
+    if mission_status == "BOOKING_CONFIRMED":
+        return "Confirm booking details. Request repeat/referral."
+    return "Observe market. Ingest metrics. Generate candidates."
+
+
+# ─── Endpoints ───
+
+@app.get("/api/health")
+def health():
+    return {
+        "status": "GREEN_REAL",
+        "service": "rentmasseur-revenue-os",
+        "mode": "Revenue OS — One paying client per day, or prove why it failed.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "endpoints": [
+            "GET /api/health",
+            "GET /api/daily-proof",
+            "GET /api/prospects",
+            "POST /api/prospects (admin)",
+            "GET /api/metrics",
+            "POST /api/metrics/ingest (admin)",
+            "GET /api/candidates",
+            "GET /api/content",
+            "POST /api/content (admin)",
+            "GET /api/events",
+            "POST /api/events (admin)",
+            "GET /api/experiments",
+            "POST /api/experiments/start (admin)",
+            "POST /api/experiments/stop (admin)",
+            "GET /api/decision",
+            "GET /api/decisions",
+            "GET /api/test-phase",
+            "GET /api/control-mode",
+            "POST /api/control-mode (admin)",
+            "POST /api/score (admin)",
+            "POST /api/experiments/{id}/close (admin)",
+            "GET /api/jobs",
+            "GET /api/jobs/{job_id}",
+            "GET /api/jobs/{job_id}/receipt",
+            "POST /api/run/pipeline (admin)",
+            "POST /api/ci/trigger (admin)",
+            "GET /api/receipts",
+            "GET /api/audit/files",
+            "POST /api/run/availability (BLOCKED)",
+        ],
+    }
+
+
+@app.get("/api/daily-proof")
+def daily_proof():
+    proof = build_daily_proof()
+    has_data = proof["mission_status"] != "NO_PROSPECTS" or proof["jobs_today"] > 0
+    proof["status"] = "GREEN_REAL" if has_data else "GRAY_NO_DATA"
+    return proof
+
+
+@app.get("/api/prospects")
+def prospects_list():
+    prospects = get_prospects()
+    if not prospects:
+        return {"status": "GRAY_NO_DATA", "count": 0, "prospects": [], "message": "No prospects discovered yet."}
+    return {"status": "GREEN_REAL", "count": len(prospects), "prospects": prospects[-50:]}
+
+
+@app.post("/api/prospects")
+def prospect_add(request: Request, x_admin_token: Optional[str] = Header(None)):
+    require_admin(x_admin_token)
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    prospect = {
+        "id": str(uuid.uuid4())[:12],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "stage": body.get("stage", "discovered"),
+        "source": body.get("source", ""),
+        "name": body.get("name", ""),
+        "notes": body.get("notes", ""),
+    }
+    append_jsonl(PROSPECTS_FILE, prospect)
+    receipt_path = write_receipt("prospect_add", f"Prospect {prospect['id']} added at stage={prospect['stage']}", prospect)
+    return {"status": "GREEN_REAL", "prospect": prospect, "receipt_path": receipt_path}
+
+
+@app.get("/api/metrics")
+def metrics_list():
+    metrics = get_metrics()
+    if not metrics:
+        return {"status": "GRAY_NO_DATA", "count": 0, "metrics": [], "message": "No metrics ingested yet. POST /api/metrics/ingest."}
+    return {"status": "GREEN_REAL", "count": len(metrics), "latest": metrics[-1], "metrics": metrics[-20:]}
+
+
+@app.post("/api/metrics/ingest")
+def metrics_ingest(payload: dict):
+    """Ingest a daily metrics packet into RevenueOps ledger.
+    No admin token required — this is the data ingestion path.
+    Returns computed CTR + strict decision."""
+    result = _rev_ingest(payload, db_path=REVENUE_OPS_DB)
+    # Also write to legacy metrics file for backward compat
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "date": payload.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d")),
+        "profile_views": payload.get("profile_views", 0),
+        "contact_clicks": payload.get("contact_clicks", 0),
+        "new_visits": payload.get("new_visits", 0),
+        "new_emails": payload.get("new_emails", 0),
+        "bio_id": payload.get("bio_id", ""),
+        "availability_status": payload.get("availability_state", "unknown"),
+        "notes": payload.get("notes", ""),
+    }
+    append_jsonl(METRICS_FILE, record)
+    return result
+
+
+@app.get("/api/candidates")
+def candidates_list():
+    candidates = get_candidates()
+    bio_files = list(BIOS_DIR.glob("*.txt")) if BIOS_DIR.exists() else []
+    if not candidates and not bio_files:
+        return {"status": "GRAY_NO_DATA", "count": 0, "candidates": [], "message": "No candidates. Generate via pipeline or add bio files to content/bios/."}
+    # Include file-backed bios
+    file_bios = []
+    for f in sorted(bio_files, key=lambda x: x.stat().st_mtime, reverse=True):
+        file_bios.append({
+            "id": f.stem,
+            "source": "file",
+            "filename": f.name,
+            "chars": f.stat().st_size,
+            "preview": f.read_text()[:200],
+        })
+    return {"status": "GREEN_REAL", "count": len(candidates) + len(file_bios), "candidates": candidates[-20:], "file_bios": file_bios}
+
+
+# ─── Content Ledger Endpoint ───
+
+@app.get("/api/content")
+def content_list(content_type: Optional[str] = None):
+    items = get_content_ledger()
+    if content_type and content_type in CONTENT_TYPES:
+        items = [c for c in items if c.get("type") == content_type]
+    if not items:
+        return {"status": "GRAY_NO_DATA", "count": 0, "content": [], "message": "No content versions logged. POST /api/content to add."}
+    return {"status": "GREEN_REAL", "count": len(items), "content": items[-50:]}
+
+
+@app.post("/api/content")
+def content_add(request: Request, x_admin_token: Optional[str] = Header(None)):
+    require_admin(x_admin_token)
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    ctype = body.get("type", "")
+    if ctype not in CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail=f"type must be one of {CONTENT_TYPES}")
+
+    content_id = body.get("id", f"{ctype}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}")
+    record = {
+        "id": content_id,
+        "type": ctype,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "body": body.get("body", ""),
+        "label": body.get("label", ""),
+        "source": body.get("source", "manual"),
+        "notes": body.get("notes", ""),
+    }
+    append_jsonl(CONTENT_LEDGER_FILE, record)
+    receipt_path = write_receipt("content_add", f"Content {content_id} ({ctype}) added", record)
+    return {"status": "GREEN_REAL", "content": record, "receipt_path": receipt_path}
+
+
+# ─── Event Ledger Endpoint ───
+
+@app.get("/api/events")
+def events_list(content_id: Optional[str] = None, experiment_id: Optional[str] = None):
+    events = get_events()
+    if content_id:
+        events = [e for e in events if e.get("content_id") == content_id]
+    if experiment_id:
+        events = [e for e in events if e.get("experiment_id") == experiment_id]
+    if not events:
+        return {"status": "GRAY_NO_DATA", "count": 0, "events": [], "message": "No events recorded. POST /api/events to log."}
+    reward = compute_reward(events)
+    return {"status": "GREEN_REAL", "count": len(events), "reward": reward, "events": events[-50:]}
+
+
+@app.post("/api/events")
+def event_add(request: Request, x_admin_token: Optional[str] = Header(None)):
+    require_admin(x_admin_token)
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    etype = body.get("event_type", "")
+    if etype not in EVENT_TYPES:
+        raise HTTPException(status_code=400, detail=f"event_type must be one of {EVENT_TYPES}")
+
+    record = {
+        "id": str(uuid.uuid4())[:12],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_type": etype,
+        "content_id": body.get("content_id", ""),
+        "experiment_id": body.get("experiment_id", ""),
+        "reward": RL_REWARD.get(etype, 0),
+        "notes": body.get("notes", ""),
+    }
+    append_jsonl(EVENT_LEDGER_FILE, record)
+    receipt_path = write_receipt("event_add", f"Event {etype} for {record['content_id'] or 'unknown'}", record)
+    return {"status": "GREEN_REAL", "event": record, "receipt_path": receipt_path}
+
+
+# ─── Decision Ledger Endpoint ───
+
+@app.get("/api/decisions")
+def decisions_list():
+    decisions = get_decisions()
+    if not decisions:
+        return {"status": "GRAY_NO_DATA", "count": 0, "decisions": [], "message": "No decisions logged yet."}
+    return {"status": "GREEN_REAL", "count": len(decisions), "decisions": decisions[-50:]}
+
+
+@app.get("/api/test-phase")
+def test_phase():
+    """Show which variable is being tested this week and what is frozen."""
+    phase = get_current_test_phase()
+    return {"status": "GREEN_REAL", **phase}
+
+
+# ─── Control Mode ───
+
+@app.get("/api/control-mode")
+def control_mode_get():
+    return {
+        "status": "GREEN_REAL",
+        "current_mode": CURRENT_CONTROL_MODE,
+        "mode_name": CONTROL_MODES[CURRENT_CONTROL_MODE],
+        "modes": {k: v for k, v in CONTROL_MODES.items()},
+        "mode4_unlock_check": check_mode4_unlock(),
+    }
+
+
+@app.post("/api/control-mode")
+def control_mode_set(request: Request, x_admin_token: Optional[str] = Header(None)):
+    global CURRENT_CONTROL_MODE
+    require_admin(x_admin_token)
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    mode = body.get("mode", -1)
+    if mode not in CONTROL_MODES:
+        raise HTTPException(status_code=400, detail=f"mode must be one of {list(CONTROL_MODES.keys())}")
+    if mode == 4:
+        checks = check_mode4_unlock()
+        if not checks["can_unlock"]:
+            return JSONResponse({"status": "BLACK_DISABLED", "reason": "Mode 4 requirements not met", "checks": checks}, status_code=403)
+    old_mode = CURRENT_CONTROL_MODE
+    CURRENT_CONTROL_MODE = mode
+    receipt_path = write_receipt("control_mode_change", f"Mode {old_mode}→{mode} ({CONTROL_MODES[mode]})", {"old": old_mode, "new": mode})
+    return {"status": "GREEN_REAL", "old_mode": old_mode, "new_mode": mode, "mode_name": CONTROL_MODES[mode], "receipt_path": receipt_path}
+
+
+# ─── RM-PRI Scoring ───
+
+@app.post("/api/score")
+def score_record(request: Request, x_admin_token: Optional[str] = Header(None)):
+    require_admin(x_admin_token)
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    rec = body.get("record", {})
+    features = body.get("features", {})
+    before = body.get("before", {})
+    after = body.get("after", {})
+    stage = body.get("stage", "all")
+
+    result = {"status": "GREEN_REAL", "stage": stage}
+    if stage in ("1", "all"):
+        result["stage1_review_strength"] = stage1_review_strength(rec, features)
+    if stage in ("2", "all"):
+        s2 = stage2_market_demand(rec, features)
+        result["stage2_market_demand"] = s2 if s2 is not None else "REQUIRES_ENRICHMENT"
+    if stage in ("3", "all"):
+        s3 = stage3_profile_conversion(before, after, features) if before and after else None
+        result["stage3_profile_conversion"] = s3 if s3 is not None else "REQUIRES_DASHBOARD_BEFORE_AFTER"
+    if stage in ("4", "all"):
+        s4 = stage4_profit_bio(before, after, features) if before and after else None
+        result["stage4_profit_bio"] = s4 if s4 is not None else "REQUIRES_BOOKINGS_DATA"
+
+    receipt_path = write_receipt("score_record", f"Scored record stage={stage}", result)
+    result["receipt_path"] = receipt_path
+    return result
+
+
+# ─── Experiment Close with Receipt ───
+
+@app.post("/api/experiments/{exp_id}/close")
+def experiment_close(exp_id: str, request: Request, x_admin_token: Optional[str] = Header(None)):
+    require_admin(x_admin_token)
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        body = {}
+
+    experiments = get_experiments()
+    exp = None
+    for e in experiments:
+        if e.get("id") == exp_id:
+            exp = e
+            break
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+
+    before = body.get("before", {})
+    after = body.get("after", {})
+    features = body.get("features", {})
+
+    computed = {}
+    if before and after:
+        computed["views_delta"] = (after.get("profile_views", 0) or 0) - (before.get("profile_views", 0) or 0)
+        computed["contact_click_delta"] = (after.get("contact_clicks", 0) or 0) - (before.get("contact_clicks", 0) or 0)
+        computed["email_delta"] = (after.get("new_emails", 0) or 0) - (before.get("new_emails", 0) or 0)
+        computed["rank_delta"] = (before.get("rank_position", 0) or 0) - (after.get("rank_position", 0) or 0)
+        views_b = before.get("profile_views", 0) or 0
+        views_a = after.get("profile_views", 0) or 0
+        clicks_b = before.get("contact_clicks", 0) or 0
+        clicks_a = after.get("contact_clicks", 0) or 0
+        computed["ctr_before"] = round(clicks_b / views_b, 6) if views_b else 0
+        computed["ctr_after"] = round(clicks_a / views_a, 6) if views_a else 0
+        computed["ctr_lift_pct"] = round((computed["ctr_after"] - computed["ctr_before"]) / computed["ctr_before"] * 100, 2) if computed["ctr_before"] else 0
+
+    s3 = stage3_profile_conversion(before, after, features) if before and after else None
+    s4 = stage4_profit_bio(before, after, features) if before and after else None
+
+    decision = body.get("decision", {})
+    rollback = body.get("rollback", {"available": True, "snapshot_path": ""})
+
+    receipt = {
+        "receipt_id": f"exp_{exp_id}",
+        "variant_id": exp.get("candidate_id") or exp.get("bio_file"),
+        "action": "close_experiment",
+        "status": "verified" if before and after else "incomplete",
+        "started_at": exp.get("started_at"),
+        "ended_at": datetime.now(timezone.utc).isoformat(),
+        "before": before,
+        "after": after,
+        "computed": computed,
+        "stage3_profile_conversion": s3,
+        "stage4_profit_bio": s4,
+        "decision": decision,
+        "rollback": rollback,
+    }
+
+    receipt_path = EXPERIMENTS_DIR / f"experiment_{exp_id}.json"
+    receipt_path.write_text(json.dumps(receipt, indent=2, default=str))
+
+    write_receipt("experiment_close", f"Experiment {exp_id} closed with before/after", receipt)
+
+    return {"status": "GREEN_REAL", "experiment_id": exp_id, "receipt": receipt, "receipt_path": str(receipt_path)}
+
+
+@app.get("/api/experiments")
+def experiments_list():
+    experiments = get_experiments()
+    if not experiments:
+        return {"status": "GRAY_NO_DATA", "count": 0, "experiments": [], "message": "No experiments. POST /api/experiments/start to begin."}
+    return {"status": "GREEN_REAL", "count": len(experiments), "experiments": experiments[-20:]}
+
+
+@app.post("/api/experiments/start")
+def experiment_start(request: Request, x_admin_token: Optional[str] = Header(None)):
+    require_admin(x_admin_token)
+    try:
+        body = json.loads(request.body)
+    except Exception:
+        body = {}
+
+    # Stop any active experiment
+    existing = get_experiments()
+    for e in existing:
+        if e.get("status") == "live":
+            e["status"] = "stopped"
+            e["stopped_at"] = datetime.now(timezone.utc).isoformat()
+
+    exp = {
+        "id": str(uuid.uuid4())[:12],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "status": "live",

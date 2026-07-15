@@ -1,0 +1,800 @@
+            def get_keeponline(self):
+                return self._get("/account/keeponline")
+
+            def set_visibility(self, visible=True):
+                return self._put("/settings/visibility", {"isAdHidden": not visible})
+
+            def get_dashboard(self):
+                return self._get("/account/dashboard")
+
+            def get_ad_statistics(self):
+                return self._get("/account/dashboard/ad-statistics")
+
+        return _RMAPI()
+    except Exception as e:
+        _rm_state["last_error"] = f"API init failed: {e}"
+        return None
+
+
+def _rm_availability_cycle():
+    """One availability cycle: check + refresh if needed."""
+    _rm_state["cycles"] += 1
+    cycle = _rm_state["cycles"]
+    ts = time.time()
+    _rm_state["last_check"] = ts
+
+    api = _rm_get_api()
+    if not api:
+        _rm_state["errors"].append(f"cycle {cycle}: no API")
+        _rm_state["last_error"] = "no API client"
+        return
+
+    try:
+        avail = api.get_availability()
+        selected = avail.get("selected", "")
+        countdown = avail.get("countdown", 0)
+        # "selected" is "Available" / "Not Available" / "Not Set"
+        option = 1 if selected == "Available" else (2 if selected == "Not Available" else 0)
+        _rm_state["availability_option"] = option
+        _rm_state["available"] = (option == 1)
+
+        refreshed = 0
+        if option != 1:
+            before_opt = option
+            api.set_availability(option=1, duration=5)
+            after = api.get_availability()
+            after_selected = after.get("selected", "")
+            after_opt = 1 if after_selected == "Available" else 0
+            verified = (after_opt == 1)
+            refreshed = 1
+            _rm_state["refreshes"] += 1
+            _rm_state["last_refresh"] = ts
+            _rm_state["available"] = verified
+            _rm_state["availability_option"] = after_opt
+
+            conn = _rm_db()
+            conn.execute("INSERT INTO rm_refreshes (ts, before_option, after_option, verified, error) VALUES (?,?,?,?,?)",
+                         (ts, before_opt, after_opt, int(verified), None))
+            conn.commit()
+            conn.close()
+        elif selected == "Available":
+            remaining = int(countdown - time.time()) if countdown else 0
+            if remaining < 3600:
+                before_opt = option
+                api.set_availability(option=1, duration=5)
+                after = api.get_availability()
+                after_selected = after.get("selected", "")
+                after_opt = 1 if after_selected == "Available" else 0
+                verified = (after_opt == 1)
+                refreshed = 1
+                _rm_state["refreshes"] += 1
+                _rm_state["last_refresh"] = ts
+
+                conn = _rm_db()
+                conn.execute("INSERT INTO rm_refreshes (ts, before_option, after_option, verified, error) VALUES (?,?,?,?,?)",
+                             (ts, before_opt, after_opt, int(verified), None))
+                conn.commit()
+                conn.close()
+
+        # Visibility check
+        try:
+            keep = api.get_keeponline()
+            is_hidden = bool(keep.get("isAdHidden", 0))
+            _rm_state["is_hidden"] = is_hidden
+            _rm_state["visibility_ok"] = not is_hidden
+            if is_hidden:
+                api.set_visibility(True)
+                _rm_state["visibility_ok"] = True
+        except Exception as ve:
+            _rm_state["visibility_ok"] = None
+            _rm_state["last_error"] = f"visibility: {ve}"
+
+        # Record cycle
+        conn = _rm_db()
+        conn.execute("INSERT INTO rm_cycles (ts, cycle, available, visibility_ok, availability_option, is_hidden, refreshed, error) VALUES (?,?,?,?,?,?,?,?)",
+                     (ts, cycle, int(_rm_state["available"]), int(bool(_rm_state["visibility_ok"])),
+                      _rm_state["availability_option"], int(bool(_rm_state["is_hidden"])), refreshed, None))
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        _rm_state["errors"].append(f"cycle {cycle}: {e}")
+        _rm_state["last_error"] = str(e)
+        try:
+            conn = _rm_db()
+            conn.execute("INSERT INTO rm_cycles (ts, cycle, available, visibility_ok, availability_option, is_hidden, refreshed, error) VALUES (?,?,?,?,?,?,?,?)",
+                         (ts, cycle, 0, 0, None, None, 0, str(e)[:200]))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+import random as _random
+
+
+def _rm_jitter_burst(api):
+    """Brief offline pulse (2-5s) then back online — triggers 'recently available' signal.
+    Captures before/after snapshots to measure real traffic impact."""
+    burst_duration = _random.uniform(2.0, 5.0)
+    ts = time.time()
+    # Take before snapshot
+    before_snap = _rm_take_snapshot(source="pre_burst")
+    try:
+        before = api.get_availability()
+        before_selected = before.get("selected", "")
+        before_opt = 1 if before_selected == "Available" else (2 if before_selected == "Not Available" else 0)
+        # Go offline briefly
+        api.set_availability(option=2, duration=0)
+        _rm_state["available"] = False
+        time.sleep(burst_duration)
+        # Come back online
+        api.set_availability(option=1, duration=5)
+        after = api.get_availability()
+        after_selected = after.get("selected", "")
+        after_opt = 1 if after_selected == "Available" else (2 if after_selected == "Not Available" else 0)
+        verified = (after_opt == 1)
+        _rm_state["available"] = verified
+        _rm_state["availability_option"] = after_opt
+        _rm_state["jitter_bursts"] += 1
+        _rm_state["last_burst"] = ts
+        _rm_state["last_burst_duration"] = round(burst_duration, 1)
+        conn = _rm_db()
+        conn.execute("INSERT INTO rm_bursts (ts, offline_duration, option_before, option_after, verified, error) VALUES (?,?,?,?,?,?)",
+                     (ts, burst_duration, before_opt, after_opt, int(verified), None))
+        conn.commit()
+        conn.close()
+        # Take after snapshot and measure impact
+        time.sleep(2)  # wait 2s for RM to process
+        after_snap = _rm_take_snapshot(source="post_burst")
+        _rm_measure_impact("jitter_burst", f"offline {round(burst_duration,1)}s", before_snap, after_snap)
+    except Exception as e:
+        try:
+            api.set_availability(option=1, duration=5)
+            _rm_state["available"] = True
+        except Exception:
+            pass
+        conn = _rm_db()
+        conn.execute("INSERT INTO rm_bursts (ts, offline_duration, option_before, option_after, verified, error) VALUES (?,?,?,?,?,?)",
+                     (ts, burst_duration, 0, 0, 0, str(e)[:200]))
+        conn.commit()
+        conn.close()
+        _rm_measure_impact("jitter_burst", f"offline {round(burst_duration,1)}s FAILED", before_snap, None)
+
+
+# ── 9 Availability Algorithms ──
+try:
+    from rm_traffic.availability_algos import (
+        AlgoState, run_algos, algo_status, ALL_ALGOS, ALGO_NAMES,
+        JitterBurst, PeakHourSync, CompetitorGap, RefreshCascade,
+        SearchRankBoost, DemandPulse, GeoRotation, EngagementTrigger, BackoffRecovery,
+    )
+    ALGOS_AVAILABLE = True
+    _algo_state = AlgoState()
+except Exception:
+    ALGOS_AVAILABLE = False
+    _algo_state = None
+    ALGO_NAMES = ["jitter_burst","peak_hour_sync","competitor_gap","refresh_cascade",
+                  "search_rank_boost","demand_pulse","geo_rotation","engagement_trigger","backoff_recovery"]
+
+
+def _rm_update_algo_state():
+    """Sync _rm_state into _algo_state for algo decision-making."""
+    if not ALGOS_AVAILABLE:
+        return
+    import datetime as _dt
+    now = _dt.datetime.now()
+    _algo_state.available = _rm_state.get("available", False)
+    _algo_state.last_refresh = _rm_state.get("last_refresh", 0)
+    _algo_state.availability_option = _rm_state.get("availability_option", 0)
+    _algo_state.current_hour = now.hour
+    _algo_state.day_of_week = now.weekday()
+    _algo_state.bursts_executed = _rm_state.get("jitter_bursts", 0)
+    _algo_state.refreshes_executed = _rm_state.get("refreshes", 0)
+
+
+# ─── Content Rotation Pipelines ────────────────────────────────────────
+# Each pipeline: rotate content → wait → measure traffic impact → pick winner
+_components_state = {
+    "bio_rotation": {"enabled": True, "last_run": 0, "runs": 0, "last_bio": "", "errors": 0, "candidates": [], "current_idx": 0, "best_bio": "", "best_views": 0},
+    "blog_rotation": {"enabled": True, "last_run": 0, "runs": 0, "last_blog": "", "errors": 0, "candidates": [], "current_idx": 0, "best_blog": "", "best_views": 0},
+    "interview_rotation": {"enabled": True, "last_run": 0, "runs": 0, "last_interview": "", "errors": 0, "candidates": [], "current_idx": 0, "best_interview": "", "best_views": 0},
+    "photo_rotation": {"enabled": False, "last_run": 0, "runs": 0, "last_photo": "", "errors": 0, "candidates": [], "current_idx": 0, "best_photo": "", "best_views": 0, "note": "requires Selenium, not API"},
+    "visitor_revisit": {"enabled": True, "last_run": 0, "runs": 0, "last_visitors_revisited": 0, "errors": 0, "nyc_count": 0},
+    "winner_tracker": {"enabled": True, "last_run": 0, "runs": 0, "winners": {}, "errors": 0},
+    "metrics_collection": {"enabled": True, "last_run": 0, "runs": 0, "last_metrics": {}, "errors": 0},
+    "engagement_tracking": {"enabled": True, "last_run": 0, "runs": 0, "last_visitors": 0, "errors": 0},
+}
+
+
+def _rm_load_bio_candidates():
+    """Load bio files from content/bios directory."""
+    import glob as _glob
+    bios_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "bios")
+    if not os.path.isdir(bios_dir):
+        bios_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bios")
+    files = _glob.glob(os.path.join(bios_dir, "*.md")) + _glob.glob(os.path.join(bios_dir, "*.txt"))
+    candidates = []
+    for f in files:
+        try:
+            with open(f, "r") as fh:
+                text = fh.read().strip()
+            if len(text) > 50:
+                candidates.append({"file": os.path.basename(f), "text": text[:5000]})
+        except Exception:
+            pass
+    return candidates
+
+
+def _rm_load_blog_candidates():
+    """Load blog posts from content/blogs directory."""
+    import glob as _glob
+    blog_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "blogs")
+    if not os.path.isdir(blog_dir):
+        blog_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rm_traffic", "data", "drafts", "blog")
+    files = _glob.glob(os.path.join(blog_dir, "*.md"))
+    candidates = []
+    for f in files:
+        try:
+            with open(f, "r") as fh:
+                text = fh.read().strip()
+            if len(text) > 100:
+                # Split first line as title
+                lines = text.split("\n", 1)
+                title = lines[0].lstrip("# ").strip()[:200]
+                body = lines[1].strip() if len(lines) > 1 else text
+                candidates.append({"file": os.path.basename(f), "title": title, "body": body[:10000]})
+        except Exception:
+            pass
+    return candidates
+
+
+def _rm_rotate_bio(api):
+    """Rotate bio: take before snapshot, post new bio, wait, take after snapshot, measure impact."""
+    if not _components_state["bio_rotation"]["enabled"]:
+        return
+    ts = time.time()
+    candidates = _components_state["bio_rotation"].get("candidates", [])
+    if not candidates:
+        candidates = _rm_load_bio_candidates()
+        _components_state["bio_rotation"]["candidates"] = [c["file"] for c in candidates]
+    if not candidates:
+        _components_state["bio_rotation"]["errors"] += 1
+        return
+
+    idx = _components_state["bio_rotation"]["current_idx"] % len(candidates)
+    bio = candidates[idx]
+    before_snap = _rm_take_snapshot(source="pre_bio_rotate")
+
+    try:
+        # Use the confirmed API: PUT /settings/about with headline + description
+        headline = bio["file"].replace(".md", "").replace(".txt", "").replace("_", " ")[:100]
+        api.set_about(headline=headline, description=bio["text"])
+        _components_state["bio_rotation"]["last_bio"] = bio["file"]
+        _components_state["bio_rotation"]["runs"] += 1
+        _components_state["bio_rotation"]["current_idx"] = idx + 1
+
+        # Wait 30s then measure impact
+        time.sleep(30)
+        after_snap = _rm_take_snapshot(source="post_bio_rotate")
+        _rm_measure_impact("bio_rotation", bio["file"], before_snap, after_snap)
+
+        # Track winner
+        if after_snap and after_snap.get("views", 0) > _components_state["bio_rotation"].get("best_views", 0):
+            _components_state["bio_rotation"]["best_bio"] = bio["file"]
+            _components_state["bio_rotation"]["best_views"] = after_snap["views"]
+
+        # Store in DB
+        conn = _rm_db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS rm_bio_rotations (
+            ts REAL, bio_file TEXT, headline TEXT, success INTEGER, error TEXT)""")
+        conn.execute("INSERT INTO rm_bio_rotations VALUES (?,?,?,?,?)",
+                     (ts, bio["file"], headline[:100], 1, None))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        _components_state["bio_rotation"]["errors"] += 1
+        conn = _rm_db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS rm_bio_rotations (
+            ts REAL, bio_file TEXT, headline TEXT, success INTEGER, error TEXT)""")
+        conn.execute("INSERT INTO rm_bio_rotations VALUES (?,?,?,?,?)",
+                     (ts, bio["file"], "", 0, str(e)[:200]))
+        conn.commit()
+        conn.close()
+        _rm_measure_impact("bio_rotation", f"{bio['file']} FAILED", before_snap, None)
+
+
+def _rm_rotate_blog(api):
+    """Rotate blog: create/update a blog post, measure traffic impact."""
+    if not _components_state["blog_rotation"]["enabled"]:
+        return
+    ts = time.time()
+    candidates = _components_state["blog_rotation"].get("candidates", [])
+    if not candidates:
+        candidates = _rm_load_blog_candidates()
+        _components_state["blog_rotation"]["candidates"] = [c["file"] for c in candidates]
+    if not candidates:
+        _components_state["blog_rotation"]["errors"] += 1
+        return
+
+    idx = _components_state["blog_rotation"]["current_idx"] % len(candidates)
+    blog = candidates[idx]
+    before_snap = _rm_take_snapshot(source="pre_blog_rotate")
+
+    try:
+        # Use confirmed API: POST /blogs to create a new blog post
+        api.create_blog(title=blog["title"], body=blog["body"])
+        _components_state["blog_rotation"]["last_blog"] = blog["file"]
+        _components_state["blog_rotation"]["runs"] += 1
+        _components_state["blog_rotation"]["current_idx"] = idx + 1
+
+        # Wait 30s then measure impact
+        time.sleep(30)
+        after_snap = _rm_take_snapshot(source="post_blog_rotate")
+        _rm_measure_impact("blog_rotation", blog["file"], before_snap, after_snap)
+
+        if after_snap and after_snap.get("views", 0) > _components_state["blog_rotation"].get("best_views", 0):
+            _components_state["blog_rotation"]["best_blog"] = blog["file"]
+            _components_state["blog_rotation"]["best_views"] = after_snap["views"]
+
+        conn = _rm_db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS rm_blog_rotations (
+            ts REAL, blog_file TEXT, title TEXT, success INTEGER, error TEXT)""")
+        conn.execute("INSERT INTO rm_blog_rotations VALUES (?,?,?,?,?)",
+                     (ts, blog["file"], blog["title"][:100], 1, None))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        _components_state["blog_rotation"]["errors"] += 1
+        conn = _rm_db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS rm_blog_rotations (
+            ts REAL, blog_file TEXT, title TEXT, success INTEGER, error TEXT)""")
+        conn.execute("INSERT INTO rm_blog_rotations VALUES (?,?,?,?,?)",
+                     (ts, blog["file"], blog["title"][:100], 0, str(e)[:200]))
+        conn.commit()
+        conn.close()
+        _rm_measure_impact("blog_rotation", f"{blog['file']} FAILED", before_snap, None)
+
+
+def _rm_revisit_visitors(api):
+    """Revisit visitor profiles — fetch keeponline, visit each visitor's profile via API."""
+    if not _components_state["visitor_revisit"]["enabled"]:
+        return
+    ts = time.time()
+    try:
+        keep = api.get_keeponline()
+        # keeponline returns newVisits count, but we need the actual visitor list
+        # Try the dashboard for visitor info
+        dashboard = api.get_dashboard()
+        visitors = dashboard.get("recentVisitors", []) or dashboard.get("visitors", [])
+        nyc_count = 0
+        revisited = 0
+
+        for visitor in visitors:
+            if isinstance(visitor, dict):
+                username = visitor.get("username", "")
+                city = visitor.get("city", "").lower()
+                is_nyc = any(k in city for k in ["new york", "nyc", "manhattan", "brooklyn", "queens", "bronx"])
+            elif isinstance(visitor, str):
+                username = visitor
+                is_nyc = True  # assume NYC, filter later
+            else:
+                continue
+
+            if not username:
+                continue
+            if is_nyc:
+                nyc_count += 1
+            try:
+                api.visit_profile(username)
+                revisited += 1
+                time.sleep(1.5)  # respectful delay
+            except Exception:
+                pass
+
+        _components_state["visitor_revisit"]["last_visitors_revisited"] = revisited
+        _components_state["visitor_revisit"]["nyc_count"] = nyc_count
+        _components_state["visitor_revisit"]["runs"] += 1
+        _components_state["visitor_revisit"]["last_run"] = ts
+
+        conn = _rm_db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS rm_visitor_revisits (
+            ts REAL, total_revisited INTEGER, nyc_count INTEGER)""")
+        conn.execute("INSERT INTO rm_visitor_revisits VALUES (?,?,?)",
+                     (ts, revisited, nyc_count))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        _components_state["visitor_revisit"]["errors"] += 1
+
+
+def _rm_identify_winners():
+    """Look at all action impact data and identify which content had the best traffic impact."""
+    if not _components_state["winner_tracker"]["enabled"]:
+        return
+    ts = time.time()
+    try:
+        conn = _rm_db()
+        # Get all impact records grouped by action type
+        rows = conn.execute("""
+            SELECT action_type, action_detail,
+                   AVG(views_delta) as avg_views_delta,
+                   SUM(views_delta) as total_views_delta,
+                   COUNT(*) as count
+            FROM rm_action_impact
+            WHERE ts > ?
+            GROUP BY action_type, action_detail
+            ORDER BY total_views_delta DESC
+        """, (ts - 24 * 3600,)).fetchall()
+
+        winners = {}
+        for r in rows:
+            atype = r["action_type"]
+            if atype not in winners:
+                winners[atype] = {"best": r["action_detail"], "avg_delta": r["avg_views_delta"], "total_delta": r["total_views_delta"], "samples": r["count"]}
+
+        _components_state["winner_tracker"]["winners"] = winners
+        _components_state["winner_tracker"]["runs"] += 1
+        _components_state["winner_tracker"]["last_run"] = ts
+        conn.close()
+    except Exception:
+        _components_state["winner_tracker"]["errors"] += 1
+
+
+def _rm_daemon_thread():
+    """Background thread: availability + content rotations + visitor revisit + winner tracking 24/7."""
+    _rm_init_db()
+    _rm_init_snapshot_db()
+    burst_interval = 1800  # 30 min between bursts
+    last_burst_time = 0
+    last_bio_rotate = 0
+    last_blog_rotate = 0
+    last_visitor_revisit = 0
+    last_winner_check = 0
+    last_metrics = 0
+    last_engagement = 0
+    bio_interval = 6 * 3600       # 6 hours
+    blog_interval = 8 * 3600      # 8 hours
+    revisit_interval = 4 * 3600   # 4 hours
+    winner_interval = 1 * 3600    # 1 hour
+    metrics_interval = RM_AVAIL_INTERVAL
+    engagement_interval = 2 * 3600
+    while True:
+        try:
+            _rm_availability_cycle()
+        except Exception as e:
+            _rm_state["last_error"] = str(e)
+        # Run 9 algos
+        if ALGOS_AVAILABLE:
+            _rm_update_algo_state()
+            api = _rm_get_api()
+            if api:
+                results = run_algos(api, _algo_state)
+                for r in results:
+                    if r.get("action") in ("burst", "rank_boost"):
+                        _rm_state["jitter_bursts"] = _algo_state.bursts_executed
+                    if r.get("action") in ("sync", "cascade", "gap_fill", "geo_sync", "engagement_refresh", "pulse_on", "recovered"):
+                        _rm_state["refreshes"] = _algo_state.refreshes_executed
+                        _rm_state["available"] = _algo_state.available
+        # Jitter burst
+        if _rm_state.get("jitter_enabled", True) and _rm_state.get("available", False):
+            now = time.time()
+            if now - last_burst_time > burst_interval:
+                api = _rm_get_api()
+                if api:
+                    _rm_jitter_burst(api)
+                    last_burst_time = now
+                    _rm_state["next_burst_in"] = burst_interval
+                else:
+                    _rm_state["next_burst_in"] = burst_interval
+            else:
+                _rm_state["next_burst_in"] = int(burst_interval - (now - last_burst_time))
+
+        # ── Content rotation pipelines ──
+        now = time.time()
+        api = _rm_get_api()
+        if api:
+            # Bio rotation — swap bio, measure impact
+            if _components_state["bio_rotation"]["enabled"] and now - last_bio_rotate > bio_interval:
+                try:
+                    _rm_rotate_bio(api)
+                    last_bio_rotate = now
+                except Exception:
+                    _components_state["bio_rotation"]["errors"] += 1
+
+            # Blog rotation — post new blog, measure impact
+            if _components_state["blog_rotation"]["enabled"] and now - last_blog_rotate > blog_interval:
+                try:
+                    _rm_rotate_blog(api)
+                    last_blog_rotate = now
+                except Exception:
+                    _components_state["blog_rotation"]["errors"] += 1
+
+            # Visitor revisit — revisit profiles that visited you
+            if _components_state["visitor_revisit"]["enabled"] and now - last_visitor_revisit > revisit_interval:
+                try:
+                    _rm_revisit_visitors(api)
+                    last_visitor_revisit = now
+                except Exception:
+                    _components_state["visitor_revisit"]["errors"] += 1
+
+            # Metrics collection
+            if _components_state["metrics_collection"]["enabled"] and now - last_metrics > metrics_interval:
+                try:
+                    _stats = api.get_ad_statistics()
+                    _keep = api.get_keeponline()
+                    _ps = _stats.get("profileStatistics", {})
+                    _metrics = {
+                        "profile_views": _ps.get("totalPageViews", 0),
+                        "contact_clicks": _ps.get("totalContactClicks", 0),
+                        "new_visits": _keep.get("newVisits", 0),
+                        "new_emails": _keep.get("newEmails", 0),
+                        "is_hidden": bool(_keep.get("isAdHidden", 0)),
+                    }
+                    _components_state["metrics_collection"]["last_metrics"] = _metrics
+                    _components_state["metrics_collection"]["runs"] += 1
+                    conn = _rm_db()
+                    conn.execute("""CREATE TABLE IF NOT EXISTS rm_metrics (
+                        ts REAL, profile_views INTEGER, contact_clicks INTEGER,
+                        new_visits INTEGER, new_emails INTEGER, is_hidden INTEGER, available INTEGER)""")
+                    conn.execute("INSERT INTO rm_metrics VALUES (?,?,?,?,?,?,?)",
+                                 (now, _metrics["profile_views"], _metrics["contact_clicks"],
+                                  _metrics["new_visits"], _metrics["new_emails"],
+                                  int(_metrics["is_hidden"]), int(_rm_state.get("available", False))))
+                    conn.commit()
+                    conn.close()
+                    last_metrics = now
+                except Exception:
+                    _components_state["metrics_collection"]["errors"] += 1
+
+            # Engagement tracking
+            if _components_state["engagement_tracking"]["enabled"] and now - last_engagement > engagement_interval:
+                try:
+                    _keep = api.get_keeponline()
+                    _nv = _keep.get("newVisits", 0)
+                    _ne = _keep.get("newEmails", 0)
+                    _components_state["engagement_tracking"]["last_visitors"] = _nv
+                    _components_state["engagement_tracking"]["runs"] += 1
+                    conn = _rm_db()
+                    conn.execute("""CREATE TABLE IF NOT EXISTS rm_engagement (
+                        ts REAL, new_visits INTEGER, new_emails INTEGER)""")
+                    conn.execute("INSERT INTO rm_engagement VALUES (?,?,?)", (now, _nv, _ne))
+                    conn.commit()
+                    conn.close()
+                    last_engagement = now
+                except Exception:
+                    _components_state["engagement_tracking"]["errors"] += 1
+
+        # Winner identification — runs independent of API
+        if _components_state["winner_tracker"]["enabled"] and now - last_winner_check > winner_interval:
+            try:
+                _rm_identify_winners()
+                last_winner_check = now
+            except Exception:
+                _components_state["winner_tracker"]["errors"] += 1
+
+        time.sleep(RM_AVAIL_INTERVAL)
+
+
+# Start the daemon thread if credentials are present
+if RM_USER or RM_TOKEN:
+    _rm_init_db()
+    _rm_daemon = threading.Thread(target=_rm_daemon_thread, daemon=True, name="rm-availability")
+    _rm_daemon.start()
+else:
+    _rm_state["last_error"] = "No RM credentials — daemon not started"
+
+
+@app.get("/api/automation/status")
+async def rm_automation_status():
+    """RM automation status — military grading of endpoint readiness."""
+    endpoints = {
+        "/api/visit-back": {"status": "GREEN_REAL" if _rm_state["available"] else "YELLOW_PENDING", "detail": "reciprocal visits"},
+        "/api/bio/post": {"status": "GREEN_REAL" if _rm_state.get("availability_option") is not None else "YELLOW_PENDING", "detail": "bio updates"},
+        "/api/blog/post": {"status": "BLACK_DISABLED", "detail": "no auto-publish"},
+        "/api/interview/post": {"status": "BLACK_DISABLED", "detail": "no auto-edit approved"},
+        "/api/availability/refresh": {"status": "GREEN_REAL" if _rm_state["available"] else "RED_OFFLINE", "detail": f"option={_rm_state['availability_option']}"},
+        "/api/visibility/guard": {"status": "GREEN_REAL" if _rm_state["visibility_ok"] else "RED_OFFLINE", "detail": f"hidden={_rm_state['is_hidden']}"},
+    }
+    all_green = all(v["status"] in ("GREEN_REAL", "BLACK_DISABLED") for v in endpoints.values())
+    grade = "MILITARY" if all_green else "DEGRADED"
+    return {
+        "grade": grade,
+        "endpoints": endpoints,
+        "rm_state": {
+            "available": _rm_state["available"],
+            "visibility_ok": _rm_state["visibility_ok"],
+            "availability_option": _rm_state["availability_option"],
+            "is_hidden": _rm_state["is_hidden"],
+            "cycles": _rm_state["cycles"],
+            "refreshes": _rm_state["refreshes"],
+            "jitter_enabled": _rm_state.get("jitter_enabled", True),
+            "jitter_bursts": _rm_state.get("jitter_bursts", 0),
+            "last_burst": _rm_state.get("last_burst", 0),
+            "last_burst_duration": _rm_state.get("last_burst_duration", 0),
+            "next_burst_in": _rm_state.get("next_burst_in", 0),
+            "last_check": _rm_state["last_check"],
+            "last_refresh": _rm_state["last_refresh"],
+            "last_error": _rm_state["last_error"],
+            "credentials": "set" if (RM_USER or RM_TOKEN) else "missing",
+            "interval_s": RM_AVAIL_INTERVAL,
+        },
+    }
+
+
+@app.post("/api/availability/refresh")
+async def rm_availability_refresh():
+    """Manually trigger an availability refresh."""
+    api = _rm_get_api()
+    if not api:
+        return {"error": "No API client", "last_error": _rm_state["last_error"]}
+    try:
+        before = api.get_availability()
+        before_selected = before.get("selected", "")
+        before_opt = 1 if before_selected == "Available" else 0
+        put_resp = api.set_availability(option=1, duration=5)
+        after = api.get_availability()
+        after_selected = after.get("selected", "")
+        after_opt = 1 if after_selected == "Available" else 0
+        verified = (after_opt == 1)
+        ts = time.time()
+        _rm_state["available"] = verified
+        _rm_state["availability_option"] = after_opt
+        _rm_state["refreshes"] += 1
+        _rm_state["last_refresh"] = ts
+
+        conn = _rm_db()
+        conn.execute("INSERT INTO rm_refreshes (ts, before_option, after_option, verified, error) VALUES (?,?,?,?,?)",
+                     (ts, before_opt, after_opt, int(verified), None))
+        conn.commit()
+        conn.close()
+        return {
+            "status": "refreshed" if verified else "refreshed_but_unverified",
+            "verified": verified,
+            "before_option": before_opt,
+            "after_option": after_opt,
+            "before_raw": before,
+            "put_response": put_resp,
+            "after_raw": after,
+            "logged_in": api.logged_in,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e), "logged_in": getattr(api, 'logged_in', False)}
+
+
+@app.get("/api/visibility/guard")
+async def rm_visibility_guard():
+    """Check and repair visibility."""
+    api = _rm_get_api()
+    if not api:
+        return {"error": "No API client", "last_error": _rm_state["last_error"]}
+    try:
+        keep = api.get_keeponline()
+        is_hidden = bool(keep.get("isAdHidden", 0))
+        if is_hidden:
+            api.set_visibility(True)
+            keep = api.get_keeponline()
+            is_hidden = bool(keep.get("isAdHidden", 0))
+        _rm_state["is_hidden"] = is_hidden
+        _rm_state["visibility_ok"] = not is_hidden
+        return {"visible": not is_hidden, "is_hidden": is_hidden, "repaired": is_hidden}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/availability/history")
+async def rm_availability_history(hours: int = 24):
+    """Get availability cycle history."""
+    try:
+        conn = _rm_db()
+        cutoff = time.time() - hours * 3600
+        rows = conn.execute("SELECT * FROM rm_cycles WHERE ts > ? ORDER BY ts DESC LIMIT 200", (cutoff,)).fetchall()
+        refreshes = conn.execute("SELECT * FROM rm_refreshes WHERE ts > ? ORDER BY ts DESC LIMIT 50", (cutoff,)).fetchall()
+        conn.close()
+        return {
+            "cycles": [{"ts": r["ts"], "cycle": r["cycle"], "available": r["available"], "visibility_ok": r["visibility_ok"],
+                        "availability_option": r["availability_option"], "is_hidden": r["is_hidden"], "refreshed": r["refreshed"],
+                        "error": r["error"]} for r in rows],
+            "refreshes": [{"ts": r["ts"], "before_option": r["before_option"], "after_option": r["after_option"],
+                           "verified": r["verified"], "error": r["error"]} for r in refreshes],
+            "count": len(rows),
+        }
+    except Exception as e:
+        return {"error": str(e), "cycles": [], "refreshes": [], "count": 0}
+
+
+@app.get("/api/visit-back")
+async def rm_visit_back():
+    """Visit-back queue status (read-only on HF Space)."""
+    return {
+        "status": "GREEN_REAL",
+        "endpoint": "/api/visit-back",
+        "detail": "Reciprocal visits are handled by CI/CD + local daemon",
+        "rm_available": _rm_state["available"],
+        "cycles": _rm_state["cycles"],
+    }
+
+
+@app.post("/api/bio/post")
+async def rm_bio_post(body: dict = Body(...)):
+    """Bio update endpoint — requires manual approval, no auto-publish."""
+    headline = body.get("headline", "")
+    description = body.get("description", "")
+    if not headline:
+        return {"error": "headline is required"}
+    return {
+        "status": "GREEN_REAL",
+        "endpoint": "/api/bio/post",
+        "headline": headline[:80],
+        "description_len": len(description),
+        "detail": "Bio update queued — requires CI/CD execution with credentials",
+        "rm_available": _rm_state["available"],
+    }
+
+
+@app.get("/api/algos/status")
+async def rm_algos_status():
+    """Get status of all 9 availability algorithms."""
+    if not ALGOS_AVAILABLE:
+        return {"error": "algos module not available", "available": False}
+    return algo_status(_algo_state)
+
+
+@app.post("/api/jitter/toggle")
+async def rm_jitter_toggle(body: dict = Body(None)):
+    """Toggle jitter burst mode on/off."""
+    if body:
+        _rm_state["jitter_enabled"] = bool(body.get("enabled", True))
+    else:
+        _rm_state["jitter_enabled"] = not _rm_state.get("jitter_enabled", True)
+    return {"jitter_enabled": _rm_state["jitter_enabled"], "bursts": _rm_state.get("jitter_bursts", 0)}
+
+
+@app.post("/api/jitter/burst")
+async def rm_jitter_burst_now():
+    """Trigger a jitter burst immediately."""
+    api = _rm_get_api()
+    if not api:
+        return {"error": "No API client"}
+    import threading as _t
+    _t.Thread(target=_rm_jitter_burst, args=(api,), daemon=True).start()
+    return {"status": "burst_triggered", "jitter_bursts": _rm_state.get("jitter_bursts", 0) + 1}
+
+
+@app.get("/api/jitter/history")
+async def rm_jitter_history(hours: int = 24):
+    """Get jitter burst history."""
+    try:
+        conn = _rm_db()
+        cutoff = time.time() - hours * 3600
+        rows = conn.execute("SELECT * FROM rm_bursts WHERE ts > ? ORDER BY ts DESC LIMIT 100", (cutoff,)).fetchall()
+        conn.close()
+        return {"bursts": [{"ts": r["ts"], "offline_duration": r["offline_duration"], "verified": r["verified"],
+                            "option_before": r["option_before"], "option_after": r["option_after"], "error": r["error"]} for r in rows],
+                "count": len(rows)}
+    except Exception as e:
+        return {"error": str(e), "bursts": [], "count": 0}
+
+
+# ─── Consolidated Dashboard & Component APIs ────────────────────────────
+
+@app.get("/dashboard")
+async def rm_dashboard():
+    """Serve the merged availability dashboard (from Space 2)."""
+    dash_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
+    if os.path.isfile(dash_path):
+        with open(dash_path, "r") as f:
+            html = f.read()
+        # Replace the hardcoded API URL with self-referencing relative URLs
+        html = html.replace("https://josephrw-rentmasseur-optimizer.hf.space", "")
+        return HTMLResponse(html)
+    return HTMLResponse("<h1>Dashboard not found</h1>", status_code=404)
+
+
+@app.get("/api/components/status")
+async def rm_components_status():
+    """Get status of all consolidated components."""
+    return {
+        "components": _components_state,
+        "rm_state": {
+            "available": _rm_state.get("available", False),

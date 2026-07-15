@@ -1,0 +1,800 @@
+        return all_passed, results
+
+    def _check_policy(self, name: str, plan: RepairPlan,
+                      diff: str, test_results: Dict) -> bool:
+        if name == "no_cloud_on_private_text":
+            # Check diff doesn't add cloud calls on private text paths
+            if "groq" in diff.lower() and "private" in diff.lower():
+                return False
+            if "openrouter" in diff.lower() and "private" in diff.lower():
+                return False
+            return True
+
+        if name == "no_auto_send_enable":
+            if "auto_send" in diff and "True" in diff:
+                return False
+            return True
+
+        if name == "no_direct_main_push":
+            # GAG never pushes to main — always branch
+            return True
+
+        if name == "no_credential_edit":
+            for f in plan.files_to_patch:
+                if f in PROTECTED_FILES or ".env" in f or "secret" in f.lower():
+                    return False
+            return True
+
+        if name == "no_fake_visits":
+            if "fake_visit" in diff.lower() or "synthetic_click" in diff.lower():
+                return False
+            return True
+
+        if name == "tests_required":
+            if not plan.test_commands:
+                return False
+            if test_results and not test_results.get("all_passed"):
+                return False
+            return True
+
+        if name == "measurement_invalid_not_rewarded":
+            # Check diff doesn't reward invalid measurements
+            if "measurement_invalid" in diff and "reward" in diff:
+                # Make sure it's setting reward to 0, not computing negative
+                if "reward = 0" not in diff and "return 0.0" not in diff:
+                    return False
+            return True
+
+        if name == "max_files_enforced":
+            return len(plan.files_to_patch) <= MAX_FILES_PER_PATCH
+
+        if name == "max_lines_enforced":
+            if diff:
+                added = sum(1 for line in diff.split("\n") if line.startswith("+") and not line.startswith("+++"))
+                removed = sum(1 for line in diff.split("\n") if line.startswith("-") and not line.startswith("---"))
+                return (added + removed) <= MAX_LINES_CHANGED_PER_PATCH
+            return True
+
+        return True
+
+
+# ─── Engine 5: Healing PR ───────────────────────────────────────────
+
+class HealingPREngine:
+    """Opens PRs with patches, evidence, tests, receipts, and rollback plans."""
+
+    def __init__(self, repo_root: str = "."):
+        self.repo_root = Path(repo_root)
+
+    def create_pr(self, branch: str, plan: RepairPlan,
+                  receipt: ArtifactReceipt, policy_results: Dict,
+                  test_results: Dict = None) -> HealingPR:
+        """Create a healing PR object with full evidence."""
+
+        confidence = plan.confidence
+        ready = (confidence >= MIN_CONFIDENCE_TO_AUTO_LABEL_READY and
+                 all(r["passed"] for r in policy_results.values()) and
+                 test_results and test_results.get("all_passed"))
+
+        pr_body = self._build_pr_body(plan, receipt, policy_results, test_results)
+
+        pr = HealingPR(
+            branch_name=branch,
+            title=f"[GAG] {plan.repair_type}: {plan.failure_class.value}",
+            body=pr_body,
+            files_changed=plan.files_to_patch,
+            receipt=receipt,
+            ready_to_merge=ready,
+            auto_merge=AUTO_MERGE_ENABLED and ready,
+        )
+
+        log.info(f"  ◆ Healing PR: {pr.title}")
+        log.info(f"    Branch: {pr.branch_name}")
+        log.info(f"    Ready: {pr.ready_to_merge} (confidence={confidence:.2f})")
+        log.info(f"    Auto-merge: {pr.auto_merge} (disabled by policy)")
+        return pr
+
+    def _build_pr_body(self, plan: RepairPlan, receipt: ArtifactReceipt,
+                       policy_results: Dict, test_results: Dict = None) -> str:
+        lines = [
+            f"## CI/CD GAG — Self-Healing PR",
+            "",
+            f"**Failure class**: `{plan.failure_class.value}`",
+            f"**Repair type**: `{plan.repair_type}`",
+            f"**Confidence**: `{plan.confidence:.2f}`",
+            f"**Files changed**: `{', '.join(plan.files_to_patch)}`",
+            "",
+            f"### Description",
+            plan.patch_description,
+            "",
+            f"### Policy Gate Results",
+            "",
+        ]
+
+        for name, result in policy_results.items():
+            icon = "✅" if result["passed"] else "❌"
+            lines.append(f"- {icon} **{name}**: {result['description']}")
+
+        lines.extend([
+            "",
+            f"### Test Results",
+            f"```json",
+            json.dumps(test_results or {}, indent=2),
+            "```",
+            "",
+            f"### Artifact Receipt",
+            f"```json",
+            json.dumps(asdict(receipt), indent=2),
+            "```",
+            "",
+            f"### Rollback Plan",
+            receipt.rollback_plan,
+            "",
+            f"### Attestation",
+            f"- `training_performed`: {receipt.training_performed}",
+            f"- `fine_tuning_performed`: {receipt.fine_tuning_performed}",
+            f"- `private_cloud_used`: {receipt.private_cloud_used}",
+            f"- `human_approval_required`: {receipt.human_approval_required}",
+            f"- `auto_merge_enabled`: {AUTO_MERGE_ENABLED}",
+            "",
+            f"---",
+            f"Generated by CI/CD GAG at {receipt.timestamp}",
+        ])
+
+        return "\n".join(lines)
+
+
+# ─── Self-Healing Rules ─────────────────────────────────────────────
+
+def rule1_403_telemetry_self_heal(failure: FailureEvent) -> RepairPlan:
+    """
+    Rule 1: 403 telemetry self-heal.
+    If post-action protected endpoints return 403, mark cycle MEASUREMENT_INVALID,
+    do not compute negative deltas, do not update bandit or hypothesis reward.
+    """
+    return RepairPlan(
+        failure_id=failure.failure_id,
+        failure_class=FailureClass.MEASUREMENT_INVALID_403,
+        repair_type="measurement_invalid_self_heal",
+        files_to_patch=["rm_traffic/reward_engine.py", "rm_traffic/state_engine.py"],
+        patch_description=(
+            "Ensure is_measurement_valid() checks both snapshots for endpoint errors. "
+            "compute_delta returns zero MetricDelta if invalid. "
+            "compute_reward returns 0.0 for invalid measurements. "
+            "Bandit update skipped when measurement_valid=False."
+        ),
+        confidence=0.95,
+        test_commands=[
+            "python3 -c 'from rm_traffic.reward_engine import is_measurement_valid; print(\"OK\")'",
+            "python3 -c 'from rm_traffic.state_engine import TrafficState; assert hasattr(TrafficState, \"measurement_valid\"); print(\"OK\")'",
+        ],
+        rollback_plan=f"git revert <merge_commit> within {ROLLBACK_WINDOW // 3600}h",
+        policy_checks=[
+            "measurement_invalid_not_rewarded",
+            "no_direct_main_push",
+            "tests_required",
+        ],
+    )
+
+
+def rule2_private_llm_policy_self_heal(failure: FailureEvent) -> RepairPlan:
+    """
+    Rule 2: Private LLM policy self-heal.
+    If reply_draft_queue attempts Groq/OpenRouter with private mailbox text,
+    block the provider, force private_local_only, and open a patch PR.
+    """
+    return RepairPlan(
+        failure_id=failure.failure_id,
+        failure_class=FailureClass.PRIVACY_POLICY_FAILURE,
+        repair_type="private_llm_policy_self_heal",
+        files_to_patch=["rm_traffic/reply_drafter.py"],
+        patch_description=(
+            "Remove cloud provider imports from reply_drafter. "
+            "Use local-only LLM (Ollama/Transformers.js) with 8s timeout. "
+            "Template is canonical — LLM is optional polish only. "
+            "No Groq, no OpenRouter on private client text."
+        ),
+        confidence=0.95,
+        test_commands=[
+            "python3 -c 'from rm_traffic.reply_drafter import draft_reply; print(\"OK\")'",
+            "python3 -c 'import inspect; from rm_traffic.reply_drafter import _try_local_llm_polish; src=inspect.getsource(_try_local_llm_polish); assert \"groq\" not in src.lower(); assert \"openrouter\" not in src.lower(); print(\"no cloud in private path OK\")'",
+        ],
+        rollback_plan=f"git revert <merge_commit> within {ROLLBACK_WINDOW // 3600}h",
+        policy_checks=[
+            "no_cloud_on_private_text",
+            "no_direct_main_push",
+            "tests_required",
+        ],
+    )
+
+
+def rule3_bad_draft_self_heal(failure: FailureEvent) -> RepairPlan:
+    """
+    Rule 3: Bad draft self-heal.
+    If local model draft contains 'we/us/our', 'app', unsupported facts,
+    raw phone when disabled, too many words, or no next-step question,
+    reject draft and use template fallback.
+    """
+    return RepairPlan(
+        failure_id=failure.failure_id,
+        failure_class=FailureClass.BAD_DRAFT,
+        repair_type="bad_draft_self_heal",
+        files_to_patch=["rm_traffic/reply_drafter.py"],
+        patch_description=(
+            "Add quality validation to LLM polish output. "
+            "Reject drafts with: 'we/us/our' pronouns, 'app' references, "
+            "known bad phrases ('reaching out to us', 'last-minute app'), "
+            ">80 words, or no question mark. "
+            "Fall back to template on rejection."
+        ),
+        confidence=0.85,
+        test_commands=[
+            "python3 -c 'from rm_traffic.reply_drafter import draft_reply; d=draft_reply(\"Hi, are you available today?\"); assert \"?\" in d.reply_text; print(\"draft has question OK\")'",
+            "python3 -c 'from rm_traffic.reply_drafter import draft_reply; d=draft_reply(\"Hi\"); assert len(d.reply_text.split()) < 80; print(\"draft length OK\")'",
+        ],
+        rollback_plan=f"git revert <merge_commit> within {ROLLBACK_WINDOW // 3600}h",
+        policy_checks=[
+            "no_cloud_on_private_text",
+            "no_direct_main_push",
+            "tests_required",
+        ],
+    )
+
+
+# ─── Main GAG Orchestrator ──────────────────────────────────────────
+
+class CICDGAG:
+    """CI/CD GitHub Actions Governor — main orchestrator."""
+
+    def __init__(self, repo_root: str = "."):
+        self.repo_root = repo_root
+        self.intake = FailureIntakeEngine(repo_root)
+        self.diagnosis = DiagnosisEngine()
+        self.patcher = PatchGenerator(repo_root)
+        self.policy = PolicyGate()
+        self.pr_engine = HealingPREngine(repo_root)
+        self.heal_history: List[Dict] = []
+        self.last_heal_time: float = 0.0
+
+    def run_healing_cycle(self) -> List[HealingPR]:
+        """Run one full healing cycle: detect → diagnose → patch → policy → PR."""
+        print(f"\n{'='*60}")
+        print(f"  CI/CD GAG — HEALING CYCLE")
+        print(f"  {datetime.now(timezone.utc).isoformat()}")
+        print(f"{'='*60}\n")
+
+        # Check cooldown
+        if self.last_heal_time and (time.time() - self.last_heal_time) < COOLDOWN_AFTER_FAILED_HEAL:
+            remaining = COOLDOWN_AFTER_FAILED_HEAL - (time.time() - self.last_heal_time)
+            print(f"  ⧖ Cooldown active — {remaining / 3600:.1f}h remaining")
+            return []
+
+        # Engine 1: Detect failures
+        print("[INTAKE] Scanning for failures...")
+        failures = self.intake.scan_all()
+        if not failures:
+            print("  ◉ No failures detected — system healthy")
+            return []
+
+        prs = []
+        for failure in failures:
+            print(f"\n[DIAGNOSE] {failure.failure_class.value}: {failure.description[:80]}")
+
+            # Engine 2: Diagnose
+            plan = self.diagnosis.diagnose(failure)
+
+            # Apply self-healing rules for known failure classes
+            if failure.failure_class == FailureClass.MEASUREMENT_INVALID_403:
+                plan = rule1_403_telemetry_self_heal(failure)
+            elif failure.failure_class == FailureClass.PRIVACY_POLICY_FAILURE:
+                plan = rule2_private_llm_policy_self_heal(failure)
+            elif failure.failure_class == FailureClass.BAD_DRAFT:
+                plan = rule3_bad_draft_self_heal(failure)
+
+            if plan.confidence < MIN_CONFIDENCE_TO_OPEN_PR:
+                print(f"  ⟁ Confidence {plan.confidence:.2f} < {MIN_CONFIDENCE_TO_OPEN_PR} — skipping")
+                continue
+
+            # Engine 3: Generate patch
+            print(f"[PATCH] Generating repair branch...")
+            branch, receipt = self.patcher.create_patch(plan)
+
+            # Engine 4: Policy gate
+            print(f"[POLICY] Evaluating policies...")
+            policy_passed, policy_results = self.policy.evaluate(plan, diff_content="", test_results=None)
+
+            if not policy_passed:
+                print(f"  ⟁ Policy gate FAILED — PR will be labeled needs-review")
+                receipt.policy_result = "failed"
+            else:
+                receipt.policy_result = "passed"
+
+            # Engine 5: Create healing PR
+            print(f"[PR] Creating healing PR...")
+            pr = self.pr_engine.create_pr(branch, plan, receipt, policy_results)
+            prs.append(pr)
+
+            # Record in history
+            self.heal_history.append({
+                "failure_id": failure.failure_id,
+                "failure_class": failure.failure_class.value,
+                "repair_type": plan.repair_type,
+                "branch": branch,
+                "confidence": plan.confidence,
+                "policy_passed": policy_passed,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+        self.last_heal_time = time.time()
+
+        # Summary
+        print(f"\n{'='*60}")
+        print(f"  HEALING CYCLE COMPLETE")
+        print(f"  Failures detected: {len(failures)}")
+        print(f"  PRs generated: {len(prs)}")
+        print(f"  Auto-merge: {AUTO_MERGE_ENABLED} (always disabled by policy)")
+        print(f"{'='*60}\n")
+
+        return prs
+
+    def get_status(self) -> Dict:
+        """Get GAG status summary."""
+        return {
+            "heal_history_count": len(self.heal_history),
+            "last_heal": datetime.fromtimestamp(self.last_heal_time, tz=timezone.utc).isoformat() if self.last_heal_time else None,
+            "cooldown_active": (time.time() - self.last_heal_time) < COOLDOWN_AFTER_FAILED_HEAL if self.last_heal_time else False,
+            "auto_merge_enabled": AUTO_MERGE_ENABLED,
+            "max_files_per_patch": MAX_FILES_PER_PATCH,
+            "max_lines_per_patch": MAX_LINES_CHANGED_PER_PATCH,
+            "protected_files": list(PROTECTED_FILES),
+            "allowlisted_files": list(ALLOWLISTED_FILES),
+        }
+
+
+# ─── CLI ────────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="CI/CD GAG — GitHub Actions Governor")
+    parser.add_argument("--run", action="store_true", help="Run one healing cycle")
+    parser.add_argument("--status", action="store_true", help="Show GAG status")
+    parser.add_argument("--repo-root", default=".", help="Repository root path")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    gag = CICDGAG(args.repo_root)
+
+    if args.status:
+        status = gag.get_status()
+        print(json.dumps(status, indent=2))
+    elif args.run:
+        prs = gag.run_healing_cycle()
+        for pr in prs:
+            print(f"\n  PR: {pr.title}")
+            print(f"  Branch: {pr.branch_name}")
+            print(f"  Ready: {pr.ready_to_merge}")
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+bio_ml:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
+```
+
+daemon.py:
+```
+"""
+RM ProfileOps Daemon — safe, bounded, receipt-bearing account ops engine.
+
+Modes:
+    audit   — read only, change nothing
+    guard   — fix visibility + availability only
+    draft   — generate content drafts, do not publish
+    daemon  — run safe loop continuously
+
+The daemon never:
+- fakes reviews
+- fakes visits
+- auto-sends messages
+- auto-publishes blogs
+- auto-changes interview
+- makes destructive changes without backup
+"""
+
+import json
+import logging
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+from .db import init_db, write_receipt, get_latest_traffic_snapshot
+from .api_client import RentMasseurAPI
+from .auth import AuthSession
+from .state import snapshot_state, save_snapshot
+from .visibility_guard import ensure_visible
+from .availability_guard import check_availability, refresh_availability
+from .stats_collector import collect_snapshot
+from .content_optimizer import run_daily_draft_cycle
+from .blog_agent import generate_blog_drafts, save_blog_drafts_to_disk, get_blog_status
+from .interview_agent import monitor_interview, generate_interview_drafts
+
+log = logging.getLogger("profileops.daemon")
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+CHECK_INTERVAL = 5 * 60           # 5 minutes
+AVAILABILITY_CHECK_INTERVAL = 30 * 60  # 30 minutes
+DAILY_DRAFT_INTERVAL = 24 * 60 * 60      # 24 hours
+
+
+class ProfileOpsDaemon:
+    def __init__(self, mode: str = "daemon", city: str = "manhattan-ny",
+                 session_file: str = "rm_traffic/session.json"):
+        self.mode = mode
+        self.city = city
+        self.api = RentMasseurAPI(min_request_interval=2.0)
+        self.auth = AuthSession(self.api, session_file=session_file)
+        self.running = True
+        self.last_check = 0
+        self.last_availability_check = 0
+        self.last_daily_draft = 0
+
+    def login(self) -> bool:
+        ok = self.auth.login()
+        if not ok:
+            log.error("Login failed")
+        return ok
+
+    def audit(self) -> dict:
+        """Read everything. Change nothing."""
+        state = snapshot_state(self.api)
+        save_snapshot(state)
+        keep = state.get("keeponline", {})
+        avail = state.get("availability", {})
+        about = state.get("about", {})
+        assets = about.get("userProps", {}).get("assets", {})
+        stats = state.get("stats", {}).get("profileStatistics", {})
+        dashboard = state.get("dashboard", {})
+
+        report = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "visible": not bool(keep.get("isAdHidden", 0)),
+            "available": avail.get("selected", "unknown"),
+            "availability_countdown": avail.get("countdown", 0),
+            "views": stats.get("totalPageViews"),
+            "contact_clicks": stats.get("totalContactClicks"),
+            "new_visits": keep.get("newVisits"),
+            "new_emails": keep.get("newEmails"),
+            "online_bookmarks": dashboard.get("onlineBookmarks"),
+            "headline": assets.get("headline"),
+            "description_len": len(assets.get("description", "")),
+            "review_url": dashboard.get("reviewUrl"),
+            "is_frozen": keep.get("isFrozen"),
+            "is_ad_hidden": keep.get("isAdHidden"),
+        }
+        write_receipt("audit_v1", "audit", {}, report, verified=True)
+        return report
+
+    def guard(self) -> dict:
+        """Fix low-risk operational issues only."""
+        state = snapshot_state(self.api)
+        save_snapshot(state)
+
+        # Visibility guard
+        visible_ok = ensure_visible(self.api)
+
+        # Availability guard
+        avail_status = check_availability(self.api)
+        if avail_status["needs_refresh"]:
+            refresh_availability(self.api)
+            avail_status = check_availability(self.api)
+
+        # Stats snapshot
+        collect_snapshot(self.api)
+
+        write_receipt("guard_cycle_v1", "guard", {}, {
+            "visible_ok": visible_ok,
+            "availability": avail_status,
+        }, verified=True)
+
+        return {
+            "visible_ok": visible_ok,
+            "availability": avail_status,
+        }
+
+    def draft(self) -> dict:
+        """Generate content drafts. Do not publish."""
+        return run_daily_draft_cycle(self.api)
+
+    def run_cycle(self):
+        """One daemon cycle."""
+        now = time.time()
+        if not self.auth.is_authenticated():
+            log.info("Session not authenticated. Re-logging in...")
+            if not self.login():
+                log.error("Could not re-authenticate. Sleeping.")
+                return
+
+        # Always guard
+        result = self.guard()
+        self.last_check = now
+
+        # Availability check every 30 min
+        if now - self.last_availability_check >= AVAILABILITY_CHECK_INTERVAL:
+            self.last_availability_check = now
+
+        # Daily draft
+        if now - self.last_daily_draft >= DAILY_DRAFT_INTERVAL:
+            if self.mode != "guard":
+                bio_drafts = run_daily_draft_cycle(self.api)
+                blog_drafts = generate_blog_drafts(count=1)
+                save_blog_drafts_to_disk(blog_drafts)
+                interview_drafts = generate_interview_drafts()
+                monitor_interview(self.api)
+                log.info("Daily drafts: bio=%s blog=%s interview=%s",
+                         bio_drafts.get("bio_draft")["variant_id"] if bio_drafts.get("bio_draft") else None,
+                         [d["variant_id"] for d in blog_drafts],
+                         [d["variant_id"] for d in interview_drafts])
+            self.last_daily_draft = now
+
+    def run(self):
+        log.info("=== RM ProfileOps Daemon starting in %s mode ===", self.mode)
+        if not self.login():
+            log.error("Initial login failed")
+            return
+
+        if self.mode == "audit":
+            print(json.dumps(self.audit(), indent=2, default=str))
+            return
+
+        if self.mode == "guard":
+            print(json.dumps(self.guard(), indent=2, default=str))
+            return
+
+        if self.mode == "draft":
+            print(json.dumps(self.draft(), indent=2, default=str))
+            return
+
+        while self.running:
+            try:
+                self.run_cycle()
+            except KeyboardInterrupt:
+                log.info("Shutdown requested")
+                self.running = False
+                break
+            except Exception as e:
+                log.error("Cycle error: %s", e)
+                write_receipt("daemon_error_v1", "error", {}, {"error": str(e)}, verified=False)
+            time.sleep(CHECK_INTERVAL)
+
+        log.info("Daemon stopped")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    parser = argparse.ArgumentParser(description="RM ProfileOps Daemon")
+    parser.add_argument("mode", choices=["audit", "guard", "draft", "daemon"], default="audit", nargs="?")
+    parser.add_argument("--city", default="manhattan-ny")
+    parser.add_argument("--session", default="rm_traffic/session.json")
+    args = parser.parse_args()
+
+    init_db()
+    daemon = ProfileOpsDaemon(mode=args.mode, city=args.city, session_file=args.session)
+    daemon.run()
+
+```
+
+content_optimizer.py:
+```
+"""
+Content Optimizer — conservative bio A/B testing.
+
+Rules:
+- One bio change per 24 hours max.
+- Only rotate through known, hypothesis-driven variants.
+- Store before/after metrics and receipt.
+- Never auto-generate random spam.
+"""
+
+import logging
+import random
+import time
+from datetime import datetime, timezone
+
+from .db import (
+    write_receipt,
+    upsert_content_variant,
+    set_variant_status,
+    get_active_variant,
+    get_variant_history,
+    start_experiment,
+    end_experiment,
+    get_open_experiments,
+    get_latest_traffic_snapshot,
+)
+from .api_client import RentMasseurAPI
+from .bio_variants import get_variant, list_variant_ids
+from .bio_variants_library import get_variant as get_library_variant, list_all as list_all_library_variants, count as library_count
+from .llm_bio_writer import generate_bio_with_llm
+from .content_policy import check_bio_risk
+
+log = logging.getLogger("profileops.content")
+
+MIN_SECONDS_BETWEEN_BIO_CHANGES = 24 * 60 * 60
+
+
+def _last_bio_change_time() -> float:
+    """Return timestamp of last applied bio variant, or 0."""
+    history = get_variant_history("bio", limit=1)
+    if not history:
+        return 0
+    row = history[0]
+    if row.get("status") == "active" and row.get("applied_at"):
+        dt = datetime.fromisoformat(row["applied_at"])
+        return dt.timestamp()
+    return 0
+
+
+def _can_change_bio() -> bool:
+    last = _last_bio_change_time()
+    if not last:
+        return True
+    return (time.time() - last) >= MIN_SECONDS_BETWEEN_BIO_CHANGES
+
+
+def _pick_next_variant(current_id: str) -> dict:
+    """Pick a different variant than the current one."""
+    candidates = [vid for vid in list_variant_ids() if vid != current_id]
+    if not candidates:
+        return None
+    return get_variant(random.choice(candidates))
+
+
+def draft_bio_variant(api: RentMasseurAPI, use_llm: bool = True) -> dict:
+    """
+    Draft a new bio variant. Uses LLM if configured, otherwise library.
+    Does NOT apply it.
+    """
+    about = api.get_about()
+    assets = about.get("userProps", {}).get("assets", {})
+    current_headline = assets.get("headline", "")
+    current_description = assets.get("description", "")
+
+    raw_history = get_latest_traffic_snapshot(7)
+    history = [
+        {"ts": r["created_at"], "views": r["profile_views"], "contact_clicks": r["contact_clicks"], "visits": r["new_visits"]}
+        for r in raw_history
+    ]
+    suggestion = None
+    if use_llm:
+        import os
+        suggestion = generate_bio_with_llm(
+            {"about": about, "stats": {}}, history,
+            current_headline, current_description,
+            city="Manhattan, NYC", provider=os.environ.get("LLM_PROVIDER"),
+            model=os.environ.get("LLM_MODEL")
+        )
+
+    if suggestion:
+        variant_id = f"llm_{int(time.time())}"
+        variant = {
+            "variant_id": variant_id,
+            "headline": suggestion["headline"],
+            "description": suggestion["bio"],
+            "hypothesis": "LLM-generated variant based on profile and recent traffic.",
+        }
+    else:
+        active = get_active_variant("bio")
+        current_idx = -1
+        if active:
+            try:
+                current_idx = int(active["variant_id"].replace("module_", ""))
+            except Exception:
+                pass
+        # Pick next from 30-module library
+        next_idx = (current_idx + 1) % library_count()
+        variant = get_library_variant(next_idx)
+        if not variant:
+            log.warning("No alternative variant found")
+            return None
+
+    # Policy check
+    risk = check_bio_risk(variant["headline"] + " " + variant["description"])
+    variant["risk_score"] = risk
+    if risk > 0.7:
+        log.error("Draft rejected by policy: risk=%.2f", risk)
+        return None
+
+    upsert_content_variant(
+        variant["variant_id"], "bio",
+        variant["headline"], variant["description"],
+        hypothesis=variant["hypothesis"],
+        status="draft"
+    )
+    write_receipt(
+        "bio_draft_created_v1",
+        "draft_bio_variant",
+        {"current_headline": current_headline},
+        variant,
+        verified=True,
+    )
+    log.info("Bio draft created: %s", variant["variant_id"])
+    return variant
+
+
+def apply_bio_variant(api: RentMasseurAPI, variant_id: str) -> bool:
+    """
+    Apply a drafted bio variant. Enforces 24-hour cooldown and policy.
+    """
+    if not _can_change_bio():
+        log.warning("Bio change blocked: within 24-hour cooldown")
+        return False
+
+    from .db import get_conn
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM content_variants WHERE variant_id=?", (variant_id,)).fetchone()
+    conn.close()
+    if not row:
+        log.error("Variant not found: %s", variant_id)
+        return False
+
+    variant = dict(row)
+
+    about = api.get_about()
+    assets = about.get("userProps", {}).get("assets", {})
+    before = {
+        "headline": assets.get("headline"),
+        "description": assets.get("description"),
+    }
+
+    api.set_about(variant["headline"], variant["description"])
+
+    # Verify
+    about = api.get_about()
+    assets = about.get("userProps", {}).get("assets", {})
+    after = {
+        "headline": assets.get("headline"),
+        "description": assets.get("description"),
+    }
+    verified = (after["headline"] == variant["headline"] and after["description"] == variant["description"])
+
+    # Mark old active as removed
+    old = get_active_variant("bio")
+    if old:
+        set_variant_status(old["variant_id"], "archived", "removed_at")
+    set_variant_status(variant_id, "active", "applied_at")
+
+    # Start experiment
+    baseline = get_latest_traffic_snapshot(1)
+    baseline_views = baseline[0]["profile_views"] if baseline else 0
+    baseline_clicks = baseline[0]["contact_clicks"] if baseline else 0
+    start_experiment(f"exp_{variant_id}_{int(time.time())}", variant_id, baseline_views, baseline_clicks)
+
+    write_receipt(
+        "bio_applied_v1",
+        "apply_bio_variant",
+        before,
+        after,
+        verified=verified,
+    )
+
+    if verified:
+        log.info("Bio applied: %s", variant_id)

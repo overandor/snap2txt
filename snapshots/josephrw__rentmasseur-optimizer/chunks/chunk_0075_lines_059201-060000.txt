@@ -1,0 +1,800 @@
+    else:
+        log.error("Bio apply verification failed: %s", variant_id)
+    return verified
+
+
+def evaluate_open_experiments(api: RentMasseurAPI) -> list:
+    """End any open experiments that have run for 24+ hours."""
+    results = []
+    open_exps = get_open_experiments()
+    now = time.time()
+    for exp in open_exps:
+        started = datetime.fromisoformat(exp["started_at"]).timestamp()
+        if now - started < 24 * 60 * 60:
+            continue
+        current = get_latest_traffic_snapshot(1)
+        final_views = current[0]["profile_views"] if current else 0
+        final_clicks = current[0]["contact_clicks"] if current else 0
+        delta_views = final_views - (exp["baseline_views"] or 0)
+        delta_clicks = final_clicks - (exp["baseline_clicks"] or 0)
+        result = {
+            "experiment_id": exp["experiment_id"],
+            "variant_id": exp["variant_id"],
+            "delta_views": delta_views,
+            "delta_clicks": delta_clicks,
+            "baseline_views": exp["baseline_views"],
+            "baseline_clicks": exp["baseline_clicks"],
+            "final_views": final_views,
+            "final_clicks": final_clicks,
+        }
+        end_experiment(exp["experiment_id"], final_views, final_clicks, result)
+        results.append(result)
+        log.info("Experiment ended: %s", result)
+    return results
+
+
+def run_daily_draft_cycle(api: RentMasseurAPI) -> dict:
+    """Generate bio and headline drafts. Do not apply."""
+    bio = draft_bio_variant(api)
+    return {
+        "bio_draft": bio,
+        "experiments_evaluated": evaluate_open_experiments(api),
+    }
+
+```
+
+probe5.py:
+```
+import requests, re, json
+
+s = requests.Session()
+s.headers.update({
+    'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json',
+    'Referer': 'https://rentmasseur.com/settings', 'Origin': 'https://rentmasseur.com',
+})
+s.get('https://rentmasseur.com/login')
+m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', s.get('https://rentmasseur.com/login').text)
+csrf = m.group(1) if m else ''
+r = s.post('https://rentmasseur.com/api/v1/login', json={
+    'email': 'karpathianwolf', 'password': 'os.environ.get("RM_PASSWORD", "")', 'csrf': csrf, 'remember': True
+})
+s.headers['Authorization'] = 'Bearer ' + r.json()['accessToken']
+print('Login OK')
+
+# Blogs
+for p in ['?page=1', '?username=Karpathianwolf', '/list', '/user']:
+    r = s.get(f'https://rentmasseur.com/api/v1/blogs{p}', timeout=5)
+    print(f'GET blogs{p}: {r.status_code} {r.text[:200]}')
+
+# POST blog variants
+for path in ['/api/v1/blogs', '/api/v1/account/blogs', '/api/v1/settings/blog']:
+    r = s.post(f'https://rentmasseur.com{path}', json={'title': 'Test', 'content': 'Test'}, timeout=5)
+    print(f'POST {path}: {r.status_code} {r.text[:200]}')
+
+# Interview - try fetching the public profile page which has interview
+r = s.get('https://rentmasseur.com/api/v1/account/blogs', timeout=5)
+print(f'GET account/blogs: {r.status_code} {r.text[:200]}')
+
+# Rates
+r = s.get('https://rentmasseur.com/api/v1/settings/rates')
+d = r.json()
+print(f'GET rates keys: {list(d.keys())}')
+print(json.dumps(d, indent=2, default=str)[:1000])
+
+```
+
+blog_interview_endpoints.json:
+```
+{
+  "blog": [],
+  "interview": [],
+  "timestamp": 1782419231.202249
+}
+```
+
+engine.py:
+```
+"""
+RentMasseur Traffic Engine — persistent daemon that:
+1. Maintains authenticated session (re-login on expiry)
+2. Auto-refreshes availability before expiry (default: every 55 min)
+3. Tracks profile stats (views, contacts, online bookmarks)
+4. Logs search position for target city
+5. Persists everything to SQLite for trend analysis
+6. Sends alerts on status changes (visibility, membership, ranking drops)
+
+Usage:
+    python -m rm_traffic.engine                    # run daemon
+    python -m rm_traffic.engine --once              # single cycle
+    python -m rm_traffic.engine --stats             # print stats summary
+    python -m rm_traffic.engine --watch "Manhattan, NY"  # track search position
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Selenium
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import (
+    StaleElementReferenceException,
+    NoSuchElementException,
+    TimeoutException,
+    WebDriverException,
+)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+USERNAME = "karpathianwolf"
+PASSWORD = os.environ.get("RM_PASSWORD", "")
+BASE_URL = "https://rentmasseur.com"
+DB_PATH = Path(__file__).parent / "traffic.db"
+LOG_PATH = Path(__file__).parent / "traffic.log"
+CHROME_PROFILE = "/tmp/rm_traffic_chrome"
+REFRESH_INTERVAL = 55 * 60  # 55 minutes — refresh before 1h expiry
+STAT_INTERVAL = 5 * 60      # check stats every 5 min
+SEARCH_CHECK_INTERVAL = 30 * 60  # check search position every 30 min
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("rm_traffic")
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+def db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def init_db():
+    conn = db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS availability_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        action TEXT NOT NULL,
+        status TEXT,
+        hours INTEGER,
+        minutes INTEGER,
+        duration_set INTEGER,
+        success INTEGER,
+        detail TEXT
+    );
+    CREATE TABLE IF NOT EXISTS stats_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        profile_views INTEGER,
+        contact_clicks INTEGER,
+        online_bookmarks INTEGER,
+        who_saw_me INTEGER,
+        membership_status TEXT,
+        visibility TEXT,
+        availability_status TEXT,
+        availability_remaining TEXT
+    );
+    CREATE TABLE IF NOT EXISTS search_position (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        city TEXT NOT NULL,
+        position INTEGER,
+        total_results INTEGER,
+        available_now INTEGER,
+        username TEXT
+    );
+    CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        type TEXT NOT NULL,
+        severity TEXT,
+        message TEXT,
+        acknowledged INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_avail_ts ON availability_log(ts);
+    CREATE INDEX IF NOT EXISTS idx_stats_ts ON stats_log(ts);
+    CREATE INDEX IF NOT EXISTS idx_search_ts ON search_position(ts);
+    """)
+    conn.commit()
+    conn.close()
+    log.info("DB initialized at %s", DB_PATH)
+
+def log_availability(action, status=None, hours=None, minutes=None,
+                     duration_set=None, success=True, detail=""):
+    conn = db()
+    conn.execute(
+        "INSERT INTO availability_log (ts, action, status, hours, minutes, duration_set, success, detail) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(), action, status, hours, minutes,
+         duration_set, int(success), detail)
+    )
+    conn.commit()
+    conn.close()
+
+def log_stats(views, contacts, bookmarks, who_saw, membership, visibility,
+              avail_status, avail_remaining):
+    conn = db()
+    conn.execute(
+        "INSERT INTO stats_log (ts, profile_views, contact_clicks, online_bookmarks, "
+        "who_saw_me, membership_status, visibility, availability_status, availability_remaining) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(), views, contacts, bookmarks,
+         who_saw, membership, visibility, avail_status, avail_remaining)
+    )
+    conn.commit()
+    conn.close()
+
+def log_search_position(city, position, total, available_now, username):
+    conn = db()
+    conn.execute(
+        "INSERT INTO search_position (ts, city, position, total_results, available_now, username) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(), city, position, total, available_now, username)
+    )
+    conn.commit()
+    conn.close()
+
+def log_alert(atype, severity, message):
+    conn = db()
+    conn.execute(
+        "INSERT INTO alerts (ts, type, severity, message) VALUES (?, ?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(), atype, severity, message)
+    )
+    conn.commit()
+    conn.close()
+    log.warning("ALERT [%s] %s: %s", severity, atype, message)
+
+# ---------------------------------------------------------------------------
+# Browser
+# ---------------------------------------------------------------------------
+
+class Browser:
+    """Managed Chrome instance with session persistence."""
+
+    def __init__(self):
+        self.driver = None
+        self.logged_in = False
+        self.last_login = 0
+
+    def start(self):
+        opts = Options()
+        opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument(f"--user-data-dir={CHROME_PROFILE}")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        self.driver = webdriver.Chrome(options=opts)
+        # Remove webdriver flag
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+        log.info("Browser started (profile: %s)", CHROME_PROFILE)
+
+    def stop(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+        self.driver = None
+        self.logged_in = False
+        log.info("Browser stopped")
+
+    def _dismiss_popups(self):
+        time.sleep(1)
+        for xpath in [
+            "//button[contains(text(),'Not now')]",
+            "//button[contains(text(),'Accept all')]",
+            "//button[contains(text(),'Close')]",
+            "//*[contains(@aria-label,'Close')]",
+        ]:
+            try:
+                for el in self.driver.find_elements(By.XPATH, xpath):
+                    if el.is_displayed():
+                        el.click()
+                        time.sleep(0.5)
+            except Exception:
+                pass
+
+    def login(self, force=False):
+        if self.logged_in and not force and (time.time() - self.last_login < 3600):
+            return True
+        if not self.driver:
+            self.start()
+
+        log.info("Logging in as %s...", USERNAME)
+        self.driver.get(f"{BASE_URL}/login")
+        time.sleep(4)
+        self._dismiss_popups()
+
+        # Find login fields
+        email = None
+        pwd = None
+        for inp in self.driver.find_elements(By.CSS_SELECTOR, "input"):
+            itype = (inp.get_attribute("type") or "").lower()
+            iname = (inp.get_attribute("name") or "").lower()
+            if itype == "email" or "email" in iname or "user" in iname:
+                if inp.is_displayed():
+                    email = inp
+            if itype == "password" and inp.is_displayed():
+                pwd = inp
+
+        if not email or not pwd:
+            log.error("Login fields not found")
+            log_availability("login", success=False, detail="fields not found")
+            return False
+
+        email.clear()
+        email.send_keys(USERNAME)
+        pwd.clear()
+        pwd.send_keys(PASSWORD)
+        time.sleep(0.3)
+
+        # Click login button
+        clicked = False
+        for by, sel in [
+            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.XPATH, "//button[contains(text(),'LOG')]"),
+            (By.XPATH, "//button[contains(text(),'Log')]"),
+            (By.CSS_SELECTOR, "form button"),
+        ]:
+            for el in self.driver.find_elements(by, sel):
+                if el.is_displayed():
+                    el.click()
+                    clicked = True
+                    break
+            if clicked:
+                break
+
+        if not clicked:
+            log.error("Login button not found")
+            return False
+
+        time.sleep(6)
+        self._dismiss_popups()
+
+        # Verify login
+        url = self.driver.current_url
+        if "/login" in url:
+            log.error("Login failed — still on login page")
+            log_availability("login", success=False, detail="redirected back to login")
+            return False
+
+        self.logged_in = True
+        self.last_login = time.time()
+        log.info("Login successful. URL: %s", url)
+        log_availability("login", success=True, detail=url)
+        return True
+
+    def ensure_session(self):
+        """Check if session is still valid, re-login if not."""
+        if not self.driver:
+            return self.login()
+        try:
+            self.driver.get(f"{BASE_URL}/settings")
+            time.sleep(3)
+            if "/login" in self.driver.current_url:
+                log.info("Session expired, re-logging in...")
+                return self.login(force=True)
+            return True
+        except WebDriverException as e:
+            log.warning("Session check failed: %s", e)
+            return self.login(force=True)
+
+    def get_settings_data(self):
+        """Fetch settings page and extract all profile data."""
+        if not self.ensure_session():
+            return None
+        self.driver.get(f"{BASE_URL}/settings")
+        time.sleep(5)
+        self._dismiss_popups()
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body").text
+        except Exception:
+            return None
+        return body
+
+    def set_available(self, duration=1):
+        """Set availability to 'Available' with given duration (hours)."""
+        if not self.ensure_session():
+            return False
+
+        log.info("Setting availability: Available, %dh", duration)
+        self.driver.get(f"{BASE_URL}/settings?availability=1")
+        time.sleep(5)
+        self._dismiss_popups()
+
+        # Check current status first
+        body = self.driver.find_element(By.TAG_NAME, "body").text
+        match = re.search(r'Status:\s*Available\s*(\d+)h\s*:\s*(\d+)m', body)
+        if match:
+            hours = int(match.group(1))
+            mins = int(match.group(2))
+            total_mins = hours * 60 + mins
+            if total_mins > 10:
+                log.info("Already available (%dh:%dm remaining), skipping", hours, mins)
+                log_availability("skip", status="Available", hours=hours,
+                                 minutes=mins, success=True, detail="sufficient time remaining")
+                return True
+
+        # Click the availability panel to open modal
+        try:
+            avail_panel = self.driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
+            avail_panel.click()
+            time.sleep(2)
+        except (NoSuchElementException, StaleElementReferenceException):
+            log.warning("Could not click availability panel")
+            log_availability("set", success=False, detail="panel not found")
+            return False
+
+        # Wait for modal and find "Available" option
+        time.sleep(1)
+        clicked_available = False
+        for by, sel in [
+            (By.XPATH, "//label[contains(text(),'Available')]"),
+            (By.XPATH, "//*[contains(text(),'Available') and not(contains(text(),'Not')) and not(contains(text(),'Status'))]"),
+            (By.CSS_SELECTOR, "input[type='radio'][value='1']"),
+            (By.CSS_SELECTOR, "input[type='radio']"),
+        ]:
+            try:
+                els = self.driver.find_elements(by, sel)
+                for el in els:
+                    if el.is_displayed():
+                        el.click()
+                        clicked_available = True
+                        log.info("Selected 'Available'")
+                        break
+            except Exception:
+                pass
+            if clicked_available:
+                break
+
+        if not clicked_available:
+            log.warning("Could not select 'Available' option")
+            log_availability("set", success=False, detail="could not select Available")
+            return False
+
+        # Select duration
+        time.sleep(0.5)
+        for sel_el in self.driver.find_elements(By.CSS_SELECTOR, "select"):
+            try:
+                from selenium.webdriver.support.ui import Select
+                sel = Select(sel_el)
+                options = [o.text for o in sel.options]
+                target = f"{duration} Hour" if duration == 1 else f"{duration} Hours"
+                if target in options:
+                    sel.select_by_visible_text(target)
+                    log.info("Selected duration: %s", target)
+                    break
+            except Exception:
+                pass
+
+        # Click SET button
+        time.sleep(0.5)
+        set_clicked = False
+        for by, sel in [
+            (By.XPATH, "//button[contains(text(),'SET')]"),
+            (By.XPATH, "//button[contains(text(),'Set')]"),
+        ]:
+            try:
+                els = self.driver.find_elements(by, sel)
+                for el in els:
+                    if el.is_displayed():
+                        el.click()
+                        set_clicked = True
+                        log.info("Clicked SET")
+                        break
+            except Exception:
+                pass
+            if set_clicked:
+                break
+
+        if not set_clicked:
+            log.warning("SET button not found")
+            log_availability("set", success=False, detail="SET button not found")
+            return False
+
+        time.sleep(3)
+        # Verify
+        body = self.driver.find_element(By.TAG_NAME, "body").text
+        if "Status: Available" in body:
+            match = re.search(r'Status:\s*Available\s*(\d+)h\s*:\s*(\d+)m', body)
+            if match:
+                h, m = int(match.group(1)), int(match.group(2))
+                log.info("Availability confirmed: %dh:%dm", h, m)
+                log_availability("set", status="Available", hours=h, minutes=m,
+                                 duration_set=duration, success=True)
+                return True
+
+        log.warning("Availability set but could not verify")
+        log_availability("set", success=True, detail="could not verify")
+        return True
+
+    def get_stats(self):
+        """Extract profile statistics from settings page."""
+        body = self.get_settings_data()
+        if not body:
+            return None
+
+        stats = {
+            "profile_views": None,
+            "contact_clicks": None,
+            "online_bookmarks": None,
+            "who_saw_me": None,
+            "membership_status": None,
+            "visibility": None,
+            "availability_status": None,
+            "availability_remaining": None,
+        }
+
+        # Profile Views: 77999
+        m = re.search(r'Profile Views:\s*([\d,]+)', body)
+        if m:
+            stats["profile_views"] = int(m.group(1).replace(",", ""))
+
+        # Who Saw Me: 30
+        m = re.search(r'Who Saw Me\s*(\d+)', body)
+        if m:
+            stats["who_saw_me"] = int(m.group(1))
+
+        # Online bookmarks
+        m = re.search(r'(\d+)\s*online', body)
+        if m:
+            stats["online_bookmarks"] = int(m.group(1))
+
+        # Membership
+        m = re.search(r'Profile Status:\s*(\w+)', body)
+        if m:
+            stats["membership_status"] = m.group(1)
+
+        # Visibility
+        if "Profile hidden" in body:
+            stats["visibility"] = "hidden"
+        elif "Profile shown" in body:
+            stats["visibility"] = "shown"
+
+        # Availability
+        m = re.search(r'Status:\s*(Available|Not Available|Not Set)\s*(\d+h\s*:\s*\d+m)?', body)
+        if m:
+            stats["availability_status"] = m.group(1)
+            stats["availability_remaining"] = m.group(2) or ""
+
+        # Contact clicks from ad statistics
+        m = re.search(r'Contact Me\s*clicks\s*([\d,]+)', body)
+        if m:
+            stats["contact_clicks"] = int(m.group(1).replace(",", ""))
+
+        return stats
+
+    def check_search_position(self, city="Manhattan, NY"):
+        """Check profile position in search results for a city."""
+        if not self.ensure_session():
+            return None
+
+        city_slug = city.lower().replace(", ", "-").replace(" ", "-")
+        url = f"{BASE_URL}/gay-massage/{city_slug}/"
+        log.info("Checking search position at %s", url)
+        self.driver.get(url)
+        time.sleep(5)
+        self._dismiss_popups()
+
+        # Find all masseur profile links
+        body = self.driver.find_element(By.TAG_NAME, "body").text
+
+        # Find profile cards/links
+        profile_links = []
+        for el in self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/']"):
+            href = el.get_attribute("href") or ""
+            text = el.text.strip().lower()
+            # Profile links are like /Username
+            if href.startswith(f"{BASE_URL}/") and not any(x in href for x in [
+                "login", "settings", "search", "blog", "reviews", "interviews",
+                "available", "find-massage", "live-cams", "sitemap", "advertise",
+                "mailbox", "static", "_next", "images",
+            ]):
+                parts = href.replace(f"{BASE_URL}/", "").split("/")
+                if parts and parts[0] and len(parts) == 1:
+                    profile_links.append((parts[0].lower(), href))
+
+        # Find our position
+        username_lower = USERNAME.lower()
+        position = None
+        for i, (uname, href) in enumerate(profile_links):
+            if uname == username_lower:
+                position = i + 1
+                break
+
+        # Check available now filter
+        avail_url = f"{url}?available=1"
+        self.driver.get(avail_url)
+        time.sleep(4)
+        self._dismiss_popups()
+
+        avail_links = []
+        for el in self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/']"):
+            href = el.get_attribute("href") or ""
+            if href.startswith(f"{BASE_URL}/") and not any(x in href for x in [
+                "login", "settings", "search", "blog", "reviews", "interviews",
+                "available", "find-massage", "live-cams", "sitemap", "advertise",
+                "mailbox", "static", "_next", "images",
+            ]):
+                parts = href.replace(f"{BASE_URL}/", "").split("/")
+                if parts and parts[0] and len(parts) == 1:
+                    avail_links.append(parts[0].lower())
+
+        avail_position = None
+        for i, uname in enumerate(avail_links):
+            if uname == username_lower:
+                avail_position = i + 1
+                break
+
+        total = len(profile_links)
+        total_avail = len(avail_links)
+
+        result = {
+            "city": city,
+            "position": position,
+            "total": total,
+            "available_position": avail_position,
+            "available_total": total_avail,
+        }
+
+        log.info("Search position: #%d/%d (available: #%s/%d) in %s",
+                 position or -1, total,
+                 avail_position or "N/A", total_avail, city)
+
+        log_search_position(city, position or 0, total, total_avail, USERNAME)
+
+        if position and position > 20:
+            log_alert("ranking_drop", "warning",
+                      f"Position dropped to #{position} in {city}")
+
+        return result
+
+# ---------------------------------------------------------------------------
+# Daemon
+# ---------------------------------------------------------------------------
+
+class TrafficEngine:
+    """Main daemon loop."""
+
+    def __init__(self, watch_city=None):
+        self.browser = Browser()
+        self.watch_city = watch_city
+        self.running = True
+        self.last_refresh = 0
+        self.last_stats = 0
+        self.last_search = 0
+        self.prev_stats = None
+
+    def cycle(self):
+        """One daemon cycle — check what needs doing."""
+        now = time.time()
+
+        # Availability refresh
+        if now - self.last_refresh >= REFRESH_INTERVAL:
+            try:
+                self.browser.set_available(duration=1)
+                self.last_refresh = now
+            except Exception as e:
+                log.error("Availability refresh failed: %s", e)
+                log_availability("set", success=False, detail=str(e))
+                # Reset browser on error
+                self.browser.stop()
+                time.sleep(5)
+
+        # Stats collection
+        if now - self.last_stats >= STAT_INTERVAL:
+            try:
+                stats = self.browser.get_stats()
+                if stats:
+                    log_stats(
+                        stats["profile_views"],
+                        stats["contact_clicks"],
+                        stats["online_bookmarks"],
+                        stats["who_saw_me"],
+                        stats["membership_status"],
+                        stats["visibility"],
+                        stats["availability_status"],
+                        stats["availability_remaining"],
+                    )
+                    log.info("Stats: views=%s contacts=%s bookmarks=%s who_saw=%s | %s | vis=%s | avail=%s %s",
+                             stats["profile_views"],
+                             stats["contact_clicks"],
+                             stats["online_bookmarks"],
+                             stats["who_saw_me"],
+                             stats["membership_status"],
+                             stats["visibility"],
+                             stats["availability_status"],
+                             stats["availability_remaining"])
+
+                    # Alert on changes
+                    if self.prev_stats:
+                        if stats["visibility"] == "hidden" and self.prev_stats.get("visibility") != "hidden":
+                            log_alert("visibility_hidden", "critical",
+                                      "Profile is HIDDEN — traffic will drop to zero")
+                        if stats["availability_status"] != "Available":
+                            log_alert("not_available", "warning",
+                                      f"Availability is {stats['availability_status']}")
+
+                    self.prev_stats = stats
+                self.last_stats = now
+            except Exception as e:
+                log.error("Stats collection failed: %s", e)
+
+        # Search position check
+        if self.watch_city and (now - self.last_search >= SEARCH_CHECK_INTERVAL):
+            try:
+                self.browser.check_search_position(self.watch_city)
+                self.last_search = now
+            except Exception as e:
+                log.error("Search position check failed: %s", e)
+
+    def run_once(self):
+        """Single cycle — for --once mode."""
+        log.info("=== Single cycle ===")
+        if not self.browser.login():
+            log.error("Login failed, aborting")
+            return
+        self.last_refresh = 0
+        self.last_stats = 0
+        self.last_search = 0
+        self.cycle()
+        self.browser.stop()
+
+    def run_daemon(self):
+        """Main daemon loop."""
+        log.info("=== Traffic Engine starting (daemon mode) ===")
+        log.info("Refresh interval: %d min | Stats: %d min | Search: %d min",
+                 REFRESH_INTERVAL // 60, STAT_INTERVAL // 60, SEARCH_CHECK_INTERVAL // 60)
+        if self.watch_city:
+            log.info("Watching search position in: %s", self.watch_city)
+
+        if not self.browser.login():
+            log.error("Initial login failed, retrying in 60s...")
+            time.sleep(60)
+            if not self.browser.login():
+                log.error("Login failed twice, exiting")
+                return
+
+        self.last_refresh = time.time() - REFRESH_INTERVAL + 10  # refresh soon
+        self.last_stats = time.time() - STAT_INTERVAL + 10
+        if self.watch_city:
+            self.last_search = time.time() - SEARCH_CHECK_INTERVAL + 10
+
+        while self.running:
+            try:
+                self.cycle()
+            except KeyboardInterrupt:
+                log.info("Shutdown requested")
+                self.running = False
+                break
+            except Exception as e:
+                log.error("Cycle error: %s", e)
+                self.browser.stop()

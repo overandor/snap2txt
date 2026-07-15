@@ -1,0 +1,800 @@
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.9,
+                    "max_tokens": max_tokens,
+                },
+                timeout=90,
+            )
+            if resp.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+    return None
+
+
+def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> Optional[dict]:
+    raw = _groq_chat(system_prompt, user_prompt, max_tokens=max_tokens)
+    if not raw:
+        return None
+    try:
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _load_rl_state() -> dict:
+    if os.path.exists(RL_STATE_PATH):
+        try:
+            with open(RL_STATE_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "bios": {},
+        "current_bio_id": None,
+        "current_bio_start": None,
+        "total_rotations": 0,
+        "best_bio_id": None,
+        "best_reward": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _save_rl_state(state: dict):
+    os.makedirs(CONTENT_DIR, exist_ok=True)
+    with open(RL_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _load_history() -> list:
+    if os.path.exists(RL_HISTORY_PATH):
+        try:
+            with open(RL_HISTORY_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def _save_history(history: list):
+    os.makedirs(CONTENT_DIR, exist_ok=True)
+    with open(RL_HISTORY_PATH, "w") as f:
+        json.dump(history[-500:], f, indent=2)
+
+
+def scrape_profile_stats() -> dict:
+    """Scrape profile view/click stats from RentMasseur dashboard."""
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+        driver = webdriver.Chrome(options=options)
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+
+        try:
+            from rentmasseur_core import login
+            if not login(driver):
+                logger.error("Login failed for stats scraping")
+                return {}
+
+            driver.get(DASHBOARD_URL)
+            time.sleep(5)
+
+            stats = {
+                "scraped_at": datetime.now(timezone.utc).isoformat(),
+                "views": 0,
+                "email_clicks": 0,
+                "phone_clicks": 0,
+                "booking_inquiries": 0,
+                "favorites": 0,
+                "messages": 0,
+            }
+
+            page_text = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+            page_html = driver.execute_script("return document.documentElement ? document.documentElement.outerHTML : '';") or ""
+
+            import re
+            patterns = {
+                "views": [r"(\d+)\s*(?:profile\s*)?views?", r"views?:\s*(\d+)", r"(\d+)\s*views"],
+                "email_clicks": [r"(\d+)\s*email\s*(?:clicks?|opens?)", r"email:\s*(\d+)", r"(\d+)\s*email"],
+                "phone_clicks": [r"(\d+)\s*phone\s*(?:clicks?|calls?)", r"phone:\s*(\d+)", r"(\d+)\s*phone"],
+                "booking_inquiries": [r"(\d+)\s*(?:booking|inquir|appoint)", r"bookings?:\s*(\d+)"],
+                "favorites": [r"(\d+)\s*(?:favorit|likes?|saves?)", r"favorites?:\s*(\d+)"],
+                "messages": [r"(\d+)\s*messages?", r"messages?:\s*(\d+)"],
+            }
+
+            for key, patterns_list in patterns.items():
+                for pattern in patterns_list:
+                    match = re.search(pattern, page_text, re.IGNORECASE)
+                    if match:
+                        stats[key] = int(match.group(1))
+                        break
+
+            logger.info("Scraped stats: %s", json.dumps(stats))
+            return stats
+
+        finally:
+            driver.quit()
+    except Exception as e:
+        logger.error("Stats scraping error: %s", e)
+        return {}
+
+
+def calculate_reward(stats: dict, bio_age_days: float) -> float:
+    """Calculate reward score from stats."""
+    reward = 0
+    for key, weight in REWARD_WEIGHTS.items():
+        reward += stats.get(key, 0) * weight
+    reward -= bio_age_days * 0.5  # stale bio penalty
+    return round(reward, 2)
+
+
+def update_rl_state(stats: dict) -> dict:
+    """Update RL state with new stats and calculate reward for current bio."""
+    state = _load_rl_state()
+    current_bio_id = state.get("current_bio_id")
+
+    if not current_bio_id:
+        logger.warning("No current bio ID in RL state — nothing to reward")
+        return state
+
+    bio_entry = state["bios"].get(current_bio_id, {})
+    previous_stats = bio_entry.get("last_stats", {})
+    bio_start = state.get("current_bio_start")
+
+    if bio_start:
+        bio_age = (datetime.now(timezone.utc) - datetime.fromisoformat(bio_start)).total_seconds() / 86400
+    else:
+        bio_age = 0
+
+    # Delta stats (new since last check)
+    delta = {key: max(0, stats.get(key, 0) - previous_stats.get(key, 0)) for key in REWARD_WEIGHTS}
+    delta_reward = calculate_reward(delta, bio_age)
+
+    # Update bio entry
+    bio_entry["last_stats"] = stats
+    bio_entry["total_reward"] = bio_entry.get("total_reward", 0) + delta_reward
+    bio_entry["delta_reward"] = delta_reward
+    bio_entry["delta_stats"] = delta
+    bio_entry["last_updated"] = datetime.now(timezone.utc).isoformat()
+    bio_entry["age_days"] = round(bio_age, 2)
+    state["bios"][current_bio_id] = bio_entry
+
+    # Track best bio
+    if bio_entry["total_reward"] > state.get("best_reward", 0):
+        state["best_bio_id"] = current_bio_id
+        state["best_reward"] = bio_entry["total_reward"]
+
+    # Log to history
+    history = _load_history()
+    history.append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "bio_id": current_bio_id,
+        "delta_stats": delta,
+        "delta_reward": delta_reward,
+        "total_reward": bio_entry["total_reward"],
+        "bio_age_days": round(bio_age, 2),
+    })
+    _save_history(history)
+
+    logger.info("Bio %s: delta_reward=%.2f, total_reward=%.2f (age: %.1f days)",
+                current_bio_id, delta_reward, bio_entry["total_reward"], bio_age)
+
+    # Decision: should we rotate?
+    should_rotate = False
+    reason = ""
+
+    if bio_age >= 3.0:
+        should_rotate = True
+        reason = "bio_age >= 3 days"
+    elif bio_age >= 1.0 and delta_reward < 5:
+        should_rotate = True
+        reason = "low reward (delta < 5 in 1+ day)"
+    elif bio_age >= 0.5 and delta_reward == 0 and sum(delta.values()) == 0:
+        should_rotate = True
+        reason = "zero engagement in 12+ hours"
+
+    state["should_rotate"] = should_rotate
+    state["rotate_reason"] = reason
+
+    if should_rotate:
+        logger.info("Rotation triggered: %s", reason)
+
+    _save_rl_state(state)
+    return state
+
+
+def register_new_bio(bio_id: str, bio_text: str, strategy: str, source: str = "generated"):
+    """Register a new bio in the RL state."""
+    state = _load_rl_state()
+
+    # Finalize previous bio
+    prev_id = state.get("current_bio_id")
+    if prev_id and prev_id in state.get("bios", {}):
+        state["bios"][prev_id]["end_time"] = datetime.now(timezone.utc).isoformat()
+
+    state["current_bio_id"] = bio_id
+    state["current_bio_start"] = datetime.now(timezone.utc).isoformat()
+    state["total_rotations"] = state.get("total_rotations", 0) + 1
+
+    state["bios"][bio_id] = {
+        "bio_text": bio_text[:500],
+        "strategy": strategy,
+        "source": source,
+        "start_time": datetime.now(timezone.utc).isoformat(),
+        "total_reward": 0,
+        "delta_reward": 0,
+        "last_stats": {},
+        "age_days": 0,
+    }
+
+    _save_rl_state(state)
+    logger.info("Registered new bio: %s (strategy: %s, rotation #%d)",
+                bio_id, strategy, state["total_rotations"])
+
+
+def get_top_performing_bios(n: int = 5) -> list:
+    """Get top N performing bios by reward."""
+    state = _load_rl_state()
+    bios = state.get("bios", {})
+    sorted_bios = sorted(bios.items(), key=lambda x: x[1].get("total_reward", 0), reverse=True)
+    return sorted_bios[:n]
+
+
+def get_retired_bios() -> list:
+    """Get bios that should be retired (low reward)."""
+    state = _load_rl_state()
+    bios = state.get("bios", {})
+    retired = []
+    for bio_id, data in bios.items():
+        if data.get("total_reward", 0) < 0 and bio_id != state.get("current_bio_id"):
+            retired.append(bio_id)
+    return retired
+
+
+def generate_mutated_bio(top_bio_text: str, strategy: str) -> Optional[str]:
+    """Generate a mutated version of a top-performing bio using LLM."""
+    system_prompt = (
+        "You are a hilarious, magnetic copywriter for RentMasseur. "
+        "Take the given top-performing bio and create a FUNNIER, MORE COMPELLING version. "
+        "Rules:\n"
+        "1. Keep what works (CTA, urgency, keywords) but make it FUNNIER\n"
+        "2. Add humor — clients call masseurs who make them smile\n"
+        "3. Must still drive PHONE CALLS — end with 'Call me now'\n"
+        "4. Under 250 words\n"
+        "5. No explicit content\n"
+        "6. Be memorable — stand out from every boring masseur bio\n"
+        "Write ONLY the bio text."
+    )
+    user_prompt = (
+        f"Top-performing bio (reward: high):\n{top_bio_text}\n\n"
+        f"Strategy: {strategy}\n"
+        f"Make it HILARIOUS and even more phone-call-driving. Mutate it."
+    )
+    return _groq_chat(system_prompt, user_prompt, max_tokens=600)
+
+
+def generate_hilarious_bio(strategy: str, strategy_desc: str, context: str = "") -> Optional[str]:
+    """Generate a hilarious, phone-call-driving bio."""
+    system_prompt = (
+        "You are the funniest, most magnetic copywriter on RentMasseur. "
+        "Write bios that make clients LAUGH and then CALL. "
+        "Rules:\n"
+        "1. Be genuinely funny — not cringe, not try-hard, naturally hilarious\n"
+        "2. Humor styles: self-deprecating, witty observations, playful exaggeration\n"
+        "3. MUST end with a phone-call CTA: 'Call me now' or 'Pick up the phone'\n"
+        "4. Include urgency: 'available now', 'today', 'don't wait'\n"
+        "5. SEO keywords: massage, Manhattan, deep tissue, therapeutic\n"
+        "6. Under 250 words\n"
+        "7. No explicit content\n"
+        "8. Make them remember you and CALL\n"
+        "Write ONLY the bio text."
+    )
+    user_prompt = (
+        f"Strategy: {strategy}\n"
+        f"Angle: {strategy_desc}\n"
+        f"Context: {context}\n"
+        f"Write the funniest, most phone-call-driving bio ever for a male masseur in Manhattan."
+    )
+    return _groq_chat(system_prompt, user_prompt, max_tokens=600)
+
+
+def report() -> str:
+    """Generate a human-readable RL report."""
+    state = _load_rl_state()
+    history = _load_history()
+
+    lines = ["=" * 60, "RL FEEDBACK REPORT", "=" * 60]
+    lines.append(f"Total rotations: {state.get('total_rotations', 0)}")
+    lines.append(f"Current bio: {state.get('current_bio_id', 'none')}")
+    lines.append(f"Best bio: {state.get('best_bio_id', 'none')} (reward: {state.get('best_reward', 0)})")
+    lines.append("")
+
+    lines.append("TOP 5 PERFORMING BIOS:")
+    for bio_id, data in get_top_performing_bios(5):
+        lines.append(f"  {bio_id}: reward={data.get('total_reward', 0)}, "
+                      f"strategy={data.get('strategy', '?')}, "
+                      f"age={data.get('age_days', 0)}d")
+
+    lines.append("")
+    lines.append(f"History entries: {len(history)}")
+    if history:
+        recent = history[-5:]
+        lines.append("RECENT REWARDS:")
+        for h in recent:
+            lines.append(f"  {h['timestamp']}: bio={h['bio_id']}, "
+                          f"delta={h['delta_reward']}, total={h['total_reward']}")
+
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="RL feedback loop for RentMasseur")
+    parser.add_argument("--report", action="store_true", help="Show RL report")
+    parser.add_argument("--reset", action="store_true", help="Reset RL state")
+    parser.add_argument("--collect", action="store_true", help="Collect stats and update rewards")
+    args = parser.parse_args()
+
+    if args.reset:
+        _save_rl_state({"bios": {}, "current_bio_id": None, "total_rotations": 0, "created_at": datetime.now(timezone.utc).isoformat()})
+        logger.info("RL state reset")
+        return
+
+    if args.report:
+        print(report())
+        return
+
+    # Default: collect stats
+    logger.info("Collecting profile stats...")
+    stats = scrape_profile_stats()
+    if not stats:
+        logger.error("Failed to collect stats")
+        sys.exit(1)
+
+    state = update_rl_state(stats)
+    print(json.dumps({
+        "stats": stats,
+        "should_rotate": state.get("should_rotate", False),
+        "rotate_reason": state.get("rotate_reason", ""),
+        "current_bio": state.get("current_bio_id"),
+        "total_reward": state["bios"].get(state.get("current_bio_id", ""), {}).get("total_reward", 0),
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+.dockerignore:
+```
+.env
+*.env
+session.json
+*cookies*
+__MACOSX/
+.DS_Store
+__pycache__/
+*.pyc
+.git/
+*bios_1m*.jsonl
+*bios_v2_1m*.jsonl
+*bios_300k*.jsonl
+*bios_30k*.jsonl
+*bios_3k*.jsonl
+private_secrets_quarantine/
+api_map.json
+*.secret.json
+
+```
+
+icon48.png:
+```
+Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
+```
+
+checker.py:
+```
+#!/usr/bin/env python3
+"""RentMasseur availability checker.
+
+This script fetches provider profile pages and records whether each provider
+appears to be available. It is designed to run in CI/CD on a schedule.
+
+Usage:
+    python3 checker.py                    # live scrape
+    python3 checker.py --mock           # demo with synthetic data
+    python3 checker.py --output data/availability.json
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from urllib.parse import urljoin
+
+import requests
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+    PlaywrightTimeoutError = TimeoutError
+
+DEFAULT_PROVIDERS = "providers.json"
+DEFAULT_OUTPUT = "availability.json"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+
+
+def load_providers(path):
+    with open(path, "r") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "providers" in data:
+        return data["providers"]
+    return data
+
+
+def fetch_profile(url, timeout=20):
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://rentmasseur.com/",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    time.sleep(random.uniform(1.5, 3.5))
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp.text
+
+
+def extract_availability(html):
+    text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.S | re.I)
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    body_lower = text.lower()
+    is_available = bool(
+        re.search(r"available now|available today|open now", body_lower)
+    )
+
+    rate_match = re.search(r"\$\d+(?:/hr| per hour|\.\d{2})", text)
+    rate = rate_match.group(0) if rate_match else ""
+
+    location_match = re.search(
+        r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)?,\s*(?:NY|NJ|CA|TX|FL|IL|PA|OH|GA|NC|MI))",
+        text,
+    )
+    location = location_match.group(1) if location_match else ""
+
+    name = ""
+    title_match = re.search(r"<title>([^<]+)</title>", html, flags=re.I)
+    if title_match:
+        title = title_match.group(1).strip()
+        name_match = re.match(r"^(.+?)\s*[-|]", title)
+        name = name_match.group(1).strip() if name_match else title
+
+    status = "available" if is_available else "unknown"
+    return {
+        "name": name,
+        "status": status,
+        "rate": rate,
+        "location": location,
+        "sample_text": text[:200],
+    }
+
+
+def check_provider(provider, mock=False):
+    url = provider.get("url")
+    slug = provider.get("slug") or url.rstrip("/").split("/")[-1]
+    if not url:
+        raise ValueError(f"Provider missing URL: {provider}")
+
+    if mock:
+        return {
+            "slug": slug,
+            "url": url,
+            "name": provider.get("name", "Mock Provider"),
+            "status": provider.get("mock_status", "available"),
+            "rate": provider.get("rate", "$150/hr"),
+            "location": provider.get("location", "New York, NY"),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "mock",
+        }
+
+    html = fetch_profile(url)
+    result = extract_availability(html)
+    result["slug"] = slug
+    result["url"] = url
+    result["checked_at"] = datetime.now(timezone.utc).isoformat()
+    result["mode"] = "live"
+    return result
+
+
+def run_check(providers_path, output_path, mock=False):
+    providers = load_providers(providers_path)
+    results = []
+    errors = []
+    for provider in providers:
+        try:
+            result = check_provider(provider, mock=mock)
+            results.append(result)
+        except Exception as e:
+            errors.append({"provider": provider, "error": str(e)})
+
+    record = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "mock" if mock else "live",
+        "count": len(results),
+        "providers": results,
+        "errors": errors,
+    }
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(record, f, indent=2)
+
+    return record
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Check RentMasseur availability")
+    parser.add_argument("--providers", default=DEFAULT_PROVIDERS)
+    parser.add_argument("--output", default=DEFAULT_OUTPUT)
+    parser.add_argument("--mock", action="store_true", help="Use synthetic data")
+    args = parser.parse_args()
+
+    record = run_check(args.providers, args.output, mock=args.mock)
+    print(json.dumps(record, indent=2))
+    if record["errors"]:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+server.py:
+```
+#!/usr/bin/env python3
+"""
+RentMasseur Revenue Operating System.
+
+Mission: Produce one paying client per day, or prove exactly why it failed today.
+
+Core object: Prospect.
+Prospect state machine:
+  discovered → qualified → contacted → viewed → clicked → messaged →
+  conversation → appointment → paid → repeat
+
+No AGI labels. No fake numbers. No mock success. Every action returns evidence or blocks.
+
+Status labels:
+  GREEN_REAL      — proven by completed job receipt
+  YELLOW_RUNNING  — command queued or running
+  RED_FAILED      — command failed with exit code and logs
+  GRAY_NO_DATA    — endpoint works but no real input exists
+  BLACK_DISABLED  — unsafe or platform-blocked action
+
+All mutation endpoints require X-Admin-Token header.
+"""
+
+import hashlib
+import json
+import os
+import sqlite3
+import subprocess
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Header, Depends
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+from rm_revenue_engine.revenue_ops import (
+    init_db as _rev_init, ingest_metrics as _rev_ingest,
+    generate_daily_evidence_packet as _rev_packet,
+    start_experiment as _rev_start_exp,
+    close_experiment as _rev_close_exp,
+    get_latest_decision as _rev_latest_decision,
+    get_metrics_history as _rev_metrics_history,
+    get_experiments as _rev_experiments,
+    write_receipt as _rev_receipt,
+    verify_receipt_chain as _rev_verify_chain,
+    DECISION_STATES,
+)
+
+_rev_init()
+
+# ─── Paths ───
+
+APP_DIR = Path(__file__).resolve().parent
+CONTENT_DIR = APP_DIR / "content"
+RECEIPTS_DIR = CONTENT_DIR / "receipts"
+BIOS_DIR = CONTENT_DIR / "bios"
+JOBS_DB = APP_DIR / "jobs.sqlite"
+
+PROSPECTS_FILE = CONTENT_DIR / "prospects.jsonl"
+METRICS_FILE = CONTENT_DIR / "metrics.jsonl"
+CANDIDATES_FILE = CONTENT_DIR / "candidates.jsonl"
+EXPERIMENTS_FILE = CONTENT_DIR / "experiments.jsonl"
+JOBS_FILE = CONTENT_DIR / "jobs.jsonl"
+DAILY_PROOF_FILE = CONTENT_DIR / "daily_proof.json"
+
+CONTENT_LEDGER_FILE = CONTENT_DIR / "content_ledger.jsonl"
+EVENT_LEDGER_FILE = CONTENT_DIR / "event_ledger.jsonl"
+DECISION_LEDGER_FILE = CONTENT_DIR / "decision_ledger.jsonl"
+
+for d in [CONTENT_DIR, RECEIPTS_DIR, BIOS_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+CONTENT_TYPES = ["bio", "photo", "price", "interview", "blog"]
+
+PHOTO_LABELS = ["friendly", "athletic", "therapeutic", "luxury", "casual", "professional"]
+
+EVENT_TYPES = [
+    "profile_view", "contact_click", "email_click", "phone_click",
+    "message_received", "booking_request", "confirmed_booking", "paid_client",
+]
+
+RL_REWARD = {
+    "profile_view": 1,
+    "contact_click": 5,
+    "email_click": 8,
+    "phone_click": 10,
+    "message_received": 15,
+    "booking_request": 25,
+    "confirmed_booking": 60,
+    "paid_client": 100,
+}
+
+MIN_EXPOSURE_HOURS = 6
+MIN_VIEWS_FOR_DECISION = 25
+
+TEST_SEQUENCE = ["bio", "photo", "price", "interview", "blog"]
+TEST_PHASE_DAYS = {"bio": 2, "photo": 2, "price": 1, "interview": 1, "blog": 1}
+WEEKLY_DECISION_DAY = 7
+
+CONTROL_MODES = {
+    0: "read_only",
+    1: "draft_only",
+    2: "approval_required",
+    3: "autonomous_monitoring",
+    4: "fully_automatic",
+}
+CURRENT_CONTROL_MODE = 0
+
+MODE4_REQUIREMENTS = {
+    "min_experiments": 20,
+    "stable_model_improvement": True,
+    "rollback_tested": True,
+    "risk_filter_tested": True,
+    "no_credential_leakage": True,
+}
+
+EXPERIMENTS_DIR = CONTENT_DIR / "experiment_receipts"
+for d in [CONTENT_DIR, RECEIPTS_DIR, BIOS_DIR, EXPERIMENTS_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "overandor/membra-companyos")
+HF_SPACE = os.getenv("SPACE_NAME", "rentmasseur-optimizer")
+
+app = FastAPI(title="RentMasseur Revenue Operating System")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ─── Ledgers ───
+
+PROSPECT_STAGES = [
+    "discovered", "qualified", "contacted", "viewed", "clicked",
+    "messaged", "conversation", "appointment", "paid", "repeat",
+]
+
+
+def append_jsonl(path: Path, record: dict):
+    with path.open("a") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+
+def read_jsonl(path: Path) -> list:
+    if not path.exists():
+        return []
+    results = []
+    for line in path.open():
+        if line.strip():
+            try:
+                results.append(json.loads(line))
+            except Exception:
+                pass
+    return results
+
+
+def write_receipt(action: str, description: str, data: dict) -> str:
+    ts = datetime.now(timezone.utc).isoformat()
+    receipt_id = hashlib.sha256(f"{action}{ts}{json.dumps(data, sort_keys=True)}".encode()).hexdigest()[:16]
+    path = RECEIPTS_DIR / f"receipt_{receipt_id}.json"
+    receipt = {
+        "receipt_id": receipt_id,
+        "timestamp": ts,
+        "action": action,
+        "description": description,
+        "data": data,
+        "hf_space": HF_SPACE,
+    }
+    path.write_text(json.dumps(receipt, indent=2))
+    return str(path)
+
+
+# ─── Job Runner (SQLite) ───
+
+def init_db():
+    conn = sqlite3.connect(str(JOBS_DB))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY,
+            command TEXT NOT NULL,
+            input_hash TEXT,
+            start_time TEXT NOT NULL,
+            end_time TEXT,
+            exit_code INTEGER,
+            stdout_tail TEXT,
+            stderr_tail TEXT,
+            output_files TEXT,
+            git_sha TEXT,
+            hf_space TEXT,
+            workflow_run_id TEXT,
+            status TEXT NOT NULL DEFAULT 'running',
+            receipt_path TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+
+def db_conn():
+    return sqlite3.connect(str(JOBS_DB))
+

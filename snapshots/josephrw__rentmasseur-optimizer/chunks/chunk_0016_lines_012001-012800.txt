@@ -1,0 +1,800 @@
+            "cycles": _rm_state.get("cycles", 0),
+            "refreshes": _rm_state.get("refreshes", 0),
+            "jitter_bursts": _rm_state.get("jitter_bursts", 0),
+        },
+    }
+
+
+@app.post("/api/components/toggle")
+async def rm_components_toggle(body: dict = Body(...)):
+    """Enable/disable a component by name."""
+    name = body.get("component", "")
+    enabled = body.get("enabled", True)
+    if name in _components_state:
+        _components_state[name]["enabled"] = enabled
+        return {"component": name, "enabled": enabled}
+    return {"error": f"Unknown component: {name}"}
+
+
+@app.get("/api/metrics/history")
+async def rm_metrics_history(hours: int = 24):
+    """Get metrics history (profile views, clicks, visits)."""
+    try:
+        conn = _rm_db()
+        cutoff = time.time() - hours * 3600
+        rows = conn.execute("SELECT * FROM rm_metrics WHERE ts > ? ORDER BY ts DESC LIMIT 200", (cutoff,)).fetchall()
+        conn.close()
+        return {
+            "metrics": [{"ts": r["ts"], "profile_views": r["profile_views"], "contact_clicks": r["contact_clicks"],
+                         "new_visits": r["new_visits"], "new_emails": r["new_emails"],
+                         "is_hidden": r["is_hidden"], "available": r["available"]} for r in rows],
+            "count": len(rows),
+        }
+    except Exception as e:
+        return {"error": str(e), "metrics": [], "count": 0}
+
+
+@app.get("/api/engagement/history")
+async def rm_engagement_history(hours: int = 24):
+    """Get engagement history (visitor and message counts)."""
+    try:
+        conn = _rm_db()
+        cutoff = time.time() - hours * 3600
+        rows = conn.execute("SELECT * FROM rm_engagement WHERE ts > ? ORDER BY ts DESC LIMIT 100", (cutoff,)).fetchall()
+        conn.close()
+        return {
+            "engagement": [{"ts": r["ts"], "new_visits": r["new_visits"], "new_emails": r["new_emails"]} for r in rows],
+            "count": len(rows),
+        }
+    except Exception as e:
+        return {"error": str(e), "engagement": [], "count": 0}
+
+
+# ─── Per-Minute Visitor Snapshot System ─────────────────────────────────
+# Takes a snapshot every 60s of: profile_views, contact_clicks, new_visits,
+# new_emails, availability state. Then before/after each burst or algo action,
+# captures a snapshot to measure real traffic impact.
+
+_snapshot_state = {
+    "last_snapshot": 0,
+    "total_snapshots": 0,
+    "last_views": 0,
+    "last_visits": 0,
+    "last_clicks": 0,
+    "baseline_views": 0,
+    "baseline_visits": 0,
+}
+
+
+def _rm_init_snapshot_db():
+    conn = _rm_db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS rm_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        profile_views INTEGER,
+        contact_clicks INTEGER,
+        new_visits INTEGER,
+        new_emails INTEGER,
+        available INTEGER,
+        availability_option INTEGER,
+        is_hidden INTEGER,
+        source TEXT
+    );
+    CREATE TABLE IF NOT EXISTS rm_action_impact (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        action_type TEXT,
+        action_detail TEXT,
+        before_views INTEGER,
+        after_views INTEGER,
+        before_visits INTEGER,
+        after_visits INTEGER,
+        before_clicks INTEGER,
+        after_clicks INTEGER,
+        views_delta INTEGER,
+        visits_delta INTEGER,
+        clicks_delta INTEGER,
+        verified INTEGER,
+        error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_snap_ts ON rm_snapshots(ts);
+    CREATE INDEX IF NOT EXISTS idx_impact_ts ON rm_action_impact(ts);
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _rm_take_snapshot(source="minute"):
+    """Take a single snapshot of current traffic + availability state."""
+    ts = time.time()
+    try:
+        api = _rm_get_api()
+        if not api:
+            return None
+        stats = api.get_ad_statistics()
+        keep = api.get_keeponline()
+        avail = api.get_availability()
+
+        ps = stats.get("profileStatistics", {})
+        views = ps.get("totalPageViews", 0)
+        clicks = ps.get("totalContactClicks", 0)
+        visits = keep.get("newVisits", 0)
+        emails = keep.get("newEmails", 0)
+        selected = avail.get("selected", "")
+        opt = 1 if selected == "Available" else (2 if selected == "Not Available" else 0)
+        is_hidden = bool(keep.get("isAdHidden", 0))
+
+        _snapshot_state["last_snapshot"] = ts
+        _snapshot_state["total_snapshots"] += 1
+        _snapshot_state["last_views"] = views
+        _snapshot_state["last_visits"] = visits
+        _snapshot_state["last_clicks"] = clicks
+        if _snapshot_state["baseline_views"] == 0:
+            _snapshot_state["baseline_views"] = views
+            _snapshot_state["baseline_visits"] = visits
+
+        conn = _rm_db()
+        conn.execute("INSERT INTO rm_snapshots (ts, profile_views, contact_clicks, new_visits, new_emails, available, availability_option, is_hidden, source) VALUES (?,?,?,?,?,?,?,?,?)",
+                     (ts, views, clicks, visits, emails, int(opt == 1), opt, int(is_hidden), source))
+        conn.commit()
+        conn.close()
+        return {"views": views, "clicks": clicks, "visits": visits, "emails": emails, "available": opt == 1}
+    except Exception as e:
+        return None
+
+
+def _rm_measure_impact(action_type, action_detail, before_snap, after_snap):
+    """Record the before/after impact of a burst or algo action."""
+    ts = time.time()
+    try:
+        b_v = before_snap.get("views", 0) if before_snap else 0
+        a_v = after_snap.get("views", 0) if after_snap else 0
+        b_vis = before_snap.get("visits", 0) if before_snap else 0
+        a_vis = after_snap.get("visits", 0) if after_snap else 0
+        b_c = before_snap.get("clicks", 0) if before_snap else 0
+        a_c = after_snap.get("clicks", 0) if after_snap else 0
+
+        conn = _rm_db()
+        conn.execute("""INSERT INTO rm_action_impact
+            (ts, action_type, action_detail, before_views, after_views, before_visits, after_visits,
+             before_clicks, after_clicks, views_delta, visits_delta, clicks_delta, verified, error)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ts, action_type, action_detail, b_v, a_v, b_vis, a_vis, b_c, a_c,
+             a_v - b_v, a_vis - b_vis, a_c - b_c,
+             int(after_snap is not None and a_v >= b_v), None))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _rm_snapshot_thread():
+    """Background thread: take a visitor snapshot every 60 seconds."""
+    _rm_init_snapshot_db()
+    while True:
+        try:
+            _rm_take_snapshot(source="minute")
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+# Start snapshot thread if credentials present
+if RM_USER or RM_TOKEN:
+    _rm_init_snapshot_db()
+    _snap_thread = threading.Thread(target=_rm_snapshot_thread, daemon=True, name="rm-snapshots")
+    _snap_thread.start()
+
+
+@app.get("/api/snapshots")
+async def rm_snapshots(hours: float = 1.0):
+    """Get per-minute visitor snapshots. Default: last 1 hour."""
+    try:
+        conn = _rm_db()
+        cutoff = time.time() - hours * 3600
+        rows = conn.execute(
+            "SELECT * FROM rm_snapshots WHERE ts > ? ORDER BY ts ASC LIMIT 2000",
+            (cutoff,)
+        ).fetchall()
+        conn.close()
+        return {
+            "count": len(rows),
+            "baseline": {
+                "views": _snapshot_state["baseline_views"],
+                "visits": _snapshot_state["baseline_visits"],
+            },
+            "latest": {
+                "views": _snapshot_state["last_views"],
+                "visits": _snapshot_state["last_visits"],
+                "clicks": _snapshot_state["last_clicks"],
+            },
+            "snapshots": [{"ts": r["ts"], "views": r["profile_views"], "clicks": r["contact_clicks"],
+                           "visits": r["new_visits"], "emails": r["new_emails"],
+                           "available": r["available"], "option": r["availability_option"],
+                           "hidden": r["is_hidden"], "source": r["source"]} for r in rows],
+        }
+    except Exception as e:
+        return {"error": str(e), "count": 0, "snapshots": []}
+
+
+@app.get("/api/impact")
+async def rm_action_impact(hours: float = 6.0):
+    """Get before/after impact measurements for all burst and algo actions."""
+    try:
+        conn = _rm_db()
+        cutoff = time.time() - hours * 3600
+        rows = conn.execute(
+            "SELECT * FROM rm_action_impact WHERE ts > ? ORDER BY ts DESC LIMIT 200",
+            (cutoff,)
+        ).fetchall()
+        conn.close()
+        total = len(rows)
+        verified = sum(1 for r in rows if r["verified"])
+        positive_views = sum(1 for r in rows if r["views_delta"] > 0)
+        positive_visits = sum(1 for r in rows if r["visits_delta"] > 0)
+        return {
+            "total_actions": total,
+            "verified": verified,
+            "positive_view_impact": positive_views,
+            "positive_visit_impact": positive_visits,
+            "effectiveness_rate": round(positive_views / total, 3) if total > 0 else 0,
+            "actions": [{"ts": r["ts"], "action": r["action_type"], "detail": r["action_detail"],
+                         "before_views": r["before_views"], "after_views": r["after_views"],
+                         "views_delta": r["views_delta"], "visits_delta": r["visits_delta"],
+                         "clicks_delta": r["clicks_delta"], "verified": r["verified"],
+                         "error": r["error"]} for r in rows],
+        }
+    except Exception as e:
+        return {"error": str(e), "total_actions": 0, "actions": []}
+
+
+@app.get("/api/bio/rotations")
+async def rm_bio_rotations(hours: int = 24):
+    """Get bio rotation history with success/failure and which bio was posted."""
+    try:
+        conn = _rm_db()
+        cutoff = time.time() - hours * 3600
+        rows = conn.execute("SELECT * FROM rm_bio_rotations WHERE ts > ? ORDER BY ts DESC LIMIT 50", (cutoff,)).fetchall()
+        conn.close()
+        return {
+            "count": len(rows),
+            "current_best": _components_state["bio_rotation"].get("best_bio", ""),
+            "best_views": _components_state["bio_rotation"].get("best_views", 0),
+            "rotations": [{"ts": r["ts"], "bio": r["bio_file"], "headline": r["headline"], "success": r["success"], "error": r["error"]} for r in rows],
+        }
+    except Exception as e:
+        return {"error": str(e), "count": 0, "rotations": []}
+
+
+@app.get("/api/blog/rotations")
+async def rm_blog_rotations(hours: int = 24):
+    """Get blog rotation history."""
+    try:
+        conn = _rm_db()
+        cutoff = time.time() - hours * 3600
+        rows = conn.execute("SELECT * FROM rm_blog_rotations WHERE ts > ? ORDER BY ts DESC LIMIT 50", (cutoff,)).fetchall()
+        conn.close()
+        return {
+            "count": len(rows),
+            "current_best": _components_state["blog_rotation"].get("best_blog", ""),
+            "best_views": _components_state["blog_rotation"].get("best_views", 0),
+            "rotations": [{"ts": r["ts"], "blog": r["blog_file"], "title": r["title"], "success": r["success"], "error": r["error"]} for r in rows],
+        }
+    except Exception as e:
+        return {"error": str(e), "count": 0, "rotations": []}
+
+
+@app.get("/api/visitors/revisits")
+async def rm_visitor_revisits(hours: int = 24):
+    """Get visitor revisit history."""
+    try:
+        conn = _rm_db()
+        cutoff = time.time() - hours * 3600
+        rows = conn.execute("SELECT * FROM rm_visitor_revisits WHERE ts > ? ORDER BY ts DESC LIMIT 50", (cutoff,)).fetchall()
+        conn.close()
+        return {
+            "count": len(rows),
+            "last_revisited": _components_state["visitor_revisit"].get("last_visitors_revisited", 0),
+            "last_nyc_count": _components_state["visitor_revisit"].get("nyc_count", 0),
+            "revisits": [{"ts": r["ts"], "revisited": r["total_revisited"], "nyc": r["nyc_count"]} for r in rows],
+        }
+    except Exception as e:
+        return {"error": str(e), "count": 0, "revisits": []}
+
+
+@app.get("/api/winners")
+async def rm_winners():
+    """Get current winner identification — which content drives the most traffic."""
+    return {
+        "winners": _components_state["winner_tracker"].get("winners", {}),
+        "bio_best": _components_state["bio_rotation"].get("best_bio", ""),
+        "bio_best_views": _components_state["bio_rotation"].get("best_views", 0),
+        "blog_best": _components_state["blog_rotation"].get("best_blog", ""),
+        "blog_best_views": _components_state["blog_rotation"].get("best_views", 0),
+    }
+
+
+# ─── Serve React frontend (built from jorki UI) ────────────────────────
+_frontend_dist = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+if os.path.isdir(_frontend_dist):
+    from fastapi.staticfiles import StaticFiles as _SM
+    app.mount("/assets", _SM(directory=os.path.join(_frontend_dist, "assets")), name="assets")
+    @app.get("/{full_path:path}")
+    async def _serve_spa(full_path: str):
+        index = os.path.join(_frontend_dist, "index.html")
+        if os.path.isfile(index):
+            return FileResponse(index)
+        return HTMLResponse("Frontend not built", status_code=404)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
+
+```
+
+profile_edit_page.png:
+```
+Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
+```
+
+content.js:
+```
+(function () {
+  'use strict';
+
+  const PANEL_ID = 'rm-booker-panel';
+  let panel = null;
+
+  const BOOKING_SERVER = 'http://localhost:3000';
+  const HF_SPACE_API = 'https://josephrw-rentmasseur-optimizer.hf.space/api/ingest';
+
+  function getSlugFromPath() {
+    const providerMatch = window.location.pathname.match(/\/provider\/([^/]+)/);
+    if (providerMatch) return providerMatch[1];
+    const rootMatch = window.location.pathname.match(/^\/([^/]+)$/);
+    return rootMatch ? rootMatch[1] : null;
+  }
+
+  function extractProfileData() {
+    const data = {
+      name: '',
+      location: '',
+      rate: '',
+      isAvailable: false,
+      url: window.location.href,
+      slug: getSlugFromPath(),
+    };
+
+    const h1 = document.querySelector('h1');
+    if (h1) data.name = h1.innerText.trim();
+
+    if (!data.name) {
+      const titleMatch = document.title.match(/^(.+?)\s*[-|]/);
+      if (titleMatch) data.name = titleMatch[1].trim();
+    }
+
+    const bodyText = document.body.innerText;
+    const rateMatch = bodyText.match(/\$\d+(?:\/hr| per hour|\.\d{2})/i);
+    if (rateMatch) data.rate = rateMatch[0];
+
+    data.isAvailable = /available now|available today|open now/i.test(bodyText);
+
+    const locMatch = bodyText.match(/([A-Z][a-z]+(?:\s[A-Z][a-z]+)?,\s*(?:NY|NJ|CA|TX|FL|IL|PA|OH|GA|NC|MI))/);
+    if (locMatch) data.location = locMatch[1];
+
+    return data;
+  }
+
+  function providerSlug(data) {
+    return data.slug || (data.name || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  }
+
+  async function fetchAvailability(slug) {
+    try {
+      const res = await fetch(`${BOOKING_SERVER}/api/availability/${slug}`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function createPanel(data, availability) {
+    if (panel) return;
+
+    panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.className = 'rm-booker-panel';
+
+    const remote = availability || {};
+    const status = remote.status || (data.isAvailable ? 'available' : 'unknown');
+    const statusClass = status === 'available' ? 'available' : 'unknown';
+    const statusText = status === 'available' ? 'Available' : 'Status unknown';
+    const checkedAt = remote.checked_at ? `Checked ${new Date(remote.checked_at).toLocaleString()}` : 'Live page only';
+    const sourceBadge = remote.mode ? `<br><span class="rm-badge">${remote.mode}</span>` : '';
+
+    const slug = providerSlug(data);
+    const bookUrl = `${BOOKING_SERVER}/widget.html?provider=${encodeURIComponent(slug)}&source=rentmasseur`;
+    const verifyUrl = `${BOOKING_SERVER}/verify.html?provider=${encodeURIComponent(slug)}&source=rentmasseur`;
+
+    panel.innerHTML = `
+      <button class="rm-close" id="rm-close-btn">&times;</button>
+      <h3>${escapeHtml(data.name || 'Masseur')}</h3>
+      <div class="rm-meta">
+        <span class="rm-status ${statusClass}"></span>${statusText}
+        ${sourceBadge}
+        <br>${escapeHtml(checkedAt)}
+        ${data.location ? '<br>' + escapeHtml(data.location) : ''}
+        ${data.rate ? '<br>' + escapeHtml(data.rate) : ''}
+      </div>
+      <a class="rm-btn" href="${bookUrl}" target="_blank">
+        Book Now
+      </a>
+      <a class="rm-btn rm-btn-verify" href="${verifyUrl}" target="_blank">
+        Verify Video Call
+      </a>
+      <button class="rm-btn rm-btn-secondary" id="rm-check-avail">
+        Check Availability
+      </button>
+    `;
+
+    document.body.appendChild(panel);
+
+    document.getElementById('rm-close-btn').addEventListener('click', () => {
+      panel.remove();
+      panel = null;
+    });
+
+    document.getElementById('rm-check-avail').addEventListener('click', async () => {
+      try {
+        const res = await fetch(`${BOOKING_SERVER}/api/availability/${slug}`);
+        if (!res.ok) throw new Error('Provider not found');
+        const result = await res.json();
+        alert(`${result.name}: ${result.status}\nLast checked: ${new Date(result.checked_at).toLocaleString()}`);
+      } catch (e) {
+        alert('Could not connect to booking server. Make sure it is running on localhost:3000');
+      }
+    });
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  async function sendMetricsToHF(data) {
+    try {
+      const payload = {
+        url: window.location.href,
+        slug: data.slug,
+        name: data.name,
+        location: data.location,
+        rate: data.rate,
+        is_available: data.isAvailable,
+        timestamp: new Date().toISOString(),
+        source: 'chrome_extension'
+      };
+      await fetch(HF_SPACE_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      console.log('[RM] Metrics sent to HF Space');
+    } catch (e) {
+      console.warn('[RM] Could not send metrics to HF Space:', e);
+    }
+  }
+
+  async function init() {
+    if (window.location.pathname === '/' || window.location.pathname === '/home') return;
+
+    const data = extractProfileData();
+    if (!data.name) return;
+
+    const slug = providerSlug(data);
+    const availability = await fetchAvailability(slug);
+
+    // Send first-party metrics to HF Space (user is logged in, no automation)
+    sendMetricsToHF(data);
+
+    setTimeout(() => {
+      createPanel(data, availability);
+    }, 2000);
+  }
+
+  // Handle SPA navigation
+  let lastUrl = location.href;
+  new MutationObserver(() => {
+    const url = location.href;
+    if (url !== lastUrl) {
+      lastUrl = url;
+      if (panel) { panel.remove(); panel = null; }
+      setTimeout(init, 1500);
+    }
+  }).observe(document, { subtree: true, childList: true });
+
+  init();
+})();
+
+```
+
+daily_promotion.py:
+```
+#!/usr/bin/env python3
+"""
+Daily Promotion Script — the bridge between rm_traffic and the runtime.
+
+rm_traffic/profileops.db → sanitize → hash → compact → daily_evidence_packet.json
+
+Usage:
+    python3 daily_promotion.py [--traffic-db PATH] [--out PATH] [--ingest-url URL]
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+
+from rm_revenue_engine.revenue_ops import (
+    init_db, generate_daily_evidence_packet, ingest_metrics, write_receipt
+)
+
+DEFAULT_TRAFFIC_DB = Path(__file__).resolve().parent.parent / "rm_traffic" / "profileops.db"
+DEFAULT_OUT = Path(__file__).resolve().parent / "content" / "daily_evidence_packet.json"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--traffic-db", default=str(DEFAULT_TRAFFIC_DB))
+    ap.add_argument("--out", default=str(DEFAULT_OUT))
+    ap.add_argument("--ingest-url", default=None, help="POST packet to this URL if set")
+    ap.add_argument("--bio-id", default="karpathian_wolf_live")
+    args = ap.parse_args()
+
+    init_db()
+
+    print(f"Generating daily evidence packet from {args.traffic_db}...")
+    packet = generate_daily_evidence_packet(args.traffic_db, bio_id=args.bio_id)
+    if "error" in packet:
+        print(f"ERROR: {packet['error']}")
+        return
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(packet, indent=2, default=str))
+    print(f"Packet written: {out_path}")
+    print(f"  packet_id: {packet['packet_id']}")
+    print(f"  profile_views: {packet['metrics']['profile_views']}")
+    print(f"  contact_clicks: {packet['metrics']['contact_clicks']}")
+    print(f"  contact_click_rate: {packet['derived']['contact_click_rate']}")
+    print(f"  decision: {packet['decision']['status']}")
+    print(f"  reason: {packet['decision']['reason']}")
+
+    # Also ingest locally
+    result = ingest_metrics({
+        "date": packet["date"],
+        "bio_id": args.bio_id,
+        "profile_views": packet["metrics"]["profile_views"],
+        "contact_clicks": packet["metrics"]["contact_clicks"],
+        "new_visits": packet["metrics"]["new_visits"],
+        "new_emails": packet["metrics"]["new_emails"],
+        "availability_state": packet["account"]["is_available"],
+        "profile_visible": packet["account"]["profile_visible"],
+        "headline_hash": packet["bio"]["bio_hash"],
+        "bio_hash": packet["bio"]["bio_hash"],
+        "notes": "Daily promotion script ingestion.",
+    })
+    print(f"\nLocal ingest: {result['decision']['status']} — {result['decision']['reason']}")
+    print(f"  computed CTR: {result['computed']['contact_click_rate']}")
+    print(f"  clicks/100 views: {result['computed']['contact_clicks_per_100_views']}")
+
+    # Optionally POST to remote runtime
+    if args.ingest_url:
+        import requests
+        print(f"\nPOSTing to {args.ingest_url}...")
+        try:
+            r = requests.post(args.ingest_url, json=packet, timeout=15)
+            print(f"  Response: {r.status_code} — {r.json()}")
+        except Exception as e:
+            print(f"  POST failed: {e}")
+
+    write_receipt("daily_promotion", {
+        "packet_id": packet["packet_id"],
+        "decision": packet["decision"]["status"],
+        "out_path": str(out_path),
+    })
+    print("\nReceipt written.")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+Spacefile:
+```
+title: FreeKey Agent
+emoji: ⚡
+colorFrom: orange
+colorTo: red
+sdk: docker
+app_port: 7860
+pinned: false
+license: mit
+
+```
+
+requirements.txt:
+```
+fastapi>=0.104.0
+uvicorn>=0.24.0
+requests>=2.31.0
+
+```
+
+competitor_scraper.py:
+```
+#!/usr/bin/env python3
+"""Competitor scraper — scrapes top RentMasseur profiles for competitive analysis.
+
+Fetches public profile pages and extracts: name, location, rate, bio text,
+availability status, and photo count. Uses Playwright for browser-based scraping
+to bypass anti-bot measures.
+
+Usage:
+    python3 competitor_scraper.py
+    python3 competitor_scraper.py --urls https://rentmasseur.com/User1 https://rentmasseur.com/User2
+    python3 competitor_scraper.py --output competitor_data.json
+"""
+
+import argparse
+import json
+import os
+import sys
+import re
+import time
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+DEFAULT_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "competitor_data.json")
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+
+DEFAULT_COMPETITORS = [
+    "https://rentmasseur.com/Preston_Banks",
+    "https://rentmasseur.com/Tonyxxxx",
+    "https://rentmasseur.com/MickeyCuteBoy",
+    "https://rentmasseur.com/ExoticYoungGuy",
+]
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+
+
+def fetch_with_playwright(url: str, timeout: int = 30) -> Optional[str]:
+    """Fetch a page using Playwright browser automation."""
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    except ImportError:
+        logger.error("Playwright not installed. Run: pip install playwright && playwright install chromium")
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(user_agent=USER_AGENT)
+            page = context.new_page()
+            page.goto(url, timeout=timeout * 1000)
+            page.wait_for_load_state("networkidle", timeout=timeout * 1000)
+            time.sleep(3)
+            html = page.content()
+            browser.close()
+            return html
+    except PlaywrightTimeoutError:
+        logger.warning("Playwright timeout for %s", url)
+        return None
+    except Exception as e:
+        logger.error("Playwright error for %s: %s", url, e)
+        return None
+
+
+def fetch_with_requests(url: str, timeout: int = 20) -> Optional[str]:
+    """Fetch a page using requests with browser-like headers."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://rentmasseur.com/",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        logger.warning("requests failed for %s: %s", url, e)
+        return None
+
+
+def extract_profile_data(html: str, url: str) -> dict:
+    """Extract profile data from HTML."""
+    soup = BeautifulSoup(html, "html.parser")
+    data = {
+        "url": url,
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "name": None,
+        "location": None,
+        "rate": None,
+        "availability": None,
+        "bio_text": None,
+        "photo_count": 0,
+        "services": [],
+        "phone": None,
+    }
+
+    # Try to extract name from h1 or title
+    h1 = soup.find("h1")
+    if h1:
+        data["name"] = h1.get_text(strip=True)
+    if not data["name"]:
+        title = soup.find("title")
+        if title:
+            name_match = re.search(r"^(.+?)\s*[-|]", title.get_text())
+            if name_match:
+                data["name"] = name_match.group(1).strip()
+
+    # Extract location
+    for selector in [".location", ".profile-location", "[data-field='location']"]:
+        el = soup.select_one(selector)
+        if el:
+            data["location"] = el.get_text(strip=True)
+            break
+
+    # Extract rate
+    for selector in [".rate", ".price", "[data-field='rate']"]:
+        el = soup.select_one(selector)
+        if el:
+            data["rate"] = el.get_text(strip=True)
+            break
+
+    # Extract bio text
+    for selector in [".bio", ".about", ".description", ".profile-bio", "[data-field='bio']"]:
+        el = soup.select_one(selector)
+        if el:
+            data["bio_text"] = el.get_text(strip=True)[:1000]
+            break
+
+    # Extract availability
+    for selector in [".availability", ".status", ".badge"]:
+        el = soup.select_one(selector)
+        if el:
+            data["availability"] = el.get_text(strip=True)
+            break
+
+    # Count photos
+    photos = soup.select("img[src*='profile'], img[src*='photo'], img[class*='profile']")
+    data["photo_count"] = len(photos)
+
+    # Extract services from text
+    page_text = soup.get_text().lower()
+    service_keywords = [
+        "deep tissue", "swedish", "hot stone", "sports massage", "trigger point",

@@ -1,0 +1,800 @@
+    return keyword_classify(message)
+
+
+def classify_mailbox(emails: List[Dict]) -> List[Dict]:
+    """
+    Classify all mailbox conversations.
+    Returns list of {username, classification, confidence, booking_probability, ...}
+    """
+    results = []
+    for email in emails:
+        uc = email.get("userCard", {})
+        msg = email.get("lastMessage", "")
+        username = uc.get("username", "")
+
+        result = classify(msg, context=f"User: {username}")
+
+        results.append({
+            "username": username,
+            "is_premium": bool(uc.get("isPremium", 0)),
+            "unread": bool(email.get("unread", 0)),
+            "classification": result.classification,
+            "confidence": result.confidence,
+            "booking_probability": result.booking_probability,
+            "suggested_reply_class": result.suggested_reply_class,
+            "risk_flags": result.risk_flags,
+        })
+
+    return results
+
+```
+
+api_extractor.py:
+```
+"""
+RentMasseur API Extractor — uses Selenium + CDP to intercept all network
+requests, capture request/response payloads, and generate documented API endpoints.
+
+Output:
+  - rm_traffic/api_endpoints.json  (structured API spec)
+  - rm_traffic/api_endpoints.md    (human-readable docs)
+  - rm_traffic/api_capture.log     (raw network log)
+"""
+
+import json
+import os
+import re
+import time
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from collections import defaultdict
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import (
+    NoSuchElementException, StaleElementReferenceException, WebDriverException,
+)
+
+BASE_URL = "https://rentmasseur.com"
+USERNAME = "karpathianwolf"
+PASSWORD = os.environ.get("RM_PASSWORD", "")
+CHROME_PROFILE = "/tmp/rm_api_chrome"
+OUT_DIR = Path(__file__).parent
+LOG_FILE = OUT_DIR / "api_capture.log"
+SPEC_JSON = OUT_DIR / "api_endpoints.json"
+SPEC_MD = OUT_DIR / "api_endpoints.md"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(str(LOG_FILE)),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("api_extractor")
+
+
+class NetworkInterceptor:
+    """Captures all network requests via Chrome DevTools Protocol."""
+
+    def __init__(self, driver):
+        self.driver = driver
+        self.captured = []  # list of request dicts
+        self._requests = {}  # request_id -> partial data
+        self._setup_cdp()
+
+    def _setup_cdp(self):
+        """Enable network tracking via CDP."""
+        self.driver.execute_cdp_cmd("Network.enable", {})
+        self.driver.execute_cdp_cmd("Network.setBypassServiceWorker", {"bypass": True})
+
+        # We'll use performance logs as fallback, but primary method is
+        # injecting a fetch/XHR interceptor via CDP script
+        script = """
+        (function() {
+            window.__api_capture = [];
+            const origFetch = window.fetch;
+            window.fetch = function(...args) {
+                const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+                const method = (args[1]?.method) || (args[0]?.method) || 'GET';
+                const body = args[1]?.body || null;
+                const headers = args[1]?.headers || {};
+                const entry = {
+                    type: 'fetch',
+                    url: url,
+                    method: method,
+                    body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null,
+                    headers: headers,
+                    ts: new Date().toISOString()
+                };
+                window.__api_capture.push(entry);
+                return origFetch.apply(this, args).then(resp => {
+                    const clone = resp.clone();
+                    clone.text().then(text => {
+                        entry.status = resp.status;
+                        entry.response = text.substring(0, 5000);
+                        entry.responseHeaders = {};
+                        resp.headers.forEach((v, k) => { entry.responseHeaders[k] = v; });
+                    }).catch(() => {});
+                    return resp;
+                });
+            };
+
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                this.__api_entry = {
+                    type: 'xhr',
+                    url: url,
+                    method: method,
+                    body: null,
+                    headers: {},
+                    ts: new Date().toISOString()
+                };
+                return origOpen.call(this, method, url, ...rest);
+            };
+            XMLHttpRequest.prototype.send = function(body) {
+                if (this.__api_entry) {
+                    this.__api_entry.body = body ? String(body).substring(0, 2000) : null;
+                    window.__api_capture.push(this.__api_entry);
+                    this.addEventListener('load', function() {
+                        this.__api_entry.status = this.status;
+                        this.__api_entry.response = this.responseText.substring(0, 5000);
+                    });
+                }
+                return origSend.call(this, body);
+            };
+
+            // Also intercept axios if present
+            if (window.axios) {
+                const origAxios = window.axios.request;
+                window.axios.request = function(config) {
+                    window.__api_capture.push({
+                        type: 'axios',
+                        url: config.url,
+                        method: config.method || 'GET',
+                        body: config.data ? JSON.stringify(config.data).substring(0, 2000) : null,
+                        headers: config.headers || {},
+                        ts: new Date().toISOString()
+                    });
+                    return origAxios.apply(this, arguments).then(resp => {
+                        const e = window.__api_capture[window.__api_capture.length - 1];
+                        if (e && e.url === config.url) {
+                            e.status = resp.status;
+                            e.response = JSON.stringify(resp.data).substring(0, 5000);
+                        }
+                        return resp;
+                    });
+                };
+            }
+        })();
+        """
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": script
+        })
+        log.info("CDP network interceptor installed")
+
+    def collect(self):
+        """Pull captured requests from the page."""
+        try:
+            entries = self.driver.execute_script(
+                "return window.__api_capture ? JSON.parse(JSON.stringify(window.__api_capture)) : [];"
+            )
+        except WebDriverException:
+            return []
+
+        new_entries = []
+        seen_urls = {e["url"] for e in self.captured}
+        for entry in entries:
+            if entry.get("url") and entry["url"] not in seen_urls:
+                self.captured.append(entry)
+                seen_urls.add(entry["url"])
+                new_entries.append(entry)
+        return new_entries
+
+    def flush(self):
+        """Get all captured entries."""
+        self.collect()
+        return self.captured
+
+
+def create_driver():
+    opts = Options()
+    opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument(f"--user-data-dir={CHROME_PROFILE}")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    return webdriver.Chrome(options=opts)
+
+
+def dismiss_popups(driver):
+    time.sleep(1)
+    for xpath in [
+        "//button[contains(text(),'Not now')]",
+        "//button[contains(text(),'Accept all')]",
+        "//button[contains(text(),'Close')]",
+        "//*[contains(@aria-label,'Close')]",
+    ]:
+        try:
+            for el in driver.find_elements(By.XPATH, xpath):
+                if el.is_displayed():
+                    el.click()
+                    time.sleep(0.5)
+        except Exception:
+            pass
+
+
+def login(driver):
+    log.info("Logging in as %s...", USERNAME)
+    driver.get(f"{BASE_URL}/login")
+    time.sleep(4)
+    dismiss_popups(driver)
+
+    email = None
+    pwd = None
+    for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
+        itype = (inp.get_attribute("type") or "").lower()
+        iname = (inp.get_attribute("name") or "").lower()
+        if itype == "email" or "email" in iname or "user" in iname:
+            if inp.is_displayed():
+                email = inp
+        if itype == "password" and inp.is_displayed():
+            pwd = inp
+
+    if not email or not pwd:
+        log.error("Login fields not found")
+        return False
+
+    email.clear()
+    email.send_keys(USERNAME)
+    pwd.clear()
+    pwd.send_keys(PASSWORD)
+    time.sleep(0.3)
+
+    for by, sel in [
+        (By.CSS_SELECTOR, "button[type='submit']"),
+        (By.XPATH, "//button[contains(text(),'LOG')]"),
+        (By.XPATH, "//button[contains(text(),'Log')]"),
+        (By.CSS_SELECTOR, "form button"),
+    ]:
+        els = driver.find_elements(by, sel)
+        for el in els:
+            if el.is_displayed():
+                el.click()
+                time.sleep(6)
+                break
+        else:
+            continue
+        break
+
+    dismiss_popups(driver)
+    if "/login" in driver.current_url:
+        log.error("Login failed")
+        return False
+
+    log.info("Login OK. URL: %s", driver.current_url)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Pages to visit for API discovery
+# ---------------------------------------------------------------------------
+
+PAGES_TO_VISIT = [
+    ("Homepage", "/"),
+    ("Login", "/login"),
+    ("Search Manhattan", "/gay-massage/manhattan-ny/"),
+    ("Search Available", "/gay-massage/manhattan-ny/?available=1"),
+    ("Settings Dashboard", "/settings"),
+    ("Settings Availability", "/settings?availability=1"),
+    ("Profile", "/ArmyMike"),
+    ("Reviews", "/ArmyMike/reviews"),
+    ("Blog", "/blog"),
+    ("Available Now", "/gay-massage/manhattan-ny/?available=1"),
+]
+
+# Actions that trigger API calls
+def trigger_actions(driver, interceptor):
+    """Interact with the page to trigger API calls."""
+
+    # 1. Open availability modal on settings
+    log.info("Triggering availability modal...")
+    driver.get(f"{BASE_URL}/settings?availability=1")
+    time.sleep(5)
+    dismiss_popups(driver)
+    interceptor.collect()
+
+    try:
+        panel = driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
+        panel.click()
+        time.sleep(2)
+        interceptor.collect()
+        log.info("  Captured availability modal API calls")
+    except Exception:
+        log.warning("  Could not open availability modal")
+
+    # 2. Toggle visibility
+    log.info("Triggering visibility toggle...")
+    driver.get(f"{BASE_URL}/settings")
+    time.sleep(4)
+    dismiss_popups(driver)
+    try:
+        vis_toggle = driver.find_element(By.CSS_SELECTOR, "#visibility")
+        vis_toggle.click()
+        time.sleep(2)
+        interceptor.collect()
+        log.info("  Captured visibility toggle API calls")
+    except Exception:
+        log.warning("  Could not toggle visibility")
+
+    # 3. Toggle SMS alerts
+    try:
+        sms_toggle = driver.find_element(By.CSS_SELECTOR, "#sms")
+        sms_toggle.click()
+        time.sleep(2)
+        interceptor.collect()
+        log.info("  Captured SMS toggle API calls")
+    except Exception:
+        log.warning("  Could not toggle SMS")
+
+    # 4. Toggle track actions
+    try:
+        track_toggle = driver.find_element(By.CSS_SELECTOR, "#trackActions")
+        track_toggle.click()
+        time.sleep(2)
+        interceptor.collect()
+        log.info("  Captured track actions toggle API calls")
+    except Exception:
+        log.warning("  Could not toggle track actions")
+
+    # 5. Search with filters
+    log.info("Triggering search with filters...")
+    driver.get(f"{BASE_URL}/gay-massage/manhattan-ny/")
+    time.sleep(4)
+    dismiss_popups(driver)
+    interceptor.collect()
+
+    # 6. Scroll to trigger lazy loading
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(3)
+    interceptor.collect()
+    log.info("  Captured search/scroll API calls")
+
+    # 7. Click "Load more" if present
+    try:
+        load_more = driver.find_element(By.XPATH, "//button[contains(text(),'Load more')]")
+        load_more.click()
+        time.sleep(3)
+        interceptor.collect()
+        log.info("  Captured 'Load more' API calls")
+    except Exception:
+        pass
+
+    # 8. Visit a profile to trigger profile API calls
+    log.info("Triggering profile view API calls...")
+    driver.get(f"{BASE_URL}/ArmyMike")
+    time.sleep(4)
+    interceptor.collect()
+
+    # 9. Check mailbox
+    log.info("Triggering mailbox API calls...")
+    driver.get(f"{BASE_URL}/settings/mailbox")
+    time.sleep(4)
+    dismiss_popups(driver)
+    interceptor.collect()
+
+
+# ---------------------------------------------------------------------------
+# API Spec Generation
+# ---------------------------------------------------------------------------
+
+def classify_endpoint(url, method, body, response):
+    """Classify an API endpoint by its URL pattern and response."""
+    url_lower = url.lower()
+
+    # Skip static assets
+    if any(url_lower.endswith(ext) for ext in [
+        ".js", ".css", ".png", ".jpg", ".jpeg", ".svg", ".gif", ".woff",
+        ".woff2", ".ico", ".webp", ".map", ".mp4", ".webm",
+    ]):
+        return None
+    if "/_next/static/" in url_lower:
+        return None
+    if "/images/" in url_lower:
+        return None
+
+    # Classify
+    category = "unknown"
+    name = url
+
+    patterns = {
+        "auth": ["login", "logout", "auth", "token", "session", "register"],
+        "availability": ["avail", "status", "online"],
+        "search": ["search", "masseur", "gay-massage", "find"],
+        "profile": ["profile", "user", "account", "card"],
+        "settings": ["settings", "setting", "config"],
+        "mailbox": ["mail", "message", "inbox", "conversation"],
+        "reviews": ["review", "rating", "feedback"],
+        "stats": ["statistic", "stats", "analytics", "visit", "view"],
+        "photos": ["photo", "image", "upload", "gallery"],
+        "rates": ["rate", "price", "service", "massage"],
+        "travels": ["travel", "location", "city"],
+        "blog": ["blog", "post", "article"],
+        "advertise": ["advert", "sponsor", "banner", "boost", "visibility"],
+        "interview": ["interview"],
+        "membership": ["membership", "payment", "subscription", "plan", "billing"],
+        "social": ["twitter", "facebook", "instagram", "x.com"],
+        "notification": ["notif", "alert", "push"],
+    }
+
+    for cat, keywords in patterns.items():
+        if any(kw in url_lower for kw in keywords):
+            category = cat
+            break
+
+    # Try to extract a clean endpoint name
+    m = re.search(r'/api/([^/?]+)', url)
+    if m:
+        name = m.group(1)
+    else:
+        # Use last path segment
+        parts = url.split("?")[0].rstrip("/").split("/")
+        if parts:
+            name = parts[-1]
+
+    # Parse response as JSON if possible
+    resp_data = None
+    if response:
+        try:
+            resp_data = json.loads(response)
+        except (json.JSONDecodeError, TypeError):
+            resp_data = response[:500] if isinstance(response, str) else None
+
+    # Parse body
+    body_data = None
+    if body:
+        try:
+            body_data = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            body_data = body[:500] if isinstance(body, str) else None
+
+    return {
+        "url": url,
+        "method": method,
+        "category": category,
+        "name": name,
+        "request_body": body_data,
+        "response_status": None,
+        "response_data": resp_data,
+        "discovered_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def generate_spec(captured):
+    """Generate structured API spec from captured requests."""
+    endpoints = {}
+    for entry in captured:
+        url = entry.get("url", "")
+        method = entry.get("method", "GET").upper()
+        body = entry.get("body")
+        response = entry.get("response", "")
+        status = entry.get("status")
+
+        # Normalize URL — remove query params for key but keep them in spec
+        base_url_key = url.split("?")[0]
+        key = f"{method} {base_url_key}"
+
+        if key in endpoints:
+            # Update with more data if we have it
+            if response and not endpoints[key].get("response_data"):
+                endpoints[key]["response_data"] = response[:5000]
+            if status and not endpoints[key].get("response_status"):
+                endpoints[key]["response_status"] = status
+            continue
+
+        classified = classify_endpoint(url, method, body, response)
+        if classified is None:
+            continue
+
+        classified["response_status"] = status
+        endpoints[key] = classified
+
+    return list(endpoints.values())
+
+
+def write_json_spec(endpoints):
+    """Write JSON spec."""
+    spec = {
+        "service": "rentmasseur.com",
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "total_endpoints": len(endpoints),
+        "categories": defaultdict(list),
+        "endpoints": endpoints,
+    }
+
+    for ep in endpoints:
+        spec["categories"][ep["category"]].append(ep["url"])
+
+    spec["categories"] = dict(spec["categories"])
+
+    with open(SPEC_JSON, "w") as f:
+        json.dump(spec, f, indent=2, default=str)
+    log.info("JSON spec written to %s (%d endpoints)", SPEC_JSON, len(endpoints))
+
+
+def write_md_spec(endpoints):
+    """Write human-readable markdown docs."""
+    by_category = defaultdict(list)
+    for ep in endpoints:
+        by_category[ep["category"]].append(ep)
+
+    lines = [
+        "# RentMasseur API Endpoints",
+        "",
+        f"Generated: {datetime.now(timezone.utc).isoformat()}",
+        f"Total endpoints discovered: {len(endpoints)}",
+        "",
+        "---",
+        "",
+    ]
+
+    for category in sorted(by_category.keys()):
+        eps = by_category[category]
+        lines.append(f"## {category.title()} ({len(eps)})")
+        lines.append("")
+
+        for ep in eps:
+            lines.append(f"### `{ep['method']}` {ep['url']}")
+            lines.append("")
+
+            if ep.get("request_body"):
+                body = ep["request_body"]
+                if isinstance(body, dict):
+                    lines.append("**Request body:**")
+                    lines.append("```json")
+                    lines.append(json.dumps(body, indent=2, default=str)[:1000])
+                    lines.append("```")
+                else:
+                    lines.append(f"**Request body:** `{str(body)[:200]}`")
+                lines.append("")
+
+            if ep.get("response_status"):
+                lines.append(f"**Status:** {ep['response_status']}")
+                lines.append("")
+
+            if ep.get("response_data"):
+                resp = ep["response_data"]
+                if isinstance(resp, dict):
+                    # Show keys
+                    lines.append("**Response keys:**")
+                    lines.append("```json")
+                    lines.append(json.dumps(list(resp.keys()), indent=2)[:500])
+                    lines.append("```")
+                    # Show first 500 chars of full response
+                    lines.append("**Response sample:**")
+                    lines.append("```json")
+                    lines.append(json.dumps(resp, indent=2, default=str)[:1500])
+                    lines.append("```")
+                else:
+                    lines.append(f"**Response:** `{str(resp)[:300]}`")
+                lines.append("")
+
+            lines.append("---")
+            lines.append("")
+
+    with open(SPEC_MD, "w") as f:
+        f.write("\n".join(lines))
+    log.info("Markdown spec written to %s", SPEC_MD)
+
+
+# ---------------------------------------------------------------------------
+# Also extract API calls from JS source
+# ---------------------------------------------------------------------------
+
+def extract_api_refs_from_js(driver):
+    """Fetch JS chunks and extract API endpoint references."""
+    log.info("Extracting API refs from JS source...")
+
+    html = driver.page_source
+    js_chunks = re.findall(r'src="(/_next/static/chunks/[^"]+)"', html)
+
+    api_refs = set()
+
+    for chunk_url in js_chunks[:15]:
+        try:
+            full_url = f"{BASE_URL}{chunk_url}"
+            driver.get(full_url)
+            time.sleep(1)
+            content = driver.find_element(By.TAG_NAME, "body").text
+            # Also get raw via execute_script
+            content = driver.execute_script("return document.body.innerText || document.documentElement.textContent || '';")
+
+            # Find API-like patterns
+            patterns = [
+                r'["\']/(api/[^"\']+)["\']',
+                r'["\'](/v\d+/[^"\']+)["\']',
+                r'["\'](/account/[^"\']+)["\']',
+                r'["\'](/user/[^"\']+)["\']',
+                r'["\'](/masseur/[^"\']+)["\']',
+                r'["\'](/settings/[^"\']+)["\']',
+                r'concat\(["\'](/[^"\']+)["\']',
+                r'\.post\(["\']([^"\']+)["\']',
+                r'\.get\(["\']([^"\']+)["\']',
+                r'\.put\(["\']([^"\']+)["\']',
+                r'\.delete\(["\']([^"\']+)["\']',
+                r'fetch\(["\']([^"\']+)["\']',
+                r'axios\(["\']([^"\']+)["\']',
+                r'url:["\']([^"\']+)["\']',
+                r'endpoint:["\']([^"\']+)["\']',
+                r'path:["\']([^"\']+)["\']',
+                r'route:["\']([^"\']+)["\']',
+            ]
+
+            for pat in patterns:
+                matches = re.findall(pat, content)
+                for m in matches:
+                    if not any(m.endswith(ext) for ext in [".js", ".css", ".png", ".jpg", ".svg", ".woff"]):
+                        api_refs.add(m)
+
+        except Exception as e:
+            log.warning("  Failed to fetch %s: %s", chunk_url, e)
+
+    log.info("  Found %d API refs from JS source", len(api_refs))
+    return api_refs
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def run():
+    os.makedirs(str(OUT_DIR), exist_ok=True)
+
+    log.info("=== RentMasseur API Extractor ===")
+    driver = create_driver()
+    interceptor = NetworkInterceptor(driver)
+
+    try:
+        # Login
+        if not login(driver):
+            log.error("Login failed, aborting")
+            driver.quit()
+            return
+
+        # Visit pages and collect API calls
+        log.info("\n--- Visiting pages to trigger API calls ---")
+        for name, path in PAGES_TO_VISIT:
+            url = f"{BASE_URL}{path}"
+            log.info("  Visiting: %s (%s)", name, url)
+            driver.get(url)
+            time.sleep(4)
+            dismiss_popups(driver)
+            new = interceptor.collect()
+            if new:
+                log.info("    Captured %d new API calls", len(new))
+
+        # Trigger interactive actions
+        log.info("\n--- Triggering interactive actions ---")
+        trigger_actions(driver, interceptor)
+
+        # Extract API refs from JS source
+        driver.get(f"{BASE_URL}/settings")
+        time.sleep(2)
+        js_api_refs = extract_api_refs_from_js(driver)
+
+        # Collect everything
+        all_captured = interceptor.flush()
+        log.info("\n=== Total captured: %d API calls ===", len(all_captured))
+
+        # Generate specs
+        endpoints = generate_spec(all_captured)
+
+        # Add JS-discovered refs as stub endpoints
+        for ref in js_api_refs:
+            full_url = ref if ref.startswith("http") else f"{BASE_URL}{ref}" if ref.startswith("/") else ref
+            key = f"GET {full_url.split('?')[0]}"
+            if not any(ep["url"] == full_url for ep in endpoints):
+                endpoints.append({
+                    "url": full_url,
+                    "method": "GET",
+                    "category": "js_discovered",
+                    "name": ref.split("/")[-1],
+                    "request_body": None,
+                    "response_status": None,
+                    "response_data": None,
+                    "discovered_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "js_source",
+                })
+
+        log.info("Total endpoints (including JS refs): %d", len(endpoints))
+
+        write_json_spec(endpoints)
+        write_md_spec(endpoints)
+
+        # Print summary
+        print(f"\n=== API ENDPOINTS DISCOVERED: {len(endpoints)} ===\n")
+        by_cat = defaultdict(list)
+        for ep in endpoints:
+            by_cat[ep["category"]].append(ep)
+
+        for cat in sorted(by_cat.keys()):
+            eps = by_cat[cat]
+            print(f"  [{cat}] ({len(eps)})")
+            for ep in eps[:5]:
+                print(f"    {ep['method']:6s} {ep['url'][:80]}")
+            if len(eps) > 5:
+                print(f"    ... and {len(eps) - 5} more")
+            print()
+
+        print(f"JSON spec: {SPEC_JSON}")
+        print(f"MD docs:   {SPEC_MD}")
+        print(f"Raw log:   {LOG_FILE}")
+
+    except Exception as e:
+        log.error("Fatal error: %s", e)
+        import traceback
+        traceback.print_exc()
+    finally:
+        driver.quit()
+        log.info("Done")
+
+
+if __name__ == "__main__":
+    run()
+
+```
+
+booking_ir.py:
+```
+#!/usr/bin/env python3
+"""
+BookingIR — Canonical business state for the revenue pipeline.
+
+The product is not traffic. The product is conversion.
+
+Core object: RevenueEvent (a lead → booking → payment → repeat journey)
+Secondary: LeadRecord, DraftReply, BookingRecord
+
+Hard revenue metrics replace vanity metrics:
+  qualified_leads, reply_rate, booking_request_rate, booking_confirm_rate,
+  show_rate, collected_revenue, average_booking_value, repeat_rate,
+  time_to_reply, source_roi, compliance_incidents
+"""
+
+import hashlib
+import json
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+
+
+# ─── Lead classification ───────────────────────────────────────────
+
+LEAD_CLASSIFICATIONS = [
+    "booking_ready",      # explicit request for session, time, location
+    "inquiry",            # asking questions, price, availability
+    "low_intent",         # vague, "maybe", "just looking"
+    "spam",               # promotional, irrelevant
+    "competitor",         # another masseur fishing
+    "unsafe",             # suspicious, potentially harmful
+    "out_of_area",        # too far, won't travel
+    "repeat_client",      # has booked before
+    "already_active",     # conversation already in progress
+]
+
+
+@dataclass
+class LeadRecord:
+    """One person who showed up in the mailbox or visitor list."""
+    person_id_hash: str = ""          # SHA-256 of username (privacy)
+    username: str = ""                # kept locally only, never committed
+    source: str = "rentmasseur"       # rentmasseur / referral / direct
+    first_seen_at: str = ""
+    last_message_at: str = ""

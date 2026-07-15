@@ -1,0 +1,800 @@
+
+Usage:
+    python3 photo_rotator.py                    # rotate to next photo
+    python3 photo_rotator.py --add /path/to/photo.jpg   # add photo to pool
+    python3 photo_rotator.py --list             # list photo pool
+    python3 photo_rotator.py --report           # show performance per photo
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import shutil
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+from dotenv import load_dotenv
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+RENTMASSEUR_PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+PHOTO_POOL_DIR = os.path.join(CONTENT_DIR, "photos")
+PHOTO_STATE_PATH = os.path.join(CONTENT_DIR, "photo_state.json")
+PROFILE_PHOTOS_URL = "https://rentmasseur.com/settings/photos"
+
+
+def _load_photo_state() -> dict:
+    if os.path.exists(PHOTO_STATE_PATH):
+        try:
+            with open(PHOTO_STATE_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "photos": [],
+        "current_photo_index": 0,
+        "rotation_count": 0,
+        "photo_rewards": {},
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _save_photo_state(state: dict):
+    os.makedirs(CONTENT_DIR, exist_ok=True)
+    with open(PHOTO_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def add_photo_to_pool(filepath: str, label: str = "") -> str:
+    """Add a photo to the rotation pool."""
+    os.makedirs(PHOTO_POOL_DIR, exist_ok=True)
+    if not os.path.exists(filepath):
+        logger.error("Photo not found: %s", filepath)
+        return ""
+
+    ext = os.path.splitext(filepath)[1] or ".jpg"
+    photo_id = f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{len(_load_photo_state().get('photos', []))}"
+    dest = os.path.join(PHOTO_POOL_DIR, f"{photo_id}{ext}")
+    shutil.copy2(filepath, dest)
+
+    state = _load_photo_state()
+    state["photos"].append({
+        "id": photo_id,
+        "path": dest,
+        "label": label or photo_id,
+        "added_at": datetime.now(timezone.utc).isoformat(),
+        "times_used": 0,
+    })
+    _save_photo_state(state)
+    logger.info("Added photo to pool: %s (%s)", photo_id, dest)
+    return photo_id
+
+
+def get_next_photo() -> Optional[dict]:
+    """Get the next photo in rotation."""
+    state = _load_photo_state()
+    photos = state.get("photos", [])
+    if not photos:
+        logger.warning("No photos in pool — add some with --add /path/to/photo.jpg")
+        return None
+
+    # Pick least-recently-used photo, weighted by reward
+    sorted_photos = sorted(photos, key=lambda p: (p.get("times_used", 0), state.get("photo_rewards", {}).get(p["id"], 0)))
+    next_photo = sorted_photos[0]
+
+    state["current_photo_index"] = photos.index(next_photo)
+    state["rotation_count"] = state.get("rotation_count", 0) + 1
+    next_photo["times_used"] = next_photo.get("times_used", 0) + 1
+    next_photo["last_used"] = datetime.now(timezone.utc).isoformat()
+    _save_photo_state(state)
+
+    logger.info("Next photo: %s (used %d times)", next_photo["id"], next_photo["times_used"])
+    return next_photo
+
+
+def rotate_photo_on_profile(photo_path: str) -> bool:
+    """Upload and set a photo as primary on RentMasseur profile."""
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from rentmasseur_core import login, dismiss_popups, POPUP_DISMISS_SELECTORS
+
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+        driver = webdriver.Chrome(options=options)
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+
+        try:
+            if not login(driver):
+                logger.error("Login failed")
+                return False
+
+            logger.info("Navigating to photos settings: %s", PROFILE_PHOTOS_URL)
+            driver.get(PROFILE_PHOTOS_URL)
+            time.sleep(5)
+            dismiss_popups(driver)
+            time.sleep(2)
+
+            # Find file upload input
+            file_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
+            if not file_inputs:
+                logger.error("No file upload input found on photos page")
+                return False
+
+            file_inputs[0].send_keys(os.path.abspath(photo_path))
+            logger.info("Photo uploaded, waiting for processing...")
+            time.sleep(10)
+
+            # Try to set as primary/make main
+            make_primary_btns = driver.find_elements(By.XPATH, "//*[contains(text(), 'Make Main') or contains(text(), 'Set Primary') or contains(text(), 'Make Primary')]")
+            if make_primary_btns:
+                driver.execute_script("arguments[0].click();", make_primary_btns[0])
+                time.sleep(3)
+                logger.info("Set as primary photo")
+
+            # Save
+            save_btns = driver.find_elements(By.XPATH, "//*[contains(text(), 'Save') or @type='submit']")
+            if save_btns:
+                driver.execute_script("arguments[0].click();", save_btns[-1])
+                time.sleep(3)
+
+            logger.info("Photo rotation complete")
+            return True
+        finally:
+            driver.quit()
+    except Exception as e:
+        logger.error("Photo rotation error: %s", e)
+        return False
+
+
+def list_photos():
+    state = _load_photo_state()
+    photos = state.get("photos", [])
+    print(f"\nPhoto Pool: {len(photos)} photos")
+    print(f"Rotations: {state.get('rotation_count', 0)}")
+    for p in photos:
+        reward = state.get("photo_rewards", {}).get(p["id"], 0)
+        print(f"  {p['id']}: used {p.get('times_used', 0)}x, reward={reward}, label={p.get('label', '')}")
+
+
+def photo_report() -> str:
+    state = _load_photo_state()
+    lines = ["=" * 60, "PHOTO ROTATION REPORT", "=" * 60]
+    lines.append(f"Total photos: {len(state.get('photos', []))}")
+    lines.append(f"Total rotations: {state.get('rotation_count', 0)}")
+    for p in state.get("photos", []):
+        reward = state.get("photo_rewards", {}).get(p["id"], 0)
+        lines.append(f"  {p['id']}: used={p.get('times_used', 0)}, reward={reward}")
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Photo rotator for RentMasseur")
+    parser.add_argument("--add", help="Add photo to pool")
+    parser.add_argument("--label", default="", help="Label for added photo")
+    parser.add_argument("--list", action="store_true", help="List photo pool")
+    parser.add_argument("--report", action="store_true", help="Show photo report")
+    parser.add_argument("--dry-run", action="store_true", help="Don't upload, just pick next")
+    args = parser.parse_args()
+
+    if args.add:
+        add_photo_to_pool(args.add, args.label)
+        return
+
+    if args.list:
+        list_photos()
+        return
+
+    if args.report:
+        print(photo_report())
+        return
+
+    # Default: rotate
+    photo = get_next_photo()
+    if not photo:
+        sys.exit(1)
+
+    print(f"Next photo: {photo['id']} ({photo['path']})")
+    if args.dry_run:
+        logger.info("Dry run — not uploading")
+        return
+
+    success = rotate_photo_on_profile(photo["path"])
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+run_bio_pipeline.py:
+```
+#!/usr/bin/env python3
+"""
+Bio Rotation Pipeline — seeds rotator, picks best bio, pushes to live profile.
+
+Steps:
+1. Load 4 bio variants from content/bios/
+2. Seed rotator_engine state JSON
+3. Run rotator --rotate bio to pick next
+4. Login to RentMasseur API
+5. Push bio via set_about(headline, description)
+6. Write receipt
+"""
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Add rm_pri to path (api_client lives in the optimizer repo)
+sys.path.insert(0, str(Path("/Users/alep/Downloads/rentmasseur-optimizer/rm_pri/py")))
+
+from api_client import RentMasseurAPI
+
+CONTENT_DIR = Path(__file__).parent / "content"
+BIOS_DIR = CONTENT_DIR / "bios"
+RECEIPTS_DIR = Path(__file__).parent / "receipts"
+RL_STATE_PATH = CONTENT_DIR / "rl_state.json"
+
+# The 4 approved bio variants with rebrandly link
+BIO_VARIANTS = [
+    {
+        "id": "bio_D_funny_direct_cta",
+        "file": "bio_D_funny_direct_cta.md",
+        "strategy": "funny_direct_cta",
+        "headline": "KARPATHIAN WOLF — Deep Tissue & Sports Recovery",
+    },
+    {
+        "id": "bio_B_karpathian_wolf",
+        "file": "bio_B_karpathian_wolf.md",
+        "strategy": "brand_identity",
+        "headline": "KARPATHIAN WOLF — Targeted Recovery for Men",
+    },
+    {
+        "id": "bio_A_clinical_recovery",
+        "file": "bio_A_clinical_recovery.md",
+        "strategy": "clinical_recovery",
+        "headline": "KARPATHIAN WOLF — Professional Therapeutic Massage",
+    },
+    {
+        "id": "bio_20260626_targeted_recovery_v2",
+        "file": "bio_20260626_targeted_recovery_v2.md",
+        "strategy": "targeted_recovery_v2",
+        "headline": "KARPATHIAN WOLF — Targeted Recovery, Not Generic Relaxation",
+    },
+]
+
+REBRANDLY_LINK = "rebrand.ly/carpathianwolf"
+
+
+def load_bio_content(filename: str) -> str:
+    """Load bio markdown and clean it for the API."""
+    path = BIOS_DIR / filename
+    if not path.exists():
+        print(f"ERROR: Bio file not found: {path}")
+        sys.exit(1)
+    content = path.read_text().strip()
+    # Remove markdown header line (# Bio X — ...)
+    lines = content.split("\n")
+    if lines and lines[0].startswith("#"):
+        lines = lines[1:]
+    bio = "\n".join(lines).strip()
+    # Ensure rebrandly link is present
+    if REBRANDLY_LINK not in bio:
+        bio += f"\n\nBook: {REBRANDLY_LINK}"
+    return bio
+
+
+def seed_rotator():
+    """Seed the rotator engine's RL state with the 4 bio variants."""
+    state = {
+        "stores": {
+            "bio": {},
+        },
+        "current": {},
+        "rotations": {},
+    }
+
+    for variant in BIO_VARIANTS:
+        bio_content = load_bio_content(variant["file"])
+        state["stores"]["bio"][variant["id"]] = {
+            "content": bio_content[:500],
+            "strategy": variant["strategy"],
+            "total_reward": 0,
+            "delta_reward": 0,
+            "times_used": 0,
+            "age_hours": 0,
+        }
+
+    RL_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RL_STATE_PATH.write_text(json.dumps(state, indent=2))
+    print(f"Seeded rotator state with {len(BIO_VARIANTS)} bio variants at {RL_STATE_PATH}")
+
+
+def run_rotator_pick() -> dict:
+    """Run the C++ rotator engine to pick the next bio."""
+    rotator = Path(__file__).parent / "rotator_engine"
+    if not rotator.exists():
+        print("Compiling rotator_engine...")
+        subprocess.run(
+            ["g++", "-O3", "-std=c++17", "-pthread", "rotator_engine.cpp", "-o", "rotator_engine"],
+            cwd=Path(__file__).parent, check=True
+        )
+
+    result = subprocess.run(
+        ["./rotator_engine", "--rotate", "bio", "--dir", str(CONTENT_DIR)],
+        cwd=Path(__file__).parent, capture_output=True, text=True
+    )
+
+    print(f"Rotator exit code: {result.returncode}")
+    print(f"Rotator stdout: {result.stdout.strip()}")
+    if result.stderr:
+        print(f"Rotator stderr: {result.stderr.strip()}")
+
+    if result.returncode != 0:
+        print("Rotator failed to pick a bio")
+        sys.exit(1)
+
+    # Parse output: "Next bio: bio_D_funny_direct_cta (strategy: funny_direct_cta, uses: 0, reward: 0)"
+    output = result.stdout.strip()
+    for variant in BIO_VARIANTS:
+        if variant["id"] in output:
+            print(f"Selected bio: {variant['id']} (strategy: {variant['strategy']})")
+            return variant
+
+    print(f"Could not parse selected bio from: {output}")
+    sys.exit(1)
+
+
+def push_bio_to_profile(variant: dict):
+    """Login to RentMasseur and push the selected bio."""
+    bio_content = load_bio_content(variant["file"])
+
+    # Verify rebrandly link
+    if REBRANDLY_LINK not in bio_content:
+        print(f"ERROR: Bio does not contain rebrandly link: {REBRANDLY_LINK}")
+        sys.exit(1)
+
+    print(f"\nBio to push ({variant['id']}):")
+    print(f"  Headline: {variant['headline']}")
+    print(f"  Length: {len(bio_content)} chars")
+    print(f"  Rebrandly link: PRESENT")
+    print(f"  Content preview: {bio_content[:200]}...")
+
+    # Load credentials from .env
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent / ".env"
+    load_dotenv(env_path)
+
+    username = os.environ.get("RENTMASSEUR_USERNAME")
+    password = os.environ.get("RENTMASSEUR_PASSWORD")
+
+    if not username or not password or username == "REDACTED_ROTATE_ME":
+        print("ERROR: No valid credentials in .env")
+        sys.exit(1)
+
+    print(f"\nLogging in as {username}...")
+    api = RentMasseurAPI(min_request_interval=2.0)
+
+    if not api.login(username, password):
+        print("ERROR: Login failed")
+        sys.exit(1)
+
+    print("Login successful")
+
+    # Check current bio first
+    print("\nFetching current bio...")
+    try:
+        current = api.get_about()
+        print(f"Current headline: {current.get('headline', 'unknown')}")
+        current_desc = current.get("description", "")
+        if REBRANDLY_LINK in current_desc:
+            print("Current bio already has rebrandly link")
+    except Exception as e:
+        print(f"Warning: Could not fetch current bio: {e}")
+
+    # Push new bio
+    print(f"\nPushing bio: {variant['id']}")
+    print(f"  Headline: {variant['headline']}")
+    print(f"  Description: {bio_content[:100]}...")
+
+    try:
+        result = api.set_about(headline=variant["headline"], description=bio_content)
+        print(f"API response: {json.dumps(result, indent=2)}")
+        print("BIO UPDATED SUCCESSFULLY")
+    except Exception as e:
+        print(f"ERROR: Failed to update bio: {e}")
+        sys.exit(1)
+
+    # Write receipt
+    write_receipt(variant, bio_content, result)
+
+    # Verify
+    print("\nVerifying update...")
+    try:
+        verify = api.get_about()
+        print(f"Verified headline: {verify.get('headline', 'unknown')}")
+        verified_desc = verify.get("description", "")
+        if REBRANDLY_LINK in verified_desc:
+            print("VERIFIED: Rebrandly link is live in profile bio")
+        else:
+            print("WARNING: Rebrandly link not found in verified bio")
+        print(f"Verified bio length: {len(verified_desc)} chars")
+    except Exception as e:
+        print(f"Warning: Could not verify: {e}")
+
+
+def write_receipt(variant: dict, bio_content: str, api_result: dict):
+    """Write a receipt for the bio update."""
+    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc)
+    receipt = {
+        "action": "bio_rotation_push",
+        "timestamp": ts.isoformat(),
+        "variant_id": variant["id"],
+        "strategy": variant["strategy"],
+        "headline": variant["headline"],
+        "bio_length": len(bio_content),
+        "rebrandly_link": REBRANDLY_LINK,
+        "rebrandly_present": REBRANDLY_LINK in bio_content,
+        "api_result": api_result,
+        "status": "pushed",
+    }
+    receipt_path = RECEIPTS_DIR / f"bio_push_{ts.strftime('%Y%m%d_%H%M%S')}.json"
+    receipt_path.write_text(json.dumps(receipt, indent=2))
+    print(f"\nReceipt written: {receipt_path}")
+
+
+def main():
+    print("=" * 60)
+    print("RM-PRI BIO ROTATION PIPELINE")
+    print("=" * 60)
+
+    # Step 1: Seed rotator
+    print("\n--- Step 1: Seed rotator ---")
+    seed_rotator()
+
+    # Step 2: Pick best bio via C++ rotator
+    print("\n--- Step 2: Rotator picks next bio ---")
+    selected = run_rotator_pick()
+
+    # Step 3: Push to live profile
+    print("\n--- Step 3: Push bio to live profile ---")
+    push_bio_to_profile(selected)
+
+    # Step 4: Show rotator report
+    print("\n--- Step 4: Rotator report ---")
+    rotator = Path(__file__).parent / "rotator_engine"
+    report = subprocess.run(
+        ["./rotator_engine", "--report", "--dir", str(CONTENT_DIR)],
+        cwd=Path(__file__).parent, capture_output=True, text=True
+    )
+    print(report.stdout)
+
+    print("\n" + "=" * 60)
+    print("PIPELINE COMPLETE")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+orchestrator.py:
+```
+#!/usr/bin/env python3
+"""Master orchestrator for RentMasseur dynamic optimization.
+
+Runs the full autonomous loop:
+1. RL feedback collection (views, clicks, calls)
+2. Bio rotation (A/B tested, hilarious, phone-call optimized)
+3. Photo rotation
+4. Price rotation
+5. Interview rotation
+6. Blog rotation
+7. Data collection and correlation
+8. Performance optimization
+
+Usage:
+    python3 orchestrator.py --all       # run all rotations
+    python3 orchestrator.py --bio       # rotate bio only
+    python3 orchestrator.py --stats     # collect stats only
+    python3 orchestrator.py --report      # show performance report
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import random
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
+from dotenv import load_dotenv
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+RENTMASSEUR_PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+ORCHESTRATOR_LOG = os.path.join(CONTENT_DIR, "orchestrator.log")
+
+# Reward weights for RL
+REWARD_WEIGHTS = {
+    "views": 1,
+    "email_clicks": 5,
+    "phone_clicks": 10,
+    "booking_inquiries": 50,
+    "favorites": 3,
+    "messages": 8,
+}
+
+# Rotation rules: max_age_hours, min_reward_threshold
+ROTATION_RULES = {
+    "bio": (24, 5),
+    "photo": (48, 3),
+    "price": (12, 8),
+    "interview": (72, 2),
+    "blog": (48, 4),
+}
+
+
+def log_event(event: dict):
+    os.makedirs(CONTENT_DIR, exist_ok=True)
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **event,
+    }
+    with open(ORCHESTRATOR_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def collect_stats() -> dict:
+    """Run rl_feedback.py to collect profile stats."""
+    logger.info("=== Collecting RL stats ===")
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["python3", "rl_feedback.py"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if result.returncode == 0:
+            logger.info("Stats collected successfully")
+        else:
+            logger.warning("Stats collection returned non-zero: %s", result.stderr)
+        # Try to parse stats from output
+        try:
+            lines = result.stdout.split("\n")
+            for line in lines:
+                if line.strip().startswith("{"):
+                    return json.loads(line)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error("Stats collection failed: %s", e)
+    return {}
+
+
+def run_bio_rotation(dry_run: bool = False) -> bool:
+    """Run A/B tested bio rotation."""
+    logger.info("=== Rotating bio (A/B tested, hilarious) ===")
+    try:
+        import subprocess
+        cmd = ["python3", "bio_ab_tester.py"]
+        if dry_run:
+            cmd.append("--dry-run")
+        result = subprocess.run(
+            cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode == 0:
+            logger.info("Bio rotation completed")
+            log_event({"component": "bio", "status": "success", "stdout": result.stdout[-500:]})
+            return True
+        logger.warning("Bio rotation failed: %s", result.stderr[-500:])
+        log_event({"component": "bio", "status": "failed", "stderr": result.stderr[-500:]})
+        return False
+    except Exception as e:
+        logger.error("Bio rotation error: %s", e)
+        log_event({"component": "bio", "status": "error", "error": str(e)})
+        return False
+
+
+def run_photo_rotation(dry_run: bool = False) -> bool:
+    logger.info("=== Rotating photo ===")
+    try:
+        import subprocess
+        cmd = ["python3", "photo_rotator.py"]
+        if dry_run:
+            cmd.append("--dry-run")
+        result = subprocess.run(
+            cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        success = result.returncode == 0
+        log_event({"component": "photo", "status": "success" if success else "failed"})
+        return success
+    except Exception as e:
+        log_event({"component": "photo", "status": "error", "error": str(e)})
+        return False
+
+
+def run_price_rotation(dry_run: bool = False) -> bool:
+    logger.info("=== Rotating price ===")
+    try:
+        import subprocess
+        cmd = ["python3", "price_rotator.py"]
+        if dry_run:
+            cmd.append("--dry-run")
+        result = subprocess.run(
+            cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        success = result.returncode == 0
+        log_event({"component": "price", "status": "success" if success else "failed"})
+        return success
+    except Exception as e:
+        log_event({"component": "price", "status": "error", "error": str(e)})
+        return False
+
+
+def run_interview_rotation(dry_run: bool = False) -> bool:
+    logger.info("=== Rotating interview ===")
+    try:
+        import subprocess
+        cmd = ["python3", "interview_rotator.py"]
+        if dry_run:
+            cmd.append("--dry-run")
+        result = subprocess.run(
+            cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        success = result.returncode == 0
+        log_event({"component": "interview", "status": "success" if success else "failed"})
+        return success
+    except Exception as e:
+        log_event({"component": "interview", "status": "error", "error": str(e)})
+        return False
+
+
+def run_blog_rotation(dry_run: bool = False) -> bool:
+    logger.info("=== Rotating blog ===")
+    try:
+        import subprocess
+        cmd = ["python3", "blog_rotator.py"]
+        if dry_run:
+            cmd.append("--dry-run")
+        result = subprocess.run(
+            cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        success = result.returncode == 0
+        log_event({"component": "blog", "status": "success" if success else "failed"})
+        return success
+    except Exception as e:
+        log_event({"component": "blog", "status": "error", "error": str(e)})
+        return False
+
+
+def generate_daily_content() -> bool:
+    """Run the full daily content generator."""
+    logger.info("=== Generating daily content ===")
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["python3", "content_generator.py"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        success = result.returncode == 0
+        log_event({"component": "content_generator", "status": "success" if success else "failed"})
+        return success
+    except Exception as e:
+        log_event({"component": "content_generator", "status": "error", "error": str(e)})
+        return False
+
+
+def master_report() -> str:
+    """Generate master performance report."""
+    lines = ["=" * 60, "RENTMASSEUR AUTONOMOUS ORCHESTRATOR REPORT", "=" * 60]
+
+    # RL state
+    if os.path.exists(os.path.join(CONTENT_DIR, "rl_state.json")):
+        try:
+            with open(os.path.join(CONTENT_DIR, "rl_state.json")) as f:
+                rl = json.load(f)
+            lines.append(f"\nCurrent bio: {rl.get('current_bio_id', 'none')}")
+            lines.append(f"Best bio: {rl.get('best_bio_id', 'none')} (reward: {rl.get('best_reward', 0)})")
+            lines.append(f"Total rotations: {rl.get('total_rotations', 0)}")
+            if rl.get('should_rotate'):
+                lines.append(f"ROTATION RECOMMENDED: {rl.get('rotate_reason', '')}")
+        except Exception:
+            pass
+
+    # Content counts
+    counts = {}
+    for subdir in ["bios", "blog_posts", "interview_questions", "social_posts", "email_templates", "seo_keywords"]:
+        path = os.path.join(CONTENT_DIR, subdir)
+        if os.path.exists(path):
+            import glob
+            counts[subdir] = len(glob.glob(os.path.join(path, "*")))
+    lines.append(f"\nContent inventory: {json.dumps(counts, indent=2)}")
+
+    # Recent orchestrator events
+    if os.path.exists(ORCHESTRATOR_LOG):
+        try:
+            with open(ORCHESTRATOR_LOG) as f:
+                events = [json.loads(line) for line in f if line.strip()]
+            lines.append(f"\nOrchestrator events: {len(events)}")
+            for e in events[-10:]:
+                lines.append(f"  {e.get('timestamp', '?')}: {e.get('component', '?')} -> {e.get('status', '?')}")
+        except Exception:
+            pass
+
+    return "\n".join(lines)
+
+

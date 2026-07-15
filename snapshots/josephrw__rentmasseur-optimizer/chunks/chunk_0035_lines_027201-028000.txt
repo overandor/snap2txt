@@ -1,0 +1,800 @@
+            row = json.loads(line)
+            if row.get("views_per_day", 0) > 0:
+                results["has_views_per_day"] += 1
+            else:
+                results["missing_views_per_day"] += 1
+            if row.get("visits", 0) > 0:
+                results["has_visits"] += 1
+            if row.get("member_since"):
+                results["has_member_since"] += 1
+
+    results["pass"] = results["has_views_per_day"] > 0
+    return results
+
+
+# ─── Gate 2: Enrichment (public visits + member-since) ───
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def fetch_profile_views(username: str) -> dict:
+    """Fetch public visits and member-since from a profile page."""
+    result = {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
+    try:
+        r = requests.get(f"https://rentmasseur.com/{username}", headers=HEADERS, timeout=12)
+        if r.status_code != 200:
+            return result
+        if "CrowdSec" in r.text:
+            result["error"] = "captcha"
+            return result
+
+        member = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
+        member_since = member.group(1).strip() if member else ""
+
+        visit_values = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
+        visits = max(visit_values) if visit_values else 0
+
+        days_online = 0
+        if member_since:
+            try:
+                joined = datetime.strptime(member_since, "%b %d, %Y")
+                days_online = max(1, (datetime.now() - joined).days)
+            except ValueError:
+                pass
+
+        views_per_day = visits / days_online if days_online > 0 else 0
+
+        return {
+            "visits": visits,
+            "member_since": member_since,
+            "days_online": days_online,
+            "views_per_day": views_per_day,
+        }
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+
+def enrich_bios(input_path: Path = RAW_PATH,
+                output_path: Path = ENRICHED_PATH,
+                workers: int = 16,
+                rate_limit: float = 0.5) -> dict:
+    """Enrich bios with public visits and member-since dates."""
+    bios = [json.loads(l) for l in input_path.open() if l.strip()]
+    total = len(bios)
+    result = {"total": total, "enriched": 0, "failed": 0, "captcha": False}
+
+    print(f"Enriching {total} bios with {workers} workers (rate_limit={rate_limit}s)...")
+
+    usernames = [b.get("username") for b in bios if b.get("username")]
+
+    # Check first request for captcha
+    test = fetch_profile_views(usernames[0])
+    if test.get("error") == "captcha":
+        result["captcha"] = True
+        result["error"] = "CrowdSec captcha active. Cannot enrich. Wait for ban to clear."
+        print(f"BLOCKED: {result['error']}")
+        return result
+
+    # If first works, proceed with batch
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_profile_views, u): u for u in usernames}
+        view_map = {}
+
+        for i, fut in enumerate(as_completed(futures)):
+            u = futures[fut]
+            try:
+                view_map[u] = fut.result()
+                if view_map[u].get("error") == "captcha":
+                    result["captcha"] = True
+                    print(f"Captcha detected at {u}. Stopping.")
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+            except Exception as e:
+                view_map[u] = {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
+
+            if (i + 1) % 100 == 0:
+                print(f"  Progress: {i+1}/{total} ({result['enriched']} enriched)")
+
+    # Update bios
+    for b in bios:
+        v = view_map.get(b.get("username"), {})
+        b["visits"] = v.get("visits", 0)
+        b["member_since"] = v.get("member_since", "")
+        b["days_online"] = v.get("days_online", 0)
+        b["views_per_day"] = v.get("views_per_day", 0)
+        b["scraped_at"] = datetime.now(timezone.utc).isoformat()
+        if b["views_per_day"] > 0:
+            result["enriched"] += 1
+        else:
+            result["failed"] += 1
+
+    # Save
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w") as f:
+        for b in bios:
+            f.write(json.dumps(b, ensure_ascii=False, default=str) + "\n")
+
+    print(f"Done: {result['enriched']} enriched, {result['failed']} failed")
+    return result
+
+
+# ─── Rank by views/day ───
+
+def rank_by_views_per_day(input_path: Path = ENRICHED_PATH,
+                          output_path: Path = RANKED_PATH) -> dict:
+    """Rank real bios by views_per_day."""
+    if not input_path.exists():
+        return {"error": "Enriched file does not exist. Run enrich-views first."}
+
+    bios = [json.loads(l) for l in input_path.open() if l.strip()]
+    has_views = [b for b in bios if b.get("views_per_day", 0) > 0]
+
+    if not has_views:
+        return {"error": "No bios have views_per_day. Enrichment needed."}
+
+    has_views.sort(key=lambda b: b.get("views_per_day", 0), reverse=True)
+
+    with output_path.open("w") as f:
+        for i, b in enumerate(has_views, 1):
+            f.write(
+                f"#{i} | {b.get('username')} | {b.get('city')} | "
+                f"visits={b.get('visits',0)} | days={b.get('days_online',0)} | "
+                f"views/day={b.get('views_per_day',0):.2f} | "
+                f"rating={b.get('ratingAverage')} | reviews={b.get('reviewsCount')} | "
+                f"gold={b.get('isGold')} | available={b.get('isAvailable')} | "
+                f"certified={b.get('isCertified')}\n"
+            )
+            f.write(f"HEADLINE: {b.get('headline','')}\n")
+            desc = (b.get("description") or "").replace("\n", " | ")
+            f.write(f"DESC: {desc[:1200]}\n")
+            f.write(f"SERVICES: {b.get('services')}\n")
+            f.write(f"MEMBER SINCE: {b.get('member_since','N/A')}\n\n")
+
+    result = {
+        "total_bios": len(bios),
+        "ranked_bios": len(has_views),
+        "top_5": [{"username": b["username"], "views_per_day": b["views_per_day"],
+                    "headline": b.get("headline", "")}
+                  for b in has_views[:5]],
+        "output": str(output_path),
+    }
+    return result
+
+
+# ─── Corpus atomizer (feature extraction) ───
+
+def atomize_bios(input_path: Path = RAW_PATH,
+                 output_path: Path = DATA_DIR / "bio_atoms.jsonl") -> dict:
+    """Extract structural atoms from each bio."""
+    bios = [json.loads(l) for l in input_path.open() if l.strip()]
+    count = 0
+
+    with output_path.open("w") as f:
+        for b in bios:
+            headline = b.get("headline", "")
+            desc = b.get("description", "")
+            full = (headline + " " + desc).lower()
+
+            atom = {
+                "id": b.get("id"),
+                "username": b.get("username"),
+                "city": b.get("city"),
+                "headline_len": len(headline),
+                "desc_len": len(desc),
+                "word_count": len(full.split()),
+                "services_count": len(b.get("services") or []),
+                "rating": float(b.get("ratingAverage") or 0),
+                "reviews": b.get("reviewsCount", 0),
+                "is_gold": bool(b.get("isGold")),
+                "is_available": bool(b.get("isAvailable")),
+                "is_certified": bool(b.get("isCertified")),
+                "has_cta": any(w in full for w in ["text", "call", "message", "book", "contact", "reach", "email", "schedule"]),
+                "has_price": bool(re.search(r'\$\d+', full)),
+                "has_urgency": any(w in full for w in ["now", "today", "same-day", "available", "limited", "visiting", "this week"]),
+                "has_deep_tissue": "deep tissue" in full,
+                "has_sports": "sports" in full or "athletic" in full or "recovery" in full,
+                "has_trust": any(w in full for w in ["certified", "licensed", "trained", "professional", "discreet", "clean", "private"]),
+                "has_location": any(w in full for w in ["manhattan", "bronx", "brooklyn", "nyc", "new york", "studio", "incall", "outcall", "travel"]),
+                "has_hygiene": any(w in full for w in ["clean", "shower", "hygiene", "safe", "sanitized", "fresh", "towels"]),
+                "has_humor": any(w in full for w in ["wolf", "funny", "joke", "desk goblin", "posture", "laugh", "lol"]),
+                "has_explicit": any(w in full for w in ["naked", "nude", "sensual", "erotic", "sexual"]),
+                "newline_count": desc.count("\n"),
+                "sentence_count": max(1, desc.count(".") + desc.count("!") + desc.count("?")),
+            }
+            f.write(json.dumps(atom, ensure_ascii=False) + "\n")
+            count += 1
+
+    return {"atomized": count, "output": str(output_path)}
+
+
+# ─── Experiment measurement ───
+
+def compute_lift(before: dict, after: dict) -> dict:
+    """Compute real lift between before/after dashboard snapshots."""
+    bv = before.get("profile_views", 0)
+    av = after.get("profile_views", 0)
+    bc = before.get("contact_clicks", 0)
+    ac = after.get("contact_clicks", 0)
+    be = before.get("new_emails", 0)
+    ae = after.get("new_emails", 0)
+
+    before_ctr = bc / bv if bv > 0 else 0
+    after_ctr = ac / av if av > 0 else 0
+
+    return {
+        "lift_views": av - bv,
+        "lift_clicks": ac - bc,
+        "lift_emails": ae - be,
+        "before_ctr": before_ctr,
+        "after_ctr": after_ctr,
+        "ctr_lift": after_ctr - before_ctr,
+        "ctr_lift_pct": ((after_ctr - before_ctr) / before_ctr * 100) if before_ctr > 0 else 0,
+        "result": "winner" if after_ctr > before_ctr else "loser",
+    }
+
+
+# ─── Receipt ledger (SHA-256 chained) ───
+
+class ReceiptLedger:
+    def __init__(self, path: Path = DATA_DIR / "receipts" / "ledger.jsonl"):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.entries: List[dict] = []
+        self._load()
+
+    def _load(self):
+        if self.path.exists():
+            for line in self.path.open():
+                if line.strip():
+                    self.entries.append(json.loads(line))
+
+    def add(self, action: str, description: str, data: dict) -> dict:
+        prev_hash = self.entries[-1]["hash"] if self.entries else "0" * 64
+        ts = datetime.now(timezone.utc).isoformat()
+        entry = {
+            "index": len(self.entries),
+            "timestamp": ts,
+            "action": action,
+            "description": description,
+            "data": data,
+            "prev_hash": prev_hash,
+        }
+        entry_str = json.dumps(entry, sort_keys=True)
+        entry["hash"] = hashlib.sha256(entry_str.encode()).hexdigest()
+        self.entries.append(entry)
+        with self.path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+        return entry
+
+    def verify(self) -> bool:
+        for i, entry in enumerate(self.entries):
+            prev = self.entries[i - 1]["hash"] if i > 0 else "0" * 64
+            if entry["prev_hash"] != prev:
+                return False
+            check = {k: v for k, v in entry.items() if k != "hash"}
+            expected = hashlib.sha256(json.dumps(check, sort_keys=True).encode()).hexdigest()
+            if entry["hash"] != expected:
+                return False
+        return True
+
+    def summary(self) -> dict:
+        return {
+            "total": len(self.entries),
+            "valid": self.verify(),
+            "last_action": self.entries[-1]["action"] if self.entries else None,
+        }
+
+```
+
+auth.py:
+```
+"""
+AuthSession — login, JWT, session health.
+
+Never stores raw password in code. Reads from env vars or keychain.
+"""
+
+import json
+import logging
+import os
+import subprocess
+from typing import Optional
+
+import requests
+
+from .api_client import RentMasseurAPI
+
+log = logging.getLogger("profileops.auth")
+
+
+def get_credential(name: str) -> Optional[str]:
+    """Read credential from environment or macOS keychain."""
+    val = os.environ.get(name)
+    if val:
+        return val
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", f"rm_profileops_{name}", "-w"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def save_token_to_keychain(token: str):
+    """Save access token to keychain (optional)."""
+    try:
+        subprocess.run(
+            ["security", "add-generic-password", "-s", "rm_profileops_access_token",
+             "-a", "rm_profileops", "-w", token, "-U"],
+            capture_output=True, text=True, timeout=5
+        )
+    except Exception as e:
+        log.warning("Could not save token to keychain: %s", e)
+
+
+def load_session_from_file(path: str) -> Optional[list]:
+    """Load cookies from a saved session JSON file."""
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data.get("cookies", [])
+    except Exception as e:
+        log.warning("Could not load session file: %s", e)
+        return None
+
+
+class AuthSession:
+    """Manages login and session state."""
+
+    def __init__(self, api: RentMasseurAPI, session_file: Optional[str] = None):
+        self.api = api
+        self.session_file = session_file
+        self.username = None
+
+    def login(self, username: Optional[str] = None, password: Optional[str] = None) -> bool:
+        """Login using credentials or saved session."""
+        self.username = username or get_credential("RM_USER")
+        password = password or get_credential("RM_PASS")
+
+        if not self.username or not password:
+            log.error("Credentials missing. Set RM_USER and RM_PASS environment variables.")
+            return False
+
+        # Try saved session first if available
+        if self.session_file:
+            cookies = load_session_from_file(self.session_file)
+            if cookies:
+                self.api.load_cookies(cookies)
+                log.info("Loaded saved session cookies")
+                # Test with a lightweight request
+                try:
+                    self.api.get_keeponline()
+                    log.info("Saved session is valid")
+                    return True
+                except Exception:
+                    log.info("Saved session expired, trying login")
+
+        return self.api.login(self.username, password)
+
+    def is_authenticated(self) -> bool:
+        try:
+            self.api.get_keeponline()
+            return True
+        except Exception:
+            return False
+
+```
+
+fast_enrich.py:
+```
+#!/usr/bin/env python3
+"""Fast multi-threaded enricher with global rate limiting."""
+
+import argparse
+import json
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+from threading import Lock
+
+import requests
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
+SITE_WIDE_PHONES = {"1778766027", "6720911878"}
+
+rate_lock = Lock()
+last_request_time = 0.0
+
+
+def rate_limited_request(url: str, min_delay: float) -> requests.Response:
+    global last_request_time
+    with rate_lock:
+        elapsed = time.time() - last_request_time
+        if elapsed < min_delay:
+            time.sleep(min_delay - elapsed)
+        last_request_time = time.time()
+    return requests.get(url, headers=HEADERS, timeout=15)
+
+
+def extract_phone(text: str) -> str:
+    phones = PHONE_RE.findall(text)
+    for p in phones:
+        digits = re.sub(r"\D", "", p)
+        if len(digits) == 11 and digits.startswith("1"):
+            digits = digits[1:]
+        if len(digits) != 10:
+            continue
+        if digits in SITE_WIDE_PHONES:
+            continue
+        return digits
+    return ""
+
+
+def fetch_profile(username: str, min_delay: float) -> dict:
+    try:
+        r = rate_limited_request(f"https://rentmasseur.com/{username}", min_delay)
+        if r.status_code != 200:
+            return {"username": username, "error": f"HTTP {r.status_code}"}
+        if "CrowdSec" in r.text:
+            return {"username": username, "error": "captcha"}
+
+        m = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
+        member_since = m.group(1).strip() if m else ""
+
+        visit_values = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
+        visits = max(visit_values) if visit_values else 0
+
+        days_online = 0
+        if member_since:
+            try:
+                joined = datetime.strptime(member_since, "%b %d, %Y")
+                days_online = max(1, (datetime.now() - joined).days)
+            except ValueError:
+                pass
+
+        views_per_day = visits / days_online if days_online > 0 else 0.0
+        phone = extract_phone(r.text)
+
+        return {
+            "username": username,
+            "visits": visits,
+            "member_since": member_since,
+            "days_online": days_online,
+            "views_per_day": views_per_day,
+            "phone": phone,
+        }
+    except Exception as e:
+        return {"username": username, "error": str(e)}
+
+
+def enrich(input_path: Path, output_path: Path, workers: int = 5, min_delay: float = 0.5):
+    bios = [json.loads(l) for l in input_path.open() if l.strip()]
+    total = len(bios)
+
+    existing = {}
+    if output_path.exists():
+        for line in output_path.open():
+            if line.strip():
+                row = json.loads(line)
+                if row.get("views_per_day", 0) > 0 and row.get("phone", "") not in SITE_WIDE_PHONES and row.get("phone") is not None:
+                    existing[row.get("username")] = row
+        print(f"Resuming: {len(existing)} profiles already enriched")
+
+    todo = [b for b in bios if b.get("username") not in existing]
+    print(f"Total: {total} | Already enriched: {len(existing)} | To fetch: {len(todo)}")
+
+    results = {}
+    captcha_hit = False
+
+    def fetch_one(b):
+        nonlocal captcha_hit
+        if captcha_hit:
+            return None
+        u = b.get("username")
+        r = fetch_profile(u, min_delay)
+        if r.get("error") == "captcha":
+            captcha_hit = True
+            print(f"\nCAPTCHA at {u}. Stopping.")
+        return r
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_one, b): b for b in todo}
+        for i, fut in enumerate(futures):
+            if captcha_hit:
+                break
+            r = fut.result()
+            if r:
+                results[r.get("username")] = r
+            if (i + 1) % 50 == 0:
+                print(f"  Fetched {i+1}/{len(todo)}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w") as out:
+        for b in bios:
+            u = b.get("username")
+            if u in existing:
+                out.write(json.dumps(existing[u], ensure_ascii=False) + "\n")
+            elif u in results:
+                v = results[u]
+                if "error" in v:
+                    b.update({"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0, "phone": "", "error": v["error"], "scraped_at": datetime.now(timezone.utc).isoformat()})
+                else:
+                    b.update(v)
+                    b["scraped_at"] = datetime.now(timezone.utc).isoformat()
+                out.write(json.dumps(b, ensure_ascii=False) + "\n")
+            else:
+                b.update({"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0, "phone": "", "scraped_at": datetime.now(timezone.utc).isoformat()})
+                out.write(json.dumps(b, ensure_ascii=False) + "\n")
+
+    print(f"\nDone. Fetched: {len(results)} | Captcha: {captcha_hit}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", default="rm_pri/data/real_bios_raw.jsonl")
+    ap.add_argument("--output", default="rm_pri/data/real_bios_with_views.jsonl")
+    ap.add_argument("--workers", type=int, default=5)
+    ap.add_argument("--delay", type=float, default=0.5)
+    args = ap.parse_args()
+    enrich(Path(args.input), Path(args.output), args.workers, args.delay)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+enrich.py:
+```
+#!/usr/bin/env python3
+"""Robust public-profile enricher for RM-PRI.
+
+Fetches public visits and member-since dates for each profile in the corpus.
+Respects rate limits, resumes from partial runs, and writes a chained receipt.
+"""
+
+import argparse
+import json
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
+SITE_WIDE_PHONES = {"1778766027", "6720911878"}
+
+
+def extract_phone(text: str) -> str:
+    """Extract profile-specific phone number, skipping site-wide template numbers."""
+    phones = PHONE_RE.findall(text)
+    for p in phones:
+        digits = re.sub(r"\D", "", p)
+        if len(digits) == 11 and digits.startswith("1"):
+            digits = digits[1:]
+        if len(digits) != 10:
+            continue
+        if digits in SITE_WIDE_PHONES:
+            continue
+        return digits
+    return ""
+
+
+def fetch_profile(username: str, retries: int = 2, delay: float = 2.0) -> dict:
+    result = {
+        "username": username,
+        "visits": 0,
+        "member_since": "",
+        "days_online": 0,
+        "views_per_day": 0.0,
+        "phone": "",
+    }
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(f"https://rentmasseur.com/{username}", headers=HEADERS, timeout=15)
+            if r.status_code != 200:
+                result["error"] = f"HTTP {r.status_code}"
+                return result
+            if "CrowdSec" in r.text:
+                result["error"] = "captcha"
+                return result
+
+            m = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
+            member_since = m.group(1).strip() if m else ""
+
+            visit_values = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
+            visits = max(visit_values) if visit_values else 0
+
+            days_online = 0
+            if member_since:
+                try:
+                    joined = datetime.strptime(member_since, "%b %d, %Y")
+                    days_online = max(1, (datetime.now() - joined).days)
+                except ValueError:
+                    pass
+
+            views_per_day = visits / days_online if days_online > 0 else 0.0
+
+            phone = extract_phone(r.text)
+
+            return {
+                "username": username,
+                "visits": visits,
+                "member_since": member_since,
+                "days_online": days_online,
+                "views_per_day": views_per_day,
+                "phone": phone,
+            }
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(delay * (attempt + 1))
+            else:
+                result["error"] = str(e)
+    return result
+
+
+def enrich(
+    input_path: Path,
+    output_path: Path,
+    limit: int = None,
+    resume: bool = True,
+    min_delay: float = 1.0,
+):
+    bios = [json.loads(l) for l in input_path.open() if l.strip()]
+    if limit:
+        bios = bios[:limit]
+    total = len(bios)
+
+    # Resume: load existing output
+    existing = {}
+    if resume and output_path.exists():
+        for line in output_path.open():
+            if line.strip():
+                row = json.loads(line)
+                existing[row.get("username")] = row
+        print(f"Resuming: {len(existing)} profiles already enriched")
+
+    enriched_count = 0
+    failed_count = 0
+    captcha_hit = False
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_suffix(".tmp")
+
+    with tmp_path.open("w") as out:
+        for i, b in enumerate(bios, 1):
+            u = b.get("username")
+            if u in existing and existing[u].get("views_per_day", 0) > 0 and existing[u].get("phone", "") not in SITE_WIDE_PHONES and existing[u].get("phone") is not None:
+                out.write(json.dumps(existing[u], ensure_ascii=False) + "\n")
+                enriched_count += 1
+                continue
+
+            print(f"[{i}/{total}] Fetching {u}...", end=" ", flush=True)
+            v = fetch_profile(u)
+            if v.get("error") == "captcha":
+                print("CAPTCHA")
+                captcha_hit = True
+                # Write remaining as-is and stop
+                b.update({"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0, "scraped_at": datetime.now(timezone.utc).isoformat()})
+                out.write(json.dumps(b, ensure_ascii=False) + "\n")
+                failed_count += 1
+                break
+            elif "error" in v:
+                print(f"FAIL: {v['error']}")
+                b.update({"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0, "scraped_at": datetime.now(timezone.utc).isoformat()})
+                out.write(json.dumps(b, ensure_ascii=False) + "\n")
+                failed_count += 1
+            else:
+                print(f"visits={v['visits']}, days={v['days_online']}, v/day={v['views_per_day']:.1f}")
+                b.update(v)
+                b["scraped_at"] = datetime.now(timezone.utc).isoformat()
+                out.write(json.dumps(b, ensure_ascii=False) + "\n")
+                enriched_count += 1
+
+            if i < total:
+                time.sleep(min_delay)
+
+    tmp_path.rename(output_path)
+
+    print(f"\nDone: {enriched_count}/{total} enriched, {failed_count} failed")
+    if captcha_hit:
+        print("CAPTCHA triggered. Stop and wait before retrying.")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", default="rm_pri/data/real_bios_raw.jsonl")
+    ap.add_argument("--output", default="rm_pri/data/real_bios_with_views.jsonl")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--no-resume", action="store_true")
+    ap.add_argument("--delay", type=float, default=1.0)
+    args = ap.parse_args()
+
+    enrich(
+        Path(args.input),
+        Path(args.output),
+        limit=args.limit,
+        resume=not args.no_resume,
+        min_delay=args.delay,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+cli.py:
+```
+#!/usr/bin/env python3
+"""RM-PRI CLI — RentMasseur Profile Revenue Intelligence.
+
+Commands:
+    validate          Gate 1: validate corpus schema
+    atomize           Extract structural atoms from bios
+    features          Build C++ feature file
+    train             Train views/day model (requires enrichment)
+    generate          Generate candidate bios
+    score             Score candidates with model
+    evolve            Run GA over scored candidates
+    select            Select top safe candidates
+    status            Show honest system status
+    api-check         Test API connectivity (requires credentials)
+    enrich-views      Enrich bios with public visits/member-since
+    rank-real         Rank bios by real views/day
+    snapshot          Take dashboard snapshot (requires credentials)
+    start-experiment  Apply approved variant and measure (requires credentials)
+    close-experiment  Close experiment and write receipt
+    receipts          Show receipt ledger
+
+Usage:
+    python3 -m rm_pri.py.cli status
+    python3 -m rm_pri.py.cli validate
+    python3 -m rm_pri.py.cli train --label reviews
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA = ROOT / "data"
+CPP = ROOT / "cpp" / "rm_pri"
+RAW = DATA / "real_bios_raw.jsonl"
+ENRICHED = DATA / "real_bios_with_views.jsonl"
+RECEIPTS = DATA / "receipts" / "ledger.jsonl"
+
+
+def _run_cpp(args: list) -> subprocess.CompletedProcess:
+    if not CPP.exists():
+        print("ERROR: C++ engine not compiled. Run: cd rm_pri/cpp && g++ -O3 -std=c++17 rm_pri.cpp -o rm_pri")
+        sys.exit(1)
