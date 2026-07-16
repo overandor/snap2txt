@@ -1,800 +1,800 @@
-    username = os.getenv("RM_USERNAME", "karpathianwolf")
-    password = os.getenv("RM_PASSWORD", "")
-    if not password:
-        # Try loading from .env in extension repo
-        env_path = os.path.join(EXTENSION_REPO, ".env")
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    if line.startswith("RENTMASSEUR_PASSWORD="):
-                        password = line.split("=", 1)[1].strip()
-                    if line.startswith("RENTMASSEUR_USERNAME="):
-                        username = line.split("=", 1)[1].strip()
-    if not password:
-        raise HTTPException(status_code=500, detail="RM_PASSWORD not set and no .env found")
-    api = RentMasseurAPI(min_request_interval=0.5)
-    if not api.login(username, password):
-        raise HTTPException(status_code=401, detail="RentMasseur login failed")
-    return api
+static std::string get_body(const std::string& request) {
+    size_t pos = request.find("\r\n\r\n");
+    return pos == std::string::npos ? "" : request.substr(pos + 4);
+}
 
+struct CommandResult {
+    int exit_code;
+    std::string output;
+};
 
-@app.post("/api/visit-back")
-def api_visit_back(payload: dict = None, _: bool = Depends(require_admin)):
-    """Visit client profiles concurrently — reciprocal profile visits.
-    Collects usernames from mailbox, visits each profile page with 33 concurrent workers."""
-    import requests as req
-    body = payload or {}
-    limit = body.get("limit", 50)
-    dry_run = body.get("dry_run", False)
-    max_workers = body.get("max_workers", 33)
-    mailbox_pages = body.get("mailbox_pages", 4)
+static CommandResult run_command_evidence(const std::string& cmd) {
+    std::string wrapped = cmd + " 2>&1";
+    FILE* pipe = popen(wrapped.c_str(), "r");
+    if (!pipe) return {127, "popen failed"};
+    char buffer[512];
+    std::string output;
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+        if (output.size() > 6000) {
+            output = output.substr(output.size() - 6000);
+        }
+    }
+    int status = pclose(pipe);
+    int code = status;
+    if (WIFEXITED(status)) code = WEXITSTATUS(status);
+    return {code, output};
+}
 
-    api = _get_api_client()
+static std::string write_receipt(const std::string& action, const std::string& status, int exit_code, const std::string& output, const std::string& extra_json = "") {
+    ensure_dir(RECEIPTS_DIR);
+    std::string path = RECEIPTS_DIR + "/hf_action_" + compact_timestamp() + "_" + action + ".json";
+    std::ofstream f(path);
+    if (f) {
+        f << "{\n";
+        f << "  \"action\": \"" << json_escape(action) << "\",\n";
+        f << "  \"status\": \"" << json_escape(status) << "\",\n";
+        f << "  \"exit_code\": " << exit_code << ",\n";
+        f << "  \"timestamp\": \"" << iso_timestamp() << "\",\n";
+        f << "  \"stdout_stderr_tail\": \"" << json_escape(output) << "\"";
+        if (!extra_json.empty()) f << ",\n  " << extra_json;
+        f << "\n}\n";
+    }
+    return path;
+}
 
-    # Enable track-actions so our profile shows when visiting others
-    try:
-        api.set_track_actions(True)
-    except Exception:
-        pass
+static int count_files(const std::string& dir) {
+    int count = 0;
+    DIR* d = opendir(dir.c_str());
+    if (!d) return 0;
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        if (entry->d_type == DT_REG) count++;
+    }
+    closedir(d);
+    return count;
+}
 
-    # Collect client usernames from mailbox
-    usernames = set()
-    for page in range(1, mailbox_pages + 1):
-        mail = api.get_mailbox(page=page, folder=1)
-        emails = mail.get("emails", [])
-        if not emails:
-            break
-        for e in emails:
-            u = e.get("userCard", {}).get("username", "")
-            if u:
-                usernames.add(u)
-    usernames = sorted(usernames)[:limit]
+static std::string read_json_or_block(const std::string& path, const std::string& name) {
+    std::string c = read_file(path);
+    if (!c.empty()) return c;
+    return "{\"status\":\"missing_real_data\",\"name\":\"" + json_escape(name) + "\",\"path\":\"" + json_escape(path) + "\"}";
+}
 
-    if dry_run:
-        return {"status": "DRY_RUN", "client_count": len(usernames), "usernames": usernames}
+static std::string bios_json() {
+    std::string dir = CONTENT_DIR + "/bios";
+    DIR* d = opendir(dir.c_str());
+    if (!d) return "{\"status\":\"missing_real_data\",\"bios\":[],\"reason\":\"content/bios directory does not exist\"}";
+    std::ostringstream ss;
+    ss << "{\"status\":\"ok\",\"bios\":[";
+    bool first = true;
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        if (entry->d_type != DT_REG) continue;
+        std::string name = entry->d_name;
+        std::string content = read_file(dir + "/" + name);
+        if (!first) ss << ",";
+        first = false;
+        ss << "{\"file\":\"" << json_escape(name) << "\",\"content\":\"" << json_escape(content) << "\"}";
+    }
+    closedir(d);
+    ss << "]}";
+    return ss.str();
+}
 
-    # Visit concurrently
-    BASE = "https://rentmasseur.com"
-    token = api.session.headers.get("Authorization", "")
-    cookies = {c.name: c.value for c in api.session.cookies}
-    visited = []
-    t0 = time.time()
+static std::string gh_api(const std::string& method, const std::string& endpoint, const std::string& body = "") {
+    if (GH_TOKEN.empty()) return "{\"status\":\"blocked\",\"reason\":\"GH_TOKEN not set\"}";
+    std::string cmd = "curl -sS -X " + method;
+    cmd += " -H \"Authorization: Bearer " + GH_TOKEN + "\"";
+    cmd += " -H \"Accept: application/vnd.github+json\"";
+    cmd += " -H \"X-GitHub-Api-Version: 2022-11-28\"";
+    if (!body.empty()) cmd += " -d '" + body + "'";
+    cmd += " https://api.github.com/repos/" + GH_REPO + "/" + endpoint;
+    CommandResult r = run_command_evidence(cmd);
+    return r.output.empty() ? "{\"status\":\"dispatched_or_empty_response\",\"exit_code\":" + std::to_string(r.exit_code) + "}" : r.output;
+}
 
-    def visit_one(uname):
-        try:
-            r = req.get(f"{BASE}/{uname}", headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                "Authorization": token,
-            }, cookies=cookies, timeout=15, allow_redirects=True)
-            return {"username": uname, "status": r.status_code}
-        except Exception as ex:
-            return {"username": uname, "status": "error", "error": str(ex)[:80]}
+static std::string url_encode_workflow(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (c == '/') out += "%2F";
+        else if (c == ' ') out += "%20";
+        else out += c;
+    }
+    return out;
+}
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(visit_one, u): u for u in usernames}
-        for fut in as_completed(futures):
-            visited.append(fut.result())
+static std::string action_response(const std::string& action, const std::string& cmd) {
+    CommandResult r = run_command_evidence(cmd);
+    std::string status = r.exit_code == 0 ? "success" : "failed";
+    std::string label = r.exit_code == 0 ? (!r.output.empty() ? "GREEN_REAL" : "GRAY_NO_DATA") : "RED_FAILED";
+    std::string receipt = write_receipt(action, status, r.exit_code, r.output, "\"command\": \"" + json_escape(cmd) + "\"");
+    std::ostringstream ss;
+    ss << "{\"status\":\"" << status << "\",\"label\":\"" << label << "\",\"action\":\"" << json_escape(action) << "\",\"exit_code\":" << r.exit_code;
+    ss << ",\"receipt\":\"" << json_escape(receipt) << "\",\"stdout_stderr_tail\":\"" << json_escape(r.output) << "\"}";
+    return ss.str();
+}
 
-    elapsed = time.time() - t0
-    success = sum(1 for v in visited if v["status"] == 200)
+static std::string blocked_response(const std::string& action, const std::string& reason) {
+    std::string receipt = write_receipt(action, "blocked", 0, reason);
+    return "{\"status\":\"blocked\",\"action\":\"" + json_escape(action) + "\",\"reason\":\"" + json_escape(reason) + "\",\"receipt\":\"" + json_escape(receipt) + "\"}";
+}
 
-    receipt_path = write_receipt("visit_back", f"Visited {len(visited)} profiles, {success} OK",
-                                  {"count": len(visited), "success": success, "elapsed": elapsed})
-    return {"status": "GREEN_REAL", "visited": len(visited), "success_200": success,
-            "elapsed_seconds": round(elapsed, 1), "workers": max_workers,
-            "receipt": receipt_path, "details": visited}
+static bool is_mutation(const std::string& m, const std::string& p) {
+    if (m == "POST" && p != "/api/metrics/ingest") return true;
+    if (p.rfind("/api/cicd/trigger/", 0) == 0) return true;
+    if (p.rfind("/api/rotate/", 0) == 0) return true;
+    if (p == "/api/run/ga-rl" || p == "/api/run/orchestrator" || p == "/api/run/availability" || p == "/api/rotator/report") return true;
+    return false;
+}
 
+static std::string check_admin(const std::string& req, const std::string& path, const std::string& method) {
+    if (!is_mutation(method, path)) return "";
+    if (ADMIN_TOKEN.empty()) return blocked_response("auth", "ADMIN_TOKEN required; mutation endpoints disabled until ADMIN_TOKEN is set.");
+    size_t ap = req.find("Authorization: Bearer ");
+    if (ap != std::string::npos) {
+        size_t vs = ap + 21;
+        size_t ve = req.find("\r\n", vs);
+        if (ve != std::string::npos && req.substr(vs, ve - vs) == ADMIN_TOKEN) return "";
+    }
+    return blocked_response("auth", "Admin token required for mutation endpoints. Use Authorization: Bearer <ADMIN_TOKEN> header.");
+}
 
-@app.post("/api/blog/post")
-def api_blog_post(payload: dict, _: bool = Depends(require_admin)):
-    """Blog posting — BLOCKED: RentMasseur does not expose a blog creation API.
-    Probed 46 paths x 4 methods (184 combinations). No blog write endpoint found.
-    Blog creation is web-form only (requires Selenium/browser)."""
-    return {
-        "status": "BLACK_DISABLED",
-        "reason": "No blog API endpoint exists on RentMasseur. 184 probes confirmed 404 on all blog paths.",
-        "probed": ["/settings/blog", "/account/blog", "/blogs/create", "/settings/blog/save", "/account/blog/post"],
-        "alternative": "Use Selenium with discover_blog_interview.py to capture web-form submission",
+static std::string landing_page() {
+    return R"HTML(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>RentMasseur RevenueOps Control Plane</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'SF Mono',Monaco,Consolas,monospace;background:#0a0b14;color:#e0e0e8;padding:20px}
+h1{font-size:24px;font-weight:600;letter-spacing:-0.5px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:1px;color:#6b7280;margin-bottom:12px}
+.subtitle{color:#6b7280;font-size:13px;margin-top:4px}
+.header{padding:24px 0;border-bottom:1px solid #1e2030;margin-bottom:24px}
+.header h1{color:#fff}
+.status-bar{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.tag{padding:4px 10px;border-radius:4px;font-size:11px;font-weight:600}
+.tag-green{background:#0d3320;color:#39ff88;border:1px solid #1a5c3a}
+.tag-gray{background:#1a1b2e;color:#6b7280;border:1px solid #2a2b3e}
+.tag-red{background:#330d0d;color:#ff5370;border:1px solid #5c1a1a}
+.tag-yellow{background:#332b0d;color:#ffd166;border:1px solid #5c4a1a}
+.tag-black{background:#0d0d0d;color:#444;border:1px solid #222}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;margin-top:16px}
+.panel{background:#11121f;border:1px solid #1e2030;border-radius:8px;padding:20px;min-height:200px}
+.panel pre{white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.5;color:#9ca3af;max-height:400px;overflow:auto}
+.metric-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1a1b2e;font-size:13px}
+.metric-label{color:#6b7280}
+.metric-value{color:#e0e0e8;font-weight:600}
+.metric-zero{color:#444}
+.truth{font-size:12px;color:#ff5370;padding:8px;background:#1a0a0a;border-radius:4px;margin-top:8px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.btn{padding:8px 14px;border-radius:6px;border:1px solid #2a2b3e;background:#161728;color:#9ca3af;text-decoration:none;font-size:12px;cursor:pointer;transition:all 0.15s}
+.btn:hover{border-color:#3a3b4e;color:#fff}
+.btn-danger{border-color:#3a1a1a;color:#ff5370}
+.btn-danger:hover{background:#1a0a0a}
+.btn-ok{border-color:#1a3a2a;color:#39ff88}
+.btn-ok:hover{background:#0a1a0a}
+.footer{margin-top:32px;padding-top:16px;border-top:1px solid #1e2030;color:#444;font-size:11px;text-align:center}
+#daily-proof{font-size:12px;line-height:1.8;color:#9ca3af}
+.proof-q{color:#6b7280}
+.proof-a{color:#e0e0e8}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>RentMasseur RevenueOps Control Plane</h1>
+  <p class="subtitle">Mission: one paying client per day, or prove exactly why it failed today.</p>
+  <div class="status-bar">
+    <span class="tag tag-gray" id="tag-health">HEALTH: checking...</span>
+    <span class="tag tag-gray" id="tag-metrics">METRICS: checking...</span>
+    <span class="tag tag-gray" id="tag-candidates">CANDIDATES: checking...</span>
+    <span class="tag tag-gray" id="tag-decision">DECISION: checking...</span>
+    <span class="tag tag-black">AVAILABILITY: BLACK_DISABLED</span>
+  </div>
+</div>
+
+<div class="grid">
+
+  <div class="panel">
+    <h2>Mission Control</h2>
+    <div class="metric-row"><span class="metric-label">Today target</span><span class="metric-value">1 paid client</span></div>
+    <div class="metric-row"><span class="metric-label">Current status</span><span class="metric-value" id="mission-status">loading...</span></div>
+    <div class="metric-row"><span class="metric-label">Prospects today</span><span class="metric-value metric-zero" id="prospects-count">0</span></div>
+    <div class="metric-row"><span class="metric-label">Leads active</span><span class="metric-value metric-zero" id="leads-active">0</span></div>
+    <div class="metric-row"><span class="metric-label">Bookings confirmed</span><span class="metric-value metric-zero" id="bookings-confirmed">0</span></div>
+    <div class="metric-row"><span class="metric-label">Revenue verified</span><span class="metric-value metric-zero">$0</span></div>
+    <div class="truth" id="mission-truth">No mock success. No simulation labels. Every number must be backed by a receipt.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Live Metrics</h2>
+    <div id="metrics-panel"><pre>loading...</pre></div>
+    <div class="actions">
+      <a class="btn" href="/api/funnel/daily">Funnel Daily</a>
+      <a class="btn" href="/api/leads">Leads</a>
+      <a class="btn btn-ok" href="/api/metrics/ingest" onclick="return false">Ingest (POST)</a>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Candidate Queue</h2>
+    <div id="candidates-panel"><pre>loading...</pre></div>
+    <div class="actions">
+      <a class="btn" href="/api/candidates">Refresh</a>
+      <a class="btn" href="/api/bios">Bios</a>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Decision Gate</h2>
+    <div id="decision-panel"><pre>loading...</pre></div>
+    <div class="actions">
+      <a class="btn" href="/api/decision/latest">Latest Decision</a>
+      <a class="btn btn-danger" href="/api/run/availability">Availability (BLOCKED)</a>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Job Ledger</h2>
+    <div id="jobs-panel"><pre>loading...</pre></div>
+    <div class="actions">
+      <a class="btn" href="/api/jobs">All Jobs</a>
+      <a class="btn" href="/api/receipts">Receipts</a>
+      <a class="btn" href="/api/audit/files">File Audit</a>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Revenue Proof</h2>
+    <div class="metric-row"><span class="metric-label">Verified revenue</span><span class="metric-value metric-zero">$0</span></div>
+    <div class="metric-row"><span class="metric-label">Confirmed bookings</span><span class="metric-value metric-zero">0</span></div>
+    <div class="metric-row"><span class="metric-label">Target</span><span class="metric-value">1 client/day</span></div>
+    <div class="metric-row"><span class="metric-label">Client probability</span><span class="metric-value metric-zero" id="prob">unverified</span></div>
+    <div class="truth">No estimates pretending to be money. Only confirmed bookings count.</div>
+  </div>
+
+</div>
+
+<div class="grid">
+  <div class="panel" style="min-height:auto">
+    <h2>Daily Revenue Proof</h2>
+    <div id="daily-proof">
+      <span class="proof-q">What did the system observe?</span> <span class="proof-a" id="dp-observe">--</span><br>
+      <span class="proof-q">How many prospects existed?</span> <span class="proof-a" id="dp-prospects">--</span><br>
+      <span class="proof-q">How many were qualified?</span> <span class="proof-a" id="dp-qualified">--</span><br>
+      <span class="proof-q">How many clicked?</span> <span class="proof-a" id="dp-clicked">--</span><br>
+      <span class="proof-q">How many messaged?</span> <span class="proof-a" id="dp-messaged">--</span><br>
+      <span class="proof-q">How many appointments?</span> <span class="proof-a" id="dp-appts">--</span><br>
+      <span class="proof-q">How many paid?</span> <span class="proof-a" id="dp-paid">--</span><br>
+      <span class="proof-q">Which experiment was live?</span> <span class="proof-a" id="dp-exp">--</span><br>
+      <span class="proof-q">What won?</span> <span class="proof-a" id="dp-won">--</span><br>
+      <span class="proof-q">What failed?</span> <span class="proof-a" id="dp-failed">--</span><br>
+      <span class="proof-q">Tomorrow next best action?</span> <span class="proof-a" id="dp-next">--</span>
+    </div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="panel" style="min-height:auto">
+    <h2>CI/CD Control</h2>
+    <div class="actions">
+      <a class="btn" href="/api/cicd/list">List Workflows</a>
+      <a class="btn" href="/api/cicd/runs">Recent Runs</a>
+      <a class="btn btn-ok" href="/api/cicd/trigger/deploy-hf-space.yml">Deploy HF</a>
+      <a class="btn" href="/api/cicd/trigger/master-rotator.yml">Master Rotator</a>
+    </div>
+    <pre id="cicd-panel" style="margin-top:12px">loading...</pre>
+  </div>
+  <div class="panel" style="min-height:auto">
+    <h2>System State</h2>
+    <pre id="state">loading...</pre>
+  </div>
+</div>
+
+<div class="footer">
+  RentMasseur RevenueOps Control Plane &middot; No receipt, no reality. No metric, no optimization. No lead, no client claim.
+</div>
+
+<script>
+function setTag(id, text, cls) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'tag ' + cls;
+}
+
+fetch('/api/health').then(r=>r.json()).then(j=>{
+  setTag('tag-health', 'HEALTH: ' + (j.status||'?'), j.status==='ok' ? 'tag-green' : 'tag-red');
+}).catch(()=>setTag('tag-health','HEALTH: OFFLINE','tag-red'));
+
+fetch('/api/report').then(r=>r.json()).then(j=>{
+  state.textContent = JSON.stringify(j, null, 2);
+  const hasMetrics = j.status === 'real_data_present';
+  setTag('tag-metrics', 'METRICS: ' + (hasMetrics ? 'REAL' : 'NO_DATA'), hasMetrics ? 'tag-green' : 'tag-gray');
+  const hasBios = (j.content_counts?.bios || 0) > 0;
+  setTag('tag-candidates', 'CANDIDATES: ' + (hasBios ? j.content_counts.bios : 'NONE'), hasBios ? 'tag-green' : 'tag-gray');
+  setTag('tag-decision', 'DECISION: ' + (j.latest_decision?.status || 'NONE'), j.latest_decision?.status === 'accepted' ? 'tag-green' : 'tag-gray');
+  document.getElementById('mission-status').textContent = j.status || 'unknown';
+  document.getElementById('mission-status').className = 'metric-value' + (j.status?.includes('blocked') ? ' metric-zero' : '');
+}).catch(e=>state.textContent=String(e));
+
+fetch('/api/funnel/daily').then(r=>r.json()).then(j=>{
+  metricsPanel.innerHTML = '';
+  const rows = [
+    ['Metric entries', j.metric_entries||0],
+    ['Profile views', j.profile_views||0],
+    ['Contact clicks', j.contact_clicks||0],
+    ['Email clicks', j.email_clicks||0],
+    ['Phone clicks', j.phone_clicks||0],
+    ['Booking requests', j.booking_requests||0],
+    ['Confirmed bookings', j.confirmed_bookings||0],
+  ];
+  rows.forEach(([k,v])=>{
+    const d=document.createElement('div');
+    d.className='metric-row';
+    d.innerHTML='<span class="metric-label">'+k+'</span><span class="metric-value'+(v===0?' metric-zero':'')+'">'+v+'</span>';
+    metricsPanel.appendChild(d);
+  });
+  if((j.metric_entries||0)===0){
+    const t=document.createElement('div');
+    t.className='truth';
+    t.textContent='NO REAL METRICS. Funnel requires first-party data from extension or manual capture.';
+    metricsPanel.appendChild(t);
+  }
+  document.getElementById('prob').textContent = j.client_probability || 'unverified';
+}).catch(e=>metricsPanel.innerHTML='<pre>'+String(e)+'</pre>');
+
+fetch('/api/candidates').then(r=>r.json()).then(j=>{
+  candidatesPanel.innerHTML='<pre>'+JSON.stringify(j,null,2)+'</pre>';
+}).catch(e=>candidatesPanel.innerHTML='<pre>'+String(e)+'</pre>');
+
+fetch('/api/decision/latest').then(r=>r.json()).then(j=>{
+  decisionPanel.innerHTML='<pre>'+JSON.stringify(j,null,2)+'</pre>';
+}).catch(e=>decisionPanel.innerHTML='<pre>'+String(e)+'</pre>');
+
+fetch('/api/jobs').then(r=>r.json()).then(j=>{
+  const count = j.jobs?.length || 0;
+  jobsPanel.innerHTML='<pre>Jobs: '+count+'\n'+JSON.stringify(j.jobs?.slice(-3),null,2)+'</pre>';
+}).catch(e=>jobsPanel.innerHTML='<pre>'+String(e)+'</pre>');
+
+fetch('/api/cicd/runs').then(r=>r.json()).then(j=>{
+  const runs = j.workflow_runs||[];
+  cicdPanel.textContent = runs.slice(0,5).map(r=>r.name+': '+(r.conclusion||r.status)+' ('+r.created_at+')').join('\n');
+}).catch(e=>cicdPanel.textContent=String(e));
+</script>
+</body></html>)HTML";
+}
+static void handle_client(int client_socket) {
+    char buffer[16384];
+    int received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+    if (received <= 0) { close(client_socket); return; }
+    buffer[received] = '\0';
+    std::string request(buffer);
+    std::string method = get_method(request);
+    std::string path = get_path(request);
+    std::string body = get_body(request);
+    std::string response;
+    std::string content_type = "application/json";
+    int code = 200;
+
+    ensure_dir(CONTENT_DIR);
+    ensure_dir(RECEIPTS_DIR);
+
+    std::string auth_err = check_admin(request, path, method);
+    if (!auth_err.empty()) {
+        code = 403;
+        response = auth_err;
+        std::string w = http_response(code, content_type, response);
+        send(client_socket, w.c_str(), w.size(), 0);
+        close(client_socket);
+        return;
     }
 
-
-@app.post("/api/blog/draft")
-def api_blog_draft(payload: dict, _: bool = Depends(require_admin)):
-    """Generate an optimized blog draft — does NOT publish. Returns draft for manual posting."""
-    import sys
-    sys.path.insert(0, RM_TRAFFIC_PATH)
-    from rm_traffic.blog_agent import generate_blog_drafts, save_blog_drafts_to_disk
-    count = payload.get("count", 1)
-    drafts = generate_blog_drafts(count=count)
-    save_blog_drafts_to_disk(drafts)
-    receipt_path = write_receipt("blog_draft", f"Drafted {len(drafts)} blog posts",
-                                  {"count": len(drafts), "titles": [d["title"] for d in drafts]})
-    return {"status": "GREEN_REAL", "drafts": drafts, "receipt": receipt_path,
-            "note": "Drafts saved to rm_traffic/data/drafts/blog/. Post manually via web form."}
-
-
-@app.post("/api/interview/post")
-def api_interview_post(payload: dict, _: bool = Depends(require_admin)):
-    """Interview posting — BLOCKED: RentMasseur does not expose an interview API.
-    Probed 46 paths x 4 methods (184 combinations). No interview write endpoint found.
-    Interview editing is web-form only (requires Selenium/browser)."""
-    return {
-        "status": "BLACK_DISABLED",
-        "reason": "No interview API endpoint exists on RentMasseur. 184 probes confirmed 404 on all interview paths.",
-        "probed": ["/settings/interview", "/account/interview", "/settings/interviews", "/settings/interview/save"],
-        "alternative": "Use Selenium with discover_blog_interview.py to capture web-form submission",
+    if (method == "OPTIONS") {
+        response = "{}";
+    } else if (path == "/" || path == "/index.html") {
+        response = landing_page(); content_type = "text/html";
+    } else if (path == "/health" || path == "/api/health") {
+        response = "{\"status\":\"ok\",\"service\":\"rentmasseur-cpp-os\",\"mode\":\"evidence_only\",\"timestamp\":\"" + iso_timestamp() + "\"}";
+    } else if (path == "/api/report") {
+        int bios_count = count_files(CONTENT_DIR + "/bios");
+        bool metrics = file_exists(CONTENT_DIR + "/live_metrics.json") || file_exists(CONTENT_DIR + "/metrics_ingest.jsonl");
+        std::ostringstream ss;
+        ss << "{\"status\":\"" << (metrics ? "real_data_present" : "blocked_missing_metrics") << "\",";
+        ss << "\"rl_state\":" << read_json_or_block(CONTENT_DIR + "/rl_state.json", "rl_state") << ",";
+        ss << "\"ga_state\":" << read_json_or_block(CONTENT_DIR + "/ga_rl_state.json", "ga_state") << ",";
+        ss << "\"availability\":" << read_json_or_block(AVAILABILITY_FILE, "availability") << ",";
+        ss << "\"content_counts\":{\"bios\":" << bios_count << ",\"receipts\":" << count_files(RECEIPTS_DIR) << "},";
+        ss << "\"live_profile_update_allowed\":false,";
+        ss << "\"timestamp\":\"" << iso_timestamp() << "\"}";
+        response = ss.str();
+    } else if (path == "/api/bios") {
+        response = bios_json();
+    } else if (path == "/api/competitors") {
+        response = read_json_or_block(CONTENT_DIR + "/competitor_bios.json", "competitor_bios");
+    } else if (path == "/api/jobs") {
+        std::ostringstream ss;
+        ss << "{\"status\":\"ok\",\"jobs\":[";
+        DIR* d = opendir(RECEIPTS_DIR.c_str());
+        if (d) {
+            struct dirent* entry;
+            bool first = true;
+            while ((entry = readdir(d)) != nullptr) {
+                if (entry->d_type != DT_REG) continue;
+                std::string fname = entry->d_name;
+                if (!first) ss << ",";
+                first = false;
+                std::string fcontent = read_file(RECEIPTS_DIR + "/" + fname);
+                ss << fcontent;
+            }
+            closedir(d);
+        }
+        ss << "]}";
+        response = ss.str();
+    } else if (path.rfind("/api/jobs/", 0) == 0) {
+        std::string job_id = path.substr(10);
+        std::string job_path = RECEIPTS_DIR + "/" + job_id;
+        std::string fcontent = read_file(job_path);
+        if (fcontent.empty()) {
+            code = 404;
+            response = "{\"status\":\"failed\",\"reason\":\"job not found\",\"job_id\":\"" + json_escape(job_id) + "\"}";
+        } else {
+            response = fcontent;
+        }
+    } else if (path == "/api/audit/files") {
+        std::ostringstream ss;
+        ss << "{\"status\":\"ok\",\"files\":[";
+        const char* files_to_audit[] = {
+            "cpp_os_server.cpp", "rotator_engine.cpp", "ga_rl_optimizer.cpp",
+            "production_control_loop.cpp", "Dockerfile", "requirements.txt",
+            "orchestrator.py", "content_generator.py", "rl_feedback.py",
+            "interview_rotator.py", "blog_rotator.py", "metrics_collector.py",
+            "rentmasseur_availability.py", "hf_app.py", nullptr
+        };
+        bool first = true;
+        for (int i = 0; files_to_audit[i]; i++) {
+            std::string fname = files_to_audit[i];
+            bool exists = file_exists(fname);
+            std::string state;
+            if (!exists) state = "dead";
+            else if (fname.find(".cpp") != std::string::npos) state = "compiled";
+            else if (fname.find(".py") != std::string::npos) state = "imported";
+            else state = "present";
+            bool has_receipt = file_exists(std::string(RECEIPTS_DIR + "/hf_action_") + fname);
+            if (!first) ss << ",";
+            first = false;
+            ss << "{\"file\":\"" << json_escape(fname) << "\",\"state\":\"" << state << "\",\"exists\":" << (exists ? "true" : "false") << ",\"has_receipt\":" << (has_receipt ? "true" : "false") << "}";
+        }
+        ss << "]}";
+        response = ss.str();
+    } else if (path == "/api/receipts") {
+        response = "{\"status\":\"ok\",\"receipt_count\":" + std::to_string(count_files(RECEIPTS_DIR)) + "}";
+    } else if (path == "/api/ingest" && method == "POST") {
+        std::string ingest_path = CONTENT_DIR + "/metrics_ingest.jsonl";
+        std::ofstream f(ingest_path, std::ios::app);
+        if (!f) { code = 500; response = "{\"status\":\"failed\",\"reason\":\"could not open metrics_ingest.jsonl\"}"; }
+        else {
+            f << "{\"timestamp\":\"" << iso_timestamp() << "\",\"body\":\"" << json_escape(body) << "\"}\n";
+            std::string receipt = write_receipt("ingest", "success", 0, "metrics accepted", "\"output_file\": \"" + ingest_path + "\"");
+            response = "{\"status\":\"success\",\"output_file\":\"" + ingest_path + "\",\"receipt\":\"" + receipt + "\"}";
+        }
+    } else if (path == "/api/run/ga-rl") {
+        response = action_response("ga-rl", "./ga_rl_optimizer --population 12 --generations 5 --target 300 && ./ga_rl_optimizer --apply-winner");
+    } else if (path == "/api/run/orchestrator") {
+        response = action_response("orchestrator", "python3 orchestrator.py --all --dry-run");
+    } else if (path == "/api/run/availability") {
+        code = 403;
+        response = blocked_response("availability", "Live login automation is disabled because prior runs hit captcha/anti-bot. Use first-party metrics ingestion or a manually approved platform path.");
+    } else if (path.rfind("/api/rotate/", 0) == 0) {
+        std::string rotate_type = path.substr(12);
+        if (!(rotate_type == "bio" || rotate_type == "photo" || rotate_type == "price" || rotate_type == "interview" || rotate_type == "blog")) {
+            code = 404; response = "{\"status\":\"failed\",\"reason\":\"unknown rotate type\"}";
+        } else {
+            response = action_response("rotate_" + rotate_type, "./rotator_engine --rotate " + rotate_type);
+        }
+    } else if (path == "/api/rotator/report") {
+        response = action_response("rotator_report", "./rotator_engine --report");
+    } else if (path == "/api/cicd/list") {
+        response = gh_api("GET", "actions/workflows");
+    } else if (path == "/api/cicd/runs") {
+        response = gh_api("GET", "actions/runs?per_page=10");
+    } else if (path.rfind("/api/cicd/trigger/", 0) == 0) {
+        std::string wf = path.substr(18);
+        std::string raw = gh_api("POST", "actions/workflows/" + url_encode_workflow(wf) + "/dispatches", "{\"ref\":\"main\"}");
+        std::string receipt = write_receipt("cicd_trigger_" + wf, "dispatched", 0, raw);
+        response = "{\"status\":\"dispatched\",\"workflow\":\"" + json_escape(wf) + "\",\"github_response\":" + raw + ",\"receipt\":\"" + json_escape(receipt) + "\"}";
+    } else if (path.rfind("/api/cicd/status/", 0) == 0) {
+        response = gh_api("GET", "actions/runs/" + path.substr(16));
+    } else if (path == "/api/funnel/daily") {
+        std::string metrics = read_file(CONTENT_DIR + "/metrics_ingest.jsonl");
+        int metric_count = 0;
+        long total_views = 0, total_clicks = 0, total_emails = 0, total_visits = 0;
+        if (!metrics.empty()) {
+            std::istringstream ms(metrics);
+            std::string line;
+            while (std::getline(ms, line)) {
+                if (line.empty()) continue;
+                metric_count++;
+                size_t vp = line.find("\"profile_views\"");
+                if (vp != std::string::npos) { size_t vn = line.find(":", vp); if (vn != std::string::npos) total_views += std::atol(line.c_str() + vn + 1); }
+                size_t cp = line.find("\"contact_clicks\"");
+                if (cp != std::string::npos) { size_t cn = line.find(":", cp); if (cn != std::string::npos) total_clicks += std::atol(line.c_str() + cn + 1); }
+                size_t ep = line.find("\"new_emails\"");
+                if (ep != std::string::npos) { size_t en = line.find(":", ep); if (en != std::string::npos) total_emails += std::atol(line.c_str() + en + 1); }
+                size_t np = line.find("\"new_visits\"");
+                if (np != std::string::npos) { size_t nn = line.find(":", np); if (nn != std::string::npos) total_visits += std::atol(line.c_str() + nn + 1); }
+            }
+        }
+        double ctr = total_views > 0 ? (double)total_clicks / total_views : 0.0;
+        char ctr_buf[16]; std::snprintf(ctr_buf, sizeof(ctr_buf), "%.4f", ctr);
+        const char* status = metric_count == 0 ? "gray_no_data" : (total_views < 100 ? "no_signal" : "real_data");
+        std::ostringstream ss;
+        ss << "{\"status\":\"" << status << "\",\"metric_entries\":" << metric_count
+           << ",\"profile_views\":" << total_views
+           << ",\"contact_clicks\":" << total_clicks
+           << ",\"new_visits\":" << total_visits
+           << ",\"new_emails\":" << total_emails
+           << ",\"contact_click_rate\":" << ctr_buf
+           << ",\"email_clicks\":0,\"phone_clicks\":0,\"booking_requests\":0,\"confirmed_bookings\":0,\"gross_revenue\":0"
+           << ",\"client_target\":1,\"client_probability\":\"unverified_no_real_metrics\""
+           << ",\"note\":\"Funnel requires first-party metrics from extension or manual dashboard capture\""
+           << ",\"timestamp\":\"" << iso_timestamp() << "\"}";
+        response = ss.str();
+    } else if (path == "/api/leads") {
+        std::string leads = read_file(CONTENT_DIR + "/leads.jsonl");
+        int lead_count = 0;
+        if (!leads.empty()) {
+            for (size_t i = 0; i < leads.size(); i++) if (leads[i] == '\n') lead_count++;
+        }
+        response = "{\"status\":\"" + std::string(lead_count > 0 ? "ok" : "gray_no_data") + "\",\"lead_count\":" + std::to_string(lead_count) + ",\"note\":\"Leads are tracked from first-party contact events only\"}";
+    } else if (path == "/api/decision/latest") {
+        std::string decision = read_file(CONTENT_DIR + "/decisions/latest_decision.json");
+        if (decision.empty()) {
+            response = "{\"status\":\"gray_no_data\",\"reason\":\"no production gate decision has been made yet\",\"note\":\"Run master-rotator with production_control_loop --evaluate to generate a decision\"}";
+        } else {
+            response = decision;
+        }
+    } else if (path == "/api/candidates") {
+        std::ostringstream ss;
+        ss << "{\"status\":\"ok\",\"candidates\":{";
+        const char* types[] = {"bios", "interviews", "blogs", "photos", "prices", nullptr};
+        bool first = true;
+        for (int i = 0; types[i]; i++) {
+            if (!first) ss << ",";
+            first = false;
+            ss << "\"" << types[i] << "\":" << count_files(CONTENT_DIR + "/" + types[i]);
+        }
+        ss << "}}";
+        response = ss.str();
+    } else if (path == "/api/metrics/ingest" && method == "POST") {
+        std::string lower_body = body;
+        for (char& c : lower_body) c = (char)tolower(c);
+        const char* secret_keys[] = {"cookie", "cookies", "token", "accesstoken", "refreshtoken", "authorization", "password", "session", "bearer", nullptr};
+        bool has_secret = false;
+        std::string secret_found = "";
+        for (int i = 0; secret_keys[i]; i++) {
+            if (lower_body.find(secret_keys[i]) != std::string::npos) {
+                has_secret = true;
+                secret_found = secret_keys[i];
+                break;
+            }
+        }
+        if (has_secret) {
+            code = 400;
+            std::string receipt = write_receipt("metrics_ingest_rejected", "rejected", 0, "payload contains secret-bearing key", "\"rejected_key\": \"" + secret_found + "\"");
+            response = "{\"status\":\"rejected\",\"reason\":\"payload contains secret-bearing field\",\"field\":\"" + secret_found + "\",\"receipt\":\"" + json_escape(receipt) + "\"}";
+        } else {
+            std::string ingest_path = CONTENT_DIR + "/metrics_ingest.jsonl";
+            std::ofstream f(ingest_path, std::ios::app);
+            if (!f) { code = 500; response = "{\"status\":\"failed\",\"reason\":\"could not write metrics file\"}"; }
+            else {
+                f << body << "\n";
+                f.close();
+                std::string latest_path = CONTENT_DIR + "/metrics/latest_metrics.json";
+                ensure_dir(CONTENT_DIR + "/metrics");
+                std::ofstream lf(latest_path);
+                if (lf) { lf << body; lf.close(); }
+                std::string receipt = write_receipt("metrics_ingest", "success", 0, "first-party metrics accepted",
+                    "\"output_file\": \"" + ingest_path + "\", \"latest_file\": \"" + latest_path + "\"");
+                response = "{\"status\":\"success\",\"output_file\":\"" + ingest_path + "\",\"latest_file\":\"" + latest_path + "\",\"receipt\":\"" + json_escape(receipt) + "\",\"note\":\"first-party metrics only, no automated login\"}";
+            }
+        }
+    } else if (path == "/api/config" && method == "POST") {
+        std::string config_path = CONTENT_DIR + "/system_config.json";
+        std::ofstream f(config_path);
+        if (!f) { code = 500; response = "{\"status\":\"failed\",\"reason\":\"could not write config\"}"; }
+        else {
+            f << body;
+            std::string receipt = write_receipt("config", "success", 0, "config saved", "\"output_file\": \"" + config_path + "\"");
+            response = "{\"status\":\"success\",\"output_file\":\"" + config_path + "\",\"receipt\":\"" + receipt + "\"}";
+        }
+    } else {
+        code = 404;
+        response = "{\"status\":\"failed\",\"error\":\"not found\"}";
     }
 
+    std::string wire = http_response(code, content_type, response);
+    send(client_socket, wire.c_str(), wire.size(), 0);
+    close(client_socket);
+}
 
-@app.post("/api/interview/draft")
-def api_interview_draft(payload: dict, _: bool = Depends(require_admin)):
-    """Generate interview answer drafts — does NOT publish. Returns drafts for manual posting."""
-    import sys
-    sys.path.insert(0, RM_TRAFFIC_PATH)
-    from rm_traffic.interview_agent import generate_interview_drafts
-    drafts = generate_interview_drafts()
-    receipt_path = write_receipt("interview_draft", f"Drafted {len(drafts)} interview answers",
-                                  {"count": len(drafts)})
-    return {"status": "GREEN_REAL", "drafts": drafts, "receipt": receipt_path,
-            "note": "Drafts generated. Post manually via web form."}
-
-
-@app.post("/api/bio/post")
-def api_bio_post(payload: dict, _: bool = Depends(require_admin)):
-    """Post/update bio on RentMasseur profile via direct API."""
-    headline = payload.get("headline", "")
-    description = payload.get("text", payload.get("description", ""))
-    bio_id = payload.get("bio_id", "")
-    bio_file = payload.get("file", "")
-
-    # If bio_id or file specified, load from content/bios
-    if bio_id and not description:
-        bio_path = os.path.join(os.path.dirname(__file__), "content", "bios", f"{bio_id}.md")
-        if os.path.exists(bio_path):
-            text = open(bio_path).read()
-            lines = text.strip().split("\n", 1)
-            headline = lines[0].lstrip("# ").strip()
-            description = lines[1].strip() if len(lines) > 1 else text
-    elif bio_file and not description:
-        if os.path.exists(bio_file):
-            text = open(bio_file).read()
-            lines = text.strip().split("\n", 1)
-            headline = lines[0].lstrip("# ").strip()
-            description = lines[1].strip() if len(lines) > 1 else text
-
-    if not headline or not description:
-        raise HTTPException(status_code=400, detail="headline and description (or bio_id/file) required")
-
-    api = _get_api_client()
-    try:
-        resp = api.set_about(headline, description)
-        receipt_path = write_receipt("bio_post", f"Bio updated: {headline[:50]}",
-                                      {"headline": headline, "description_len": len(description),
-                                       "bio_id": bio_id, "response": str(resp)[:500]})
-        return {"status": "GREEN_REAL", "headline": headline, "description_len": len(description),
-                "bio_id": bio_id or "custom", "receipt": receipt_path, "response": str(resp)[:500]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Bio post error: {str(e)[:200]}")
-
-
-@app.get("/api/automation/status")
-def api_automation_status():
-    """Military-grade automation status — honest grading, no mock."""
-    return {
-        "mode": "direct_api",
-        "selenium": False,
-        "grade": "MILITARY",
-        "endpoints": {
-            "/api/visit-back": {"status": "GREEN_REAL", "proof": "48 profiles visited in 2.2s with 33 workers", "method": "concurrent HTTP GET"},
-            "/api/blog/post": {"status": "BLACK_DISABLED", "reason": "No API endpoint exists (184 probes confirmed 404)"},
-            "/api/blog/draft": {"status": "GREEN_REAL", "method": "generates optimized drafts, no publish"},
-            "/api/interview/post": {"status": "BLACK_DISABLED", "reason": "No API endpoint exists (184 probes confirmed 404)"},
-            "/api/interview/draft": {"status": "GREEN_REAL", "method": "generates answer drafts, no publish"},
-            "/api/bio/post": {"status": "GREEN_REAL", "proof": "PUT /settings/about returns 200", "method": "direct API"},
-        },
-        "probe_report": "184 combinations (46 paths x 4 methods) probed in 14.9s with 33 workers",
-        "rm_traffic_path": RM_TRAFFIC_PATH,
-        "extension_repo": EXTENSION_REPO,
+static int start_server(int port) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { std::cerr << "Socket creation failed\n"; return 1; }
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+    if (bind(server_fd, (sockaddr*)&address, sizeof(address)) < 0) { std::cerr << "Bind failed\n"; close(server_fd); return 1; }
+    if (listen(server_fd, 10) < 0) { std::cerr << "Listen failed\n"; close(server_fd); return 1; }
+    std::cout << "RentMasseur C++ OS listening on port " << port << std::endl;
+    while (true) {
+        sockaddr_in client_addr{};
+        socklen_t addr_len = sizeof(client_addr);
+        int client_socket = accept(server_fd, (sockaddr*)&client_addr, &addr_len);
+        if (client_socket < 0) continue;
+        handle_client(client_socket);
     }
+    close(server_fd);
+    return 0;
+}
 
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+int main(int argc, char* argv[]) {
+    int port = PORT;
+    if (argc > 1) port = std::atoi(argv[1]);
+    std::cout << "Starting RentMasseur C++ OS evidence-only mode on port " << port << std::endl;
+    return start_server(port);
+}
 
 ```
 
-content_generator.py:
+metrics_collector.py:
 ```
 #!/usr/bin/env python3
-"""Daily content generator for RentMasseur profile optimization.
+"""
+Metrics collector — accepts first-party data from the Chrome extension or manual uploads.
+No automated login. No Selenium. No captcha-bypassing.
 
-Generates bios, blog posts, and interview questions using Groq LLM.
-Runs mass analysis across all 30 strategies and collects the best versions.
-Designed to run daily in CI/CD.
+Data sources:
+  1. Chrome extension sends metrics to HF Space /api/ingest (user-approved, first-party)
+  2. Manual JSON upload via CI/CD workflow_dispatch inputs
+  3. Dashboard screenshot OCR (user-provided, not automated)
 
-Usage:
-    python3 content_generator.py                    # generate all content
-    python3 content_generator.py --bios-only        # bios only
-    python3 content_generator.py --blogs-only       # blog posts only
-    python3 content_generator.py --questions-only   # interview questions only
+This script processes ingested metrics and updates the availability/RL state files.
 """
 
 import argparse
 import json
 import os
 import sys
-import time
-import hashlib
-import logging
 from datetime import datetime, timezone
-from typing import Optional
+from pathlib import Path
 
-import requests
-from dotenv import load_dotenv
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger(__name__)
-
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv()
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-
-CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
-BIOS_DIR = os.path.join(CONTENT_DIR, "bios")
-BLOGS_DIR = os.path.join(CONTENT_DIR, "blog_posts")
-QUESTIONS_DIR = os.path.join(CONTENT_DIR, "interview_questions")
-HISTORY_FILE = os.path.join(CONTENT_DIR, "content_history.json")
-
-STRATEGIES = [
-    ("sensory_luxury", "Luxurious sensory experience, premium oils, candlelight, high-end clientele"),
-    ("therapeutic_expert", "Clinical therapeutic massage, pain relief, certifications, back/neck focus"),
-    ("mystery_desire", "Mysterious, alluring, teases the experience, curiosity-driven bookings"),
-    ("local_hustle", "Manhattan local vibe, neighborhood energy, approachable, easy booking"),
-    ("transformation_story", "Story-based, stress-to-relief transformation, emotional hook"),
-    ("night_owl", "Late-night availability, after-hours, private evening sessions"),
-    ("athlete_recovery", "Gym-goers, pre/post-workout, muscle recovery, sports performance"),
-    ("ceo_executive", "Executive wellness, CEO/founder stress relief, time-efficient, premium"),
-    ("spiritual_healer", "Holistic, energy work, chakras, mindfulness, breathwork"),
-    ("traveler_companion", "Out-of-town visitors, jet lag, hotel-friendly, concierge service"),
-    ("medical_referral", "Doctor-recommended, clinical back pain, sciatica, posture correction"),
-    ("artist_soul", "Creative artistic approach, massage as art, intuitive touch"),
-    ("discrete_confidential", "Absolute privacy, VIP clients, judgment-free, confidential studio"),
-    ("first_timer", "Welcoming newcomers, gentle introduction, no experience needed"),
-    ("seasonal_special", "Seasonal themes, winter warmth, summer cool-down, holiday stress"),
-    ("couples_duo", "Couples, partners, duet sessions, romantic bonding experience"),
-    ("bodybuilder_therapy", "Heavy lifters, deep pressure, fascia release, intense muscle work"),
-    ("yoga_fusion", "Yoga + massage, stretching, flexibility, mind-body connection"),
-    ("luxury_concierge", "White-glove in-home/hotel service, elite concierge, effortless booking"),
-    ("recovery_addiction", "Sober wellness, recovery support, clean living, healthy coping"),
-    ("military_veteran", "Veteran-friendly, service member respect, PT recovery, brotherhood"),
-    ("lgbtq_pride", "Inclusive pride-forward, safe space, community, authentic expression"),
-    ("senior_gentle", "Senior-friendly, gentle touch, mobility, arthritis, circulation"),
-    ("office_relief", "Desk job recovery, neck pain, carpal tunnel, corporate warrior"),
-    ("dancer_flexibility", "Dancers/performers, flexibility maintenance, injury prevention"),
-    ("meditation_guide", "Guided meditation + massage, mindfulness, breath, tranquility"),
-    ("hot_stone_specialist", "Hot stone specialty, heat therapy, deep relaxation, indulgence"),
-    ("quick_lunch", "Express 30-45 min lunch-break massage, fast, effective, convenient"),
-    ("birthday_gift", "Gift-worthy special occasion, treat yourself, memorable experience"),
-    ("weekly_ritual", "Recurring weekly maintenance, body upkeep, long-term investment"),
-]
+CONTENT_DIR = Path("content")
+AVAILABILITY_FILE = Path("availability.json")
+METRICS_INGEST = CONTENT_DIR / "metrics_ingest.jsonl"
 
 
-def _ensure_dirs():
-    for d in [CONTENT_DIR, BIOS_DIR, BLOGS_DIR, QUESTIONS_DIR]:
-        os.makedirs(d, exist_ok=True)
+def process_ingested_metrics():
+    """Read all ingested metrics and produce a summary."""
+    if not METRICS_INGEST.exists():
+        print("[metrics] No ingested metrics file found.")
+        return {"status": "no_data", "message": "No metrics ingested yet."}
 
-
-def _load_history() -> list:
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
-
-
-def _save_history(history: list):
-    _ensure_dirs()
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history[-200:], f, indent=2)
-    except Exception as e:
-        logger.warning("Failed to save history: %s", e)
-
-
-def _content_hash(text: str) -> str:
-    return hashlib.md5(text.strip().lower().encode()).hexdigest()[:12]
-
-
-def _groq_chat(system_prompt: str, user_prompt: str, temperature: float = 0.9, max_tokens: int = 800, retries: int = 3) -> Optional[str]:
-    if not GROQ_API_KEY:
-        logger.error("No GROQ_API_KEY")
-        return None
-    for attempt in range(retries):
-        try:
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                },
-                timeout=90,
-            )
-            if resp.status_code == 429:
-                wait = 5 * (attempt + 1)
-                logger.warning("Groq rate limited, waiting %ds (attempt %d/%d)", wait, attempt + 1, retries)
-                time.sleep(wait)
+    metrics = []
+    with open(METRICS_INGEST, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
-            return content
-        except Exception as e:
-            logger.error("Groq API error: %s", e)
-            if attempt < retries - 1:
-                time.sleep(5 * (attempt + 1))
-    return None
-
-
-def _save_content(directory: str, strategy_name: str, content: str, ext: str = "md") -> str:
-    ts = datetime.now().strftime("%Y%m%d")
-    filename = f"{ts}_{strategy_name}.{ext}"
-    filepath = os.path.join(directory, filename)
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(content)
-    logger.info("Saved: %s (%d chars)", filepath, len(content))
-    return filepath
-
-
-def generate_bios(history: list, used_hashes: set) -> list:
-    logger.info("=== Generating bios for all 30 strategies ===")
-    system_prompt = (
-        "You are an elite copywriter for massage therapy profiles on RentMasseur. "
-        "Each bio must be under 300 words, magnetic, SEO-friendly, and conversion-optimized. "
-        "Avoid explicit content. Include keywords: massage, therapeutic, deep tissue, relaxation, session, Manhattan. "
-        "CRITICAL: Every bio MUST end with a strong phone-call call-to-action like "
-        "'Call now to book your session' or 'Pick up the phone and call me today'. "
-        "The goal is MAXIMUM PHONE CALLS. Make the reader want to call immediately. "
-        "Include urgency words: today, now, available, waiting, ready. "
-        "Write ONLY the bio text."
-    )
-    results = []
-    for strategy_name, strategy_desc in STRATEGIES:
-        user_prompt = (
-            f"Strategy: {strategy_name}\n"
-            f"Description: {strategy_desc}\n"
-            f"Write a compelling profile bio for a male masseur in Manhattan, NYC. "
-            f"The bio MUST drive phone calls. End with a direct call-to-action "
-            f"telling the reader to CALL NOW to book. No labels, no quotes, no explanation. Just the bio."
-        )
-        bio = _groq_chat(system_prompt, user_prompt)
-        if bio:
-            h = _content_hash(bio)
-            if h in used_hashes:
-                logger.info("Skip duplicate bio: %s", strategy_name)
+            try:
+                entry = json.loads(line)
+                metrics.append(entry)
+            except json.JSONDecodeError:
                 continue
-            used_hashes.add(h)
-            filepath = _save_content(BIOS_DIR, strategy_name, bio)
-            results.append({
-                "type": "bio",
-                "strategy": strategy_name,
-                "chars": len(bio),
-                "hash": h,
-                "file": filepath,
-                "preview": bio[:120],
-            })
-            history.append({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "type": "bio",
-                "strategy": strategy_name,
-                "hash": h,
-                "chars": len(bio),
-            })
-        time.sleep(1)
-    logger.info("Generated %d bios", len(results))
-    return results
 
+    if not metrics:
+        return {"status": "no_data", "message": "Metrics file is empty."}
 
-def generate_blog_posts(history: list, used_hashes: set) -> list:
-    logger.info("=== Generating blog posts for all 30 strategies ===")
-    system_prompt = (
-        "You are an expert content writer for a massage therapy blog. "
-        "Write engaging, SEO-optimized blog posts (500-800 words) that attract clients. "
-        "Include a compelling title, subheadings, and a call-to-action. "
-        "Avoid explicit content. Use markdown formatting."
-    )
-    results = []
-    for strategy_name, strategy_desc in STRATEGIES:
-        user_prompt = (
-            f"Strategy: {strategy_name}\n"
-            f"Angle: {strategy_desc}\n"
-            f"Write a blog post for a male masseur in Manhattan, NYC. "
-            f"The post should be informative, engaging, and drive bookings. "
-            f"Use markdown with a # title, ## subheadings, and a CTA at the end."
-        )
-        post = _groq_chat(system_prompt, user_prompt, max_tokens=1200)
-        if post:
-            h = _content_hash(post)
-            if h in used_hashes:
-                logger.info("Skip duplicate blog: %s", strategy_name)
-                continue
-            used_hashes.add(h)
-            filepath = _save_content(BLOGS_DIR, strategy_name, post)
-            results.append({
-                "type": "blog_post",
-                "strategy": strategy_name,
-                "chars": len(post),
-                "hash": h,
-                "file": filepath,
-                "preview": post[:120],
-            })
-            history.append({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "type": "blog_post",
-                "strategy": strategy_name,
-                "hash": h,
-                "chars": len(post),
-            })
-        time.sleep(1)
-    logger.info("Generated %d blog posts", len(results))
-    return results
-
-
-def generate_interview_questions(history: list, used_hashes: set) -> list:
-    logger.info("=== Generating interview questions for all 30 strategies ===")
-    system_prompt = (
-        "You are an interview coach for massage therapists. "
-        "Generate 10 insightful interview questions that a journalist or blogger "
-        "would ask a male masseur, based on the given strategy angle. "
-        "Also include suggested answers that are professional, engaging, and on-brand. "
-        "Use markdown formatting with numbered questions and bullet-point answers."
-    )
-    results = []
-    for strategy_name, strategy_desc in STRATEGIES:
-        user_prompt = (
-            f"Strategy: {strategy_name}\n"
-            f"Angle: {strategy_desc}\n"
-            f"Generate 10 interview questions with suggested answers for a male masseur "
-            f"in Manhattan, NYC. Make the answers compelling and booking-oriented. "
-            f"Format: ## Q1: question? followed by **A:** answer."
-        )
-        questions = _groq_chat(system_prompt, user_prompt, max_tokens=1500)
-        if questions:
-            h = _content_hash(questions)
-            if h in used_hashes:
-                logger.info("Skip duplicate questions: %s", strategy_name)
-                continue
-            used_hashes.add(h)
-            filepath = _save_content(QUESTIONS_DIR, strategy_name, questions)
-            results.append({
-                "type": "interview_questions",
-                "strategy": strategy_name,
-                "chars": len(questions),
-                "hash": h,
-                "file": filepath,
-                "preview": questions[:120],
-            })
-            history.append({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "type": "interview_questions",
-                "strategy": strategy_name,
-                "hash": h,
-                "chars": len(questions),
-            })
-        time.sleep(1)
-    logger.info("Generated %d interview question sets", len(results))
-    return results
-
-
-def generate_mass_analysis(bios: list, blogs: list, questions: list) -> Optional[str]:
-    logger.info("=== Running mass analysis across all generated content ===")
-    system_prompt = (
-        "You are a marketing analyst and content strategist. "
-        "Analyze the generated bios, blog posts, and interview questions across all strategies. "
-        "Produce a comprehensive report with: "
-        "1. Top 5 bios ranked by conversion potential "
-        "2. Top 5 blog posts ranked by SEO and engagement potential "
-        "3. Top 5 interview question sets ranked by PR value "
-        "4. Cross-strategy themes that perform best "
-        "5. Recommended posting schedule for the week "
-        "6. Best bio to use on the profile right now "
-        "Use markdown formatting."
-    )
-
-    bios_summary = "\n".join([f"- {b['strategy']} ({b['chars']} chars): {b['preview']}..." for b in bios])
-    blogs_summary = "\n".join([f"- {b['strategy']} ({b['chars']} chars): {b['preview']}..." for b in blogs])
-    questions_summary = "\n".join([f"- {q['strategy']} ({q['chars']} chars): {q['preview']}..." for q in questions])
-
-    user_prompt = (
-        f"Today's generated content:\n\n"
-        f"## Bios ({len(bios)} generated):\n{bios_summary}\n\n"
-        f"## Blog Posts ({len(blogs)} generated):\n{blogs_summary}\n\n"
-        f"## Interview Questions ({len(questions)} generated):\n{questions_summary}\n\n"
-        f"Produce the mass analysis report."
-    )
-
-    analysis = _groq_chat(system_prompt, user_prompt, temperature=0.7, max_tokens=2000)
-    if analysis:
-        ts = datetime.now().strftime("%Y%m%d")
-        filepath = os.path.join(CONTENT_DIR, f"mass_analysis_{ts}.md")
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(analysis)
-        logger.info("Mass analysis saved: %s (%d chars)", filepath, len(analysis))
-        return filepath
-    return None
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Daily content generator for RentMasseur")
-    parser.add_argument("--bios-only", action="store_true")
-    parser.add_argument("--blogs-only", action="store_true")
-    parser.add_argument("--questions-only", action="store_true")
-    parser.add_argument("--no-analysis", action="store_true", help="Skip mass analysis")
-    args = parser.parse_args()
-
-    _ensure_dirs()
-    history = _load_history()
-    used_hashes = {entry.get("hash", "") for entry in history}
-
-    all_bios = []
-    all_blogs = []
-    all_questions = []
-
-    if not args.blogs_only and not args.questions_only:
-        all_bios = generate_bios(history, used_hashes)
-    if not args.bios_only and not args.questions_only:
-        all_blogs = generate_blog_posts(history, used_hashes)
-    if not args.bios_only and not args.blogs_only:
-        all_questions = generate_interview_questions(history, used_hashes)
-
-    if not args.no_analysis and (all_bios or all_blogs or all_questions):
-        generate_mass_analysis(all_bios, all_blogs, all_questions)
-
-    _save_history(history)
-
+    latest = metrics[-1]
     summary = {
-        "date": datetime.now(timezone.utc).isoformat(),
-        "bios_generated": len(all_bios),
-        "blog_posts_generated": len(all_blogs),
-        "interview_questions_generated": len(all_questions),
-        "total_strategies": len(STRATEGIES),
+        "status": "ok",
+        "total_ingested": len(metrics),
+        "latest_timestamp": latest.get("timestamp", ""),
+        "latest_metrics": latest,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
     }
-    summary_path = os.path.join(CONTENT_DIR, "daily_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
+
+    # Update availability file if metrics contain availability info
+    body = latest.get("body", {})
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except json.JSONDecodeError:
+            body = {}
+
+    if "is_available" in body or "availability" in body:
+        avail = {
+            "status": "available" if body.get("is_available") else "unknown",
+            "checked_at": latest.get("timestamp", ""),
+            "source": "extension_first_party",
+            "mode": "user_approved",
+        }
+        with open(AVAILABILITY_FILE, "w") as f:
+            json.dump(avail, f, indent=2)
+        print(f"[metrics] Updated availability: {avail['status']}")
+
+    # Save metrics summary
+    CONTENT_DIR.mkdir(exist_ok=True)
+    with open(CONTENT_DIR / "metrics_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
-    logger.info("=== Daily content generation complete ===")
-    logger.info("Bios: %d | Blog posts: %d | Interview questions: %d",
-                len(all_bios), len(all_blogs), len(all_questions))
-    print(json.dumps(summary, indent=2))
+    print(f"[metrics] Processed {len(metrics)} ingested metric entries.")
+    return summary
+
+
+def generate_proof():
+    """Generate a proof/receipt file for this run."""
+    receipts_dir = Path("receipts")
+    receipts_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    proof = {
+        "action": "metrics-collector",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": "first_party_extension_or_manual",
+        "automated_login": False,
+        "captcha_bypassed": False,
+        "metrics_processed": 0,
+        "availability_updated": AVAILABILITY_FILE.exists(),
+        "status": "completed",
+    }
+
+    summary = process_ingested_metrics()
+    proof["metrics_processed"] = summary.get("total_ingested", 0)
+    proof["summary"] = summary
+
+    proof_path = receipts_dir / f"metrics_{timestamp}.json"
+    with open(proof_path, "w") as f:
+        json.dump(proof, f, indent=2)
+
+    print(f"[proof] Receipt written: {proof_path}")
+    return proof
 
 
 if __name__ == "__main__":
-    main()
-
-```
-
-deploy_bio_experiment.py:
-```
-#!/usr/bin/env python3
-"""One-time manual bio deployment for controlled experiment 001.
-
-Usage:
-    python3 deploy_bio_experiment.py --bio controlled_wolf_v1 --dry-run
-    python3 deploy_bio_experiment.py --bio controlled_wolf_v1
-
-This is NOT a scheduled automation. It is a one-time manual deployment
-of an approved candidate bio for a controlled experiment.
-"""
-import argparse
-import json
-import logging
-import os
-import sys
-from datetime import datetime, timezone
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
-CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
-BIOS_DIR = os.path.join(CONTENT_DIR, "bios")
-EXPERIMENTS_DIR = os.path.join(CONTENT_DIR, "experiments")
-RECEIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
-
-
-def load_bio(bio_id: str) -> str:
-    path = os.path.join(BIOS_DIR, f"{bio_id}.md")
-    if not os.path.exists(path):
-        logger.error(f"Bio file not found: {path}")
-        sys.exit(1)
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().strip()
-
-
-def load_experiment(exp_id: str) -> dict:
-    path = os.path.join(EXPERIMENTS_DIR, f"{exp_id}.json")
-    if not os.path.exists(path):
-        logger.error(f"Experiment file not found: {path}")
-        sys.exit(1)
-    with open(path, "r") as f:
-        return json.load(f)
-
-
-def write_receipt(bio_id: str, experiment_id: str, success: bool, notes: str = ""):
-    os.makedirs(RECEIPTS_DIR, exist_ok=True)
-    ts = datetime.now(timezone.utc).isoformat()
-    receipt = {
-        "action": "bio_deploy",
-        "bio_id": bio_id,
-        "experiment_id": experiment_id,
-        "success": success,
-        "timestamp": ts,
-        "notes": notes,
-    }
-    path = os.path.join(RECEIPTS_DIR, f"deploy_{bio_id}_{ts.replace(':', '-')}.json")
-    with open(path, "w") as f:
-        json.dump(receipt, f, indent=2)
-    logger.info(f"Receipt written: {path}")
-    return path
-
-
-def deploy_bio(bio_text: str, headless: bool = False) -> bool:
-    """Log in and update the profile bio on RentMasseur via Selenium."""
-    from rentmasseur_core import setup_driver, login, update_bio, save_bio_field
-
-    driver = setup_driver(headless=headless)
-    try:
-        if not login(driver):
-            logger.error("Login failed - cannot deploy bio")
-            return False
-
-        logger.info("Login successful, locating bio field...")
-        result = update_bio(driver, "")
-        if result is None or (isinstance(result, dict) and result.get("error")):
-            logger.error("Could not find bio field on profile settings")
-            return False
-
-        field_info, current_bio = result
-        logger.info(f"Current bio preview: {current_bio[:80]}...")
-
-        saved = save_bio_field(driver, field_info, bio_text)
-        if saved:
-            logger.info("Bio deployed successfully!")
-            return True
-        else:
-            logger.error("Failed to save bio")
-            return False
-    finally:
-        driver.quit()
-
-
-def main():
-    parser = argparse.ArgumentParser(description="One-time manual bio deployment for controlled experiment")
-    parser.add_argument("--bio", required=True, help="Bio ID (e.g. controlled_wolf_v1)")
-    parser.add_argument("--experiment", default="exp_001_targeted_wolf", help="Experiment ID")
-    parser.add_argument("--dry-run", action="store_true", help="Show bio without updating profile")
-    parser.add_argument("--headless", default="false", help="Run headless (true/false)")
+    parser = argparse.ArgumentParser(description="RentMasseur first-party metrics collector")
+    parser.add_argument("--process", action="store_true", help="Process ingested metrics")
+    parser.add_argument("--proof", action="store_true", help="Generate proof file only")
     args = parser.parse_args()
 
-    bio_text = load_bio(args.bio)
-    exp = load_experiment(args.experiment)
-
-    print(f"\n{'='*60}")
-    print(f"EXPERIMENT: {exp['experiment_id']}")
-    print(f"BIO ID: {args.bio}")
-    print(f"VARIABLE: {exp['variable']}")
-    print(f"FROZEN: photos={exp['photos_frozen']} price={exp['price_frozen']} services={exp['services_frozen']} availability={exp['availability_frozen']}")
-    print(f"BIO LENGTH: {len(bio_text)} chars")
-    print(f"{'='*60}")
-    print(bio_text)
-    print(f"{'='*60}\n")
-
-    if args.dry_run:
-        logger.info("Dry run - not updating profile")
-        write_receipt(args.bio, args.experiment, False, "dry_run_only")
-        return
-
-    headless = args.headless.lower() == "true"
-    success = deploy_bio(bio_text, headless=headless)
-    write_receipt(args.bio, args.experiment, success, "manual_deploy" if success else "deploy_failed")
-
-    if success:
-        print("\nBio deployed. Now:")
-        print("1. Freeze all other profile variables (photos, prices, services)")
-        print("2. Wait 24-48 hours or 100+ new profile views")
-        print("3. Capture after-snapshot metrics")
-        print("4. POST to /api/metrics/ingest with after data")
-        print("5. Check /api/decision/latest for verdict")
-    else:
-        print("\nDeploy failed. Check logs above.")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+    if args.proof or args.process or not sys.argv[1:]:
+        result = generate_proof()
+        print(json.dumps(result, indent=2))
 
 ```
 
-.gitattributes:
+make-icons.js:
 ```
-*.7z filter=lfs diff=lfs merge=lfs -text
-*.arrow filter=lfs diff=lfs merge=lfs -text
-*.bin filter=lfs diff=lfs merge=lfs -text
-*.bz2 filter=lfs diff=lfs merge=lfs -text
-*.ckpt filter=lfs diff=lfs merge=lfs -text
-*.ftz filter=lfs diff=lfs merge=lfs -text
-*.gz filter=lfs diff=lfs merge=lfs -text
-*.h5 filter=lfs diff=lfs merge=lfs -text
-*.joblib filter=lfs diff=lfs merge=lfs -text
-*.lfs.* filter=lfs diff=lfs merge=lfs -text
-*.mlmodel filter=lfs diff=lfs merge=lfs -text
-*.model filter=lfs diff=lfs merge=lfs -text
-*.msgpack filter=lfs diff=lfs merge=lfs -text
-*.npy filter=lfs diff=lfs merge=lfs -text
-*.npz filter=lfs diff=lfs merge=lfs -text
-*.onnx filter=lfs diff=lfs merge=lfs -text
-*.ot filter=lfs diff=lfs merge=lfs -text
-*.parquet filter=lfs diff=lfs merge=lfs -text
-*.pb filter=lfs diff=lfs merge=lfs -text
-*.pickle filter=lfs diff=lfs merge=lfs -text
-*.pkl filter=lfs diff=lfs merge=lfs -text
-*.pt filter=lfs diff=lfs merge=lfs -text
-*.pth filter=lfs diff=lfs merge=lfs -text
-*.rar filter=lfs diff=lfs merge=lfs -text
-*.safetensors filter=lfs diff=lfs merge=lfs -text
-saved_model/**/* filter=lfs diff=lfs merge=lfs -text
-*.tar.* filter=lfs diff=lfs merge=lfs -text
-*.tar filter=lfs diff=lfs merge=lfs -text
-*.tflite filter=lfs diff=lfs merge=lfs -text
-*.tgz filter=lfs diff=lfs merge=lfs -text
-*.wasm filter=lfs diff=lfs merge=lfs -text
-*.xz filter=lfs diff=lfs merge=lfs -text
-*.zip filter=lfs diff=lfs merge=lfs -text
-*.zst filter=lfs diff=lfs merge=lfs -text
-*tfevents* filter=lfs diff=lfs merge=lfs -text
-rm_pri/cpp/rm_pri filter=lfs diff=lfs merge=lfs -text
-rm_pri/cpp/rm_pri_built filter=lfs diff=lfs merge=lfs -text
-rotator_engine filter=lfs diff=lfs merge=lfs -text
-profile_debug.png filter=lfs diff=lfs merge=lfs -text
-profile_edit_page.png filter=lfs diff=lfs merge=lfs -text
-profile_page.png filter=lfs diff=lfs merge=lfs -text
-settings_avail.png filter=lfs diff=lfs merge=lfs -text
-settings_page.png filter=lfs diff=lfs merge=lfs -text
-rm_traffic/data/batch/bios_1m.jsonl filter=lfs diff=lfs merge=lfs -text
-rm_traffic/data/batch/bios_300k.jsonl filter=lfs diff=lfs merge=lfs -text
-rm_traffic/data/batch/bios_30k.jsonl filter=lfs diff=lfs merge=lfs -text
+const fs = require('fs');
+const zlib = require('zlib');
 
-```
-
-manifest.json:
-```
-{
-  "manifest_version": 3,
-  "name": "RentMasseur Booker",
-  "version": "1.0.0",
-  "description": "Book RentMasseur providers directly from their profile pages.",
-  "permissions": [
-    "activeTab",
-    "storage"
-  ],
-  "host_permissions": [
-    "https://rentmasseur.com/*",
-    "http://localhost:3000/*"
-  ],
-  "content_scripts": [
-    {
-      "matches": ["https://rentmasseur.com/*"],
-      "js": ["content.js"],
+function crc32(buf) {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) {
+      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[i] = c >>> 0;
+  }
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) {
+    c = table[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  }
+  return (c ^ 0xFFFFFFFF) >>> 0;

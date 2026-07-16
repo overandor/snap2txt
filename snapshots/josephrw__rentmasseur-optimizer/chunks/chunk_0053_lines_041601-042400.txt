@@ -1,245 +1,565 @@
-            for (int j = 0; j < output_size; j++)
-                W2[i][j] = dist(rng) * std::sqrt(2.0 / hidden_size);
-        b2.resize(output_size, 0.0);
-        mb2.resize(output_size, 0.0);
-        vb2.resize(output_size, 0.0);
+    elif action == "headline_variant_test":
+        # Only valuable when contact rate is low
+        expected_lift = max(0, (5.0 - state.contact_rate) / 5.0) * 1.5
+
+    elif action == "bio_variant_test":
+        expected_lift = max(0, (5.0 - state.contact_rate) / 5.0) * 1.0
+
+    elif action == "rate_position_test":
+        expected_lift = 0.2  # risky, low default
+
+    elif action == "photo_order_test":
+        expected_lift = 0.3
+
+    elif action == "traffic_report":
+        expected_lift = 0.2
+
+    elif action == "do_nothing":
+        expected_lift = 0.0
+
+    # Confidence from bandit history
+    confidence = s["confidence"] if s["n"] >= 3 else 0.3  # default low confidence
+
+    # Attribution weight: safe actions have higher attribution reliability
+    attribution_weight = 0.9 if action in SAFE_ACTIONS else 0.6
+
+    # Repeatability: can we do this again and again?
+    repeatability = 0.8 if action in SAFE_ACTIONS else 0.4
+
+    # Compliance risk
+    compliance_risk = 0.0 if action in SAFE_ACTIONS else 0.3
+
+    # Mutation cost: penalize frequent profile changes
+    mutation_cost = 0.5 if action in MUTATION_ACTIONS else 0.0
+
+    # Platform error risk
+    platform_error_risk = 0.1 if action in SAFE_ACTIONS else 0.2
+
+    roa = (
+        expected_lift * confidence * attribution_weight * repeatability
+        - compliance_risk
+        - mutation_cost
+        - platform_error_risk
+    )
+
+    return round(roa, 3)
+
+
+def select_action(state, tenant_id: str = "") -> Tuple[str, Dict[str, float]]:
+    """
+    Select best action using contextual bandit.
+
+    Returns (action_name, roa_scores).
+    """
+    conn = _db()
+    stats = get_action_stats(conn, tenant_id)
+
+    roa_scores = {}
+    for action in ACTIONS:
+        roa_scores[action] = compute_roa(action, state, stats)
+
+    conn.close()
+
+    # argmax ROA
+    best = max(roa_scores, key=roa_scores.get)
+    return best, roa_scores
+
+
+def record_outcome(outcome: ActionOutcome, tenant_id: str = ""):
+    """Record action outcome for bandit learning."""
+    conn = _db()
+    conn.execute(
+        "INSERT INTO action_history (tenant_id, action, reward, metric_delta, state_before_hash, state_after_hash, error, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (tenant_id, outcome.action, outcome.reward,
+         json.dumps(outcome.metric_delta),
+         outcome.state_before_hash, outcome.state_after_hash,
+         outcome.error, outcome.timestamp or datetime.now(timezone.utc).isoformat())
+    )
+    conn.commit()
+    conn.close()
+    log.info(f"  ◉ Recorded: {outcome.action} reward={outcome.reward:.3f}")
+
+
+def explain_last_action(tenant_id: str = "") -> str:
+    """Explain the last action taken and why."""
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM action_history WHERE tenant_id = ? ORDER BY id DESC LIMIT 1",
+        (tenant_id,)
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return "No actions recorded yet."
+
+    stats = get_action_stats(_db(), tenant_id)
+    action = row["action"]
+    s = stats.get(action, {})
+
+    return (
+        f"Last action: {action}\n"
+        f"  Reward: {row['reward']:.3f}\n"
+        f"  Metric delta: {row['metric_delta']}\n"
+        f"  Error: {row['error'] or 'none'}\n"
+        f"  Timestamp: {row['timestamp']}\n"
+        f"  History: {s['n']} runs, avg_reward={s['avg_reward']:.3f}, win_rate={s['win_rate']:.1%}\n"
+        f"  Confidence: {s['confidence']:.3f}"
+    )
+
+```
+
+reply_drafter.py:
+```
+"""
+LLM Reply Drafter — template-first reply drafting for client messages.
+
+Template is canonical. LLM is optional polish only (local, 8s timeout).
+Uses local-only providers for private client text:
+  template canonical → local Ollama/Transformers optional polish → template retained if invalid.
+No Groq. No OpenRouter. No cloud fallback.
+
+Drafts replies, does NOT auto-send. Human approval required for first contact.
+Ready-for-fast-approval only for repeat/opt-in clients with valid templates.
+
+Reply structure (always):
+  - availability
+  - location / incall-outcall boundary
+  - rate clarity
+  - session length
+  - professional tone
+  - one next-step question
+  - no spammy pressure
+  - no weird sexual escalation
+"""
+
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+from .intent_engine import classify, IntentResult
+
+# Local-only LLM imports — NO cloud providers for private client text
+try:
+    from .llm_client import LLMClient
+    _HAS_LLM = True
+except ImportError:
+    _HAS_LLM = False
+
+log = logging.getLogger("reply_drafter")
+
+# Reply classes
+REPLY_BOOKING_NOW = "booking_now_reply"
+REPLY_PRICE_QUESTION = "price_question_reply"
+REPLY_LOCATION_QUESTION = "location_question_reply"
+REPLY_REPEAT_CLIENT = "repeat_client_reply"
+REPLY_INQUIRY = "inquiry_reply"
+REPLY_FOLLOW_UP = "follow_up_reply"
+REPLY_CLOSE_LOOP = "close_loop_reply"
+REPLY_AVAILABILITY_QUESTION = "availability_reply"
+REPLY_HIGH_VALUE_REPEAT = "high_value_repeat_reply"
+REPLY_NONE = "none"
+
+# Risk levels
+RISK_SAFE = "safe"
+RISK_REVIEW = "review"
+RISK_BLOCKED = "blocked"
+
+
+@dataclass
+class DraftReply:
+    username: str = ""
+    intent_class: str = ""
+    confidence: float = 0.0
+    booking_probability: float = 0.0
+    reply_text: str = ""
+    reply_class: str = ""
+    risk_level: str = RISK_SAFE
+    needs_human_approval: bool = True
+    reason: str = ""
+    suggested_time_slots: List[str] = field(default_factory=list)
+    error: str = ""
+
+
+def _build_polish_prompt(template_text: str, message: str, intent: IntentResult, context: Dict) -> str:
+    """Build LLM prompt for polishing an existing template draft.
+    The model rewrites the template for clarity — it does NOT generate from scratch."""
+    username = context.get("username", "")
+    is_repeat = intent.classification in ("repeat_client", "high_value_repeat")
+
+    prompt = f"""Rewrite this existing draft only for clarity. Do not add facts. Do not change rates, location, session length, phone, or availability. Return one reply only.
+
+Existing draft:
+"{template_text}"
+
+Client message: "{message[:300]}"
+Client username: {username}
+Intent: {intent.classification}
+Is repeat client: {is_repeat}
+
+Rules:
+- Rewrite the existing draft for clarity and warmth only
+- Do NOT add new facts, rates, locations, or availability not in the existing draft
+- Do NOT change the rate, location, session length, or phone number
+- Keep it under 80 words
+- End with exactly ONE next-step question
+- Professional tone, first person singular (I/my, not we/us/our)
+- No sexual language, no innuendo
+- Return only the rewritten reply text, nothing else
+
+Rewritten reply:"""
+
+    return prompt
+
+
+def _clean_llm_output(text: str) -> str:
+    """Clean LLM output — remove quotes, markdown, extra whitespace."""
+    if not text:
+        return ""
+    text = text.strip()
+    # Remove surrounding quotes
+    if text.startswith('"') and text.endswith('"'):
+        text = text[1:-1]
+    # Remove markdown
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    # Remove any "Reply:" prefix
+    text = re.sub(r'^(Reply|Response|Message):\s*', '', text, flags=re.IGNORECASE)
+    # Normalize whitespace
+    text = ' '.join(text.split())
+    return text.strip()
+
+
+def _template_fallback(intent: IntentResult, context: Dict) -> str:
+    """Fixed template fallback when LLM is unavailable."""
+    rate = context.get("rate", "$200")
+    phone = context.get("phone", "")
+    cls = intent.classification
+
+    if cls == "booking_now":
+        return (
+            f"Yes — I'm available today. I have openings at 7:30 or 9 PM. "
+            f"Manhattan incall, {rate} for 60 min. "
+            f"Which time works for you? Text {phone} to confirm."
+        )
+
+    if cls == "price_question":
+        return (
+            f"Rate is {rate} for 60 min, $280 for 90 min, $360 for 120 min. "
+            f"Manhattan incall. What duration and time work for you? "
+            f"Text {phone} to book."
+        )
+
+    if cls == "availability_question":
+        return (
+            f"I'm available today and this week. "
+            f"Manhattan incall, {rate} for 60 min. "
+            f"What day and time work for you? Text {phone} to schedule."
+        )
+
+    if cls == "location_question":
+        return (
+            f"I'm based in Manhattan — private incall space. "
+            f"Outcall available within Manhattan for additional travel fee. "
+            f"Rate is {rate}. Text {phone} for faster booking."
+        )
+
+    if cls in ("repeat_client", "high_value_repeat"):
+        return (
+            f"Great to hear from you again! "
+            f"I have openings today. Same location in Manhattan. "
+            f"Text {phone} to confirm your time."
+        )
+
+    if cls == "ghosted_lead":
+        return (
+            f"Hi — following up. I'm available this week if you'd like to book. "
+            f"Manhattan incall, {rate} for 60 min. "
+            f"Text {phone} to schedule."
+        )
+
+    return (
+        f"Hi! Thanks for your interest. "
+        f"I offer deep tissue and sports recovery massage in Manhattan. "
+        f"Rate is {rate} for 60 min. "
+        f"What questions can I answer? Text {phone} for faster response."
+    )
+
+
+def _determine_reply_class(intent: IntentResult) -> str:
+    """Map intent classification to reply class."""
+    mapping = {
+        "booking_now": REPLY_BOOKING_NOW,
+        "price_question": REPLY_PRICE_QUESTION,
+        "availability_question": REPLY_AVAILABILITY_QUESTION,
+        "location_question": REPLY_LOCATION_QUESTION,
+        "repeat_client": REPLY_REPEAT_CLIENT,
+        "high_value_repeat": REPLY_HIGH_VALUE_REPEAT,
+        "ghosted_lead": REPLY_FOLLOW_UP,
+        "do_not_contact": REPLY_NONE,
+        "spam": REPLY_NONE,
+        "unknown": REPLY_INQUIRY,
     }
+    return mapping.get(intent.classification, REPLY_INQUIRY)
 
-    double relu(double x) { return std::max(0.0, x); }
-    double sigmoid(double x) { return 1.0 / (1.0 + std::exp(-std::min(500.0, std::max(-500.0, x)))); }
 
-    std::vector<double> forward(const std::vector<double>& x, bool training, std::vector<double>& z1_out, std::vector<double>& a1_out, std::vector<double>& mask) {
-        z1_out.resize(hidden_size);
-        a1_out.resize(hidden_size);
-        mask.resize(hidden_size);
-        std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
-        for (int j = 0; j < hidden_size; j++) {
-            z1_out[j] = b1[j];
-            for (int i = 0; i < input_size; i++) z1_out[j] += x[i] * W1[i][j];
-            a1_out[j] = relu(z1_out[j]);
-            if (training) {
-                mask[j] = (rng() / (double)rng.max() > dropout) ? 1.0 / (1.0 - dropout) : 0.0;
-                a1_out[j] *= mask[j];
-            }
+def _determine_risk(intent: IntentResult, is_first_contact: bool = True) -> str:
+    """Determine risk level for the reply."""
+    if intent.classification in ("do_not_contact", "spam"):
+        return RISK_BLOCKED
+    if "unsafe" in (intent.risk_flags or []):
+        return RISK_BLOCKED
+    if "opt_out" in (intent.risk_flags or []):
+        return RISK_BLOCKED
+    if is_first_contact:
+        return RISK_REVIEW
+    return RISK_SAFE
+
+
+def validate_reply_text(text: str, context: Dict = None) -> Tuple[bool, str]:
+    """Validate reply text against quality and safety rules.
+    Returns (is_valid, reason)."""
+    if not text or not text.strip():
+        return False, "empty_text"
+
+    if context is None:
+        context = {}
+
+    text_lower = text.lower()
+    word_count = len(text.split())
+
+    # ─── Reject: bad pronouns (first person plural = wrong voice) ───
+    if re.search(r'\b(we|us|our)\b', text_lower):
+        return False, "first_person_plural_detected"
+
+    # ─── Reject: "app" reference ───
+    if re.search(r'\bapp\b', text_lower):
+        return False, "app_reference_detected"
+
+    # ─── Reject: known bad phrases ───
+    bad_phrases = ["sorry to hear", "reaching out to us", "last-minute app",
+                   "thank you for reaching out"]
+    if any(p in text_lower for p in bad_phrases):
+        return False, f"bad_phrase_detected"
+
+    # ─── Reject: sexual/innuendo terms ───
+    sexual_kw = ["sexual", "erotic", "sensual", "nude", "naked", "happy ending",
+                 "full service", "extras", "menu", "gfe", "bb", "bareback"]
+    if any(kw in text_lower for kw in sexual_kw):
+        return False, "sexual_innuendo_detected"
+
+    # ─── Reject: phone number when not allowed ───
+    allow_phone = os.environ.get("ALLOW_PHONE_IN_DRAFT", "false").lower() == "true"
+    if not allow_phone:
+        phone_in_context = context.get("phone", "")
+        # Check for raw phone numbers (not the word "text")
+        if re.search(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', text):
+            return False, "raw_phone_in_draft_not_allowed"
+        if phone_in_context and phone_in_context in text and not allow_phone:
+            return False, "phone_in_draft_not_allowed"
+
+    # ─── Reject: over 80 words ───
+    if word_count > 80:
+        return False, f"too_many_words ({word_count})"
+
+    # ─── Reject: no question mark (no next-step question) ───
+    if "?" not in text:
+        return False, "no_next_step_question"
+
+    # ─── Reject: multiple questions (rule is one next-step question) ───
+    question_count = text.count("?")
+    if question_count > 2:  # allow up to 2 for compound questions like "What time and duration?"
+        return False, f"too_many_questions ({question_count})"
+
+    # ─── Reject: missing rate (for booking/price/location intents) ───
+    rate = context.get("rate", "$200")
+    intent_class = context.get("intent_class", "")
+    if intent_class in ("booking_now", "price_question", "location_question", "availability_question"):
+        if rate and rate not in text:
+            return False, "missing_rate"
+
+    # ─── Reject: missing location ───
+    location = context.get("location", "Manhattan")
+    if location and location.lower() not in text_lower and "manhattan" not in text_lower:
+        return False, "missing_location"
+
+    # ─── Reject: missing session length ───
+    if intent_class in ("booking_now", "price_question"):
+        if not re.search(r'\b(60|90|120)\s*min', text_lower) and "min" not in text_lower:
+            return False, "missing_session_length"
+
+    return True, "valid"
+
+
+def _try_local_llm_polish(template_text: str, message: str, intent: IntentResult,
+                            context: Dict, timeout_seconds: int = 8) -> Optional[str]:
+    """Try local-only LLM (Ollama or Transformers.js) for light polish.
+    Rewrites the existing template — does NOT generate from scratch.
+    NO cloud providers. Returns None if unavailable or too slow."""
+    if not _HAS_LLM:
+        return None
+
+    import threading
+
+    prompt = _build_polish_prompt(template_text, message, intent, context)
+
+    result = [None]
+    def _call():
+        try:
+            # Try Ollama only (local), then Transformers.js (local)
+            # NO Groq, NO OpenRouter — private client text stays local
+            for provider, model in [("ollama", "llama3.2"), ("transformers", None)]:
+                try:
+                    client = LLMClient(provider=provider, model=model)
+                    resp = client.generate(prompt, max_tokens=150)
+                    if resp and len(resp) > 20:
+                        result[0] = resp
+                        return
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    t.join(timeout=timeout_seconds)
+
+    if t.is_alive():
+        log.info(f"  ⟁ Local LLM timed out ({timeout_seconds}s) — using template")
+        return None
+
+    return result[0]
+
+
+def draft_reply(message: str, context: Dict = None) -> DraftReply:
+    """
+    Generate a template-first draft reply for a client message.
+
+    Template is canonical. LLM is optional polish only (local, 8s timeout).
+    No cloud providers ever called on private client text.
+    All first-contact drafts are approval-gated.
+
+    Args:
+        message: The client's message text
+        context: Dict with username, is_premium, rate, phone, location, is_first_contact
+
+    Returns:
+        DraftReply with reply_text, risk_level, needs_human_approval
+    """
+    if context is None:
+        context = {}
+
+    # Classify intent
+    intent = classify(message, context.get("username", ""))
+
+    # Build draft
+    draft = DraftReply(
+        username=context.get("username", ""),
+        intent_class=intent.classification,
+        confidence=intent.confidence,
+        booking_probability=intent.booking_probability,
+        reply_class=_determine_reply_class(intent),
+        risk_level=_determine_risk(intent, context.get("is_first_contact", True)),
+        reason=f"Intent: {intent.classification} (conf={intent.confidence:.2f})",
+    )
+
+    # Blocked — no reply
+    if draft.risk_level == RISK_BLOCKED:
+        draft.reply_text = ""
+        draft.needs_human_approval = False
+        draft.reason = f"BLOCKED: {intent.classification} with risk flags {intent.risk_flags}"
+        return draft
+
+    # ─── Template first (canonical) ───
+    draft.reply_text = _template_fallback(intent, context)
+    draft.reason += " | template-canonical"
+    log.info(f"  ◉ Template reply for {draft.username}: {draft.reply_text[:80]}...")
+
+    # ─── Optional local LLM polish (8s timeout, no cloud) ───
+    polished = _try_local_llm_polish(draft.reply_text, message, intent, context, timeout_seconds=8)
+    if polished:
+        cleaned = _clean_llm_output(polished)
+        # Validate polished output against strict quality rules
+        validation_context = {**context, "intent_class": intent.classification}
+        is_valid, reject_reason = validate_reply_text(cleaned, validation_context)
+        if is_valid:
+            draft.reply_text = cleaned
+            draft.reason += " | llm-polished"
+            log.info(f"  ◉ Polished reply for {draft.username}: {draft.reply_text[:80]}...")
+        else:
+            draft.reason += f" | llm-polish-rejected:{reject_reason}"
+            log.info(f"  ⟁ LLM polish rejected ({reject_reason}) — keeping template")
+
+    # Approval gate — all first contact needs approval
+    is_repeat = intent.classification in ("repeat_client", "high_value_repeat")
+    if is_repeat and not context.get("is_first_contact", True):
+        draft.needs_human_approval = False
+    else:
+        draft.needs_human_approval = True
+
+    # Suggested time slots for booking intent
+    if intent.classification in ("booking_now", "high_value_repeat"):
+        draft.suggested_time_slots = ["7:30 PM", "9:00 PM", "Tomorrow 12:00 PM"]
+
+    return draft
+
+
+def draft_mailbox_replies(emails: List[Dict], context: Dict = None) -> List[DraftReply]:
+    """
+    Generate draft replies for all mailbox conversations.
+
+    Args:
+        emails: List of email dicts from api.get_mailbox()
+        context: Base context (rate, phone, location)
+
+    Returns:
+        List of DraftReply objects
+    """
+    if context is None:
+        context = {}
+
+    drafts = []
+    for email in emails:
+        uc = email.get("userCard", {})
+        msg = email.get("lastMessage", "")
+        username = uc.get("username", "")
+
+        email_context = {
+            **context,
+            "username": username,
+            "is_premium": bool(uc.get("isPremium", 0)),
+            "is_first_contact": not bool(email.get("lastMessage", "")),
         }
-        std::vector<double> z2(output_size);
-        for (int j = 0; j < output_size; j++) {
-            z2[j] = b2[j];
-            for (int i = 0; i < hidden_size; i++) z2[j] += a1_out[i] * W2[i][j];
-        }
-        std::vector<double> a2(output_size);
-        for (int j = 0; j < output_size; j++) a2[j] = sigmoid(z2[j]);
-        return a2;
-    }
 
-    void backward(const std::vector<double>& x, const std::vector<double>& y, const std::vector<double>& y_pred,
-                  const std::vector<double>& z1, const std::vector<double>& a1, const std::vector<double>& mask,
-                  double lr, double beta1 = 0.9, double beta2 = 0.999, double eps = 1e-8) {
-        t++;
-        int m = 1;
-        std::vector<double> dz2(output_size);
-        for (int j = 0; j < output_size; j++) dz2[j] = (y_pred[j] - y[j]) / m;
-        std::vector<std::vector<double>> dW2(hidden_size, std::vector<double>(output_size, 0.0));
-        std::vector<double> db2(output_size, 0.0);
-        for (int j = 0; j < output_size; j++) {
-            for (int i = 0; i < hidden_size; i++) dW2[i][j] += a1[i] * dz2[j];
-            db2[j] += dz2[j];
-        }
-        std::vector<double> da1(hidden_size, 0.0);
-        for (int i = 0; i < hidden_size; i++) {
-            for (int j = 0; j < output_size; j++) da1[i] += dz2[j] * W2[i][j];
-            da1[i] *= mask[i];
-        }
-        std::vector<std::vector<double>> dW1(input_size, std::vector<double>(hidden_size, 0.0));
-        std::vector<double> db1(hidden_size, 0.0);
-        for (int j = 0; j < hidden_size; j++) {
-            double dz1 = da1[j] * (z1[j] > 0 ? 1.0 : 0.0);
-            for (int i = 0; i < input_size; i++) dW1[i][j] += x[i] * dz1;
-            db1[j] += dz1;
-        }
+        draft = draft_reply(msg, email_context)
+        drafts.append(draft)
 
-        auto adam = [&](double& W, double& mW, double& vW, double dW) {
-            mW = beta1 * mW + (1 - beta1) * dW;
-            vW = beta2 * vW + (1 - beta2) * dW * dW;
-            double m_hat = mW / (1 - std::pow(beta1, t));
-            double v_hat = vW / (1 - std::pow(beta2, t));
-            W -= lr * m_hat / (std::sqrt(v_hat) + eps);
-        };
-        for (int i = 0; i < input_size; i++)
-            for (int j = 0; j < hidden_size; j++)
-                adam(W1[i][j], mW1[i][j], vW1[i][j], dW1[i][j]);
-        for (int j = 0; j < hidden_size; j++) adam(b1[j], mb1[j], vb1[j], db1[j]);
-        for (int i = 0; i < hidden_size; i++)
-            for (int j = 0; j < output_size; j++)
-                adam(W2[i][j], mW2[i][j], vW2[i][j], dW2[i][j]);
-        for (int j = 0; j < output_size; j++) adam(b2[j], mb2[j], vb2[j], db2[j]);
-    }
+    return drafts
 
-    void train_epoch(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& y,
-                     double lr, int batch_size, std::mt19937& rng) {
-        int n = X.size();
-        std::vector<int> idx(n);
-        std::iota(idx.begin(), idx.end(), 0);
-        std::shuffle(idx.begin(), idx.end(), rng);
-        for (int i = 0; i < n; i += batch_size) {
-            for (int k = i; k < std::min(n, i + batch_size); k++) {
-                int ii = idx[k];
-                std::vector<double> z1, a1, mask;
-                auto pred = forward(X[ii], true, z1, a1, mask);
-                backward(X[ii], y[ii], pred, z1, a1, mask, lr);
-            }
-        }
-    }
 
-    std::vector<double> predict(const std::vector<double>& x) {
-        std::vector<double> z1, a1, mask;
-        return forward(x, false, z1, a1, mask);
-    }
-};
+def format_drafts_summary(drafts: List[DraftReply]) -> str:
+    """Format drafts for display."""
+    lines = [f"\n{'='*60}", f"  REPLY DRAFT QUEUE — {len(drafts)} drafts", f"{'='*60}\n"]
 
-// ---------------------------------------------------------------------------
-// Metrics
-// ---------------------------------------------------------------------------
+    for d in drafts:
+        if d.risk_level == RISK_BLOCKED:
+            lines.append(f"  🚫 {d.username} [{d.intent_class}] — BLOCKED")
+            lines.append(f"     {d.reason}")
+            continue
 
-struct Metrics {
-    double mae, rmse, r2;
-};
+        approval = "🔒 approval" if d.needs_human_approval else "⚡ ready_for_fast_approval"
+        lines.append(f"  ◉ {d.username} [{d.intent_class}] conf={d.confidence:.2f} {approval}")
+        lines.append(f"    Reply: \"{d.reply_text[:120]}\"")
+        if d.suggested_time_slots:
+            lines.append(f"    Slots: {', '.join(d.suggested_time_slots)}")
+        lines.append("")
 
-Metrics evaluate(MLP& model, const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& y) {
-    int n = X.size();
-    double mae = 0, mse = 0;
-    std::vector<double> y_mean(3, 0);
-    for (const auto& row : y) for (int j = 0; j < 3; j++) y_mean[j] += row[j];
-    for (double& v : y_mean) v /= n;
-    double ss_tot = 0;
-    for (int i = 0; i < n; i++) {
-        auto pred = model.predict(X[i]);
-        for (int j = 0; j < 3; j++) {
-            double diff = pred[j] - y[i][j];
-            mae += std::abs(diff);
-            mse += diff * diff;
-            ss_tot += (y[i][j] - y_mean[j]) * (y[i][j] - y_mean[j]);
-        }
-    }
-    mae /= (n * 3);
-    mse /= (n * 3);
-    return {mae, std::sqrt(mse), 1 - mse * (n * 3) / ss_tot};
-}
-
-// ---------------------------------------------------------------------------
-// Data loading
-// ---------------------------------------------------------------------------
-
-struct Bio {
-    std::string headline, description;
-    std::vector<double> features;
-    std::vector<double> labels;
-};
-
-std::vector<Bio> load_bios(const std::string& path, int limit = 0) {
-    std::vector<Bio> bios;
-    std::ifstream f(path);
-    std::string line;
-    while (std::getline(f, line)) {
-        if (line.empty()) continue;
-        Bio b;
-        b.headline = extract_json_string(line, "headline");
-        b.description = extract_json_string(line, "description");
-        b.features = extract_features(b.headline, b.description);
-        b.labels = heuristic_score(b.headline, b.description);
-        bios.push_back(b);
-        if (limit > 0 && (int)bios.size() >= limit) break;
-    }
-    return bios;
-}
-
-// ---------------------------------------------------------------------------
-// k-fold cross-validation
-// ---------------------------------------------------------------------------
-
-void k_fold_cv(std::vector<Bio>& bios, int k, int epochs, double lr, int batch_size) {
-    int n = bios.size();
-    int fold_size = n / k;
-    std::vector<Metrics> metrics;
-    for (int fold = 0; fold < k; fold++) {
-        int val_start = fold * fold_size;
-        int val_end = val_start + fold_size;
-        std::vector<std::vector<double>> X_train, y_train, X_val, y_val;
-        for (int i = 0; i < n; i++) {
-            if (i >= val_start && i < val_end) {
-                X_val.push_back(bios[i].features);
-                y_val.push_back(bios[i].labels);
-            } else {
-                X_train.push_back(bios[i].features);
-                y_train.push_back(bios[i].labels);
-            }
-        }
-        MLP model(feature_count(), 32, 3, fold + 1);
-        std::mt19937 rng(fold + 1);
-        for (int e = 0; e < epochs; e++) model.train_epoch(X_train, y_train, lr, batch_size, rng);
-        Metrics m = evaluate(model, X_val, y_val);
-        metrics.push_back(m);
-        std::cout << "Fold " << fold << " — MAE=" << m.mae << " RMSE=" << m.rmse << " R2=" << m.r2 << std::endl;
-    }
-    double mae = 0, rmse = 0, r2 = 0;
-    for (const auto& m : metrics) { mae += m.mae; rmse += m.rmse; r2 += m.r2; }
-    std::cout << "CV mean — MAE=" << mae / k << " RMSE=" << rmse / k << " R2=" << r2 / k << std::endl;
-}
-
-// ---------------------------------------------------------------------------
-// Walk-forward validation
-// ---------------------------------------------------------------------------
-
-void walk_forward(std::vector<Bio>& bios, double train_ratio, int epochs, double lr, int batch_size) {
-    int n = bios.size();
-    int split = (int)(train_ratio * n);
-    std::vector<std::vector<double>> X_train, y_train, X_val, y_val;
-    for (int i = 0; i < n; i++) {
-        if (i < split) { X_train.push_back(bios[i].features); y_train.push_back(bios[i].labels); }
-        else { X_val.push_back(bios[i].features); y_val.push_back(bios[i].labels); }
-    }
-    MLP model(feature_count(), 32, 3, 42);
-    std::mt19937 rng(42);
-    for (int e = 0; e < epochs; e++) {
-        model.train_epoch(X_train, y_train, lr, batch_size, rng);
-        if (e % 20 == 0) {
-            Metrics m = evaluate(model, X_train, y_train);
-            std::cout << "Epoch " << e << " train_loss=" << m.mae << std::endl;
-        }
-    }
-    Metrics m = evaluate(model, X_val, y_val);
-    std::cout << "Walk-forward — MAE=" << m.mae << " RMSE=" << m.rmse << " R2=" << m.r2 << std::endl;
-}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cout << "Usage: bio_ml <bios.jsonl> [cv|walk|train] [limit] [epochs] [lr] [batch_size]" << std::endl;
-        return 1;
-    }
-    std::string path = argv[1];
-    std::string mode = argc > 2 ? argv[2] : "cv";
-    int limit = argc > 3 ? std::stoi(argv[3]) : 10000;
-    int epochs = argc > 4 ? std::stoi(argv[4]) : 100;
-    double lr = argc > 5 ? std::stod(argv[5]) : 0.01;
-    int batch_size = argc > 6 ? std::stoi(argv[6]) : 64;
-
-    auto start = std::chrono::high_resolution_clock::now();
-    std::cout << "Loading bios..." << std::endl;
-    auto bios = load_bios(path, limit);
-    std::cout << "Loaded " << bios.size() << " bios" << std::endl;
-
-    if (mode == "cv") k_fold_cv(bios, 5, epochs, lr, batch_size);
-    else if (mode == "walk") walk_forward(bios, 0.8, epochs, lr, batch_size);
-
-    auto end = std::chrono::high_resolution_clock::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    std::cout << "Total time: " << ms << " ms" << std::endl;
-    return 0;
-}
+    return "\n".join(lines)
 
 ```
 
@@ -450,351 +770,31 @@ int main(int argc, char* argv[]) {
 
 ```
 
-discover_blog_interview.py:
+probe4.py:
 ```
-"""
-Discover Blog + Interview API endpoints via Selenium CDP.
+import requests, re, json
 
-Uses the existing logged-in Chrome profile to avoid login/captcha.
-Opens the blog and interview editor pages and captures the exact network
-requests when saving/publishing.
+s = requests.Session()
+s.headers.update({
+    'User-Agent': 'Mozilla/5.0',
+    'Accept': 'application/json',
+    'Referer': 'https://rentmasseur.com/settings',
+    'Origin': 'https://rentmasseur.com',
+})
+s.get('https://rentmasseur.com/login')
+m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', s.get('https://rentmasseur.com/login').text)
+csrf = m.group(1) if m else ''
+r = s.post('https://rentmasseur.com/api/v1/login', json={
+    'email': 'karpathianwolf', 'password': 'os.environ.get("RM_PASSWORD", "")', 'csrf': csrf, 'remember': True
+})
+s.headers['Authorization'] = 'Bearer ' + r.json()['accessToken']
+print('Login OK')
 
-Usage:
-    python3 rm_traffic/discover_blog_interview.py
-
-Output:
-    rm_traffic/blog_interview_endpoints.json
-"""
-
-import json
-import time
-from pathlib import Path
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-
-BASE = "https://rentmasseur.com"
-PROFILE = "/tmp/rm_action_api"
-
-
-def get_driver():
-    opts = Options()
-    opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument(f"--user-data-dir={PROFILE}")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    return webdriver.Chrome(options=opts)
-
-
-def dismiss_popups(driver):
-    time.sleep(1)
-    try:
-        driver.execute_script("document.querySelectorAll('.DialogOverlay,[class*=\"overlay\"]').forEach(e=>e.remove())")
-    except Exception:
-        pass
-
-
-def get_api_calls(driver):
-    logs = driver.get_log("performance")
-    reqs = {}
-    for entry in logs:
-        try:
-            msg = json.loads(entry["message"])["message"]
-            if msg["method"] == "Network.requestWillBeSent":
-                p = msg["params"]
-                r = p["request"]
-                rid = p["requestId"]
-                reqs[rid] = {
-                    "url": r["url"],
-                    "method": r["method"],
-                    "postData": r.get("postData", "")[:2000],
-                }
-            elif msg["method"] == "Network.responseReceived":
-                p = msg["params"]
-                rid = p["requestId"]
-                if rid in reqs:
-                    reqs[rid]["status"] = p["response"]["status"]
-                    try:
-                        body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": rid})
-                        reqs[rid]["response"] = body.get("body", "")[:2000]
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    return [v for v in reqs.values() if "/api/" in v["url"]]
-
-
-def find_clickable(driver, texts):
-    for text in texts:
-        for el in driver.find_elements(By.XPATH, f"//*[contains(text(),'{text}')]"):
-            if el.is_displayed():
-                return el
-    return None
-
-
-def discover_blog(driver):
-    print("\n=== BLOG DISCOVERY ===")
-    driver.get(f"{BASE}/settings?blog=1")
-    time.sleep(5)
-    dismiss_popups(driver)
-    print(f"URL: {driver.current_url}")
-
-    # List possible buttons
-    buttons = driver.find_elements(By.TAG_NAME, "button")
-    print(f"Buttons found: {len(buttons)}")
-    for b in buttons:
-        txt = (b.text or "").strip()
-        if txt:
-            print(f"  Button: {txt[:50]}")
-
-    # Try to click "Create" or "New"
-    for action_text in ["Create", "New", "Add", "Write", "Post"]:
-        el = find_clickable(driver, [action_text])
-        if el:
-            print(f"Clicking '{action_text}'...")
-            driver.execute_script("arguments[0].click()", el)
-            time.sleep(3)
-            break
-
-    # Clear logs and try to find form
-    driver.get_log("performance")
-    textareas = driver.find_elements(By.TAG_NAME, "textarea")
-    inputs = driver.find_elements(By.TAG_NAME, "input")
-    print(f"Textareas: {len(textareas)}, Inputs: {len(inputs)}")
-    for i, ta in enumerate(textareas):
-        print(f"  textarea[{i}]: placeholder={ta.get_attribute('placeholder') or 'N/A'}")
-    for i, inp in enumerate(inputs):
-        t = inp.get_attribute("type") or "text"
-        if t in ("text", "email", "search"):
-            print(f"  input[{i}]: type={t} placeholder={inp.get_attribute('placeholder') or 'N/A'}")
-
-    # Save action
-    save_btn = find_clickable(driver, ["Save", "Submit", "Publish", "Create", "Post"])
-    if save_btn:
-        print("Clicking save...")
-        driver.execute_script("arguments[0].click()", save_btn)
-        time.sleep(3)
-        calls = get_api_calls(driver)
-        print(f"Captured {len(calls)} API calls")
-        for c in calls:
-            print(f"  {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
-        return calls
-    else:
-        print("No save button found")
-        return []
-
-
-def discover_interview(driver):
-    print("\n=== INTERVIEW DISCOVERY ===")
-    driver.get(f"{BASE}/settings?interview=1")
-    time.sleep(5)
-    dismiss_popups(driver)
-    print(f"URL: {driver.current_url}")
-
-    # List inputs and buttons
-    textareas = driver.find_elements(By.TAG_NAME, "textarea")
-    inputs = driver.find_elements(By.TAG_NAME, "input")
-    buttons = driver.find_elements(By.TAG_NAME, "button")
-    print(f"Textareas: {len(textareas)}, Inputs: {len(inputs)}, Buttons: {len(buttons)}")
-    for i, ta in enumerate(textareas):
-        print(f"  textarea[{i}]: placeholder={ta.get_attribute('placeholder') or 'N/A'}")
-    for b in buttons:
-        txt = (b.text or "").strip()
-        if txt:
-            print(f"  Button: {txt[:50]}")
-
-    # Clear logs and try to save
-    driver.get_log("performance")
-    save_btn = find_clickable(driver, ["Save", "Submit", "Update", "Confirm"])
-    if save_btn:
-        print("Clicking save...")
-        driver.execute_script("arguments[0].click()", save_btn)
-        time.sleep(3)
-        calls = get_api_calls(driver)
-        print(f"Captured {len(calls)} API calls")
-        for c in calls:
-            print(f"  {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
-        return calls
-    else:
-        print("No save button found")
-        return []
-
-
-def main():
-    driver = get_driver()
-    try:
-        blog_calls = discover_blog(driver)
-        interview_calls = discover_interview(driver)
-        out = {
-            "blog": blog_calls,
-            "interview": interview_calls,
-            "timestamp": time.time(),
-        }
-        Path("rm_traffic/blog_interview_endpoints.json").write_text(
-            json.dumps(out, indent=2, default=str)
-        )
-        print("\nSaved to rm_traffic/blog_interview_endpoints.json")
-    finally:
-        driver.quit()
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-bio_variants.py:
-```
-"""
-Bio variant library — conservative, tested headline + bio copy.
-
-These are not random mutations. Each variant has a hypothesis and is tracked.
-"""
-
-BIO_VARIANTS = {
-    "direct_recovery": {
-        "headline": "Deep Recovery Massage — Manhattan",
-        "description": (
-            "I work with men who train hard, sit long hours, or carry stress in their shoulders and lower back. "
-            "My sessions are pressure-forward, slow, and deliberate — built around what your body actually needs "
-            "that day. Incall in Manhattan. Outcall available. Same-day when my schedule allows."
-        ),
-        "hypothesis": "Recovery-focused copy increases contact clicks from serious clients.",
-    },
-    "professional_discretion": {
-        "headline": "Discreet Therapeutic Massage — Manhattan",
-        "description": (
-            "Private, professional massage in a clean Manhattan space. I focus on therapeutic work first — "
-            "neck, shoulders, back, and hips — with a calm, confident presence. No rushed sessions. "
-            "Respectful clients only. Available for incall and selective outcall."
-        ),
-        "hypothesis": "Professional/discretion framing increases trust and booking quality.",
-    },
-    "luxury_manhattan": {
-        "headline": "Premium Bodywork — Manhattan, NYC",
-        "description": (
-            "Athletic, intuitive bodywork for men who want more than a standard massage. "
-            "I combine deep tissue, pressure-point work, and full-body flow in a private Manhattan studio. "
-            "Clean, quiet, and comfortable. Incall preferred. Outcall considered for established clients."
-        ),
-        "hypothesis": "Premium positioning attracts higher-value bookings.",
-    },
-    "sports_deep_tissue": {
-        "headline": "Sports & Deep Tissue — Manhattan",
-        "description": (
-            "Built for lifters, runners, and guys who beat up their bodies. My sessions target the muscle groups "
-            "that actually hurt: hips, hamstrings, shoulders, lats. Strong pressure. No fluff. "
-            "Manhattan incall. Book when available."
-        ),
-        "hypothesis": "Sports positioning captures fitness-focused traffic.",
-    },
-    "last_minute": {
-        "headline": "Same-Day Massage — Manhattan",
-        "description": (
-            "When you need real bodywork today, not next week. I keep blocks open for same-day bookings in Manhattan "
-            "when I am available. Clean private space, strong hands, no attitude. Text or email. "
-            "Respectful clients only."
-        ),
-        "hypothesis": "Last-minute availability angle converts urgent search traffic.",
-    },
-}
-
-
-def get_variant(variant_id: str) -> dict:
-    v = BIO_VARIANTS.get(variant_id)
-    if not v:
-        return None
-    return {
-        "variant_id": variant_id,
-        "headline": v["headline"],
-        "description": v["description"],
-        "hypothesis": v["hypothesis"],
-    }
-
-
-def list_variant_ids() -> list:
-    return list(BIO_VARIANTS.keys())
-
-
-def all_variants() -> list:
-    return [get_variant(vid) for vid in list_variant_ids()]
-
-```
-
-__init__.py:
-```
-# RentMasseur Traffic Engine
-
-```
-
-money_daemon.py:
-```
-"""
-Money-Making 24/7 Daemon — continuous revenue optimization loop.
-
-Combines:
-  1. Profile visibility guard (unhide if hidden → clients find you)
-  2. Availability auto-refresh (stay "Available" → appear in search)
-  3. Stats collection (views, contacts, emails → track conversion)
-  4. Search rank monitoring (know your position in Manhattan)
-  5. ML training loop (retrain money model every 6h → better bio predictions)
-  6. Bio A/B testing (rotate bio every 24h → higher CTR → more bookings)
-  7. Selenium verification (verify search visibility every 30min)
-  8. Live dashboard (print revenue metrics to terminal)
-
-The loop never stops. It handles crashes, re-auths, and writes receipts.
-
-Usage:
-    python3 -m rm_traffic.money_daemon
-
-Credentials read from .env file or environment variables.
-"""
-
-import json
-import logging
-import os
-import signal
-import sys
-import threading
-import time
-import traceback
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, Optional
-
-import numpy as np
-
-CYCLE_TIMEOUT = 120  # max seconds per cycle before watchdog kills it
-
-# Load .env
-ENV_PATH = Path(__file__).parent.parent / ".env"
-if ENV_PATH.exists():
-    for line in open(ENV_PATH):
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
-
-os.environ.setdefault("RM_USER", os.environ.get("RENTMASSEUR_USER", ""))
-os.environ.setdefault("RM_PASS", os.environ.get("RENTMASSEUR_PASS", ""))
-
-from .api_client import RentMasseurAPI
-from .auth import AuthSession
-from .db import init_db, write_receipt, write_traffic_snapshot, get_latest_traffic_snapshot
-from .visibility_guard import ensure_visible
-from .availability_guard import check_availability, refresh_availability
-from .stats_collector import collect_snapshot
-from .search_rank import check_search_rank
-from .content_optimizer import run_daily_draft_cycle
-from .bio_ml_trainer import MLP
-from .bio_appraiser import load_bios
-from .money_training_selenium import build_money_dataset, predict_top_bios, selenium_verify_search
-
-log = logging.getLogger("money.daemon")
-logging.basicConfig(
-    level=logging.INFO,
+# Exhaustive probe
+paths = [
+    # Interview variations
+    '/api/v1/account/interview',
+    '/api/v1/account/interviews',
+    '/api/v1/settings/interview',
+    '/api/v1/interview',
+    '/api/v1/account/dashboard/interview',

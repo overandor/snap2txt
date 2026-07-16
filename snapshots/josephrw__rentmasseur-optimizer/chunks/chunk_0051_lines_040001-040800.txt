@@ -1,800 +1,800 @@
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, asdict
 
-from .api_client import RentMasseurAPI
-from .state_engine import collect_state
-from .reward_engine import compute_delta, compute_reward, delta_to_dict
+import requests
 
-log = logging.getLogger("hypothesis_lab")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
-                    handlers=[logging.StreamHandler(sys.stdout)])
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-LAB_DB = Path(__file__).parent / "hypothesis_lab.db"
+BASE_URL = "https://rentmasseur.com"
+API_URL = f"{BASE_URL}/api/v1"
+DB_PATH = Path(__file__).parent / "fortress.db"
+LOG_PATH = Path(__file__).parent / "fortress.log"
 
-# Allowed actions only
-ALLOWED_ACTIONS = [
-    "refresh_availability",
-    "ensure_visible",
-    "detect_account_issues",
-    "classify_mailbox_intent",
-    "draft_reply_queue",
-    "headline_variant_test",
-    "about_variant_test",
-    "search_rank_scan",
-    "competitor_position_scan",
-    "pricing_copy_test",
-    "traffic_delta_report",
-    "roi_report",
+DEFAULT_PROXIES = [None]
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
 ]
 
-# ─── 300 Hypothesis definitions ────────────────────────────────────
+# Intervals
+AVAIL_CHECK_INTERVAL = 60 * 60
+AVAIL_REFRESH_THRESHOLD = 10 * 60
+VISIBILITY_CHECK_INTERVAL = 5 * 60
+STATS_INTERVAL = 15 * 60
+BIO_EXPERIMENT_INTERVAL = 24 * 60 * 60
+DASHBOARD_INTERVAL = 60 * 60
+HEALTH_CHECK_INTERVAL = 5 * 60
 
-def generate_300_hypotheses() -> List[Dict]:
-    """Generate 300 measurable hypotheses across 10 buckets of 30."""
-    hyps = []
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("fortress")
 
-    # 001-030: Availability uptime
-    availability_hyps = [
-        ("Keeping availability above 90% increases contact clicks within 24h.", "refresh_availability", "contact_click_delta"),
-        ("Setting availability to 6h duration reduces expiry gaps.", "refresh_availability", "availability_uptime"),
-        ("Refreshing availability every 4h maintains steady view flow.", "refresh_availability", "profile_view_delta"),
-        ("Availability set before peak hours (5-8pm) increases evening inquiries.", "refresh_availability", "new_inquiry_delta"),
-        ("Availability refresh recovers lost contact clicks within 6h.", "refresh_availability", "contact_click_delta"),
-        ("Continuous availability increases mailbox booking intent score.", "refresh_availability", "booking_intent_delta"),
-        ("Availability gaps longer than 2h reduce next-day views.", "refresh_availability", "profile_view_delta"),
-        ("Setting availability to Available vs Not Set changes CTR.", "refresh_availability", "contact_click_delta"),
-        ("Availability refresh improves search rank visibility.", "refresh_availability", "search_rank_gain"),
-        ("Morning availability refresh captures early search traffic.", "refresh_availability", "profile_view_delta"),
-        ("Availability countdown < 1h triggers urgency in profile views.", "refresh_availability", "contact_click_delta"),
-        ("Consistent availability reduces profile_hidden incidents.", "refresh_availability", "visibility_delta"),
-        ("Availability refresh during weekday increases contact clicks vs weekend.", "refresh_availability", "contact_click_delta"),
-        ("Multiple availability refreshes per day do not overmutate profile.", "refresh_availability", "overmutation_penalty"),
-        ("Availability refresh with 6h duration outperforms 1h duration.", "refresh_availability", "contact_click_delta"),
-        ("Late-night availability refresh captures night-owl searchers.", "refresh_availability", "profile_view_delta"),
-        ("Availability refresh after login session drop recovers metrics.", "refresh_availability", "profile_view_delta"),
-        ("Keeping availability always on increases repeat client messages.", "refresh_availability", "repeat_client_signal"),
-        ("Availability status affects new_emails count from keeponline.", "refresh_availability", "new_inquiry_delta"),
-        ("Availability refresh reduces account issues count.", "refresh_availability", "error_rate"),
-        ("Availability consistency improves competitor position scan.", "refresh_availability", "search_rank_gain"),
-        ("Availability refresh before weekend increases Friday inquiries.", "refresh_availability", "new_inquiry_delta"),
-        ("Availability set to Available increases profile visit count.", "refresh_availability", "profile_view_delta"),
-        ("Availability gaps cause measurable view decline within 12h.", "refresh_availability", "profile_view_delta"),
-        ("Availability refresh improves traffic anomaly recovery speed.", "refresh_availability", "profile_view_delta"),
-        ("Setting availability after visibility check ensures both are on.", "refresh_availability", "visibility_delta"),
-        ("Availability refresh does not increase opt-out risk.", "refresh_availability", "opt_out_risk"),
-        ("Availability uptime > 95% correlates with higher contact rate.", "refresh_availability", "contact_click_delta"),
-        ("Availability refresh timing at 9am captures morning search peak.", "refresh_availability", "profile_view_delta"),
-        ("Availability always-on is the highest-leverage single action.", "refresh_availability", "contact_click_delta"),
-    ]
+# ---------------------------------------------------------------------------
+# Database & Receipts
+# ---------------------------------------------------------------------------
 
-    # 031-060: Profile headline/about conversion
-    profile_hyps = [
-        ("Headline with 'Deep Tissue' increases contact clicks vs generic.", "headline_variant_test", "contact_click_delta"),
-        ("Headline mentioning Manhattan increases local search CTR.", "headline_variant_test", "contact_click_delta"),
-        ("Headline with 'Sports Recovery' attracts athletic demographic.", "headline_variant_test", "new_inquiry_delta"),
-        ("Headline with price range increases qualified inquiries.", "headline_variant_test", "new_inquiry_delta"),
-        ("Headline with availability language increases urgency clicks.", "headline_variant_test", "contact_click_delta"),
-        ("Shorter headline (under 50 chars) outperforms longer.", "headline_variant_test", "contact_click_delta"),
-        ("About section with FAQ format reduces price-only inquiries.", "about_variant_test", "booking_intent_delta"),
-        ("About section with session duration increases booking intent.", "about_variant_test", "booking_intent_delta"),
-        ("About section with location detail increases local CTR.", "about_variant_test", "contact_click_delta"),
-        ("Headline with 'Manhattan incall' increases location-match leads.", "headline_variant_test", "new_inquiry_delta"),
-        ("Headline A/B test: emotional vs clinical language.", "headline_variant_test", "contact_click_delta"),
-        ("About section with professional credentials increases trust clicks.", "about_variant_test", "contact_click_delta"),
-        ("Headline with time urgency ('today') increases same-day inquiries.", "headline_variant_test", "new_inquiry_delta"),
-        ("About section with clear next-step CTA increases contact clicks.", "about_variant_test", "contact_click_delta"),
-        ("Headline without buzzwords outperforms with buzzwords.", "headline_variant_test", "contact_click_delta"),
-        ("About section length 200-400 chars is optimal.", "about_variant_test", "contact_click_delta"),
-        ("Headline mentioning specific technique increases niche inquiries.", "headline_variant_test", "new_inquiry_delta"),
-        ("About section with boundary language reduces unsafe inquiries.", "about_variant_test", "opt_out_risk"),
-        ("Headline with 'Available Now' increases immediate contact clicks.", "headline_variant_test", "contact_click_delta"),
-        ("About section with repeat-client acknowledgment increases return visits.", "about_variant_test", "repeat_client_signal"),
-        ("Headline change frequency weekly is optimal vs daily.", "headline_variant_test", "overmutation_penalty"),
-        ("About section with FAQ reduces redundant price questions.", "about_variant_test", "booking_intent_delta"),
-        ("Headline with neighborhood specificity increases local search hits.", "headline_variant_test", "search_rank_gain"),
-        ("About section with session types increases qualified inquiry rate.", "about_variant_test", "new_inquiry_delta"),
-        ("Headline testing 'Recovery' vs 'Relaxation' language.", "headline_variant_test", "contact_click_delta"),
-        ("About section with availability mention increases same-day bookings.", "about_variant_test", "booking_intent_delta"),
-        ("Headline with certification mention increases trust CTR.", "headline_variant_test", "contact_click_delta"),
-        ("About section with clear rate mention reduces price-only messages.", "about_variant_test", "booking_intent_delta"),
-        ("Headline with 'Same Day' increases urgent booking intent.", "headline_variant_test", "booking_intent_delta"),
-        ("About section update improves search rank within 48h.", "about_variant_test", "search_rank_gain"),
-    ]
-
-    # 061-090: Mailbox intent and reply timing
-    mailbox_hyps = [
-        ("Classifying mailbox within 1h of receipt increases booking conversion.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Drafting replies within 30 seconds of classification increases response rate.", "draft_reply_queue", "booking_intent_delta"),
-        ("Replying within 5 minutes increases booking confirmation rate.", "draft_reply_queue", "booking_intent_delta"),
-        ("Booking_now classified leads convert 3x when replied same hour.", "draft_reply_queue", "booking_intent_delta"),
-        ("Price_question leads need rate + availability in first reply.", "draft_reply_queue", "booking_intent_delta"),
-        ("Repeat_client leads respond best to familiarity + slot offer.", "draft_reply_queue", "repeat_client_signal"),
-        ("Location_question leads need incall address + travel policy.", "draft_reply_queue", "booking_intent_delta"),
-        ("Mailbox intent scan detects high-value leads missed by keyword filter.", "classify_mailbox_intent", "new_inquiry_delta"),
-        ("Reply drafts with time slots outperform open-ended replies.", "draft_reply_queue", "booking_intent_delta"),
-        ("Reply drafts with rate clarity reduce follow-up price questions.", "draft_reply_queue", "booking_intent_delta"),
-        ("Follow-up after 3h increases response rate from ghosted leads.", "draft_reply_queue", "booking_intent_delta"),
-        ("Close-loop message after 24h recovers 5% of lost leads.", "draft_reply_queue", "new_inquiry_delta"),
-        ("Mailbox classification accuracy > 80% with keyword fallback.", "classify_mailbox_intent", "error_rate"),
-        ("Ollama-based classification outperforms keyword-only.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Premium senders have 2x booking intent vs non-premium.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Unread messages > 3 indicate reply backlog hurting conversion.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Reply with boundary language reduces unsafe follow-ups.", "draft_reply_queue", "opt_out_risk"),
-        ("Reply with phone number increases off-platform booking speed.", "draft_reply_queue", "booking_intent_delta"),
-        ("Mailbox intent score > 0.5 correlates with booking requests.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Reply timing under 2 minutes is the single biggest conversion lever.", "draft_reply_queue", "booking_intent_delta"),
-        ("Classified leads with booking_now + location_match have 90% booking probability.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Reply drafts with 3 time slots outperform 2 or 5.", "draft_reply_queue", "booking_intent_delta"),
-        ("Mailbox scan frequency every 15 min catches hot leads faster.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Reply with session duration mention increases confirmed bookings.", "draft_reply_queue", "booking_intent_delta"),
-        ("Ghosted leads reactivated within 7 days have 15% rebooking rate.", "draft_reply_queue", "repeat_client_signal"),
-        ("Mailbox classification reduces spam handling time by 80%.", "classify_mailbox_intent", "error_rate"),
-        ("Reply with 'Text me' CTA increases off-platform conversion.", "draft_reply_queue", "booking_intent_delta"),
-        ("Intent classification confidence > 0.7 enables safe auto-reply.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Reply queue sorted by urgency outperforms sorted by timestamp.", "draft_reply_queue", "booking_intent_delta"),
-        ("Mailbox intent scan detects trends before they appear in ad stats.", "classify_mailbox_intent", "new_inquiry_delta"),
-    ]
-
-    # 091-120: Search rank and category position
-    search_hyps = [
-        ("Search rank in top 10 increases contact clicks by 50%.", "search_rank_scan", "search_rank_gain"),
-        ("Search rank in top 5 increases views by 2x vs top 20.", "search_rank_scan", "profile_view_delta"),
-        ("Category position in 'Deep Tissue' increases qualified inquiries.", "search_rank_scan", "new_inquiry_delta"),
-        ("Competitor position scan identifies rank decline early.", "competitor_position_scan", "search_rank_gain"),
-        ("Search rank scan frequency daily catches algorithm changes.", "search_rank_scan", "search_rank_gain"),
-        ("Manhattan search rank outperforms borough-specific rank.", "search_rank_scan", "profile_view_delta"),
-        ("Search rank decline > 5 positions triggers profile review.", "search_rank_scan", "contact_click_delta"),
-        ("Competitor count in search affects click distribution.", "competitor_position_scan", "contact_click_delta"),
-        ("Search rank on page 1 vs page 2 is 10x difference in views.", "search_rank_scan", "profile_view_delta"),
-        ("New masseurs entering search reduce existing rank temporarily.", "competitor_position_scan", "search_rank_gain"),
-        ("Search rank correlates with availability status.", "search_rank_scan", "search_rank_gain"),
-        ("Search rank improves after profile update within 48h.", "search_rank_scan", "search_rank_gain"),
-        ("Search rank is stable on weekdays vs volatile on weekends.", "search_rank_scan", "search_rank_gain"),
-        ("Competitor position scan finds ranking opportunities.", "competitor_position_scan", "search_rank_gain"),
-        ("Search rank in 'Sports Recovery' category is less competitive.", "search_rank_scan", "search_rank_gain"),
-        ("Rank scan detects when profile drops to page 2.", "search_rank_scan", "profile_view_delta"),
-        ("Competitor scan identifies bio strategies of top-ranked masseurs.", "competitor_position_scan", "contact_click_delta"),
-        ("Search rank improves with consistent availability.", "search_rank_scan", "search_rank_gain"),
-        ("Rank position 1-3 gets 60% of search clicks.", "search_rank_scan", "contact_click_delta"),
-        ("Search rank decline correlates with availability gaps.", "search_rank_scan", "search_rank_gain"),
-        ("Competitor scan weekly identifies new market entrants.", "competitor_position_scan", "search_rank_gain"),
-        ("Search rank in 'Therapeutic' category attracts higher-intent clients.", "search_rank_scan", "booking_intent_delta"),
-        ("Rank scan detects sudden algorithm penalty.", "search_rank_scan", "profile_view_delta"),
-        ("Competitor position in top 5 changes weekly.", "competitor_position_scan", "search_rank_gain"),
-        ("Search rank affects mailbox inquiry volume directly.", "search_rank_scan", "new_inquiry_delta"),
-        ("Rank scan + availability refresh combo improves position.", "search_rank_scan", "search_rank_gain"),
-        ("Competitor scan finds rate positioning opportunities.", "competitor_position_scan", "contact_click_delta"),
-        ("Search rank on mobile vs desktop shows different positions.", "search_rank_scan", "profile_view_delta"),
-        ("Rank improvement of 1 position increases views by 10%.", "search_rank_scan", "profile_view_delta"),
-        ("Competitor scan identifies photo strategy of top-ranked.", "competitor_position_scan", "contact_click_delta"),
-    ]
-
-    # 121-150: Pricing/rate presentation
-    pricing_hyps = [
-        ("Displaying rate in headline increases qualified inquiries.", "pricing_copy_test", "new_inquiry_delta"),
-        ("Rate in about section reduces price-only messages.", "pricing_copy_test", "booking_intent_delta"),
-        ("Rate range (60/90/120 min) increases upsell bookings.", "pricing_copy_test", "booking_intent_delta"),
-        ("Rate positioned as 'starting from' increases inquiry volume.", "pricing_copy_test", "new_inquiry_delta"),
-        ("Rate clarity in reply drafts increases booking confirmation.", "pricing_copy_test", "booking_intent_delta"),
-        ("Premium rate positioning attracts higher-value clients.", "pricing_copy_test", "booking_intent_delta"),
-        ("Rate below market average increases contact clicks but lowers value.", "pricing_copy_test", "contact_click_delta"),
-        ("Rate above market average decreases inquiries but increases show rate.", "pricing_copy_test", "new_inquiry_delta"),
-        ("Rate in first reply increases booking speed.", "pricing_copy_test", "booking_intent_delta"),
-        ("Package pricing (3-session) increases repeat client rate.", "pricing_copy_test", "repeat_client_signal"),
-        ("Rate transparency reduces negotiation messages.", "pricing_copy_test", "booking_intent_delta"),
-        ("Rate mention in about section increases search CTR.", "pricing_copy_test", "contact_click_delta"),
-        ("Rate positioning affects competitor rank scan results.", "pricing_copy_test", "search_rank_gain"),
-        ("Rate copy test: 'session' vs 'massage' wording.", "pricing_copy_test", "contact_click_delta"),
-        ("Rate with duration context increases booking intent.", "pricing_copy_test", "booking_intent_delta"),
-        ("Rate in reply draft reduces follow-up questions by 40%.", "pricing_copy_test", "booking_intent_delta"),
-        ("Rate test: listing 60min only vs 60/90/120 options.", "pricing_copy_test", "booking_intent_delta"),
-        ("Rate positioning affects opt-out risk if too aggressive.", "pricing_copy_test", "opt_out_risk"),
-        ("Rate copy with value proposition outperforms rate alone.", "pricing_copy_test", "contact_click_delta"),
-        ("Rate in profile reduces mailbox price questions by 60%.", "pricing_copy_test", "booking_intent_delta"),
-        ("Rate test: round number vs .99 ending.", "pricing_copy_test", "contact_click_delta"),
-        ("Rate mention in headline increases CTR but may lower trust.", "pricing_copy_test", "contact_click_delta"),
-        ("Rate transparency increases repeat client booking value.", "pricing_copy_test", "repeat_client_signal"),
-        ("Rate copy with 'inclusive' language reduces boundary issues.", "pricing_copy_test", "opt_out_risk"),
-        ("Rate test affects search rank position indirectly.", "pricing_copy_test", "search_rank_gain"),
-        ("Rate in about section increases profile view duration.", "pricing_copy_test", "profile_view_delta"),
-        ("Rate copy with session type detail increases qualified leads.", "pricing_copy_test", "new_inquiry_delta"),
-        ("Rate positioning affects competitor differentiation.", "pricing_copy_test", "contact_click_delta"),
-        ("Rate test: seasonal pricing increases off-peak bookings.", "pricing_copy_test", "new_inquiry_delta"),
-        ("Rate copy in reply is the highest-conversion element.", "pricing_copy_test", "booking_intent_delta"),
-    ]
-
-    # 151-180: Photo/order/media hypotheses
-    photo_hyps = [
-        ("Primary photo with professional lighting increases CTR.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo order with face-first increases trust clicks.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo showing massage table increases booking intent.", "traffic_delta_report", "booking_intent_delta"),
-        ("Photo count 4-6 is optimal vs 1-3 or 7+.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo with gym/athletic setting attracts sports recovery clients.", "traffic_delta_report", "new_inquiry_delta"),
-        ("Photo update frequency monthly maintains profile freshness.", "traffic_delta_report", "profile_view_delta"),
-        ("Photo without face increases curiosity but lowers trust.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo with Manhattan backdrop increases local search CTR.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo order test: body-first vs face-first.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo quality affects search rank position.", "traffic_delta_report", "search_rank_gain"),
-        ("Photo with professional attire increases premium inquiries.", "traffic_delta_report", "new_inquiry_delta"),
-        ("Photo update triggers search algorithm re-indexing.", "traffic_delta_report", "search_rank_gain"),
-        ("Photo with hands visible increases professional trust.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo A/B test: studio vs natural setting.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo with client testimonial overlay increases CTR.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo order affects profile view duration.", "traffic_delta_report", "profile_view_delta"),
-        ("Photo with massage technique demonstrated increases bookings.", "traffic_delta_report", "booking_intent_delta"),
-        ("Photo freshness affects repeat client return rate.", "traffic_delta_report", "repeat_client_signal"),
-        ("Photo with clean background outperforms cluttered.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo count affects search visibility score.", "traffic_delta_report", "search_rank_gain"),
-        ("Photo with smile increases approachability CTR.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo update reduces profile fatigue signal.", "traffic_delta_report", "profile_view_delta"),
-        ("Photo with professional setup increases rate acceptance.", "traffic_delta_report", "booking_intent_delta"),
-        ("Photo order test: technique vs portrait first.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo with location context increases local inquiries.", "traffic_delta_report", "new_inquiry_delta"),
-        ("Photo quality is top factor in contact click decision.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo with before/after increases sports recovery inquiries.", "traffic_delta_report", "new_inquiry_delta"),
-        ("Photo update frequency affects overmutation penalty.", "traffic_delta_report", "overmutation_penalty"),
-        ("Photo with availability text overlay increases urgency clicks.", "traffic_delta_report", "contact_click_delta"),
-        ("Photo strategy of top-ranked competitors differs from ours.", "competitor_position_scan", "contact_click_delta"),
-    ]
-
-    # 181-210: Repeat-client reactivation
-    repeat_hyps = [
-        ("Repeat client reactivation message within 30 days has 40% response rate.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat clients respond to familiarity + slot offer format.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client reactivation increases revenue per lead by 3x.", "draft_reply_queue", "booking_intent_delta"),
-        ("Repeat client detection from mailbox history improves targeting.", "classify_mailbox_intent", "repeat_client_signal"),
-        ("Repeat client follow-up after 60 days recovers 15%.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client with booking_now intent has 95% conversion.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Repeat client reactivation reduces CAC to zero.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client rate > 30% indicates healthy retention.", "classify_mailbox_intent", "repeat_client_signal"),
-        ("Repeat client detection from message keywords is 80% accurate.", "classify_mailbox_intent", "repeat_client_signal"),
-        ("Repeat client reactivation message timing Friday afternoon is optimal.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client with premium status has 2x lifetime value.", "classify_mailbox_intent", "repeat_client_signal"),
-        ("Repeat client reactivation with offer increases response rate.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client lost > 90 days is harder to reactivate.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client acknowledgment in about section increases returns.", "about_variant_test", "repeat_client_signal"),
-        ("Repeat client follow-up after session increases rebooking within 7 days.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client detection improves with Ollama classification.", "classify_mailbox_intent", "repeat_client_signal"),
-        ("Repeat client reactivation is cheaper than new lead acquisition.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client with location_match has higher show rate.", "classify_mailbox_intent", "repeat_client_signal"),
-        ("Repeat client reactivation with priority slot offer outperforms discount.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client segment is the highest ROI action target.", "draft_reply_queue", "booking_intent_delta"),
-        ("Repeat client detection from iMessage history enriches CRM.", "classify_mailbox_intent", "repeat_client_signal"),
-        ("Repeat client reactivation after holiday season has 50% response.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client with booking history > 3 sessions is loyal.", "classify_mailbox_intent", "repeat_client_signal"),
-        ("Repeat client reactivation message with specific memory increases trust.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client rate is the strongest revenue predictor.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Repeat client reactivation reduces no-show rate.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client with same-day intent converts 90% with fast reply.", "draft_reply_queue", "booking_intent_delta"),
-        ("Repeat client detection accuracy affects reactivation ROI.", "classify_mailbox_intent", "repeat_client_signal"),
-        ("Repeat client reactivation is the highest-leverage retention action.", "draft_reply_queue", "repeat_client_signal"),
-        ("Repeat client segment growth compounds revenue over time.", "draft_reply_queue", "booking_intent_delta"),
-    ]
-
-    # 211-240: City/time/daypart behavior
-    time_hyps = [
-        ("Peak search time 5-8pm ET has highest contact click rate.", "traffic_delta_report", "contact_click_delta"),
-        ("Morning availability (9am) captures early search traffic.", "refresh_availability", "profile_view_delta"),
-        ("Friday has highest booking intent in mailbox.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Sunday evening has highest repeat client reactivation rate.", "draft_reply_queue", "repeat_client_signal"),
-        ("Tuesday-Thursday are optimal for profile updates.", "headline_variant_test", "contact_click_delta"),
-        ("Late-night searches (10pm-2am) have urgent booking intent.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Weekend availability increases casual browser inquiries.", "refresh_availability", "new_inquiry_delta"),
-        ("Daypart analysis reveals 3pm is low-traffic period.", "traffic_delta_report", "profile_view_delta"),
-        ("Post-work hours (6-9pm) have highest conversion rate.", "draft_reply_queue", "booking_intent_delta"),
-        ("Monday morning has lowest search volume.", "traffic_delta_report", "profile_view_delta"),
-        ("Availability refresh at 4pm captures pre-evening search peak.", "refresh_availability", "contact_click_delta"),
-        ("Saturday afternoon has high no-show probability.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Holiday weekends reduce inquiry volume by 50%.", "traffic_delta_report", "profile_view_delta"),
-        ("First week of month has higher booking rate (payday effect).", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Last week of month has lower booking rate.", "traffic_delta_report", "new_inquiry_delta"),
-        ("Summer months reduce indoor massage demand slightly.", "traffic_delta_report", "profile_view_delta"),
-        ("Winter months increase deep tissue massage demand.", "traffic_delta_report", "booking_intent_delta"),
-        ("Rainy days increase same-day booking inquiries.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Post-holiday period has surge in wellness inquiries.", "classify_mailbox_intent", "new_inquiry_delta"),
-        ("Daypart targeting for reply drafts improves conversion.", "draft_reply_queue", "booking_intent_delta"),
-        ("Search rank fluctuates more on weekends.", "search_rank_scan", "search_rank_gain"),
-        ("Competitor activity peaks on Thursday evenings.", "competitor_position_scan", "search_rank_gain"),
-        ("Mailbox volume correlates with daypart search peaks.", "classify_mailbox_intent", "new_inquiry_delta"),
-        ("Availability expiry during peak hours is most damaging.", "refresh_availability", "contact_click_delta"),
-        ("Reply timing within same daypart as inquiry increases conversion.", "draft_reply_queue", "booking_intent_delta"),
-        ("Profile view count peaks at 7pm ET.", "traffic_delta_report", "profile_view_delta"),
-        ("Contact click rate is highest 6-8pm ET.", "traffic_delta_report", "contact_click_delta"),
-        ("Daypart-aware availability scheduling reduces gaps.", "refresh_availability", "availability_uptime"),
-        ("Weekday vs weekend inquiry quality differs.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Time-of-day affects reply template effectiveness.", "draft_reply_queue", "booking_intent_delta"),
-    ]
-
-    # 241-270: Traffic anomaly recovery
-    anomaly_hyps = [
-        ("Sudden view drop > 30% triggers availability check.", "refresh_availability", "profile_view_delta"),
-        ("Contact click drop to 0 for 24h indicates profile issue.", "detect_account_issues", "error_rate"),
-        ("Search rank drop > 10 positions triggers profile review.", "search_rank_scan", "search_rank_gain"),
-        ("Mailbox volume drop > 50% triggers visibility check.", "ensure_visible", "new_inquiry_delta"),
-        ("Availability expiry causes measurable view decline within 6h.", "refresh_availability", "profile_view_delta"),
-        ("Profile hidden flag causes 100% view loss.", "ensure_visible", "profile_view_delta"),
-        ("Account issues count > 3 indicates systemic problem.", "detect_account_issues", "error_rate"),
-        ("Login session drop causes availability reset.", "refresh_availability", "availability_uptime"),
-        ("Traffic anomaly recovery speed < 1h prevents lead loss.", "refresh_availability", "contact_click_delta"),
-        ("New_visits drop in keeponline signals search visibility issue.", "detect_account_issues", "profile_view_delta"),
-        ("CTR drop > 2 percentage points triggers headline review.", "headline_variant_test", "contact_click_delta"),
-        ("Mailbox intent score drop indicates lead quality decline.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Competitor surge causes temporary rank decline.", "competitor_position_scan", "search_rank_gain"),
-        ("Anomaly detection + availability refresh combo recovers views.", "refresh_availability", "profile_view_delta"),
-        ("Traffic anomaly during peak hours is 3x more costly.", "refresh_availability", "contact_click_delta"),
-        ("Anomaly recovery with visibility check prevents extended loss.", "ensure_visible", "profile_view_delta"),
-        ("Account issue detection reduces error rate by 80%.", "detect_account_issues", "error_rate"),
-        ("Traffic delta report identifies anomaly within 24h.", "traffic_delta_report", "profile_view_delta"),
-        ("Anomaly recovery speed is the key resilience metric.", "refresh_availability", "profile_view_delta"),
-        ("Proactive availability refresh prevents 90% of anomaly gaps.", "refresh_availability", "availability_uptime"),
-        ("Anomaly during weekend is harder to detect.", "detect_account_issues", "error_rate"),
-        ("View anomaly correlates with availability status change.", "refresh_availability", "profile_view_delta"),
-        ("Contact click anomaly triggers immediate action.", "detect_account_issues", "contact_click_delta"),
-        ("Anomaly recovery with headline refresh recovers CTR.", "headline_variant_test", "contact_click_delta"),
-        ("Traffic anomaly report identifies pattern vs one-off.", "traffic_delta_report", "profile_view_delta"),
-        ("Anomaly detection frequency every 15 min is optimal.", "detect_account_issues", "error_rate"),
-        ("Recovery from profile_hidden is fastest with ensure_visible.", "ensure_visible", "profile_view_delta"),
-        ("Anomaly during holiday has lower impact.", "traffic_delta_report", "profile_view_delta"),
-        ("Traffic anomaly recovery is a competitive advantage.", "refresh_availability", "contact_click_delta"),
-        ("Anomaly detection + action reduces revenue loss by 70%.", "refresh_availability", "contact_click_delta"),
-    ]
-
-    # 271-300: Composite strategy bundles
-    composite_hyps = [
-        ("Availability + mailbox scan combo increases qualified leads by 40%.", "refresh_availability", "new_inquiry_delta"),
-        ("Availability + reply draft queue increases booking rate by 50%.", "refresh_availability", "booking_intent_delta"),
-        ("Headline test + availability combo outperforms either alone.", "headline_variant_test", "contact_click_delta"),
-        ("Search scan + availability refresh maintains rank position.", "search_rank_scan", "search_rank_gain"),
-        ("Mailbox scan + reply drafts is the highest-ROI combo.", "draft_reply_queue", "booking_intent_delta"),
-        ("Availability + visibility + mailbox = full profile health check.", "refresh_availability", "contact_click_delta"),
-        ("Competitor scan + headline test responds to market changes.", "competitor_position_scan", "search_rank_gain"),
-        ("Pricing test + reply draft combo increases booking value.", "pricing_copy_test", "booking_intent_delta"),
-        ("Repeat client detection + reactivation draft increases retention.", "draft_reply_queue", "repeat_client_signal"),
-        ("Anomaly detection + availability refresh prevents revenue loss.", "refresh_availability", "contact_click_delta"),
-        ("Full daily cycle: availability + mailbox + reply + report.", "roi_report", "booking_intent_delta"),
-        ("Availability + search scan + competitor scan = position defense.", "search_rank_scan", "search_rank_gain"),
-        ("Headline + about + pricing = full profile conversion optimization.", "about_variant_test", "contact_click_delta"),
-        ("Mailbox classification + reply timing = speed-to-lead engine.", "draft_reply_queue", "booking_intent_delta"),
-        ("Availability + visibility = profile actionability guarantee.", "ensure_visible", "profile_view_delta"),
-        ("Traffic report + ROI report = business intelligence layer.", "roi_report", "booking_intent_delta"),
-        ("All safe actions in sequence outperform random selection.", "refresh_availability", "contact_click_delta"),
-        ("Bandit-selected action outperforms fixed schedule.", "refresh_availability", "booking_intent_delta"),
-        ("Morning availability + evening mailbox scan = daily rhythm.", "classify_mailbox_intent", "new_inquiry_delta"),
-        ("Profile refresh + search scan = weekly optimization cycle.", "search_rank_scan", "search_rank_gain"),
-        ("Availability guard + intent engine = conversion precondition.", "classify_mailbox_intent", "booking_intent_delta"),
-        ("Receipt chain + FDR control = trustworthy experiment engine.", "roi_report", "error_rate"),
-        ("Composite strategy: availability + mailbox + reply + report.", "roi_report", "booking_intent_delta"),
-        ("Full stack: state + bandit + intent + reward + receipt.", "roi_report", "booking_intent_delta"),
-        ("Availability uptime + reply speed = conversion velocity.", "draft_reply_queue", "booking_intent_delta"),
-        ("Search rank + competitor scan = market position awareness.", "competitor_position_scan", "search_rank_gain"),
-        ("Profile quality + pricing clarity = conversion optimization.", "pricing_copy_test", "contact_click_delta"),
-        ("Repeat client + reactivation + retention = revenue compound.", "draft_reply_queue", "repeat_client_signal"),
-        ("Anomaly recovery + availability + visibility = resilience.", "ensure_visible", "profile_view_delta"),
-        ("Full overclock: all engines running in sequence daily.", "roi_report", "booking_intent_delta"),
-    ]
-
-    buckets = [
-        ("availability", availability_hyps),
-        ("profile", profile_hyps),
-        ("mailbox", mailbox_hyps),
-        ("search", search_hyps),
-        ("pricing", pricing_hyps),
-        ("photo", photo_hyps),
-        ("retention", repeat_hyps),
-        ("timing", time_hyps),
-        ("anomaly", anomaly_hyps),
-        ("composite", composite_hyps),
-    ]
-
-    idx = 1
-    for category, hyp_list in buckets:
-        for claim, action, primary_metric in hyp_list:
-            hyps.append({
-                "hypothesis_id": f"H{idx:03d}",
-                "category": category,
-                "claim": claim,
-                "action": action,
-                "primary_metric": primary_metric,
-                "secondary_metrics": ["profile_view_delta", "new_inquiry_delta", "booking_intent_delta"],
-                "guardrail_metrics": ["error_rate", "overmutation_penalty", "opt_out_risk"],
-                "minimum_window_hours": 24,
-                "max_runs": 5,
-                "status": "candidate",
-                "confidence": 0.0,
-                "reward": 0.0,
-                "runs_completed": 0,
-                "evidence_receipts": [],
-            })
-            idx += 1
-
-    return hyps
-
-
-# ─── DB ────────────────────────────────────────────────────────────
-
-def _db():
-    conn = sqlite3.connect(str(LAB_DB))
+def db():
+    conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS hypotheses (
-        hypothesis_id TEXT PRIMARY KEY,
-        category TEXT,
-        claim TEXT,
-        action TEXT,
-        primary_metric TEXT,
-        secondary_metrics TEXT,
-        guardrail_metrics TEXT,
-        minimum_window_hours INTEGER,
-        max_runs INTEGER,
-        status TEXT DEFAULT 'candidate',
-        confidence REAL DEFAULT 0.0,
-        reward REAL DEFAULT 0.0,
-        runs_completed INTEGER DEFAULT 0,
-        evidence_receipts TEXT DEFAULT '[]',
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS hypothesis_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        hypothesis_id TEXT,
-        tenant_id TEXT,
-        state_before_hash TEXT,
-        state_after_hash TEXT,
-        metric_delta TEXT,
-        reward REAL,
-        receipt_hash TEXT,
-        timestamp TEXT
-    );
-    CREATE TABLE IF NOT EXISTS hypothesis_receipts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        hypothesis_id TEXT,
-        tenant_id TEXT,
-        receipt_hash TEXT UNIQUE,
-        timestamp TEXT,
-        action TEXT,
-        reward REAL,
-        metric_delta TEXT,
-        state_before_hash TEXT,
-        state_after_hash TEXT
-    );
-    CREATE TABLE IF NOT EXISTS hypothesis_promotions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        hypothesis_id TEXT,
-        tenant_id TEXT,
-        promoted_at TEXT,
-        reward REAL,
-        confidence REAL,
-        fdr_corrected INTEGER DEFAULT 0
-    );
-    CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status);
-    CREATE INDEX IF NOT EXISTS idx_hyp_category ON hypotheses(category);
-    CREATE INDEX IF NOT EXISTS idx_runs_hyp ON hypothesis_runs(hypothesis_id);
-    """)
-    conn.commit()
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
-
-# ─── FDR Control ───────────────────────────────────────────────────
-
-def benjamini_hochberg(p_values: List[float], alpha: float = 0.05) -> List[bool]:
-    """Benjamini-Hochberg FDR correction. Returns list of which hypotheses survive."""
-    n = len(p_values)
-    if n == 0:
-        return []
-
-    # Sort by p-value, keep track of original indices
-    indexed = sorted(enumerate(p_values), key=lambda x: x[1])
-    rejected = [False] * n
-
-    # BH procedure: find largest k where p(k) <= k/n * alpha
-    max_k = 0
-    for rank, (orig_idx, p) in enumerate(indexed, 1):
-        threshold = (rank / n) * alpha
-        if p <= threshold:
-            max_k = rank
-
-    # Reject all hypotheses with rank <= max_k
-    for rank, (orig_idx, p) in enumerate(indexed, 1):
-        if rank <= max_k:
-            rejected[orig_idx] = True
-
-    return rejected
-
-
-def apply_fdr_control(conn: sqlite3.Connection, tenant_id: str) -> Dict:
-    """Apply FDR correction every 25 completed hypothesis tests."""
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT hypothesis_id, reward, runs_completed
-        FROM hypotheses
-        WHERE status IN ('candidate', 'running') AND runs_completed > 0
-        ORDER BY reward DESC
+def init_db():
+    conn = db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS receipts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        action TEXT NOT NULL,
+        success INTEGER DEFAULT 1,
+        detail TEXT,
+        before_state TEXT,
+        after_state TEXT,
+        hash TEXT,
+        prev_hash TEXT,
+        chain_verified INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        views INTEGER,
+        contact_clicks INTEGER,
+        visits INTEGER,
+        bookmarks INTEGER,
+        new_emails INTEGER,
+        is_ad_hidden INTEGER,
+        available INTEGER,
+        availability_remaining TEXT,
+        headline TEXT,
+        description_len INTEGER,
+        city TEXT,
+        search_position INTEGER,
+        search_available_position INTEGER,
+        search_total INTEGER,
+        search_available_total INTEGER,
+        login_method TEXT,
+        latency_ms REAL
+    );
+    CREATE TABLE IF NOT EXISTS bio_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        headline TEXT,
+        description TEXT,
+        reason TEXT,
+        applied INTEGER DEFAULT 0,
+        views_before INTEGER,
+        views_after INTEGER,
+        contacts_before INTEGER,
+        contacts_after INTEGER,
+        llm_provider TEXT,
+        notes TEXT
+    );
+    CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        severity TEXT,
+        type TEXT,
+        message TEXT,
+        acknowledged INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        token TEXT,
+        cookies TEXT,
+        user_agent TEXT,
+        proxy TEXT,
+        login_method TEXT,
+        expires_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_receipts_ts ON receipts(ts);
+    CREATE INDEX IF NOT EXISTS idx_stats_ts ON stats(ts);
+    CREATE INDEX IF NOT EXISTS idx_bio_versions_ts ON bio_versions(ts);
     """)
-    rows = cur.fetchall()
-
-    if len(rows) < 25:
-        return {"applied": False, "reason": f"only {len(rows)} completed, need 25"}
-
-    # Compute approximate p-values from reward scores
-    # (using reward as proxy: higher reward = lower p-value)
-    rewards = [r["reward"] for r in rows]
-    max_reward = max(rewards) if rewards else 1.0
-    p_values = [1.0 - (r / max_reward) if max_reward > 0 else 1.0 for r in rewards]
-
-    rejected = benjamini_hochberg(p_values, alpha=0.05)
-
-    promoted = 0
-    retired = 0
-    for i, row in enumerate(rows):
-        if rejected[i]:
-            conn.execute("UPDATE hypotheses SET status = 'winner' WHERE hypothesis_id = ?", (row["hypothesis_id"],))
-            conn.execute("INSERT INTO hypothesis_promotions (hypothesis_id, tenant_id, promoted_at, reward, confidence, fdr_corrected) VALUES (?, ?, ?, ?, ?, 1)",
-                        (row["hypothesis_id"], tenant_id, datetime.now(timezone.utc).isoformat(), row["reward"], 0.8))
-            promoted += 1
-        elif row["runs_completed"] >= 5:
-            conn.execute("UPDATE hypotheses SET status = 'retired' WHERE hypothesis_id = ?", (row["hypothesis_id"],))
-            retired += 1
-
     conn.commit()
-    return {"applied": True, "promoted": promoted, "retired": retired, "tested": len(rows)}
+    conn.close()
+
+def sha256_chain(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def get_last_receipt_hash() -> str:
+    conn = db()
+    row = conn.execute("SELECT hash FROM receipts ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    return row["hash"] if row else "0" * 64
+
+def receipt(action: str, success: bool, detail: str, before: Any = None, after: Any = None):
+    ts = datetime.now(timezone.utc).isoformat()
+    before_json = json.dumps(before, default=str) if before is not None else None
+    after_json = json.dumps(after, default=str) if after is not None else None
+    prev_hash = get_last_receipt_hash()
+    payload = f"{prev_hash}|{ts}|{action}|{int(success)}|{detail}|{before_json}|{after_json}"
+    h = sha256_chain(payload)
+    conn = db()
+    conn.execute(
+        "INSERT INTO receipts (ts, action, success, detail, before_state, after_state, hash, prev_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (ts, action, int(success), detail, before_json, after_json, h, prev_hash)
+    )
+    conn.commit()
+    conn.close()
+    if success:
+        log.info("RECEIPT: %s | %s", action, detail)
+    else:
+        log.error("RECEIPT FAIL: %s | %s", action, detail)
+    return h
+
+def record_stats(login_method: str = "api", latency_ms: float = 0.0, **kwargs):
+    ts = datetime.now(timezone.utc).isoformat()
+    cols = ["ts", "login_method", "latency_ms"] + list(kwargs.keys())
+    vals = [ts, login_method, latency_ms] + list(kwargs.values())
+    conn = db()
+    conn.execute(
+        f"INSERT INTO stats ({','.join(cols)}) VALUES ({','.join(['?'] * len(cols))})",
+        vals
+    )
+    conn.commit()
+    conn.close()
+
+def record_alert(severity: str, atype: str, message: str):
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    conn.execute(
+        "INSERT INTO alerts (ts, severity, type, message) VALUES (?, ?, ?, ?)",
+        (ts, severity, atype, message)
+    )
+    conn.commit()
+    conn.close()
+    log.warning("ALERT [%s/%s]: %s", severity, atype, message)
+
+# ---------------------------------------------------------------------------
+# Credential Vault
+# ---------------------------------------------------------------------------
+
+def get_credential(name: str, prompt_if_missing: bool = False) -> Optional[str]:
+    """Read credential from env or macOS keychain."""
+    val = os.environ.get(name)
+    if val:
+        return val
+    # Try macOS keychain
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", f"fortress_{name}", "-w"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    if prompt_if_missing:
+        return input(f"Enter {name}: ")
+    return None
+
+# ---------------------------------------------------------------------------
+# Identity Manager
+# ---------------------------------------------------------------------------
+
+class IdentityManager:
+    """Manages browser fingerprints, proxies, and user agents."""
+
+    def __init__(self):
+        self.proxy = random.choice(get_proxy_list())
+        self.user_agent = random.choice(USER_AGENTS)
+        self.chrome_profile = f"/tmp/fortress_profile_{random.randint(1000, 9999)}"
+
+    def rotate(self):
+        self.proxy = random.choice(get_proxy_list())
+        self.user_agent = random.choice(USER_AGENTS)
+        self.chrome_profile = f"/tmp/fortress_profile_{random.randint(1000, 9999)}"
+
+    def get_requests_session(self) -> requests.Session:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": self.user_agent,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"{BASE_URL}/settings",
+            "Origin": BASE,
+        })
+        if self.proxy:
+            s.proxies.update({"http": self.proxy, "https": self.proxy})
+        return s
+
+    def get_selenium_driver(self):
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        opts = Options()
+        opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument(f"--user-data-dir={self.chrome_profile}")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_argument(f"--user-agent={self.user_agent}")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        if self.proxy:
+            opts.add_argument(f"--proxy-server={self.proxy}")
+        driver = webdriver.Chrome(options=opts)
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+        return driver
 
 
-# ─── Bandit selection ──────────────────────────────────────────────
+def get_proxy_list() -> List[Optional[str]]:
+    """Return list of proxies. Env var RM_PROXIES overrides."""
+    raw = os.environ.get("RM_PROXIES", "")
+    if raw:
+        return [p.strip() or None for p in raw.split(",")]
+    return DEFAULT_PROXIES
 
-def select_next_hypothesis(conn: sqlite3.Connection, state) -> Optional[Dict]:
-    """Select next hypothesis using contextual bandit (UCB-style)."""
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM hypotheses
-        WHERE status IN ('candidate', 'running') AND runs_completed < max_runs
-        ORDER BY reward DESC, confidence DESC
-    """)
-    rows = cur.fetchall()
+# ---------------------------------------------------------------------------
+# Adaptive Rate Limiter
+# ---------------------------------------------------------------------------
 
-    if not rows:
+class AdaptiveRateLimiter:
+    """Slows down when site shows stress signals."""
+
+    def __init__(self):
+        self.min_interval = 2.0
+        self.current_interval = 2.0
+        self.max_interval = 60.0
+        self.last_request = 0
+        self.error_count = 0
+
+    def wait(self):
+        now = time.time()
+        elapsed = now - self.last_request
+        if elapsed < self.current_interval:
+            time.sleep(self.current_interval - elapsed)
+        self.last_request = time.time()
+
+    def report_success(self):
+        self.error_count = max(0, self.error_count - 1)
+        if self.error_count <= 0:
+            self.current_interval = max(self.min_interval, self.current_interval * 0.9)
+
+    def report_error(self, status_code: int = 0):
+        self.error_count += 1
+        factor = 2.0 if status_code in (403, 429, 503) else 1.5
+        self.current_interval = min(self.max_interval, self.current_interval * factor)
+        log.warning("Rate limiter slowed to %.1fs (error_count=%d, code=%s)",
+                    self.current_interval, self.error_count, status_code)
+
+# ---------------------------------------------------------------------------
+# API Client (Fortress Edition)
+# ---------------------------------------------------------------------------
+
+class FortressAPI:
+    """Hardened API client with multi-path login and self-healing."""
+
+    def __init__(self, identity: IdentityManager):
+        self.identity = identity
+        self.session = identity.get_requests_session()
+        self.token = None
+        self.username = None
+        self.login_method = "none"
+        self.rate_limiter = AdaptiveRateLimiter()
+        self.last_login = 0
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        self.rate_limiter.wait()
+        start = time.time()
+        try:
+            resp = self.session.request(method, url, timeout=15, **kwargs)
+            latency = (time.time() - start) * 1000
+            if resp.status_code in (403, 429, 503):
+                self.rate_limiter.report_error(resp.status_code)
+            else:
+                self.rate_limiter.report_success()
+            return resp
+        except Exception as e:
+            self.rate_limiter.report_error()
+            raise
+
+    def _get_csrf(self) -> str:
+        resp = self._request("GET", f"{BASE_URL}/login")
+        m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', resp.text)
+        if m:
+            return m.group(1)
+        return ""
+
+    def login_api(self, username: str, password: str) -> bool:
+        csrf = self._get_csrf()
+        resp = self._request("POST", f"{API_URL}/login", json={
+            "email": username,
+            "password": password,
+            "csrf": csrf,
+            "remember": True,
+        })
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                self.token = data.get("accessToken")
+                if self.token:
+                    self.session.headers["Authorization"] = f"Bearer {self.token}"
+                self.login_method = "api"
+                self.last_login = time.time()
+                return True
+            except Exception:
+                return False
+        return False
+
+    def login_selenium(self, username: str, password: str) -> bool:
+        from selenium.webdriver.common.by import By
+        driver = self.identity.get_selenium_driver()
+        try:
+            driver.get(f"{BASE_URL}/login")
+            time.sleep(4)
+            # Dismiss popups
+            try:
+                driver.execute_script("document.querySelectorAll('.DialogOverlay,[class*=\"overlay\"]').forEach(e=>e.remove())")
+            except: pass
+            for xpath in ["//button[contains(text(),'Not now')]", "//button[contains(text(),'Accept all')]", "//button[contains(text(),'Close')]"]:
+                try:
+                    for el in driver.find_elements(By.XPATH, xpath):
+                        if el.is_displayed(): driver.execute_script("arguments[0].click()", el); time.sleep(0.5)
+                except: pass
+            # Fill login
+            for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
+                t = (inp.get_attribute("type") or "").lower()
+                n = (inp.get_attribute("name") or "").lower()
+                if (t == "email" or "email" in n or "user" in n) and inp.is_displayed():
+                    inp.clear(); inp.send_keys(username)
+                if t == "password" and inp.is_displayed():
+                    inp.clear(); inp.send_keys(password)
+            time.sleep(0.3)
+            for el in driver.find_elements(By.CSS_SELECTOR, "button[type='submit']"):
+                if el.is_displayed(): driver.execute_script("arguments[0].click()", el); break
+            time.sleep(6)
+            if "/login" not in driver.current_url:
+                for c in driver.get_cookies():
+                    self.session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
+                self.login_method = "selenium"
+                self.last_login = time.time()
+                return True
+            return False
+        finally:
+            driver.quit()
+
+    def login(self, username: str, password: str) -> bool:
+        self.username = username
+        log.info("Trying API login...")
+        if self.login_api(username, password):
+            log.info("API login OK")
+            return True
+        log.info("API login blocked/captcha, trying Selenium...")
+        if self.login_selenium(username, password):
+            log.info("Selenium login OK")
+            return True
+        log.error("All login methods failed")
+        return False
+
+    def ensure_session(self) -> bool:
+        if time.time() - self.last_login > 3600:
+            log.info("Session older than 1h, refreshing...")
+            return self.login(self.username, os.environ.get("RM_PASS") or "")
+        return True
+
+    def get(self, path: str, params: Optional[Dict] = None) -> requests.Response:
+        return self._request("GET", f"{API_URL}{path}", params=params)
+
+    def post(self, path: str, json_data: Dict) -> requests.Response:
+        return self._request("POST", f"{API_URL}{path}", json=json_data)
+
+    def put(self, path: str, json_data: Dict) -> requests.Response:
+        return self._request("PUT", f"{API_URL}{path}", json=json_data)
+
+    def full_status(self) -> Dict:
+        endpoints = {
+            "dashboard": "GET /account/dashboard",
+            "availability": "GET /account/dashboard/availability",
+            "stats": "GET /account/dashboard/ad-statistics",
+            "keeponline": "GET /account/keeponline",
+            "about": "GET /settings/about",
+            "mailbox": "GET /mailbox",
+        }
+        results = {}
+        for key, (method, path) in [(k, v.split()) for k, v in endpoints.items()]:
+            try:
+                if method == "GET":
+                    resp = self.get(path)
+                else:
+                    resp = self.post(path, {})
+                resp.raise_for_status()
+                results[key] = resp.json()
+            except Exception as e:
+                results[key] = {"error": str(e)}
+        return results
+
+# ---------------------------------------------------------------------------
+# Safety Governor
+# ---------------------------------------------------------------------------
+
+class SafetyGovernor:
+    """Blocks risky actions and provides human-in-the-loop."""
+
+    RISKY_ACTIONS = {"apply_bio", "change_rates", "send_message", "publish_blog", "edit_interview", "delete_profile"}
+
+    def __init__(self, auto_approve: bool = False):
+        self.auto_approve = auto_approve
+
+    def approve(self, action: str, detail: str) -> bool:
+        if action not in self.RISKY_ACTIONS:
+            return True
+        if self.auto_approve:
+            log.warning("AUTO-APPROVED risky action: %s", action)
+            return True
+        print(f"\nRISKY ACTION REQUESTED: {action}")
+        print(f"Detail: {detail}")
+        ans = input("Approve? (yes/no): ").strip().lower()
+        return ans in ("yes", "y", "approve")
+
+# ---------------------------------------------------------------------------
+# Multi-LLM Bio Writer
+# ---------------------------------------------------------------------------
+
+from rm_traffic.llm_client import LLMClient, generate_with_fallback
+from rm_traffic.llm_bio_writer import build_prompt, parse_llm_output
+
+def generate_bio_with_analysis(api: FortressAPI, stats_history: list, city: str) -> Optional[Dict]:
+    """Pull live data and generate a bio with LLM."""
+    try:
+        status = api.full_status()
+        about = status.get("about", {})
+        assets = about.get("userProps", {}).get("assets", {})
+        current_headline = assets.get("headline", "")
+        current_desc = assets.get("description", "")
+        prompt = build_prompt(status, stats_history, current_headline, current_desc, city)
+        provider = os.environ.get("LLM_PROVIDER")
+        model = os.environ.get("LLM_MODEL")
+        if provider:
+            client = LLMClient(provider, model)
+            response = client.generate(prompt, 1200)
+        else:
+            response = generate_with_fallback(prompt, 1200)
+        if not response:
+            return None
+        return parse_llm_output(response)
+    except Exception as e:
+        log.error("LLM bio generation failed: %s", e)
         return None
 
-    # UCB-style: score = avg_reward + exploration_bonus
-    total_runs = sum(r["runs_completed"] for r in rows) or 1
-    scored = []
-    for row in rows:
-        avg_reward = row["reward"] / max(1, row["runs_completed"])
-        exploration = math.sqrt(2 * math.log(total_runs) / max(1, row["runs_completed"]))
-        ucb_score = avg_reward + 0.3 * exploration
-        scored.append((ucb_score, dict(row)))
+# ---------------------------------------------------------------------------
+# Fortress Engine
+# ---------------------------------------------------------------------------
 
-    scored.sort(key=lambda x: -x[0])
-    return scored[0][1]
+class Fortress:
+    """Main fortress engine."""
 
+    def __init__(self, username: str, password: str, city: str = "manhattan-ny", auto_approve: bool = False):
+        self.username = username
+        self.password = password
+        self.city = city
+        self.identity = IdentityManager()
+        self.api = FortressAPI(self.identity)
+        self.governor = SafetyGovernor(auto_approve)
+        self.running = True
+        self.last_visibility = 0
+        self.last_avail = 0
+        self.last_stats = 0
+        self.last_bio = 0
+        self.last_dashboard = 0
+        self.last_health = 0
+        self.stats_history = []
 
-# ─── Action execution ──────────────────────────────────────────────
+    def login(self) -> bool:
+        ok = self.api.login(self.username, self.password)
+        receipt("login", ok, f"Fortress login via {self.api.login_method}")
+        return ok
 
-def execute_hyp_action(action: str, api: RentMasseurAPI, state) -> Dict:
-    """Execute the hypothesis action. Returns {error, result}."""
-    result = {"error": "", "result": {}}
-    try:
-        if action == "refresh_availability":
-            if state.available_status != "Available" or state.availability_seconds_left < 3600:
-                api.set_availability(option=1, duration=5)
-                api.invalidate_cache("availability")
-                result["result"] = {"set_to": "Available"}
+    def ensure_visible(self):
+        try:
+            self.api.ensure_session()
+            keep = self.api.get("/account/keeponline").json()
+            if keep.get("isAdHidden"):
+                before = {"isAdHidden": True}
+                self.api.put("/settings/visibility", {"isAdHidden": False})
+                receipt("ensure_visible", True, "Profile hidden, now shown", before, {"isAdHidden": False})
+                record_alert("critical", "visibility", "Profile was hidden. Auto-shown.")
+        except Exception as e:
+            receipt("ensure_visible", False, str(e))
+            log.error("Visibility guard failed: %s", e)
+
+    def ensure_available(self):
+        try:
+            self.api.ensure_session()
+            avail = self.api.get("/account/dashboard/availability").json()
+            selected = avail.get("selected", "")
+            countdown = avail.get("countdown", 0)
+            remaining = max(0, int(countdown - time.time()))
+            log.info("Availability: %s (%ds remaining)", selected, remaining)
+            if selected != "Available" or remaining < AVAIL_REFRESH_THRESHOLD:
+                record_alert("warning", "availability", f"Availability needs refresh: {selected}, {remaining}s left")
             else:
-                result["result"] = {"already_available": True}
+                receipt("ensure_available", True, f"Availability OK: {selected}, {remaining}s left")
+        except Exception as e:
+            receipt("ensure_available", False, str(e))
 
-        elif action == "ensure_visible":
-            if state.profile_hidden:
-                try:
-                    api._post("/account/dashboard/hide", {"hide": False})
-                    result["result"] = {"unhid": True}
-                except Exception:
-                    result["result"] = {"note": "manual check needed"}
+    def collect_stats(self):
+        try:
+            self.api.ensure_session()
+            start = time.time()
+            dash = self.api.get("/account/dashboard").json()
+            stats = self.api.get("/account/dashboard/ad-statistics").json()
+            keep = self.api.get("/account/keeponline").json()
+            about = self.api.get("/settings/about").json()
+            latency = (time.time() - start) * 1000
+
+            prof = stats.get("profileStatistics", {}) or {}
+            assets = about.get("userProps", {}).get("assets", {})
+            us = dash.get("userSetting", {})
+
+            record_stats(
+                login_method=self.api.login_method,
+                latency_ms=latency,
+                views=prof.get("totalPageViews"),
+                contact_clicks=prof.get("totalContactClicks"),
+                visits=keep.get("newVisits"),
+                bookmarks=dash.get("onlineBookmarks"),
+                new_emails=keep.get("newEmails"),
+                is_ad_hidden=keep.get("isAdHidden"),
+                available=us.get("availability", {}).get("available"),
+                availability_remaining=str(us.get("availability", {}).get("validTo", "")),
+                headline=assets.get("headline"),
+                description_len=len(assets.get("description", "")),
+                city=self.city,
+            )
+
+            # Update history
+            conn = db()
+            self.stats_history = [dict(r) for r in conn.execute(
+                "SELECT ts, views, contact_clicks, visits FROM stats ORDER BY ts DESC LIMIT 14"
+            ).fetchall()]
+            conn.close()
+
+            log.info("Stats collected: views=%s contacts=%s visits=%s (%.0fms)",
+                     prof.get("totalPageViews"), prof.get("totalContactClicks"),
+                     keep.get("newVisits"), latency)
+            receipt("collect_stats", True, f"Stats collected in {latency:.0f}ms")
+        except Exception as e:
+            receipt("collect_stats", False, str(e))
+            log.error("Stats collection failed: %s", e)
+
+    def bio_experiment(self, auto_apply: bool = False):
+        try:
+            # Daily limit
+            conn = db()
+            row = conn.execute("SELECT ts FROM bio_versions WHERE applied=1 ORDER BY ts DESC LIMIT 1").fetchone()
+            conn.close()
+            if row and datetime.now(timezone.utc) - datetime.fromisoformat(row["ts"]) < timedelta(days=1):
+                log.info("Bio experiment skipped: within 24h cooldown")
+                return
+
+            suggestion = generate_bio_with_analysis(self.api, self.stats_history, self.city)
+            if not suggestion:
+                log.error("Bio suggestion failed")
+                return
+
+            stats = self.api.get("/account/dashboard/ad-statistics").json()
+            prof = stats.get("profileStatistics", {}) or {}
+            views_before = prof.get("totalPageViews")
+            contacts_before = prof.get("totalContactClicks")
+
+            provider = os.environ.get("LLM_PROVIDER", "fallback")
+            conn = db()
+            conn.execute(
+                "INSERT INTO bio_versions (ts, headline, description, reason, applied, views_before, contacts_before, llm_provider) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (datetime.now(timezone.utc).isoformat(), suggestion["headline"],
+                 suggestion["bio"], "fortress_llm", 0, views_before, contacts_before, provider)
+            )
+            conn.commit()
+            conn.close()
+
+            log.info("Bio drafted: %s", suggestion["headline"])
+            if auto_apply:
+                if self.governor.approve("apply_bio", suggestion["headline"]):
+                    about = self.api.get("/settings/about").json()
+                    assets = about.get("userProps", {}).get("assets", {})
+                    before = {"headline": assets.get("headline"), "description": assets.get("description")}
+                    self.api.put("/settings/about", {"headline": suggestion["headline"], "description": suggestion["bio"]})
+                    after = {"headline": suggestion["headline"], "description": suggestion["bio"][:200]}
+                    conn = db()
+                    conn.execute("UPDATE bio_versions SET applied=1 WHERE ts=(SELECT ts FROM bio_versions ORDER BY ts DESC LIMIT 1)")
+                    conn.commit()
+                    conn.close()
+                    receipt("apply_bio", True, f"Applied LLM bio: {suggestion['headline']}", before, after)
+                else:
+                    log.info("Bio application rejected by governor")
             else:
-                result["result"] = {"already_visible": True}
+                receipt("draft_bio", True, f"Drafted bio: {suggestion['headline']}")
+        except Exception as e:
+            receipt("bio_experiment", False, str(e))
+            log.error("Bio experiment failed: %s", e)
 
-        elif action == "detect_account_issues":
-            keep = api.get_keeponline()
-            issues = keep.get("issues", {})
-            result["result"] = {"total_issues": issues.get("totalItems", 0), "alerts": len(issues.get("alerts", []))}
+    def health_check(self):
+        try:
+            self.api.ensure_session()
+            resp = self.api.get("/account/dashboard")
+            if resp.status_code == 200:
+                receipt("health_check", True, "Session healthy")
+            else:
+                record_alert("error", "health", f"Dashboard returned {resp.status_code}")
+        except Exception as e:
+            record_alert("error", "health", str(e))
 
-        elif action == "classify_mailbox_intent":
-            mailbox = api.get_mailbox(page=1, folder=1, sort=1)
-            from .intent_engine import classify_mailbox
-            emails = mailbox.get("emails", [])
-            classified = classify_mailbox(emails)
-            result["result"] = {"total": len(emails), "booking_now": sum(1 for c in classified if c["classification"] == "booking_now")}
+    def cycle(self):
+        now = time.time()
+        if now - self.last_visibility >= VISIBILITY_CHECK_INTERVAL:
+            self.ensure_visible()
+            self.last_visibility = now
+        if now - self.last_avail >= AVAIL_CHECK_INTERVAL:
+            self.ensure_available()
+            self.last_avail = now
+        if now - self.last_stats >= STATS_INTERVAL:
+            self.collect_stats()
+            self.last_stats = now
+        if now - self.last_bio >= BIO_EXPERIMENT_INTERVAL:
+            self.bio_experiment(auto_apply=False)
+            self.last_bio = now
+        if now - self.last_health >= HEALTH_CHECK_INTERVAL:
+            self.health_check()
+            self.last_health = now
+        if now - self.last_dashboard >= DASHBOARD_INTERVAL:
+            self.print_dashboard()
+            self.last_dashboard = now
 
-        elif action == "draft_reply_queue":
-            mailbox = api.get_mailbox(page=1, folder=1, sort=1)
-            from .intent_engine import classify_mailbox
-            emails = mailbox.get("emails", [])
-            classified = classify_mailbox(emails)
-            drafts = [c for c in classified if c["suggested_reply_class"] and c["classification"] != "do_not_contact"]
-            result["result"] = {"drafts": len(drafts)}
+    def print_dashboard(self):
+        try:
+            self.api.ensure_session()
+            dash = self.api.get("/account/dashboard").json()
+            stats = self.api.get("/account/dashboard/ad-statistics").json()
+            keep = self.api.get("/account/keeponline").json()
+            about = self.api.get("/settings/about").json()
+            prof = stats.get("profileStatistics", {}) or {}
+            assets = about.get("userProps", {}).get("assets", {})
+            us = dash.get("userSetting", {})
+            print(f"\n{'='*60}")
+            print(f"  FORTRESS DASHBOARD")
+            print(f"{'='*60}")
+            print(f"  Time: {datetime.now(timezone.utc).isoformat()[:19]} UTC")
+            print(f"  User: {self.username}")
+            print(f"  Login: {self.api.login_method}")
+            print(f"  Visibility: {'HIDDEN' if keep.get('isAdHidden') else 'SHOWN'}")
+            print(f"  Availability: {us.get('availability', {}).get('message', 'N/A')}")
+            print(f"  Views: {prof.get('totalPageViews', 'N/A')}")
+            print(f"  Contacts: {prof.get('totalContactClicks', 'N/A')}")
+            print(f"  Visits: {keep.get('newVisits', 'N/A')}")
+            print(f"  Emails: {keep.get('newEmails', 'N/A')}")
+            print(f"  Bookmarks: {dash.get('onlineBookmarks', 'N/A')}")
+            print(f"  Headline: {assets.get('headline', 'N/A')}")
+            print(f"  Bio: {len(assets.get('description', ''))} chars")
+            print(f"  Rate interval: {self.api.rate_limiter.current_interval:.1f}s")
+            print(f"{'='*60}\n")
+        except Exception as e:
+            log.error("Dashboard print failed: %s", e)
 
-        elif action == "headline_variant_test":
-            result["result"] = {"note": "headline test requires manual approval"}
-            result["error"] = "manual_approval_required"
+    def run_once(self):
+        if not self.login():
+            print("Login failed")
+            return
+        self.print_dashboard()
+        self.ensure_visible()
+        self.ensure_available()
+        self.collect_stats()
+        self.bio_experiment(auto_apply=False)
 
-        elif action == "about_variant_test":
-            result["result"] = {"note": "about test requires manual approval"}
-            result["error"] = "manual_approval_required"
-
-        elif action == "search_rank_scan":
-            results = api.search_masseurs(city="manhattan-ny", page=1)
-            result["result"] = {"total": len(results.get("users", [])), "rank": state.search_rank}
-
-        elif action == "competitor_position_scan":
-            results = api.search_masseurs(city="manhattan-ny", page=1)
-            users = results.get("users", [])
-            result["result"] = {"competitors": len(users), "top3": [u.get("username", "") for u in users[:3]]}
-
-        elif action == "pricing_copy_test":
-            result["result"] = {"note": "pricing test requires manual approval"}
-            result["error"] = "manual_approval_required"
-
-        elif action == "traffic_delta_report":
-            result["result"] = {"views": state.views, "contacts": state.contact_clicks, "ctr": state.contact_rate}
-
-        elif action == "roi_report":
-            result["result"] = {"pressure": state.revenue_pressure, "components": state.pressure_components}
-
-        else:
-            result["error"] = f"unknown action: {action}"
-
-    except Exception as e:
-        result["error"] = str(e)
-
-    return result
-
-
-# ─── Commands ──────────────────────────────────────────────────────
-
-def cmd_seed_300():
-    """Seed 300 hypotheses into the database."""
-    conn = _db()
-    hyps = generate_300_hypotheses()
-    now = datetime.now(timezone.utc).isoformat()
-
-    for h in hyps:
-        conn.execute("""
-            INSERT OR REPLACE INTO hypotheses
-            (hypothesis_id, category, claim, action, primary_metric,
-             secondary_metrics, guardrail_metrics, minimum_window_hours,
-             max_runs, status, confidence, reward, runs_completed,
-             evidence_receipts, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (h["hypothesis_id"], h["category"], h["claim"], h["action"],
-              h["primary_metric"], json.dumps(h["secondary_metrics"]),
-              json.dumps(h["guardrail_metrics"]), h["minimum_window_hours"],
-              h["max_runs"], h["status"], h["confidence"], h["reward"],
-              h["runs_completed"], json.dumps(h["evidence_receipts"]), now))
-
-    conn.commit()
-    conn.close()
-
-    by_cat = {}
-    for h in hyps:
-        by_cat[h["category"]] = by_cat.get(h["category"], 0) + 1
-
-    print(f"✅ Seeded {len(hyps)} hypotheses")
-    for cat, count in sorted(by_cat.items()):
-        print(f"  {cat}: {count}")
-
-
-def cmd_list():
-    """List all hypotheses with their status."""
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("SELECT category, status, COUNT(*) as n FROM hypotheses GROUP BY category, status ORDER BY category, status")
-    rows = cur.fetchall()
-
-    print(f"\n{'Category':<15} {'Status':<12} {'Count':>5}")
-    print(f"{'-'*15} {'-'*12} {'-'*5}")
-    for r in rows:
-        print(f"{r['category']:<15} {r['status']:<12} {r['n']:>5}")
-
-    cur.execute("SELECT COUNT(*) as total FROM hypotheses")
-    total = cur.fetchone()["total"]
-    print(f"\nTotal: {total} hypotheses")
-
-    cur.execute("SELECT status, COUNT(*) as n FROM hypotheses GROUP BY status")
-    for r in cur.fetchall():
-        print(f"  {r['status']}: {r['n']}")
-
-    conn.close()
+    def run_daemon(self):
+        log.info("=== FORTRESS daemon starting ===")
+        if not self.login():
+            log.error("Initial login failed")
+            return
+        self.print_dashboard()
+        while self.running:
+            try:
+                self.cycle()
+            except KeyboardInterrupt:
+                log.info("Shutdown")
+                self.running = False
+                break
+            except Exception as e:
+                log.error("Cycle error: %s", e)
+                receipt("daemon_cycle", False, str(e))
+                time.sleep(60)
+            time.sleep(60)
+        log.info("Fortress stopped")
 
 
-def cmd_run_next(tenant_id: str, username: str, password: str):
-    """Run the next best hypothesis."""
-    conn = _db()
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-    # Login
-    api = RentMasseurAPI(min_request_interval=2.0)
-    if not api.login(username, password):
-        print("🔴 Login failed")
-        return 2
+def main():
+    parser = argparse.ArgumentParser(description="FORTRESS — RentMasseur Profile Automation Fortress")
+    parser.add_argument("--daemon", action="store_true")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--suggest-bio", action="store_true")
+    parser.add_argument("--apply-bio", action="store_true", help="Apply latest drafted bio (requires approval)")
+    parser.add_argument("--history", action="store_true")
+    parser.add_argument("--city", default="manhattan-ny")
+    parser.add_argument("--auto-approve", action="store_true", help="Auto-approve risky actions (use with caution)")
+    args = parser.parse_args()
 
-    # Collect state before
-    print("[STATE] Collecting state before...")
-    state_before = collect_state(api, tenant_id)
-    print(f"  ◉ State: {state_before.state_hash} | Pressure: {state_before.revenue_pressure}")
+    init_db()
+    username = os.environ.get("RM_USER") or get_credential("RM_USER", prompt_if_missing=True)
+    password = os.environ.get("RM_PASS") or get_credential("RM_PASS", prompt_if_missing=True)
+    if not username or not password:
+        print("Credentials required")
+        sys.exit(1)
 
-    # Select hypothesis
-    hyp = select_next_hypothesis(conn, state_before)
-    if not hyp:
-        print("No hypotheses available to run.")
-        # Try FDR control
-        fdr = apply_fdr_control(conn, tenant_id)
-        if fdr["applied"]:
-            print(f"FDR control applied: {fdr}")
+    fortress = Fortress(username, password, city=args.city, auto_approve=args.auto_approve)
+
+    if args.status:
+        if not fortress.login(): sys.exit(1)
+        fortress.print_dashboard()
+    elif args.once:
+        fortress.run_once()
+    elif args.suggest_bio:
+        if not fortress.login(): sys.exit(1)
+        fortress.bio_experiment(auto_apply=False)
+    elif args.apply_bio:
+        if not fortress.login(): sys.exit(1)
+        fortress.bio_experiment(auto_apply=True)
+    elif args.history:
+        conn = db()
+        for r in conn.execute("SELECT * FROM receipts ORDER BY ts DESC LIMIT 20"):
+            print(f"{r['ts'][:19]} | {'OK' if r['success'] else 'FAIL'} | {r['action']} | {r['detail'][:60]}")
         conn.close()
-        return 0
-
-    print(f"\n[HYPOTHESIS] {hyp['hypothesis_id']} ({hyp['category']})")
-    print(f"  Claim: {hyp['claim']}")
-    print(f"  Action: {hyp['action']}")
-    print(f"  Primary metric: {hyp['primary_metric']}")
-    print(f"  Runs: {hyp['runs_completed']}/{hyp['max_runs']}")
-
-    # Execute
-    print(f"\n[EXEC] Executing {hyp['action']}...")
-    result = execute_hyp_action(hyp["action"], api, state_before)
-    if result["error"]:
-        print(f"  ⟁ Error: {result['error']}")
+    elif args.daemon:
+        fortress.run_daemon()
     else:
-        print(f"  ◉ Result: {json.dumps(result['result'])}")
+        parser.print_help()
 
-    # Collect state after
-    print("\n[MEASURE] Collecting state after...")
-    time.sleep(2)
-    api.invalidate_cache()
-    state_after = collect_state(api, tenant_id)
 
-    # Compute reward
-    delta = compute_delta(state_before, state_after)
-    reward = compute_reward(delta, hyp["action"], result["error"])
-    print(f"\n[REWARD] Delta: {json.dumps(delta_to_dict(delta))}")
-    print(f"  Reward: {reward:.3f}")
+if __name__ == "__main__":
+    main()
 
-    # Write receipt
-    receipt_hash = hashlib.sha256(
-        f"{hyp['hypothesis_id']}:{state_before.state_hash}:{state_after.state_hash}:{reward}".encode()
-    ).hexdigest()[:16]
+```
 
-    conn.execute("""INSERT INTO hypothesis_runs
-        (hypothesis_id, tenant_id, state_before_hash, state_after_hash, metric_delta, reward, receipt_hash, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (hyp["hypothesis_id"], tenant_id, state_before.state_hash, state_after.state_hash,
-         json.dumps(delta_to_dict(delta)), reward, receipt_hash, datetime.now(timezone.utc).isoformat()))
+feature_store.py:
+```
+"""
+Feature Store — collects and stores metric snapshots from verified RM endpoints.
 
-    conn.execute("""INSERT OR IGNORE INTO hypothesis_receipts
-        (hypothesis_id, tenant_id, receipt_hash, timestamp, action, reward, metric_delta, state_before_hash, state_after_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (hyp["hypothesis_id"], tenant_id, receipt_hash, datetime.now(timezone.utc).isoformat(),
-         hyp["action"], reward, json.dumps(delta_to_dict(delta)), state_before.state_hash, state_after.state_hash))
+Tables: metric_snapshots, actions
 
-    # Update hypothesis
-    new_runs = hyp["runs_completed"] + 1
-    new_reward = hyp["reward"] + reward
-    new_confidence = min(1.0, new_runs / hyp["max_runs"])
-
-    new_status = hyp["status"]
-    if new_runs >= hyp["max_runs"]:
-        if new_reward / new_runs > 0.5:
-            new_status = "winner"
-        elif new_reward / new_runs < -0.5:
-            new_status = "loser"
-        else:
-            new_status = "retired"
-
-    conn.execute("""UPDATE hypotheses SET runs_completed = ?, reward = ?, confidence = ?, status = ? WHERE hypothesis_id = ?""",
-                (new_runs, new_reward, new_confidence, new_status, hyp["hypothesis_id"]))
-
-    # FDR control every 25 runs
-    total_completed = conn.execute("SELECT COUNT(*) as n FROM hypothesis_runs").fetchone()["n"]
-    if total_completed % 25 == 0 and total_completed > 0:
-        print(f"\n[FDR] Applying Benjamini-Hochberg correction at {total_completed} completed runs...")
-        fdr = apply_fdr_control(conn, tenant_id)
-        print(f"  Result: {fdr}")
-
-    conn.commit()
+Verified endpoints only:
+  GET  /account/dashboard
+  GET  /account/dashboard/availability

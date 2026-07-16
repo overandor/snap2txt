@@ -1,800 +1,800 @@
-        return max(1, (datetime.now(timezone.utc).replace(tzinfo=None) - d).days)
-    except ValueError:
-        return 0
-
-
-def fetch_profile_views(username: str, delay: float = 0.3) -> Dict:
-    """Fetch view count and member-since from web profile page."""
-    try:
-        url = f"https://rentmasseur.com/{username}"
-        r = requests.get(url, headers=WEB_HEADERS, timeout=15)
-        if r.status_code != 200:
-            return {"visits": 0, "member_since": "", "days_online": 0}
-        member_since = parse_member_since(r.text)
-        visits = parse_visits(r.text)
-        days = days_since(member_since)
-        time.sleep(delay)
-        return {"visits": visits, "member_since": member_since, "days_online": days}
-    except Exception as e:
-        log.error("Error fetching %s: %s", username, e)
-        return {"visits": 0, "member_since": "", "days_online": 0}
-
-
-def scrape_with_views(api: RentMasseurAPI, max_pages: int = 10, delay: float = 0.5,
-                      fetch_views: bool = True) -> List[Dict]:
-    """Scrape all bios and fetch view counts."""
-    all_bios = []
-    seen_ids = set()
-
-    for city in CITIES:
-        log.info("Scraping %s...", city)
-        for page in range(1, max_pages + 1):
-            try:
-                results = search_city(api, city, page)
-                bios = extract_bios_from_results(results, city)
-                if not bios:
-                    break
-                new_count = 0
-                for bio in bios:
-                    if bio["id"] and bio["id"] not in seen_ids:
-                        seen_ids.add(bio["id"])
-                        if fetch_views and bio["username"]:
-                            views = fetch_profile_views(bio["username"], delay=0.3)
-                            bio["visits"] = views["visits"]
-                            bio["member_since"] = views["member_since"]
-                            bio["days_online"] = views["days_online"]
-                            bio["views_per_day"] = (
-                                views["visits"] / views["days_online"]
-                                if views["days_online"] > 0 else 0
-                            )
-                        else:
-                            bio["visits"] = 0
-                            bio["member_since"] = ""
-                            bio["days_online"] = 0
-                            bio["views_per_day"] = 0
-                        all_bios.append(bio)
-                        new_count += 1
-                log.info("  %s p%d: %d bios (%d new, total %d)", city, page, len(bios), new_count, len(all_bios))
-                if new_count == 0:
-                    break
-                time.sleep(delay)
-            except Exception as e:
-                log.error("  Error on %s page %d: %s", city, page, e)
-                break
-
-    log.info("Scraped %d unique bios", len(all_bios))
-    return all_bios
-
-
-def rank_by_views_per_day(bios: List[Dict]) -> List[Dict]:
-    """Rank bios by views per day online."""
-    return sorted(bios, key=lambda b: b.get("views_per_day", 0), reverse=True)
-
-
-def save_ranked_report(bios: List[Dict], path: Path = RANKED_PATH):
-    """Save ranked report sorted by views/day."""
-    ranked = rank_by_views_per_day(bios)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for i, b in enumerate(ranked):
-            try:
-                rating = float(b.get("ratingAverage", 0) or 0)
-            except (ValueError, TypeError):
-                rating = 0
-            reviews = b.get("reviewsCount", 0) or 0
-            visits = b.get("visits", 0)
-            days = b.get("days_online", 0)
-            vpd = b.get("views_per_day", 0)
-            f.write(f"#{i+1} | {b['username']} | {b['city']} | visits={visits} | days={days} | views/day={vpd:.1f} | ⭐{rating} | {reviews} reviews\n")
-            f.write(f"  Headline: {b['headline']}\n")
-            desc = b["description"].replace("\n", " | ")[:500]
-            f.write(f"  Desc: {desc}\n")
-            f.write(f"  Services: {b.get('services', [])}\n")
-            f.write(f"  Member since: {b.get('member_since', 'N/A')}\n")
-            f.write(f"  Gold: {b.get('isGold', 0)} | Avail: {b.get('isAvailable', 0)} | Certified: {b.get('isCertified', 0)}\n")
-            f.write("\n")
-    log.info("Ranked report saved to %s", path)
-    return path
-
-
-def save_bios(bios: List[Dict], path: Path = OUTPUT_PATH):
-    """Save bios to JSONL."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for bio in bios:
-            f.write(json.dumps(bio, default=str) + "\n")
-    log.info("Saved %d bios to %s", len(bios), path)
-
-
-def scrape_all_with_views(api: RentMasseurAPI, max_pages: int = 10, delay: float = 0.5) -> int:
-    """Full scrape with view counts and ranking."""
-    bios = scrape_with_views(api, max_pages=max_pages, delay=delay, fetch_views=True)
-    save_bios(bios)
-    save_ranked_report(bios)
-    return len(bios)
-
-```
-
-execution_engine.py:
-```
-"""
-Execution Engine — execute API mutations with verification and receipts.
-
-Every action: read → mutate → verify → receipt.
-"""
-
-import logging
-from typing import Dict, Any, Callable
-
-from .api_client import RentMasseurAPI
-from .db import write_receipt
-from .content_policy import check_bio_risk, check_headline_risk
-
-log = logging.getLogger("profileops.execution")
-
-
-def _hash_text(text: str) -> str:
-    import hashlib
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
-
-
-def execute_visibility(api: RentMasseurAPI, visible: bool) -> Dict:
-    """Set visibility and verify."""
-    keep_before = api.get_keeponline()
-    before = {"isAdHidden": int(keep_before.get("isAdHidden", 0))}
-
-    result = api.set_visibility(visible)
-
-    keep_after = api.get_keeponline()
-    after = {"isAdHidden": int(keep_after.get("isAdHidden", 0))}
-    verified = (after["isAdHidden"] == int(not visible))
-
-    write_receipt("visibility_change_v1", "set_visibility", before, after, verified=verified)
-    log.info("Visibility set to %s (verified=%s)", visible, verified)
-    return {"success": verified, "result": result}
-
-
-def execute_bio(api: RentMasseurAPI, headline: str, description: str) -> Dict:
-    """Update bio with policy check and verification."""
-    headline_risk = check_headline_risk(headline)
-    bio_risk = check_bio_risk(description)
-    if headline_risk > 0.7 or bio_risk > 0.7:
-        write_receipt("bio_change_blocked_v1", "set_about",
-                      {"headline": headline, "description": description[:200]},
-                      {"reason": "policy_risk", "headline_risk": headline_risk, "bio_risk": bio_risk},
-                      verified=False)
-        log.error("Bio change blocked by policy")
-        return {"success": False, "reason": "policy_risk"}
-
-    about_before = api.get_about()
-    assets_before = about_before.get("userProps", {}).get("assets", {})
-    before = {
-        "headline": assets_before.get("headline"),
-        "description_hash": _hash_text(assets_before.get("description", "")),
-    }
-
-    result = api.set_about(headline, description)
-
-    about_after = api.get_about()
-    assets_after = about_after.get("userProps", {}).get("assets", {})
-    after = {
-        "headline": assets_after.get("headline"),
-        "description_hash": _hash_text(assets_after.get("description", "")),
-    }
-    verified = (after["headline"] == headline and after["description_hash"] == _hash_text(description))
-
-    write_receipt("bio_change_v1", "set_about", before, after, verified=verified)
-    log.info("Bio updated (verified=%s)", verified)
-    return {"success": verified, "result": result}
-
-
-def rollback_bio(api: RentMasseurAPI, previous_headline: str, previous_description: str) -> Dict:
-    """Rollback to previous bio."""
-    log.warning("Rolling back bio to previous version")
-    before = api.get_about()
-    result = execute_bio(api, previous_headline, previous_description)
-    after = api.get_about()
-    write_receipt("bio_rollback_v1", "rollback_bio",
-                  {"headline": before.get("userProps", {}).get("assets", {}).get("headline")},
-                  {"headline": after.get("userProps", {}).get("assets", {}).get("headline")},
-                  verified=result["success"])
-    return result
-
-
-def execute_if_verified(api: RentMasseurAPI, action: Callable, *args, **kwargs) -> Dict:
-    """Generic wrapper: execute an action and verify."""
-    try:
-        result = action(*args, **kwargs)
-        return {"success": True, "result": result}
-    except Exception as e:
-        log.error("Execution failed: %s", e)
-        write_receipt("execution_error_v1", "execute", {}, {"error": str(e)}, verified=False)
-        return {"success": False, "error": str(e)}
-
-```
-
-fetch_all_views.py:
-```
-import json, re, time
-from pathlib import Path
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-import requests
-
-RAW = Path("rm_traffic/data/real_bios.jsonl")
-OUT = Path("rm_traffic/data/real_bios_with_views.jsonl")
-RANKED = Path("rm_traffic/data/real_bios_ranked.txt")
-
-bios = [json.loads(l) for l in RAW.open()]
-print(f"Loaded {len(bios)} real bios")
-
-headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-
-def fetch_views(username):
-    if not username:
-        return {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
-    try:
-        r = requests.get(f"https://rentmasseur.com/{username}", headers=headers, timeout=12)
-        if r.status_code != 200:
-            return {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
-        member = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
-        member_since = member.group(1).strip() if member else ""
-        visit_values = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
-        visits = max(visit_values) if visit_values else 0
-        days_online = 0
-        if member_since:
-            try:
-                joined = datetime.strptime(member_since, "%b %d, %Y")
-                days_online = max(1, (datetime.now() - joined).days)
-            except Exception:
-                days_online = 0
-        views_per_day = visits / days_online if days_online else 0
-        return {
-            "visits": visits,
-            "member_since": member_since,
-            "days_online": days_online,
-            "views_per_day": views_per_day,
-        }
-    except Exception:
-        return {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
-
-usernames = [b.get("username") for b in bios]
-print(f"Fetching views for {len(usernames)} profiles with 32 workers...")
-
-done = 0
-with ThreadPoolExecutor(max_workers=32) as pool:
-    results = list(pool.map(fetch_views, usernames))
-    view_map = dict(zip(usernames, results))
-
-for b in bios:
-    b.update(view_map.get(b.get("username"), {}))
-
-bios.sort(key=lambda x: x.get("views_per_day", 0), reverse=True)
-
-with OUT.open("w") as f:
-    for b in bios:
-        f.write(json.dumps(b, ensure_ascii=False) + "\n")
-
-with RANKED.open("w") as f:
-    for i, b in enumerate(bios, 1):
-        desc = (b.get("description") or "").replace("\n", " | ")
-        f.write(
-            f"#{i} | {b.get('username')} | {b.get('city')} | "
-            f"visits={b.get('visits',0)} | days={b.get('days_online',0)} | "
-            f"views/day={b.get('views_per_day',0):.2f} | "
-            f"rating={b.get('ratingAverage')} | reviews={b.get('reviewsCount')} | "
-            f"gold={b.get('isGold')} | available={b.get('isAvailable')}\n"
-        )
-        f.write(f"HEADLINE: {b.get('headline')}\n")
-        f.write(f"DESC: {desc[:1200]}\n")
-        f.write(f"SERVICES: {b.get('services')}\n")
-        f.write(f"MEMBER SINCE: {b.get('member_since')}\n\n")
-
-print(f"\nDONE: {len(bios)} real bios scored")
-print(f"Saved: {OUT}")
-print(f"Ranked: {RANKED}")
-print(f"\nTop 25:")
-for i, b in enumerate(bios[:25], 1):
-    print(
-        f"#{i:03d} {b.get('username'):<22} "
-        f"{b.get('city'):<18} "
-        f"v/day={b.get('views_per_day',0):>8.2f} "
-        f"visits={b.get('visits',0):>8} "
-        f"reviews={b.get('reviewsCount',0):>4} "
-        f"headline={b.get('headline')}"
-    )
-
-```
-
-fortress.py:
-```
-"""
-FORTRESS — RentMasseur Automation Fortress
-
-The world has never seen this level of disciplined, self-healing, anti-fragile
-profile automation. Built like a fortress: layered defenses, multiple fallback
-login paths, captcha handling, health monitoring, and iron-clad safety rails.
-
-Layers:
-1. Credential Vault          — env vars / macOS Keychain, never hardcoded
-2. Identity Rotation         — browser fingerprint rotation, proxy support
-3. Multi-Modal Login         — API token, cookie replay, Selenium, manual captcha
-4. Adaptive Rate Limiting    — slow down when site shows signs of stress
-5. Self-Healing Session      — detect expiry, re-login, retry with backoff
-6. Health Monitor            — track every metric, alert on anomalies
-7. Multi-LLM Engine          — Ollama / Groq / OpenRouter with fallback
-8. Safety Governor           — kill switch, human approval for risky actions
-9. Receipt Fortress          — Merkle-style chained receipt log
-10. Local Dashboard           — web UI showing real-time status
-
-Usage:
-    export RM_USER=...
-    export RM_PASS=...
-    export OPENROUTER_API_KEY=...
-    python3 -m rm_traffic.fortress --daemon
-    python3 -m rm_traffic.fortress --dashboard
-    python3 -m rm_traffic.fortress --status
-    python3 -m rm_traffic.fortress --suggest-bio
-    python3 -m rm_traffic.fortress --apply-bio
-"""
-
-import argparse
-import json
-import os
-import random
-import re
-import sqlite3
-import sys
-import time
-import logging
-import hashlib
-import subprocess
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Optional, Dict, Any, List
-from dataclasses import dataclass, asdict
-
-import requests
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-BASE_URL = "https://rentmasseur.com"
-API_URL = f"{BASE_URL}/api/v1"
-DB_PATH = Path(__file__).parent / "fortress.db"
-LOG_PATH = Path(__file__).parent / "fortress.log"
-
-DEFAULT_PROXIES = [None]
-USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-]
-
-# Intervals
-AVAIL_CHECK_INTERVAL = 60 * 60
-AVAIL_REFRESH_THRESHOLD = 10 * 60
-VISIBILITY_CHECK_INTERVAL = 5 * 60
-STATS_INTERVAL = 15 * 60
-BIO_EXPERIMENT_INTERVAL = 24 * 60 * 60
-DASHBOARD_INTERVAL = 60 * 60
-HEALTH_CHECK_INTERVAL = 5 * 60
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
-)
-log = logging.getLogger("fortress")
-
-# ---------------------------------------------------------------------------
-# Database & Receipts
-# ---------------------------------------------------------------------------
-
-def db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-def init_db():
-    conn = db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS receipts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        action TEXT NOT NULL,
-        success INTEGER DEFAULT 1,
-        detail TEXT,
-        before_state TEXT,
-        after_state TEXT,
-        hash TEXT,
-        prev_hash TEXT,
-        chain_verified INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS stats (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        views INTEGER,
-        contact_clicks INTEGER,
-        visits INTEGER,
-        bookmarks INTEGER,
-        new_emails INTEGER,
-        is_ad_hidden INTEGER,
-        available INTEGER,
-        availability_remaining TEXT,
-        headline TEXT,
-        description_len INTEGER,
-        city TEXT,
-        search_position INTEGER,
-        search_available_position INTEGER,
-        search_total INTEGER,
-        search_available_total INTEGER,
-        login_method TEXT,
-        latency_ms REAL
-    );
-    CREATE TABLE IF NOT EXISTS bio_versions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        headline TEXT,
-        description TEXT,
-        reason TEXT,
-        applied INTEGER DEFAULT 0,
-        views_before INTEGER,
-        views_after INTEGER,
-        contacts_before INTEGER,
-        contacts_after INTEGER,
-        llm_provider TEXT,
-        notes TEXT
-    );
-    CREATE TABLE IF NOT EXISTS alerts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        severity TEXT,
-        type TEXT,
-        message TEXT,
-        acknowledged INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS sessions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        token TEXT,
-        cookies TEXT,
-        user_agent TEXT,
-        proxy TEXT,
-        login_method TEXT,
-        expires_at TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_receipts_ts ON receipts(ts);
-    CREATE INDEX IF NOT EXISTS idx_stats_ts ON stats(ts);
-    CREATE INDEX IF NOT EXISTS idx_bio_versions_ts ON bio_versions(ts);
-    """)
-    conn.commit()
-    conn.close()
-
-def sha256_chain(s: str) -> str:
-    return hashlib.sha256(s.encode()).hexdigest()
-
-def get_last_receipt_hash() -> str:
-    conn = db()
-    row = conn.execute("SELECT hash FROM receipts ORDER BY id DESC LIMIT 1").fetchone()
-    conn.close()
-    return row["hash"] if row else "0" * 64
-
-def receipt(action: str, success: bool, detail: str, before: Any = None, after: Any = None):
-    ts = datetime.now(timezone.utc).isoformat()
-    before_json = json.dumps(before, default=str) if before is not None else None
-    after_json = json.dumps(after, default=str) if after is not None else None
-    prev_hash = get_last_receipt_hash()
-    payload = f"{prev_hash}|{ts}|{action}|{int(success)}|{detail}|{before_json}|{after_json}"
-    h = sha256_chain(payload)
-    conn = db()
-    conn.execute(
-        "INSERT INTO receipts (ts, action, success, detail, before_state, after_state, hash, prev_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (ts, action, int(success), detail, before_json, after_json, h, prev_hash)
-    )
-    conn.commit()
-    conn.close()
-    if success:
-        log.info("RECEIPT: %s | %s", action, detail)
-    else:
-        log.error("RECEIPT FAIL: %s | %s", action, detail)
-    return h
-
-def record_stats(login_method: str = "api", latency_ms: float = 0.0, **kwargs):
-    ts = datetime.now(timezone.utc).isoformat()
-    cols = ["ts", "login_method", "latency_ms"] + list(kwargs.keys())
-    vals = [ts, login_method, latency_ms] + list(kwargs.values())
-    conn = db()
-    conn.execute(
-        f"INSERT INTO stats ({','.join(cols)}) VALUES ({','.join(['?'] * len(cols))})",
-        vals
-    )
-    conn.commit()
-    conn.close()
-
-def record_alert(severity: str, atype: str, message: str):
-    ts = datetime.now(timezone.utc).isoformat()
-    conn = db()
-    conn.execute(
-        "INSERT INTO alerts (ts, severity, type, message) VALUES (?, ?, ?, ?)",
-        (ts, severity, atype, message)
-    )
-    conn.commit()
-    conn.close()
-    log.warning("ALERT [%s/%s]: %s", severity, atype, message)
-
-# ---------------------------------------------------------------------------
-# Credential Vault
-# ---------------------------------------------------------------------------
-
-def get_credential(name: str, prompt_if_missing: bool = False) -> Optional[str]:
-    """Read credential from env or macOS keychain."""
-    val = os.environ.get(name)
-    if val:
-        return val
-    # Try macOS keychain
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", f"fortress_{name}", "-w"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    if prompt_if_missing:
-        return input(f"Enter {name}: ")
-    return None
-
-# ---------------------------------------------------------------------------
-# Identity Manager
-# ---------------------------------------------------------------------------
-
-class IdentityManager:
-    """Manages browser fingerprints, proxies, and user agents."""
-
-    def __init__(self):
-        self.proxy = random.choice(get_proxy_list())
-        self.user_agent = random.choice(USER_AGENTS)
-        self.chrome_profile = f"/tmp/fortress_profile_{random.randint(1000, 9999)}"
-
-    def rotate(self):
-        self.proxy = random.choice(get_proxy_list())
-        self.user_agent = random.choice(USER_AGENTS)
-        self.chrome_profile = f"/tmp/fortress_profile_{random.randint(1000, 9999)}"
-
-    def get_requests_session(self) -> requests.Session:
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": self.user_agent,
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": f"{BASE_URL}/settings",
-            "Origin": BASE,
-        })
-        if self.proxy:
-            s.proxies.update({"http": self.proxy, "https": self.proxy})
-        return s
-
-    def get_selenium_driver(self):
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        opts = Options()
-        opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument(f"--user-data-dir={self.chrome_profile}")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_argument(f"--user-agent={self.user_agent}")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        if self.proxy:
-            opts.add_argument(f"--proxy-server={self.proxy}")
-        driver = webdriver.Chrome(options=opts)
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        })
-        return driver
-
-
-def get_proxy_list() -> List[Optional[str]]:
-    """Return list of proxies. Env var RM_PROXIES overrides."""
-    raw = os.environ.get("RM_PROXIES", "")
-    if raw:
-        return [p.strip() or None for p in raw.split(",")]
-    return DEFAULT_PROXIES
-
-# ---------------------------------------------------------------------------
-# Adaptive Rate Limiter
-# ---------------------------------------------------------------------------
-
-class AdaptiveRateLimiter:
-    """Slows down when site shows stress signals."""
-
-    def __init__(self):
-        self.min_interval = 2.0
-        self.current_interval = 2.0
-        self.max_interval = 60.0
-        self.last_request = 0
-        self.error_count = 0
-
-    def wait(self):
-        now = time.time()
-        elapsed = now - self.last_request
-        if elapsed < self.current_interval:
-            time.sleep(self.current_interval - elapsed)
-        self.last_request = time.time()
-
-    def report_success(self):
-        self.error_count = max(0, self.error_count - 1)
-        if self.error_count <= 0:
-            self.current_interval = max(self.min_interval, self.current_interval * 0.9)
-
-    def report_error(self, status_code: int = 0):
-        self.error_count += 1
-        factor = 2.0 if status_code in (403, 429, 503) else 1.5
-        self.current_interval = min(self.max_interval, self.current_interval * factor)
-        log.warning("Rate limiter slowed to %.1fs (error_count=%d, code=%s)",
-                    self.current_interval, self.error_count, status_code)
-
-# ---------------------------------------------------------------------------
-# API Client (Fortress Edition)
-# ---------------------------------------------------------------------------
-
-class FortressAPI:
-    """Hardened API client with multi-path login and self-healing."""
-
-    def __init__(self, identity: IdentityManager):
-        self.identity = identity
-        self.session = identity.get_requests_session()
-        self.token = None
-        self.username = None
-        self.login_method = "none"
-        self.rate_limiter = AdaptiveRateLimiter()
-        self.last_login = 0
-
-    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
-        self.rate_limiter.wait()
-        start = time.time()
-        try:
-            resp = self.session.request(method, url, timeout=15, **kwargs)
-            latency = (time.time() - start) * 1000
-            if resp.status_code in (403, 429, 503):
-                self.rate_limiter.report_error(resp.status_code)
-            else:
-                self.rate_limiter.report_success()
-            return resp
-        except Exception as e:
-            self.rate_limiter.report_error()
-            raise
-
-    def _get_csrf(self) -> str:
-        resp = self._request("GET", f"{BASE_URL}/login")
-        m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', resp.text)
-        if m:
-            return m.group(1)
-        return ""
-
-    def login_api(self, username: str, password: str) -> bool:
-        csrf = self._get_csrf()
-        resp = self._request("POST", f"{API_URL}/login", json={
-            "email": username,
-            "password": password,
-            "csrf": csrf,
-            "remember": True,
-        })
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-                self.token = data.get("accessToken")
-                if self.token:
-                    self.session.headers["Authorization"] = f"Bearer {self.token}"
-                self.login_method = "api"
-                self.last_login = time.time()
-                return True
-            except Exception:
-                return False
-        return False
-
-    def login_selenium(self, username: str, password: str) -> bool:
-        from selenium.webdriver.common.by import By
-        driver = self.identity.get_selenium_driver()
-        try:
-            driver.get(f"{BASE_URL}/login")
-            time.sleep(4)
-            # Dismiss popups
-            try:
-                driver.execute_script("document.querySelectorAll('.DialogOverlay,[class*=\"overlay\"]').forEach(e=>e.remove())")
-            except: pass
-            for xpath in ["//button[contains(text(),'Not now')]", "//button[contains(text(),'Accept all')]", "//button[contains(text(),'Close')]"]:
-                try:
-                    for el in driver.find_elements(By.XPATH, xpath):
-                        if el.is_displayed(): driver.execute_script("arguments[0].click()", el); time.sleep(0.5)
-                except: pass
-            # Fill login
-            for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
-                t = (inp.get_attribute("type") or "").lower()
-                n = (inp.get_attribute("name") or "").lower()
-                if (t == "email" or "email" in n or "user" in n) and inp.is_displayed():
-                    inp.clear(); inp.send_keys(username)
-                if t == "password" and inp.is_displayed():
-                    inp.clear(); inp.send_keys(password)
-            time.sleep(0.3)
-            for el in driver.find_elements(By.CSS_SELECTOR, "button[type='submit']"):
-                if el.is_displayed(): driver.execute_script("arguments[0].click()", el); break
-            time.sleep(6)
-            if "/login" not in driver.current_url:
-                for c in driver.get_cookies():
-                    self.session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
-                self.login_method = "selenium"
-                self.last_login = time.time()
-                return True
-            return False
-        finally:
-            driver.quit()
-
-    def login(self, username: str, password: str) -> bool:
-        self.username = username
-        log.info("Trying API login...")
-        if self.login_api(username, password):
-            log.info("API login OK")
-            return True
-        log.info("API login blocked/captcha, trying Selenium...")
-        if self.login_selenium(username, password):
-            log.info("Selenium login OK")
-            return True
-        log.error("All login methods failed")
-        return False
-
-    def ensure_session(self) -> bool:
-        if time.time() - self.last_login > 3600:
-            log.info("Session older than 1h, refreshing...")
-            return self.login(self.username, os.environ.get("RM_PASS") or "")
-        return True
-
-    def get(self, path: str, params: Optional[Dict] = None) -> requests.Response:
-        return self._request("GET", f"{API_URL}{path}", params=params)
-
-    def post(self, path: str, json_data: Dict) -> requests.Response:
-        return self._request("POST", f"{API_URL}{path}", json=json_data)
-
-    def put(self, path: str, json_data: Dict) -> requests.Response:
-        return self._request("PUT", f"{API_URL}{path}", json=json_data)
-
-    def full_status(self) -> Dict:
-        endpoints = {
-            "dashboard": "GET /account/dashboard",
-            "availability": "GET /account/dashboard/availability",
-            "stats": "GET /account/dashboard/ad-statistics",
-            "keeponline": "GET /account/keeponline",
-            "about": "GET /settings/about",
-            "mailbox": "GET /mailbox",
-        }
-        results = {}
-        for key, (method, path) in [(k, v.split()) for k, v in endpoints.items()]:
-            try:
-                if method == "GET":
-                    resp = self.get(path)
-                else:
-                    resp = self.post(path, {})
-                resp.raise_for_status()
-                results[key] = resp.json()
-            except Exception as e:
-                results[key] = {"error": str(e)}
-        return results
-
-# ---------------------------------------------------------------------------
-# Safety Governor
-# ---------------------------------------------------------------------------
-
-class SafetyGovernor:
-    """Blocks risky actions and provides human-in-the-loop."""
-
-    RISKY_ACTIONS = {"apply_bio", "change_rates", "send_message", "publish_blog", "edit_interview", "delete_profile"}
-
-    def __init__(self, auto_approve: bool = False):
+MEMBER SINCE: 
+
+#25 | Joshuamasc | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=16 | gold=1 | available=1
+HEADLINE: Masculine Muscular Strong Man Masseur
+DESC: Hello, I’m Joshua. | I am a discreet, respectful, intelligent, muscular, and very masculine man. I possess a strong, warm, and sensual presence. |  | I offer a deep-tissue massage—profoundly relaxing and sensual—letting my hands trace every inch of your body. It is an experience centered on comfort, connection, relaxation, and pleasure. | My hands can be slow, gentle, and enveloping, or firm, strong, and decisive; you choose the intensity. I interpret your body's signals and provide you with exactly what it needs. |  | If you are seeking a deeply relaxing and sensual moment with a strong, attractive man, you have come to the right place. |  | ✨ FOUR-HAND MASSAGE EXPERIENCE ✨ | For those seeking a more PREMIUM experience. |  | 📲 Text messages only (this is the best way to reach me).
+SERVICES: None
+MEMBER SINCE: 
+
+#26 | CamiloAndres | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=9 | gold=1 | available=1
+HEADLINE: Young Masseur w Expert Hands
+DESC: Greetings! — My name is Camilo 🤠 |  | Colombian-American young lad here to transport you to Relaxation Land; tailored just for you. I’m a trained and intuitive masseur with a calm presence and strong, attentive hands. I offer a relaxing, judgment-free space where you can fully unwind, de-stress, and reconnect with your body. Whether you're looking to loosen tight muscles, relieve tension, or just take a break from the everyday grind, I’m here to help. |  | Each session is tailored to your needs — combining techniques like Swedish, deep tissue, and light stretching to make sure you leave feeling recharged and grounded. |  | *In-call sessions are available* | *Out-call sessions are available citywide* |  | Please text me for more details and to schedule a session. I’m looking forward to our time together!
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#27 | Dys | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=11 | gold=1 | available=1
+HEADLINE: Relax sensual massage, deep tissue  🤗
+DESC: I offer Swedish, deep tissue and sensual massages. Nude or clothed—your choice. 
+ | 
+ | My massages are designed to help people relieve tension and pent-up stress. I'm not proficient in sports/physical therapy massages. I'm unable to treat or cure injuries.
+ | 
+ | I look forward to meeting new people and having some fun!
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#28 | TantricRitualNYC | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=11 | gold=1 | available=1
+HEADLINE: Relax • Unwind • Reconnect
+DESC: My work blends tantra-inspired bodywork, four-handed massage, Ayurveda, Reiki, breathwork, and mindful touch into a deeply relaxing and restorative experience tailored to the individual. |  | Many clients come to me feeling stressed, overworked, disconnected, touch-starved, or simply in need of a space where they can fully let go. Whether you're seeking relaxation, nurturing touch, energetic healing, or a more sensual and meditative experience, each session is customized to your needs and intentions. |  | All sessions include four-handed bodywork and may incorporate warm oils, Reiki, meditation, breathwork, herbal steam therapy, and other Ayurvedic techniques designed to help you reconnect with your body, quiet the mind, and leave feeling grounded, renewed, and deeply relaxed. |  | A safe, welcoming space to slow down, unwind, and receive exactly what you need. |  | Private Williamsburg studio.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#29 | SportsMassageNYC | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=25 | gold=1 | available=0
+HEADLINE: BODY TUNE UP- LMT- BIG STRONG HANDS
+DESC: Hi- Thanks for checking out my listing! I am a Licensed Massage Therapist and a graduate of The Swedish Institute of Massage in NYC. I also have a MFA from Rutgers University. I've worked in Gyms (Equinox, I ran a Sports Massage clinic at Crunch NY/LA), Spas (Burke-Williams LA), Hotels, Sports Clinics and with private clients. |  | I specialize in a highly skilled, strong, sensual and deep, full body pro massage. A combination of circulating, soothing Swedish, targeted and focused deep tissue, Thai stretching, pressure point Shiatsu and energy balancing Reiki- an intimate and vigorous full body tune up! Relaxing and stimulating at once! I work on a large heated pro table and a shower is available in my clean, spacious and private space. |   | I only offer 2 sessions a day- so I'm always at 100%. I know what I'm doing- I care about what I'm doing- it will be time and money well spent! The earliest start time is around 12pm and the latest is around 7pm. I'm a reliable and respectful nice guy with big strong hands and a big heart.  |  | Please text me to set up a session. I appreciate for the interest and I hope you're having a great day! |  | In-calls only on 15th Street and 3rd Aven
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#30 | NikNik | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=9 | gold=1 | available=1
+HEADLINE: NikNik
+DESC: Hey guys, I’m experienced and well trained on deep tissue, therapeutic, sport and relaxing technics and can be done with strong, medium or light pressure (the pressure level is up to you). | My main goal is to relax your body, make you feel amazing and refreshed. | I really enjoy assisting people and ensuring that you not only well taken care of, but your experience is enjoyable and you are provided with the high quality of service. | You can expect to be relaxed, treated professionally and touched with strong hands. | I'm a formal professional soccer player, an easy-going and well educated person who’s goal is to provide to you a best massage session which you deserve! | You can feel secured and relaxed with me. Just feel my touch. I am fully vaccinated and boosted.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#31 | Michael_V | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=22 | gold=1 | available=1
+HEADLINE: Sexy Cuban Masseur
+DESC: Thank you for visiting my profile,
+ | 
+ | My goal is to make sure you not only feel like you're coming in for a massage, but also make sure there's a little bit more of an intuitive experience so that you feel more relaxed and comfortable.
+ | 
+ | 
+ | ⭐️Quality is important⭐️
+ | Stress relief is the key to have a good day, and to balance the negativity with the positivity.
+ | 
+ | No stress, I will apply light, medium, to heavy pressure to remove knots and increase your circulation to promote a healthier body. 
+ | You can expect to feel refreshed and rejuvenated after every session. I will make an effort to be in touch with your body, mind, and consciousness and hope to pass on these good vibes to you !! 
+ | 
+ | 
+ | By the time you leave my studio, your tight muscles will be loosened and your body and mind will feel more relaxed.  I want to make sure I can release all the tension from your body.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#32 | Anndy | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=75 | gold=1 | available=1
+HEADLINE: massage therapist with 13 years Experience .
+DESC: Hello guys, with over 12 years of professional licensed massage therapy, I’d like to offer my clients a high quality deep tissue massage.  |  | I am a professional athlete and know the pains and stress that the body can encounter. I’d like to take my time to give you a massage that will relax your body and make you feel refreshed.  |  | I’m located in Manhattan but am willing to travel to you. |  | I am very friendly and speak multiple languages.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#33 | Passionateisaac | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=25 | gold=1 | available=0
+HEADLINE: Full of Passion 🌹
+DESC: Hello and welcome to my page. I’m Isaac! |  | I only offer services involving MASSAGES. Please do not message me about any other service outside of this. These texts/calls will be blocked.  |  | I’ve been doing massages since 2019 and I enjoy the connections I have made with clients in the time I’ve been doing this. I’m a very down to earth person and an easy conversationalist that will put you at ease the moment you walk through the door.  |  | While some masseurs lack any sort of personality, I thrive in mine. I’m very comfortable to be around and I will keep your interests and desires in mind during our time together. I always think “What would I want out of an appointment if the roles were switched?” as I go about a session and it is my main goal to ensure that expectations are exceeded during our session.  |  | I am based in Charlotte, but travel on occasion. Usually a weekend if that’s the case. I approach each individual with intuition, tailoring the session to their needs. I provide an emotionally nurturing and safe environment. I love what I do and enjoy the connections I make along the way through these sessions.  |  | Best way to contact me is by text. PLEASE NO PHONE CA
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#34 | nicolatinomasseu | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=5 | gold=1 | available=1
+HEADLINE: ENJOY WITH ME😈🔥
+DESC: Hi, I’m NICO. |  | I’m professional, easy-going, and focused on creating a relaxing and enjoyable experience for every client. |  | My hands know the male body perfectly. I begin with deep therapeutic work to release every knot and tension, then smoothly flow into long, sensual strokes, My touch is strong, intuitive, sensual, and interactive, always adjusted to your needs and comfort level. |  | Incalls and Outcalls | All are welcome — gay, bi, straight, etc. |  | Feel free to text me anytime for more information. | Looking forward to meeting you.
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#35 | Jefferesongunz | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=22 | gold=1 | available=1
+HEADLINE: Safe friendly hygienic
+DESC: Hello, I’m Jefferson you can call me Jeff. I am finally back! I was gone for two years but I am back now.  My goal is to create a comfortable and relaxing environment where you feel safe and free to relax any way you want. You can always expect to leave our session feeling deeply relaxed, integrated, and energized. |  | The massage is completely performed in bed or massage table, whichever you’d prefer best. I am also fully vaccinated for COVID and Monkeypox.  |  | I welcome input from my clients. Telling me what you want in your massage session is the most reliable way to make sure you have the best possible massage experience. | If you have any questions about my rates, services or other details, please don’t hesitate to text or message me! I will gladly answer all questions to ensure you’re most comfortable. Thank you 😊. Everyone is welcome. I speak English, Spanish and Portuguese |  | PLEASE TEXT OR CALL FOR BEST AND FASTEST RESPONSE.  THANK YOU 🙏
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#36 | jacobomasseur | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=16 | gold=1 | available=1
+HEADLINE: NEW HAIRY LATIN BOY IN THE CITY text me
+DESC: Hello gentlemen, Thank you for visiting my advert. My name is Jacobo. I have experience of 3 years. | You are cordially invited into my humble abode where dreams are made, and fantasies fulfilled. I'm a tall, masculine, Latin, with an *** magic wand.  whether you are slim, large, medium or anywhere in between, you are very welcome. | I’m friendly, easy going and love to make people comfortable and relaxed, everything is about the energy…  | GREAT MASSAGE If you are looking for a relaxing time after a long day of work, I’m the right guy for you. | Very polite and respectful, love meeting new people. You can always call me or text me before an appointment to chat and ask questions. I usually reply really fast, if not its because I’m probably working, but I’ll get back to you in the next hour. I’ll so glad to be able to help people have a better mood and day.I will relax your mind & your body. Im very intuitive & I listen. Very humble & down to earth. I genuinely care about giving you the best ❤️ I’m looking forward to see seeing you soon 🔜 pls TEXT to schedule. *** FOR PROMPT RESPONSE, SEND ME A TEXT *** | **************
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#37 | Alexfitfun | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=7 | gold=1 | available=1
+HEADLINE: Recovery and Pleasurable
+DESC: Hi, I’m Alex. | I’m a sensual and professional Latino masseur. My hands know exactly how to relax your body and ignite your senses. |  | I offer a full-body two-hand massage on a professional massage table or in a warm, intimate bed setting—depending on the experience you want. Soft music, close contact, and a slow, deliberate touch will guide you into deep relaxation. |  | Every stroke is designed to release tension, increase circulation, and bring you pure pleasure. |  | I also specialize in deep tissue and recovery massages, ideal for athletes or anyone needing muscle relief with a strong, focused technique. |  | And if you’re ready for something even more unforgettable, I also offer four-hand massages with my partner. | Pure connection. Pure desire. | I can travel in manhattan
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#38 | Leito | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=59 | gold=1 | available=1
+HEADLINE: Garoto (READ)
+DESC: Iam a Latin boy who will please you with a relaxing massage 💆 (any questions you have, you can write me a text and I will answer. |  | Welcome to a space dedicated to relaxation, connection, and well-being. I offer relaxing, sensual, and wellness massages designed to help you release tension, disconnect from daily stress, and enjoy a personalized experience in a comfortable and discreet setting. Services are available either at your location or at a private space where I can host you. Rates: Sensual Massage — $150; Premium Experience Massage — $250. In-home services incur an additional fee based on travel distance. By appointment only. Contact me to book your session. |  | I only tell you one thing, what I want most is for you to feel relaxed the moment you lie down on the massage table, forget about all your problems and let yourself be carried away by my hands massaging your entire body.
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#39 | ColombiaMarco | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=20 | gold=1 | available=1
+HEADLINE: Experienced Masseur-Upper West-
+DESC: Revitalize your Body, Mind and Spirit... From Reiki-Swedish to Deep Techniques... In a Very Comfortable, Cozy and Clean Space with a very friendly, 15 Year Experienced Massage Therapist in New York City.... and Give me the Pleasure to Have You Back ;)
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#40 | latinofit | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=17 | gold=1 | available=1
+HEADLINE: Latino fit
+DESC: I'm Colombian 🥵 masculine guy! Discreet, clean, kind  ! If you are looking for the Best experience, reach me out.   |  | Available for hour, multiple hour,  travel  Or special request .
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#41 | HeavyHanded | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=7 | gold=1 | available=1
+HEADLINE: Marc- HEAVY HANDED ITALIAN
+DESC: My deep tissue massage is known to create a unique connection and experience. I have big, strong hands and know how to use them, achieving a deep, intense sensation. I will leave you relaxed and rejuvenated, ready to face the world’s stresses. I am good because of the pride I have in my technique which I am constantly aiming to improve. I am open to any suggestion and realize every man is different and has different needs. I am very accommodating and down to earth, I am a man’s man with no pretenses. | Everything about me is geared towards your relaxation and serenity. My pictures are recent and very accurate. I am very flexible. | Your satisfaction is my goal. Looking forward to hearing from you and getting to know you.  | Best way to reach me is by text. I don't answer calls with blocked numbers.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#42 | LuizCarlosNYC | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=157 | gold=1 | available=1
+HEADLINE: Massage by Luiz Carlos
+DESC: Hi, I'm Luiz Carlos -- welcome!  With over 14 years of experience in professional massage, I offer a relaxing and holistic full body experience tailored for men of all orientations.  My sessions help you unwind and reconnect with your body in a clean and comfortable environment in Hell's Kitchen.  I provide a high-quality massage table and a friendly atmosphere for you to relax fully.  I'm fluent in English, Portuguese, and Spanish so we can communicate in your preferred language.  To schedule an appointment, please call or text me directly.  PLEASE DO NOT CONTACT ME BY E-MAIL.  ID is required by building security.  Payment is accepted via Venmo, Zelle & Cash. | * I am fully vaccinated for COVID including boosters. | * I am fully vaccinated for Monkeypox.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#43 | Samgl | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=66 | gold=1 | available=1
+HEADLINE: M2M relaxing
+DESC: *** Now I am located in Chelsea at 16&8*** | ~I provide good blend of deep tissue, swedish, sports and sensual massage experience in my studio or at your place. | ~I have several years massage experience in one of the busiest mens spa in nyc.  | ~I can guarantee that I will work on all of your muscle groups in your body. | ~Once finished, you will leave very relaxed and satisfied. | ~I’m a hairy, fit, masculine Mediterranean guy. | ~All are welcome. I don’t discriminate when it comes to body type, age or appearance and provide  and attitude-free environment for all of my clients. | ~Please text me to get a fastest response.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#44 | Manhattanhotboy | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=13 | gold=1 | available=1
+HEADLINE: Hello guys and welcome to my page
+DESC: Hi guys, I’m 24 years old white guy from Europe, in a really good shape with strong massage skills. | 6’2, 200 lbs, brown/dark hair. I do mix Swedish with deep tissue massage style so if you want to have an unforgettable experience with me feel free to text me. | All picture are mine, real and recent. I can travel or host | I respect your privacy, you respect mine. Feel free to text me | Thank you
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#45 | Johnsport | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=19 | gold=1 | available=1
+HEADLINE: Luxury Massage Experience in Midtown Manhattan
+DESC: Welcome to my page.  | I’m a certified massage therapist offering a tailored, high-end massage experience in the heart of Midtown Manhattan. My private studio, located in an elite high-rise building, is designed for ultimate relaxation, featuring luxury spa amenities, a heated massage table, and a serene ambiance. | Personalized Massage Services | Choose from a variety of expert techniques tailored to your needs, including: | ✔ Full-body relaxation or deep tissue massage | ✔ Thai massage (Certified by The Union of Thai Traditional Medicine Society) | ✔ Aromatherapy massage | ✔ Foot reflexology (including wooden stick technique) | ✔ Swedish & sports massage with hot stones & towels | ✔ Myofascial release massage | ✔ *** oil massage (to reduce inflammation & soothe muscles) | Why Choose My Services? | ✅ Personalized, high-quality care tailored to your body’s needs | ✅ Luxury spa experience in a private, comfortable setting | ✅ Fully vaccinated & LGBTQIA+ friendly | ✅ Premium products & professional spa-grade materials | Escape the city’s stress and rejuvenate your body and mind with a massage experience that is second to none. | Book your session today and feel the difference!
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#46 | tomyyX | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=37 | gold=1 | available=1
+HEADLINE: Private. Asian
+DESC: Hello everyone,  | I’m Tommy. In today’s world, trust is the most valuable currency. I believe honesty is the most important thing. To give you complete peace of mind, my photos are officially verified, and I have linked my Instagram and Twitter accounts so you can see the real me before we meet. | About My Triple Life: I balance three distinct careers: | • Professional Massage Therapist: This is my craft and main focus. I travel frequently and return to each city every 3 to 4 months to serve my regular clients and welcome new clients. | • Adult Media Creator (US): I produce professional video blogs for the adult industry in the US, celebrating body aesthetics and confidence. | • Lifestyle Blogger (China): I document my life and travels on the Chinese internet, sharing my journey with a large audience. | A Transparent Note on Reviews: Because of my public presence as a blogger in China, this profile is occasionally targeted by malicious negative reviews from "non-fans" who have never met me or experienced my services. They use this platform to spread negativity based on social media bias. I kindly ask you to trust my verified status, my social media transparency, and our direct int
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#47 | Giomassage | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=80 | gold=1 | available=0
+HEADLINE: Gio masseur
+DESC: Hey, thanks for checking my profile | I am Gio, a confident and authentic guy | 100% real and current photos |  | Offering sports and relaxation massages, from firm and deep pressure to light pressure, depending on your preference. |  | Outcall - Incall  |  | If you are really looking to get out of the monotony and have a new experience, do not hesitate to contact me. |  | Also if you are looking for discretion and privacy, welcome to my place near Times Square. Great place and private. |  | I use spa and first class products, giving you the comfort you deserve. |  | I will give you the time you have reserved. no rush , you won’t REGRET  |  | MASSAGE TABLE  | SHOWER AVAILABLE  | music, candles, aromatherapy.  |   | Do not call  | TEXT ME .✅✅.. |   | I'm a nice guy, but please don't contact me with the intention that I have to convince you to use my service. Because that's not my style. | I DONT send pics .. |  | Besides if I’m PLANNING VISIT your city, I would recommend pre booking.  |  | ONLY INTERESTED CLIENTS.. If you are really looking for quality service contact me and I will be here to assist you.. See you SOON .
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#48 | Fredericodedeus | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=43 | gold=1 | available=1
+HEADLINE: 🔔 TRY MY MASTERPIECE MASSAGE (UNTIL SUNDAY)
+DESC: 📍 HELL'S KITCHEN FOR 2 NIGHTS! 🏷️ SELLING MY TABLE - 💆‍♂️ VISITING NYC FOR A SHORT TIME -I'M YOUR 🥇FAVORITE 🇧🇷 BRAZILIAN MASSEUR🏅🔔TRY MY MASTERPIECE MASSAGE (UNTIL SUNDAY)What makes my sessions special goes beyond techniques… and honestly my reviews and my dear clients can explain the experience better than I can.  | Please read them here: | https://rentmasseur.com/Fredericodedeus/reviews/ | This is not the type of massage where somebody leaves you face down on a table for one hour. |  | I’m a Certified Masseur, Reiki Therapist, Kundalini Activation Facilitator and Personal Trainer. |  | More than 3 years in NYC creating massage experiences for men who wanted something beyond the traditional session. |  | Please read them here: | https://rentmasseur.com/Fredericodedeus/reviews/ |  | Some sessions are therapeutic. | Some are sensual. | Some become something HARD to EXPLAIN after. |  | Every connection is different and every session are really unique for both of us! |  | -Chelsea Manhattan. | -Private upscale environment. | -Text is the best way to reach me. |  | Obrigado por visitar meu website, | Frederico |  | Want to see my massage videos and more? Visit, FREDERICOX.COM .
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#49 | VelvetConcierge | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=70 | gold=1 | available=1
+HEADLINE: Buff,Tall,European Powerhouse with XXL Magic Wand!
+DESC: Hello gentlemen, Thank you for visiting my advert. | You are cordially invited into my humble abode where dreams are made, and fantasies fulfilled. I’m a tall, masculine, European (Italian - Hungarian) powerhouse, with an BIG magic wand. I totally adore the male body; whether you are slim, large, medium or anywhere in between, you are very welcome in my home. I’m a clean living kind of guy. I am your elite Tantric masseur. I am 100% dedicated to your pleasure. |  | This is not a standard massage. Enjoy a curated, high-end experience featuring a heated table, hot towels, hot stones, and a luxurious hot massage with warm oil or lotion. Every detail is designed for maximum relaxation and indulgence. |  | Come to me with any intimacy issues you may have. Welcome to my world of pure bliss and imagination, we shall proceed with a loving deep tissue massage from the bed, my massive hands, reaching and caressing your tender spots, so sensually your heart will melt. Next i will be on top of you, using my chest and afriendboys, slowly and so passionately sliding over you. You may groan with pleasure, but that will only motivate me, for I am here for you, not until euphoric pleasure and relie
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#50 | MercuryRising | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=62 | gold=1 | available=0
+HEADLINE: My technique is out of this world & beyond words.
+DESC: My massage touch is simply magical. You couldn’t ask for a more dedicated Massuer for all your needs, because I truly love what I do and I do it well. I have 9 years of experience and deceptively strong hands. I’m also skilled in using my body to get an even deeper massage pressure for those who need it. |  | You will instantly feel at ease with me and my touch will be what you need. I strive to make each massage special and tailored around your specific needs.  | I have studied many different forms of movement including gymnastics, dance, biomechanics, and more that help to inform my technique. | I keep active, fit, and flexible by doing yoga on a regular basis ensuring I’m in top shape to give you the therapeutic massage you deserve. | I also meditate daily & have found ways to integrate meditation into my massage technique as well. | As a queer person I also understand how difficult it can be to find a masseur you feel comfortable with and being apart of the LGBT community I feel I can give that comfort.  | I am all about body positivity; the value all bodies have not just the ones we think do. So rest assured you have a safe place to feel comfortable and no reason to ever feel 
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#51 | Alex_muscles | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=54 | gold=1 | available=1
+HEADLINE: 🔥 Exclusive NYC Athletic Masseur • Verified
+DESC: Looking for a strong, skilled, masculine masseur who knows exactly how to make your body relax? You’re in the right place. I blend deep-tissue, sports, Swedish, and slow sensual flow to melt tension, release stress, and leave you floating. |  | My touch is confident, intuitive, and fully tailored to your pace — never rushed, never routine. |  | ⸻ |  | ✨ What You Get |  | • Deep-tissue strength with relaxing flow | • Sensual full-body option | • Top quality lotion + slow, controlled pressure | • Muscle recovery + stress relief | • Clean, private, judgment-free environment | • Total discretion | • You set the vibe — slow, strong, or deeply sensual |  | Your comfort and experience come first. Always. |  | ⸻ |  | 🏡 My Space |  | A private luxury studio in UES — warm lighting, comfortable setup, shower available, and complete privacy. | Prefer your place? I bring the same professional, relaxing, sensual experience to you. |  | ⸻ |  | 💛 Why Clients Choose Me |  | Because they leave feeling: | ✔ lighter | ✔ calmer | ✔ more confident | ✔ deeply connected and completely relaxed |  | This is more than a massage. | It’s your time — to unwind, feel desired, recharge, and be fully yourself. |  
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#52 | MarcusNYC | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=16 | gold=1 | available=0
+HEADLINE: Massage by Marcus
+DESC: Hello, thanks for checking my profile ;) |  | I am a massage therapist with over 6 years of experience. I focus on ****** and sensual massage techniques developed to ensure that clients have a nice and relaxing unforgettable experience.  |  | I have my in-home studio in Midtown, NYC with a professional massage table. Accepting in-calls or out-calls. |  | 4 hand tandem massage available upon request |  | I'm a nice guy. Please be polite and respectful with my time if you contact me, as I'll be with yours. |  | I'm vaccinated for COVID and Monkey Pox/ |  | TEXT for the fastest response, PLEASE MENTION THIS WEBSITE. |  | NO CALLS.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#53 | Michael_fit | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=77 | gold=1 | available=0
+HEADLINE: Affordable rates🔥Updated reviews🔥Recent pics
+DESC: I'm a European massage therapist with 8 years experience. | I have my own technique which based on Classic European massage and Deep tissue. | My studio is located in Manhattan near Union Sq, but always ready to travel to you. | I'm happy to give you great massage so you can leave absolutely relaxed. | All my photos are real and recent. | Welcome to my massage session and I’m sure you will love it! | Thank you
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#54 | AJMassaging | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=12 | gold=1 | available=0
+HEADLINE: Something to Come Back For
+DESC: Intuitive hands and a passion and professional knowledge of anatomy/physiology, I can find what you need. Tell me what you want and let me get lost as I explore every inch of your body. |  | ($30 discount on sessions before 5pm on Mondays and Tuesdays.)
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#55 | RodrigoDiPietro | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=5 | gold=1 | available=1
+HEADLINE: Rodrigo Di Pietro
+DESC: Visiting from NYC |  | Incall mainly |  | Full Body Massage Services.  |  | Fully Vaccinated against Covid-19.  |  |  | Each massage session can be tailored to your specific needs. Types of massage sessions are a combination of Body Streching, sensual massage, Swedish, Deep Tissue, Full body massage on table. |  | Whether it is a specific problem or the entire body, all sessions are treated with the same amount of attention and care.  |  | Certified massage therapist.  I work on clients of all types and do not discriminate against race, religion, all orientation, age, or body type. All are welcome.  |  | Please, feel free TO TEXT for further information about service, technics, rates.  |  | You will be treated with the same level of respect and dignity as you do for me.
+SERVICES: None
+MEMBER SINCE: 
+
+#56 | Essentiall | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=67 | gold=1 | available=0
+HEADLINE: NYENERGY
+DESC: Hello gentlemen. *Vaccinated for Monkeypox* DoxyPep. |  |  |  | I am a handsome masculine latino masseur  | I've been doing bodywork for over 7 years | Taking care of all body types with a sensual and intuitive touch, always providing excellent service here in New York.  | My training applied on different techniques | From Swedish to sports ,and deep tissue. or just looking to unwind and relax from a long day.  | I work out of a studio on Manhattan | Peaceful and private space with all amenities | For all your needs. Also use quality massage lotions and professional table and fresh linens.  | You can book me for 60 or 90 minutes sessoons .  | I can also travel to your home or hotel for your convenience.  | The best way to contact me is through text. please no blocked or private calls.  | And i would greatly appreciate at least an hour notice,  and confirmation before appointment.  | Looking forward to meeting you and hearing from you soon.  |  | Bests | Miguel.
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#57 | ThePlayBoy | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=7 | gold=1 | available=1
+HEADLINE: Soft but strong hands
+DESC: 10% off for new clients! |  | I live alone, located in the Bronx, Fordham area. |  | I offer full nude massages with mutual touching and release included in posted rate 😉 | (I have a massage table) |  |  | Also available for FaceTime shows |  |  |  | For outcalls to CT please give me a couple hours or within a 2 day notice for booking  |  |  |  |  |  |  |  |  |  |  |  |  |  | Lastly, please feel free to message me with any questions. I check the site often and will respond in a timely manner. |  |  P.S I don’t like smiling in photos but in real life I’m always smiling😂
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#58 | Antoniomassage | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=30 | gold=1 | available=1
+HEADLINE: Strong and Gentle Therapeutic Massage
+DESC: Dancer with Strong hands and feet . My massage is an integration of different massage techniques and modalities combining a variety of trigger,and pressure points . Be prepare to experience foot work or yoga twisted positions to make it a more efficient massage. |  | The work is done on a table or mat with unscented or scented oil in a clean and safe environment in/out table or not table available . |  | All bodies are welcome there is no discrimination on my table . |  | My goals are to tune your body to the right frequency ,looking beyond the physical, emotional,and mental limitations. Give it a try.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#59 | VelvetBoy | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=6 | gold=1 | available=0
+HEADLINE: Therapeutic Massage for Pain Relief & Relaxation
+DESC: Licensed Massage Therapist (LMT) 
+ | Helping your body move better, recover faster, and feel pain-free
+ | Hello, I’m Will (Eastern Europe). I offer a variety of massage techniques and bodywork services tailored to your individual needs and goals:
+ | 1. Relaxation Massage (Swedish) – ideal for stress relief and full-body relaxation
+ | 2. Deep Tissue / Sports Massage – focused work to release tension and improve performance
+ | 3. Post-Injury Recovery & Mobility Coaching – assisted stretching, corrective exercise, and movement optimization
+ | 4. Customized Sessions (by request) – combine techniques for a fully personalized experience. 
+ | I also offer extended sessions for clients who want more time to fully relax, recover, and enjoy a personalized wellness experience.
+ | Feel free to choose a single service or mix styles to create what works best for you.
+ | If I don’t respond right away, I’m most likely with a client and will get back to you as soon as possible.
+ | Hygiene and cleanliness are a top priority. All equipment and the space are fully sanitized before and after each session, and I maintain personal hygiene between clients. A shower is available upon request.
+ | I look for
+SERVICES: None
+MEMBER SINCE: 
+
+#60 | NatesXscape | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=1
+HEADLINE: Experience the Escape with Nate 🕯️
+DESC: Hey You!  | Step away from the ordinary and into an experience that lingers—where skilled hands and intuitive touch come together to create something truly unforgettable. |  | Each session is thoughtfully crafted, blending advanced bodywork knowledge with a slow, flowing approach that melts tension while awakening a deeper sense of ease throughout the body. Your comfort, your needs, and your experience guide every moment. |  | I offer relaxing massage services including deep tissue, Swedish, Sensational, ****** & customized body-to-body sessions (Naked & Mutual touch allowed). |  | Let me know if you’d like to book an appointment! |  | 🕯️ Discreet, calming environment🕯️
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#61 | ITACOUPLE | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=11 | gold=1 | available=1
+HEADLINE: Last few days in town. 😉🔥
+DESC: Unforgettable experience!  | Ciao, we’re Luke and Gianpaolo. A very friendly and down to earth professional and discrete masseur duo. Our sessions combine deep tissue and relaxation techniques with a warm, sensual touch that helps melt away stress and tension. We offer 4-hand massages, creating a calm, comfortable atmosphere where you can fully unwind and recharge. | Host in Upper Manhattan and can travel as well.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#62 | Arjun | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=87 | gold=1 | available=1
+HEADLINE: Prepare to let go of your stress!
+DESC: I am a professional masseur dedicated to providing the best session for every client. I am respectful to my clients and I am always punctual. I have years of experience, positive reviews, and many long-term satisfied clients. I am friendly and welcome new clients. |  | During your session, I will find areas of tightness, tension and work to relieve them. My technique is to use slow, deep pressure to release tight muscles and overall to relieve stress. This gradual soothing process is intensely satisfying. |  | I focus on comfort, adjusting pressures to meet your needs, and providing service that exceeds expectations. |  | Massage is shown to improve circulation in your muscles, restore vitality and rejuvenate your skin. My massage sessions begin with a gentle touch, progresses in intensity to satisfaction and ends with your rebalanced body in a state of calm. |  | Contact me is by text message. I will respond promptly unless I am doing massage.  | I am available from 8am until 10pm. Thank you for visiting my page and I hope you will consider scheduling a massage.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#63 | NikolasNY | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=4 | gold=1 | available=1
+HEADLINE: Nikolas
+DESC: 🥇 Professional Masseur & Licensed Esthetician |  | I specialize in deep, effective massage techniques designed to release tension, reduce stress, and restore your energy. With strong, trained hands and a personalized approach, every session is tailored to your needs. |  | I offer a range of services including full body massage in different techniques, head massage, face massage, masks, and deep cleansing treatments ( extraction ) - all designed to help you relax, feel refreshed, and look your best. |  | I’m easy to talk to and bring a calm, positive energy that makes it easy to relax, feel comfortable, and enjoy your time during the session |  | After your session, you won’t just feel relaxed — you’ll feel refreshed, recharged, and renewed 🌝 |  | I value both your time and mine, so appointments are appreciated in advance 🙌 |  | You work so much and stay so busy — you deserve to slow down and feel special sometimes. Treat yourself like a prince and enjoy a 90 or 120-minute session ✨ |  | If needed, I can share additional details or photos via WhatsApp 📸 |  |  Travel and I can host: Gramercy Park 10003
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#64 | joneslatinhot | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Jhair Latin Hot Men
+DESC: I am a professional massage therapist specializing in relaxation and muscle relief techniques. My approach is to create a safe and relaxed environment, tailored to each client, to help you feel refreshed and balanced.
+SERVICES: ['sensual', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#65 | Jesuscolombia | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=1
+HEADLINE: Jesus XXL
+DESC: Hello, my name is Jesús, and I'm a young Colombian man. I offer sensual, relaxing, and highly ****** massages with stimulation for gentlemen. I have five years of experience, and my only goal is for you to feel calm, comfortable, relaxed, and above all, pleased and happy. I have a space with an excellent, tranquil, safe, and discreet atmosphere. I'm located in Florida, but I can also come to you wherever you are. Come and enjoy a unique experience in the hands of a skilled masseur and expert in giving pleasure. ☁️☁️🍑🍆🍾🎊🎊🪅🎉🎉🎉🎀✈️✈️🛩️🛩️
+SERVICES: None
+MEMBER SINCE: 
+
+#66 | LucasNJ | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=12 | gold=1 | available=0
+HEADLINE: Hygienic, clean, great touch and safe
+DESC: Hi Guys I am Lucas from Brazil I am here to apply my force and transfer good energy into your body. I use my body strength, from slow movements to strong pressure, using my hands & forearms. I can use strong pressure or lighter pressure relaxing according to your needs, but I always listen first to you and your body. I welcome everyone and I will greet you with a smile. I’m very friendly and have an enthusiastic and positive attitude. I don’t discriminate, I will receive everyone with open hands. I work on my bed or table in my cozy apartment a comfortable space with a calming atmosphere, generated through calming and relaxing music. I accept payment by Cash, Zelle and Venmo |  | Serious only, please. | To receive the quickest response, PLEASE TEXT TEXT TEXT!!! I don’t take calls. | See you soon.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#67 | RussianHands | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=1
+HEADLINE: Calm Energy, Strong Hands
+DESC: Hey there! I’m a certified massage therapist with 2 years of experience, originally from Russia, now based in NYC. |  | I offer professional bodywork in a calm and clean space, or I can travel to your location. My sessions are focused on relaxation, stress relief, and body awareness. |  | I use light to medium pressure depending on your needs — always intuitive and responsive. My goal is to create a safe space where your body feels supported, and your mind can let go. |  | 💬 Text only for first contact — helps me stay focused. |  | 📍 Based in Manhattan, available for in/outcall. |  | Let’s make this hour about you.
+SERVICES: None
+MEMBER SINCE: 
+
+#68 | Benyou | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=117 | gold=1 | available=1
+HEADLINE: Incredible massage experience with strong hands
+DESC: I specialize in a variety of massage techniques, including deep tissue and Swedish massage. My goal is to alleviate tension throughout your body, leaving you in a state of relaxation. I provide a comfortable massage table, clean linens, massage cream and relaxing music. |  | Your well-being is my top priority, and I welcome all individuals. |  | I’m available for in-studio appointments in West Hollywood. |  | I look forward to meeting you and providing you with a massage that goes beyond your expectations! |  | I’m unable to respond to calls, so please text for faster replies.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#69 | HOTMEDITERRANEAN | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=16 | gold=1 | available=1
+HEADLINE: Exclusive touch
+DESC: Back On RentMasseur.  |  | Hi I am Omar. | Friendly, open-minded, and talented. | Experience masseur for over 6 years - studied massage therapy in Germany. |  | I provide deep-tissue, sports, relaxing, ******, and many more techniques - just ask! With me, you can be very relaxed and enjoy a very pleasant  | experience. |  | With complete discretion,  | I massage in my private, clean home in a  | relaxing and calm atmosphere on a Massage table or bed with candles around.  |  | I am located in Midtown West in Manhattan - close to most train lines - 5-10 minutes walk from 42nd st./50th street stations. |  | Don't hesitate to reach out. Thank you
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#70 | KevinOS | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=60 | gold=1 | available=1
+HEADLINE: KevinOS
+DESC: I'm a certified massage therapist with more than 8 years of massage experience. During the massage, I will provide you with deep tissue massage, acupressure massage, head massage. When you enjoy these massage techniques, you will definitely feel completely relaxed and drive away all your fatigue. In the room, accompanied by beautiful and soothing music, enjoy the best massage time.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#71 | Kennethz | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=11 | gold=1 | available=1
+HEADLINE: Massage By Kenneth Asian Masseur
+DESC: Hello Gentleman!
+ | -----------------------
+ | ENJOY YOUR RELAXING MASSAGE TEXT ME
+ | My name is Kenneth, Asian young man.I'm a professional male masseur for men. I have been a masseur for more than 4 years and i know how to make your body feel great. I offer soothing and calming sensual massage. Using a combination of Deep tissue massage, Swedish massage and Thai massage. I provide strong, firm and deep massage. 
+ | I'm very friendly, understanding, polite and genuine. I work in my beautiful clean, studio apartment where only one person is receiving a massage (YOU!)
+ | You will never regret that you have chosen me and you will definitely get back for more!
+ | Try my exclusive male massage once and you will become my loyal client forever, all gay men love it.
+ | 
+ | Please call/Text with any question, I will be glad to assist you. 
+ | 
+ | --TEXT IS THE BEST WAY TO REACH ME--
+ | 
+ | Thank you for considering my ad. I am looking forward to seeing you soon!
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#72 | Mascnyctop | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=13 | gold=1 | available=1
+HEADLINE: Great Massage By Masc Daddy-type
+DESC: Smart, informed and easy going daddy gives great nude ****** massage.  I do a full body, deep-tissue/Swedish massage, I work with us both in the nude.  My massage will be relaxing, sensual, ****** and you can choose to do a 60 or 90 minute session.  I work on a firm queen size bed.  My apartment is comfortable and always exceptionally neat and clean.  A shower is always available.  Fully vaccinated  for Covid-19 (Moderna) and boosted on 10/26/21.  Both doses of Monkey Pox vaccine.  8/3/22 and 1/10//23.  Call or text me to set up a session.  Ted
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#73 | Ssunshinee | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: young sunny boy
+DESC: An experienced masseur | I‘m light so i can use different ways of doing massage for u like stepping or knealing on your back which many ppl cant do for you.  |  | I provide high-level service and experience.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#74 | Oliverlatin | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=7 | gold=1 | available=1
+HEADLINE: Oliver Latin
+DESC: LATIN #ATHLETICBOY |  | ""Thanks for visiting my page! Hello gentlemen, my name is Oliver I am 24 years old I am very friendly, I am real, I am a fit boy, looking to meet ******** men! I like good moments. I am open minded and I like to be dominant! I! I’m very respectful of your privacy. I
+SERVICES: None
+MEMBER SINCE: 
+
+#75 | loganmagichands | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=63 | gold=1 | available=1
+HEADLINE: !¡ Top notch service ¡!
+DESC: Hello, I'm Logan, your friendly Asian masseur. | Thanks for visiting me. |  | **All my photos are the real deal. No touch ups. No AI generated. A photo shoot with a photographer, some selfies, and a few candid shots from friends.  I can verify photo source, location and date. ** |  | I welcome all who wish a warm, comforting experience. Allow my hands to bring you to a place of relaxation and tranquility. |  | My signature offering is a body scrub and massage combo - a customized session of exfoliation in my shower followed by a soothing massage. It is truly a sensual experience.  |  | I host - Astoria, Queens (my private studio) |  | You Host - Your apartment / hotel |  | Spa Locations - I am independent and I will reserve a room at a convenient location in Manhattan |  | I will cater to some out of town clients nearby NYC.  |  | No hidden fees. Tips are welcome. |  | Cash/Venmo/ApplePay/Zelle
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#76 | relaxandrestore | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=1
+HEADLINE: Licensed Massage Therapist with 7 years experience
+DESC: With certifications in Swedish, Deep Tissue, Myofascial Technique, Neuromuscular technique, Sports massage, and with specializations in Reiki and Lomi Lomi(Hawaiian), I provide a truly holistic approach to bodywork. With my mix of clinical and relaxation techniques, I guarantee you'll leave our session feeling better in mind, body, and spirit. Located on the UES.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#77 | Dancoltop | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=1
+HEADLINE: Masculine Colombian man, Relax and enjoy 👌🏻💪🏽
+DESC: I am colombian man a serious, respectful, and polite man. I offer relaxing massage services where you can unwind and enjoy a pleasant experience in my hands🤲🏼. Tell me what you'd like, and let's enjoy a nice time together. 😏👌🏻💪🏽
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#78 | JThai | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=9 | gold=1 | available=1
+HEADLINE: Magic hands
+DESC: If you're looking to disconnect from stress, release built-up tension, and enter a deep state of relaxation… you're in the right place. | My name is Jon and thank you for checking out my page. I am a trained and certified masseur from Watpo, Thailand. I specialize in a real massage that incorporates Eastern and Western pressure points, deep tissue, and various healing massage techniques. I have experience working with all different types clients from gays, bisexuals, women, and straight men, as well as all different body types. I am respectful and very focused on achieving your goals. I hope this message finds you well and I look forward to hearing from you.  | Fully Vaccinated of Covid & Monkeypox.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#79 | BullLatin | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=1
+HEADLINE: Masseurs
+DESC: ✨ Certified Professional Massage Therapist ✨ | Welcome to a private space dedicated to your wellness, relaxation, and complete rejuvenation. |  | I am a certified massage therapist with extensive experience in relaxation massage, sports massage, lymphatic drainage, and  tantric massage. I operate from my own fully equipped private studio, designed to provide an exclusive, safe, and professional experience. |  | 🌿 Specialized Services: |  | * Relaxation Massage | * Sports Massage | * Manual Lymphatic Drainage | *  Tantric Massage |  | 💆‍♂️  Tantric Massage | A unique experience focused on mind-body connection .This session explores sensation, breathing, and body awareness to promote deep relaxation, energy flow, and personal reconnection. |  | 🏆 Professionalism and Trust |  | * Certified therapist | * Personalized attention | * Private, clean, and welcoming studio | * Complete discretion and respect |  | Allow yourself to release tension, restore your energy, and enjoy a truly revitalizing experience. |  | ✨ Your well-being is my priority. You are warmly invited to experience a unique journey of relaxation and renewal.
+SERVICES: ['therapeutic', 'sensual', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#80 | Polohands | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=4 | reviews=13 | gold=1 | available=1
+HEADLINE: Magical and playful hands ✌🏼
+DESC: Hi There! ✌🏼 | I'm a masseur , latino, I have 28 years old. | 😏 |  | ❤️ If you had a good time, could you please give me a good review? I'd be very grateful. 🥰❤️ | https://rentmasseur.com/Polohands/reviews/ |  | I'm a kind, open mind , honest, very fun, easy going, polite and educated man. | If you looking for an amazing relaxing time please text me, promise to take excellent care of you and your body. |  | I’m a versatile and very romantic masseur with a very open mind, expert in provides services and pleasures massages. With a smooth body. big and delicious lips, a nice and strong tool 8 inches & perfect bubble juicy ass. I love provide a very best deep throw blows, good handjobs, a perfect body contact, kissing with passion from soft to hard and more, |  | I am a person who gives himself %100, I love giving pleasure, relaxing and having a good time. I love meet a new clients and given them moments they won’t forget. I love making your fantasies come true, when my body interacts with yours, it creates a sensual & very intimate energy which is profoundly gratifying and deeply relaxing,  |  | STATUS | Free of desease, HIV neg on PREP  | Last tested January/2026, COVID vaccinated X3
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#81 | JohnFitness | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=14 | gold=1 | available=1
+HEADLINE: Colombian - Exclusive
+DESC: Colombian - Exclusive
+ | If you want a relaxing massage with a nice Colombian guy, you are in the right place! I am nice and very friendly!
+ | 
+ | I provide a relaxing and invigorating sensual massage! You will have a sensual, relaxed experience and you will feel relaxed at the end of the massage. I offer therapeutic, deep tissue, as well as sensual massage. I have experience working with the male and woman body and can help relieve knots in the upper back, neck, and lower back.
+ | 
+ | ✅ COVID 19 - 4 shots
+ | ✅ MENINGITIS - 2 shots
+ | ✅ MONKEYPOX
+ | 
+ | 🔝 I do offer 4 hands job. Just ask for it. 🤲🏼🤲🏽
+ | 
+ | don't call, just messages😄✅
+ | 
+ | Speaks: Spanish
+ | 
+ | Open to a conversation and negotiation. Don’t call, Text me only 👆🏻
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#82 | AndyNY | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=35 | gold=1 | available=1
+HEADLINE: •Nuru Massage  •Tantric Massage •Deep Tissue
+DESC: Experience |  | An elevated bodywork experience defined by precision, presence, and attention to detail. |  | Each session is tailored to you—seamless, unhurried, and deeply restorative. |  | ⸻ |  | Services |  | Signature Massage | A bespoke full-body treatment combining Deep Tissue, Swedish, Reflexology, and Aromatherapy for complete relaxation and renewal. |  | Nuru Massage (Body-to-Body massage). | A luxurious, fluid experience designed to create full-body connection and deep release. |  | Tantric Massage | An immersive session focused on awareness, energy, and refined relaxation. |  | ⸻ |  | Private Sessions |  | Signature massage — $200 / 60 min | Nuru massage — $280 / 60 min | Tantric — $300 / 60 min |  | 90-minute sessions available upon request. |  | ⸻ |  | Details |  | Located in Midtown Manhattan, near Hudson Yards & Penn Station. | By appointment only. |  | I gladly accept all major credit cards (AMEX, Visa, Mastercard), as well as Venmo, Zelle, Apple Pay, and PayPal. |  | A calm, private setting. All equipment is carefully sanitized to ensure a clean and comfortable experience.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#83 | Toony | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=12 | gold=1 | available=1
+HEADLINE: Asia  boy  Help you relax and release.
+DESC: Tony is a certified aromatherapy massage therapist with over three years of professional experience in helping clients restore balance, reduce stress, and achieve deep relaxation through the healing power of essential oils. |  | With a calm and intuitive approach, Tony combines skilled massage techniques with carefully selected natural essential oils to create a personalized, therapeutic experience for every client. His goal is to promote physical well-being and emotional harmony in a peaceful, nurturing environment. |  | Whether you’re looking to relieve muscle tension, improve sleep, reduce anxiety, or simply unwind after a long day, Tony tailors each session to suit your unique needs and preferences. |  | Tony’s specialties include: | 	•	Full-body aromatherapy massage | 	•	Stress and anxiety relief through essential oils | 	•	Muscle relaxation and tension release | 	•	Holistic wellness consultation | 	•	Creating a safe, clean, and calming treatment space |  | Tony believes in the power of touch and scent to support the body’s natural healing processes. With a warm demeanor and a passion for wellness, he has helped many clients feel renewed, recharged, and more in tune with thems
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#84 | ItalianHeat | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=5 | gold=1 | available=1
+HEADLINE: Sensual massage in HK
+DESC: RATE : $250 | Hello and welcome — I’m glad you’re here 😉 |  | Experienced licensed massage therapist originally from Italy with over 5 years specializing in slow, flowing, full-body sensual massages tailored just for you. Deep pressure where needed, gentle gliding strokes, warm oils, and total attention to unwinding every muscle. Discreet, private in-call space (or in the comfort of your own space) — your perfect escape to relax, recharge, and feel completely taken care of.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#85 | YULIAN | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=12 | gold=1 | available=1
+HEADLINE: Your  best experience
+DESC: Athletic young masculine man  |  | Outcall  available too  |   |  | ESP/Eng
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#86 | dongdongdedian | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=103 | gold=1 | available=0
+HEADLINE: Asian muscle handsome boy.
+DESC: Im Eason, |   From China | I am a professional masseur with 3 years experience, , I am good at deep relaxation massage and provide to my customers  The most perfect service
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#87 | AsianMuscleTouch | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=30 | gold=1 | available=1
+HEADLINE: 🔥Muscle Hands🔥
+DESC: Hey there, I’m Kay |  | Sensual :  $220/hour | - Deep Tissue, Swedish, Sensual | - release, both nude, mutual touch  | - light extras |  |  | 💆‍♂️My hands are trained in Deep Tissue, Swedish, Sports. My sessions are focused on relaxation and stress relief.  |  | I offer professional bodywork in a calm and clean space, or I can travel to your location. My sessions are focused on relaxation, stress relief, and body awareness. I apply light, medium, and hard pressure depending on your needs. |  | ✅I can verify by FaceTime, IG or X. | ⭐️Men of all ages are welcome.  | 💊 On PrEP and DoxyPep (proof available)
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#88 | EIMARLATINN | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=1
+HEADLINE: Eimar
+DESC: Hot Latin boy 😈🔥 | "Hi, I'm a young Latino guy willing to please you and have a good time with you. Good energy, fun, and hot."
+SERVICES: None
+MEMBER SINCE: 
+
+#89 | HandsAndBody | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=68 | gold=1 | available=0
+HEADLINE: Physique model with some really good hands, try me
+DESC: Hello All!  My name is Nick.  Happy to share that I’ve been serving incredible massages for 7 years now, however I am a newbie to this site. My soft and cozy massage table is located in a prime manhattan location. My workspace is clean, comfortable, and inviting with access to the shower. Aromatherapy, hot towels, and other massage related goodies await you.  I have very strong hands that do not get tired during sessions.  Thru the years my massage technique has evolved a bit and doesn’t necessarily fit into any one category.  It’s more of a blend of the “better-feeling” techniques.  Imagine Swedish/deep-tissue but not too deep/sports massage/skin to skin friction/ long strokes and body contact all in one session. Now pair this up with just the right amount of sensual touch and your really in for a pleasurable and healing experience.  
+ | 
+ | *I have a few different friends that I partner up with for 4 hand massages (just mention it and I’ll share some pics)
+ | 
+ | *I also offer a loyalty rewards program as I love building a rapport with people
+ | 
+ | *Text or Call Me anytime for my scheduling and pricing tier, booking in advance is best but sometimes I can take last minute request
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#90 | XxxAlexandroXl | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=1
+HEADLINE: XLalexandro
+DESC: I'm a very friendly and easygoing guy that loves meeting new people and helping them feel better. I really hope to make some kind of a positive impact in your life because it's pretty validating, so I make it a point to give you the experience you're looking for while reflecting the integrity and excellence I bring to everything I do. I want to check in with you throughout and make sure you're actually comfortable, getting the massage style you want, and make sure that you're actually getting what you pay for to keep you coming back. |  | anything is on the menu. No limits to your desires. I love my body and with you the feeling is mutual. Come in and relax. |  | All Ages, Races, Builds Are Welcome!! |  | Book w/Confidence: Professional & Discreet. |  | INBOX - TEXT ONLY - WHATS APP
+SERVICES: None
+MEMBER SINCE: 
+
+#91 | AngelStrong | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=1
+HEADLINE: NEW  in the city  💪 masseur erotico and relaxing
+DESC: Latin man strong hands  | Massage relaxing  | Massage ****** naked
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#92 | Jake_NYC | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=29 | gold=1 | available=1
+HEADLINE: A new Asian boy in town.
+DESC: Hi everyone 😘 |  | It’s Jake, I am a very friendly Asian boy with smooth and fit body. I provide a variety relaxing full body massage from deep tissue to sensual. I absolutely love making people feel amazing and hope you are next!!  |  | Please don’t hesitate to ask me any questions.I’m hosting in my private apartment or in a nice hotel when I travel so please come visit me and I will make sure you leave with happiness 🤗 |  | The best way to reach me out is to Text me through my phone number and I will get back to you shortly.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#93 | Kellythai | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: Asian Thai Professional
+DESC: Overview | More than 5 years experience, Thai massage, Deep tissue, Thai combination, Swedish, stretching, free hot stone , You know? Thai massage is the best massage in the world for relaxing massage , I’m Ken I have Thai traditional license, California and Australia license, if you like strong massage I’m the best , Some one like soft massage I can do just my fingers or my hands please let me know what do you want in session , I can do In call -Out call to your place
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#94 | FutureDILF | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=23 | gold=1 | available=1
+HEADLINE: Check the reviews!
+DESC: ** Texts highly preferred over phone calls or website messages. Message 917 512 1403 with name/availability/preferred location/what you're looking for. :-) ** |  | Sensual, intimate ****** bodywork from a furry, friendly guy who enjoys being nude with other men. No attitude, relaxed atmosphere. First timers welcome. Mutual touch encouraged. Multiple hour sessions & overnight visits available. |  | Outcalls available (and preferred) to all NYC boroughs, Westchester, NNJ and LI. Incalls available in Bed-Stuy Brooklyn (no table) and near Union Square with 2hr notice (table included). |  | All COVID, MPX vax/boosters up-to-date, as of April 2024.
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#95 | BodyworkByAlexi | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=12 | gold=1 | available=1
+HEADLINE: Aim to please
+DESC: Hey there , I’m Alexi. I’m trained and certified  in Thai body work but I also use traditional massage techniques as well to offer a unique experience that will leave you feeling rejuvenated and relaxed . I can host at my in-home studio or travel to you . Feel free to message me if you have any questions .
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#96 | Wolfnew | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=11 | gold=1 | available=1
+HEADLINE: Sensual massage
+DESC: Hi , I’m a masculine, well-groomed and professional guy known for calm confidence, genuine energy, and a strong presence. I value quality connection, good conversation, and creating moments that feel natural, engaging, and memorable. |  | Whether you’re looking for great massage, a relaxed evening, meaningful conversation, or travel companionship, I bring positive energy, discretion, and an authentic vibe to every experience. |  | Easygoing, respectful, and attentive I believe the best moments happen when chemistry feels effortless and real. |  | Best way to reach me is via text or the platform. Let’s make it unforgettable.
+SERVICES: None
+MEMBER SINCE: 
+
+#97 | Maxxnum | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: Asian guy in midtown
+DESC: I do massage as Thai ****** professionally at the spa place  in NYC locate at Hell’s kitchen |  | Massage Type: Thai Massage / Oil Massage / Relaxatio |  |  a friendly Thai massage therapist with over 5 years of experience. Ontable |  | My style combines traditional Thai techniques with relaxing oil massage to relieve muscle tension and stress. My touch is firm yet gentle, aiming to make you feel completely relaxed and recharged. |  | The session is always clean, comfortable, and personalized for your needs.Available both in-studio (private, hygienic space) and outcall (hotel or home visits).If you’re looking for genuine relaxation and good energy, I’ll be happy to take care of you. |  |  | What do you want try in our session? | Text me and let's talk about it. | ****************
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#98 | Jordanlatin | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=1
+HEADLINE: Sexy Latín
+DESC: Hello guys, Thank you for visiting my profile  My name is Jordan  I’m a passionate , handsome guy very friendly and discreet. Having had over 4 years of experience in man to man bodywork I have gained confidence and knowledge needed to make every massage I give ,the best one you can possibly receive. Every moment of my session is very respectful and of high quality. I believe every man of any age,lifestyle or body type deserves to experience kind ,generous and skilled full bodywork that will release muscle tension,pain and improve circulation and lymph movement.  I have athletic muscular body,handsome face, skillful strong hands and sensual touch.  I am also very easy going and open minded . I focus on giving a quality experience that will leave you satisfied ,relaxed and pleased.  Thank you!
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#99 | Onyxforu | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=126 | gold=1 | available=0
+HEADLINE: ARRIVING IN ATLANTIC CITY 6/25
+DESC: *PROFESSIONAL MASSAGE SERVICES*  |  | *ONLINE FITNESS COACHING AVAILABLE* | *OPEN TO SUGAR ARRANGEMENTS*  | * HOURLY EXPERIENCES* | * OPEN TO TRAVEL* |  | NEXT LOCATION: | NYC (HAPPY PRIDE) 🏳️‍🌈 6/26 |  | Bringing happiness, healing, relief, and spiritual consciousness to others is a part of my Life’s Mission 🫶🏽 |  | Recently moved back to the U.S. from Medellín, Colombia now based in Atlanta, GA (Buckhead area). Having grown up in a Navy family, I’ve lived all over the country, so respect, being open minded and professionalism are at my core. |  | I’m also an EMT/Paramedic with 5 years of experience in the ER and 911 Ambulances, meaning I know my way around the male body. 😈 |  | I travel nationwide, so if I’m in or coming to your city, PLEASE TEXT IN ADVANCED to book an appointment🙏🏽. (This Website’s notifications aren’t always reliable!) |  | (DISCOUNTS AVALIBLE) | EMT/PARAMEDICS | MILITARY PERSONNEL |  | (VAXXED & SAFE AGAINST COVID) |  | All Incall Massages Include: | ✔️ Optional hot shower before & after | ✔️ Disposable sheets to offer protection | ✔️ Disinfected memory foam table | ✔️ Scented candles & relaxing music | ✔️ 100% privacy always guaranteed | ✔️ Me, clean, in shap
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#100 | GoodVibesGuy | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=21 | gold=1 | available=1
+HEADLINE: Magic Hands and Intuitive Touch
+DESC: Hi, my name is Macho, I'm half Filipino and half Polish #Polipino 😁 | I have over 10 years of experience specializing in swedish, deep tissue and sports massage. Enjoy the sensation of a connected massage that arouses your deepest senses.✨ |  | I truly enjoy using my hands and all the parts of my body to touch and connect with other men.  My specialty is using my power of touch to soothe, relax, and release all of your tension. Offering total relaxation and complete rejuvenation. |  | I live alone in my spacious 1 bedroom where my table is set up comfortably for you. |  | *Please mention you found me on RentMasseur when you message
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#101 | sensestwo | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: 4-Hand Massage Hells Kitchen
+DESC: Two experienced massage therapists working together to give a calm four-hand massage. You get twice the hands moving in smooth, matched motions with warm oil. We mix gentle Swedish massage with deeper pressure to help your body fully relax. The vibe is professional, easygoing, and private. We work from our studio's in Hell’s Kitchen area. We can also come to you if you have a massage table. All prices are clear and listed on our profile.
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#102 | Elicarmelo | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=15 | gold=1 | available=1
+HEADLINE: Natural Massage
+DESC: I use natural products to make sure your skin is taken care of! |  | A key focus of my work is enhancing circulation to encourage the body’s natural ability to renew and heal itself. By getting the blood flowing, I help revitalize your body, bringing fresh oxygen and nutrients to tissues while flushing out toxins. This not only leaves you feeling deeply restored but also promotes better overall health, increased energy, and a renewed sense of well-being.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#103 | Jesu | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=105 | gold=1 | available=0
+HEADLINE: Advanced Bodywork & The Art of Connection
+DESC: Top-level technique. Intentional touch. Elevated experience. |  | This space is for clients who value quality, presence, and refined energetic awareness in bodywork. |  | Each session is grounded in advanced technique, intuitive sensitivity, and a respectful energetic exchange, creating an experience that goes beyond the physical. |  | Take a moment to read the reviews, they offer insight into the depth and consistency of the work. |  | Sessions are personalized to your body and energy. |  | All major payment methods accepted. Travel available with advance booking.
+SERVICES: None
+MEMBER SINCE: 
+
+#104 | RelaxwithNick | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=40 | gold=1 | available=0
+HEADLINE: Happy time together
+DESC: Hi,,,im nick  |  | I’m  a licensed from Thailand , I've been a massage therapist for 4 years. | If you are looking for a skilled masseur who understands muscles and provides therapeutic and relaxing massage, you have come to the right person.  | My  techniques combines traditional Thai techniques with relaxing lotions massage to relieve muscle tension and stress. My touch is firm yet gentle, aiming to make you feel completely relaxed and recharged. | I work on massage table  | Showers available  |  | I hope to see you soon. | 👉🏻My service  | Sports massage  | Sensual massage  | Deep issues massage  | Aroma massage  | Thai massage  |  | Im host at Midtown Manhattan ,private apartments, clean, stylish,warm  | Try me if you want new experiences 🙏🏻🙏🏻
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#105 | RickyXl | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=29 | gold=1 | available=1
+HEADLINE: Premium Bodywork Experience
+DESC: Deep Relaxation & Exclusivity | This is not a conventional massage. | It’s a refined sensory experience designed to release tension, restore your energy, and bring your body into a state of complete relaxation. | Each session is fully customized, blending deep tissue, Swedish techniques, stretching, and advanced bodywork with a slow, intentional, and intuitive approach. | ✨ The Experience | • Strong, confident, and intuitive touch | • Slow, fluid movements that invite full release | • Attention to detail in every moment | • Deep physical and mental relaxation | • Clean, exclusive, and completely private environment | • Total discretion at all times | 🏡 The Space | A private studio thoughtfully prepared for your comfort: | warm lighting, ambient music, subtle aromas, and an atmosphere designed for complete disconnection. | Includes: shower, hot towels, and a heated massage table. | 📍 Availability | Available daily by appointment | Last session: 10 PM | Text message is the preferred method of contact | (Respect and discretion are appreciated) | More than a massage… an elevated wellness experience.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#106 | HotHandsNYC | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=14 | gold=1 | available=0
+HEADLINE: Hot Masseur, helping you Relax and Release.
+DESC: Certified Masseur, Deep Tissue, Hot Stone Therapy   | I'm Mike, a 5'10, 230lb fitness enthusiast and bodybuilder living in Hells Kitchen. |  |     My massage style adapts to each individual giving a personalized M2M experience like no other. Using my strong hands and body, I'll help you relieve stress in your stubborn muscles and undo knots of tension to make you feel relaxed and rejuvenated. I offer stretching techniques to restore flexibility, blood flow and mobility back in your body. |  | I have a clean, inviting studio apt. Showers available before and after each visit with fresh towels and wash cloths. Aromatherapy, candles and  soothing music to create a comforting environment to block out the world.  |  | Please text me for availability. | Look forward to meting you soon. |  |  | State your name and verify are from RentMassure. |  | Open minded | NO discrimination | Fully Vaxed
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#107 | DeepTantricman | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=10 | gold=1 | available=1
+HEADLINE: The Best of both worlds 🙏
+DESC: Hi, I’m David.  | I offer deep relaxation pleasure sensuality and therapy in one unique experience | Help you come back and feel good in body and mind. |  | More info + photos: https://davidtouch.org | 📱 Best way to reach me: Text message |  | Enjoy, relax, and melt away. An upscale private space, a discreet oasis steps from Penn Station (8th Ave & 31st St, NYC). |  | Same-day appointments are possible. It is best to schedule your appointment 1 to 3 days in advance to secure a time slot.🙏 |  | 💉 Fully vaccinated (COVID & Monkeypox) |  | What I offer: |  | 🌿 Therapeutic Bodywork – Deep, relaxing, and restorative |  | 🔥 Therapeutic + Sensual – Melt into total release |  | ✨ Tantric Bodywork – Awaken your body, mind & senses |  |  | ⭐️⭐️⭐️⭐️⭐️ Reviews — 16+ years of hands-on experience | I combine deep tissue, tantric, Swedish, Lomi Lomi, Shiatsu, sports massage, and neuromuscular therapy — like a five-star spa… with a little extra magic 😉 |  | Each session is custom-tailored to you. | I love connecting with people, giving pleasure, and bringing ease through touch. For me, it's an art. |  |  | 🧼 Please arrive clean and scent-free (shower available upon request) | My space is spotless,
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#108 | gwayne | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=4 | gold=1 | available=0
+HEADLINE: More Touch in 26 Happy SPRING!!
+DESC: Convenient Astoria Queens location. Modalities are Swedish/Esalen trained at BodyElectric School and Shiatsu trained at the AMMA institute. Brand new Infinity Eartlite table.  Convenient Location in Astoria Queens. Take the R/M to Steinway or N/W train to Broadway.  Get back into your body. Treat yourself right!! Happy New Year . ALL AGES AND BODY TYPES WELCOME. Air conditioned space, Shower Available. Minutes away from all Manhattan and LIC hotels for OUTCALLS. Fully Vaccinated double boosted. Monkey Pox Times 2. Need a discount please ask.  |  | Reasons you might choose me.  |  | Your experiencing touch deprivation. |  | Body shame  |  | It’s time for a change |  | Need a welcoming ear to hear your body issue concerns.  |  | Lack of joy, fun and play in your life.  |  | You’re in the closet. |  | Election stress |  | Men in recovery are most welcome.  |  | Cuddlist training |  | Discounts for men over 60 |  |  | Sliding Scale |  | A truth |  | Queer people don't grow up as ourselves, we grow up playing a version of ourselves that sacrifices authenticity to minimise humiliation & prejudice. The massive task of our adult lives is to unpick which parts of ourselves are truly us & wh
+SERVICES: ['therapeutic', 'sensual', 'swedish']
+MEMBER SINCE: 
+
+#109 | LucasNY | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=10 | gold=1 | available=0
+HEADLINE: Slow touch. Real connection. Lasting sensation.
+DESC: Hey guys! |  | Im Lucas; a masculine, athletic and overall nice guy. |  | I offer an experience designed to be felt — deeply, fully, and without distraction. |  | A sensual massage experience for those who value intention, warmth, and real connection. My touch is slow, intuitive, and grounded — never rushed, always attentive |  | Hit me up and let’s create an experience that lingers long after the session ends. |  | This is not a routine massage, but an experience crafted to be memorable, intimate, and undeniably worth having. |  | Looking to elevate your sensations??? Ask me for my 4 hands massage. |  | Hope we get to meet soon.
+SERVICES: None
+MEMBER SINCE: 
+
+#110 | Davidmills | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=38 | gold=1 | available=1
+HEADLINE: Davidmills
+DESC: Hi, I’m David, a  massage therapist with several years of experience. I specialize in providing therapeutic and relaxing massage services, with a focus on creating a safe, respectful, and affirming space for the LGBTQ+ community—especially gay men. |  | My sessions combine Swedish, deep tissue, and intuitive techniques tailored to each client’s unique needs. I believe that massage is not only about relieving physical tension but also about helping people reconnect with their bodies in a caring and judgment-free environment. |  | Professionalism, discretion, and hygiene are my top priorities. Whether you’re looking to reduce stress, release chronic tension, or simply take time for yourself, I’m here to support your well-being with skilled, compassionate care. |  | TEXT ONLY ! NO CALLS 📞 |  | I CAN HOST!
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#111 | AnderNYCmasseur | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=43 | gold=1 | available=1
+HEADLINE: Ander_xxxfun
+DESC: Upcoming cities  |     |     living in the big city of New York  with a charming personality very easy going and chill kinda guy who is very respectful so feel free to come experience an amazing massage  that would free you soul , body and mind . |  | I’m fully vaccinated for your safety. | Pfizer 3/3 and Monkeypox ✅ |  |  Always want to have a good time and focus on my goals. I have  almost 5 years expertise in Swedish and Deep Tissue massage ✅ | Aromatherapy  ✅Sensual/****** massage ✅ | Body grooming ✅ |  | Offer :60 min. 90min. 120min  |  | Incall and Outcall available. | Contact me by text message or WhatsApp. I rather calls vs.e-mail. very flexible and easygoing.   Let's talk and make it happen. Your body will thank you📲 | ✅ Cash | ✅ Venmo | ✅ Zelle | Also offer ✅4 hand massage Available to travel  can also travel within the states ✈️ |  |   I’m Very open to meet people and please don’t hesitate on asking any question .You can expect to be treated professionally and touched with strong hands. I do not discriminate based on age, race or body type. Male/Females welcome  |  | Very discreet and respectful here . I host at my very clean studio in NYC ,with a shower and clean towels
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#112 | Ken_NYC | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=117 | gold=1 | available=0
+HEADLINE: Passionate Trained and Certified Masseur
+DESC: 🚨 NOTICE🚨 | If you’re wondering about cities outside of NYC, that I have listed as Near-Travel cities (Philly, and other locations around the North East), I use the feature to mean that I’m willing to travel to you for outcall 🙏🏽 |  | Welcome ✨ | You’ve come upon 1 of the top rated masseurs in NYC, and nation wide 🙏🏽 |  | 🔔 For clarification, the lower rated listed under “therapeutic” and “deep tissue”, are for my new, shorter 30 min offerings. A more concise session where I strictly focus on your muscular problem areas, and focus on either upper or lower body, depending on your needs. Giving you a small taste of what my full body experience entails 🔔 |  | It is my belief that the best kind body work, calls for great knowledge, strength, vulnerability, mindfulness, and spirit. With every stroke, I listen carefully to your body, receive your energy, and reciprocate passionately.  | And on that note, let’s get the conversation started to schedule your first elevated massage session with me 🙌🏽  in my uniquely charming, yet sophisticated and inviting speakeasy-space. I’m eager and excited to welcome you here with open arms. |  | While I do ask to move the conversation off-site for safe
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#113 | Cubanangel | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=34 | gold=1 | available=1
+HEADLINE: Celestial Indulgence™ by Cuban Angel
+DESC: Celestial Indulgence™ by Cuban Angel is not a massage (A Bespoke Therapeutic Encounter for the Discerning Gentleman) — it is a meticulously orchestrated ritual of rejuvenation, indulgence, and connection. |  | I also offer a business card with several premium benefits offers. |  | For the gentleman who understands that luxury is not a price, but a state of being, I offer an experience curated to transcend the ordinary. With over eight years as an artisan of touch and presence, I blend precision, intuition, and a refined aesthetic into a bespoke journey designed exclusively for you. |  | Every detail — from the impeccably tailored ambiance, to the rare essential elixirs, to the deliberate rhythm of each stroke — is crafted to awaken not only the body, but the unspoken parts of the soul. Time slows. Tension dissolves. You are seen, understood, and indulged at the highest level. |  | My clientele is select, my availability limited. This is not a session you book — it is an encounter you are invited into. |  | For the man who has everything… except this.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#114 | Davidlatinhands | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: 🔥 Latino • Discreet • Passionate • Available 💋
+DESC: 💆‍♂️✨ Friendly, discreet, and passionate massage experience ✨💆‍♂️ | 🔒 Complete discretion and respect 🔒 | 😌 Relaxing massages in a comfortable and welcoming atmosphere 🧘‍♂️💫 | 🤗 Friendly, easygoing, and genuinely caring ❤️ | 🔥 Versatile, passionate, and attentive to your needs 😈💋 | 😘 Great kisses, amazing chemistry, and personalized attention 💖 | 🌹 Enjoy fantastic moments of relaxation, connection, and pleasure ✨ | 🕒 Available and ready to make your experience unforgettable 💫 | 💯 Clean, respectful, professional, and always positive vibes 🫶🔥 |  | My location:  51w 14th st Unión Square Manhattan, NY |  | 🙌🏻 I offfer the option of 4 hands massage too  | https://rentmasseur.com/Polohands
+SERVICES: None
+MEMBER SINCE: 
+
+#115 | Valentinoxxx | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=10 | gold=1 | available=1
+HEADLINE: Let me delight you, let me entertain you.
+DESC: Hey! I'm Valentino, adventurous peruvian guy, versatile, passionate and always horny.  |  | Let's discover new horizons together and live unforgettable moments. My goal is to satisfy your fantasies and make you feel special in every encounter. If you're seeking a genuine and relaxing connection, I'm here to make your dreams come true. |  | Text me and let's see how we can plan our next adventure. Cannot literally wait to excite you, you won't be disappointed, let's go all the way! |  | Available to travel.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#116 | StrongStrokes | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=92 | gold=1 | available=0
+HEADLINE: Muscled Bodywork
+DESC: COVID-19 vaccinated and boosted ✅  | Monkeypox fully vaccinated (both shots) ✅  |  | Hey guys, |  | Thanks for visiting my page. I provide a full-body M4M massage in my cozy studio on the Lower East Side. I have worked on all different body types and addressed an array of issues in my 8 year long carrer as a massage therapist. |  | I use organic massage lotion or oil.  My sessions combine a few techniques such as acupressure, Swedish and Deep Tissue.  I've taken every measure to ensure a relaxing and healing vibe- soft music, candles, heated massage oil, heated table with crisp linens.  I offer showers before or after the massage. |  | I love what I do and continue to study different modalities and attend massage workshops.  My goal is to make you feel completely stress free and relaxed. |  | 4 hand tandem massage available upon request.  |  | Email or text to schedule an appointment.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#117 | AdrianNYC | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=7 | gold=1 | available=0
+HEADLINE: Get ready for a truly indulgent experience!
+DESC: It all starts with you unwinding as you undress and lay down on my luxurious massage table. I have four years of experience giving massages in spa settings and for private clients. I specialize in invigorating Swedish massages that will melt away your stress. Once you're completely relaxed, we have the perfect opportunity to enhance the experience with a blissful happy ending.  |  | You can visit me at my cozy private apartment in Hudson Yards (37th St & 10th Ave), or I can come to your location for ultimate convenience.  |  | There's nothing more fulfilling for me than helping you feel utterly relaxed and liberated from tension, leaving you in a state of pure happiness.  |  | **Rates:**  |  | - $160 for a revitalizing 60-minute session  | - $260 for an extended 90-minute escape  | - Note: There’s an additional $100 charge for outcalls within the area. Gratuity is always appreciated, especially if you leave feeling even more satisfied!  |  | I also offer a 4-hands massage. |  | The easiest way to reach me is by sending a text message to [PHONE].  |  | **Clean Living:**  |  | Your safety and comfort are my top priorities! I use air filtration technology to ensure flawless air qualit
+SERVICES: ['therapeutic', 'sensual', 'swedish']
+MEMBER SINCE: 
+
+#118 | Alexfeels | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=6 | gold=1 | available=1
+HEADLINE: Relax & Unwind
+DESC: Hello- My name is Alex. I offer a deeply therapeutic, and sensual experience. Relaxing you from head-to-toe. With a refined touch, I intuitively adjust techniques and pressure to suit your body’s specific needs, ensuring a truly personalized and restorative experience. |  | If you are interested in booking an appointment- please text for all inquiries. I look forward to meeting you.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#119 | Lucasking | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: Hot Latin Masseur🔥 Unforgettable Experience 💦
+DESC: Young boy🤤, I am new in this town,  spend one of the best moments of your life. I am a versatile guy, cheerful, funny, very hot, good body, attractive and very nice lips. Willing to any kind of travel inside and outside the country🔥😋
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#120 | OmarCures | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=69 | gold=1 | available=1
+HEADLINE: A Unique Healing Experience!
+DESC: with over 8 years in the industry, I have managed to hone my skills to create a personalized session for every individual.  |  | Whether you’re looking to release some stress, take care of some knots, restore your muscles and body, or just treat yourself, my approach is to come up with something special tailored to your needs. |  | My studio is in the east village, a cozy space for the ultimate privacy and relaxation. From swedish, to deep tissue, stretching to hot stones, your session will not fall short of what you’re looking for.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#121 | Gorgeousxxx | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=25 | gold=1 | available=1
+HEADLINE: crème de la crème
+DESC: Hello my name is Gorgeous. I’m a skilled masseur and a complete gentleman. Let’s meet after a long days work for a relaxing and pleasant massage. I can fulfill your wildest fantasies … | *Incalls and Outcalls | *Massage Table | *Upscale Location/Shower Available
+SERVICES: ['sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#122 | Tiagogato | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=8 | gold=1 | available=1
+HEADLINE: Professional Muscle Masseur | Expert in Relaxation
+DESC: Hi, I’m Gabriel—a strong, masculine, and discreet professional committed to providing exceptional massage therapy tailored to your specific needs. With a confident and calming presence, I create a welcoming environment where you can fully unwind and recharge. |  | I specialize in a range of massage techniques, including deep tissue, Swedish, and relaxation therapy. My skilled hands and intuitive approach ensure a personalized experience designed to relieve tension, reduce stress, and promote overall well-being. Whether you’re seeking targeted muscle recovery or a tranquil escape from daily pressures, I’m here to help you feel your best. |  | Clean, respectful, and attentive, I value trust and comfort in every session. Whether you’re a first-time client or looking for a regular massage therapist, I’m dedicated to exceeding your expectations with every visit. |  | Let’s work together to bring balance and relaxation back into your life.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#123 | Mike_XL | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=30 | gold=1 | available=1
+HEADLINE: Best mix of techniques
+DESC: I have trained and have experience in Swedish , deep tissue and sport massages.  | My technique is unique to each person and make you feeling wonderfully relaxed.  |  | At my Studio you will be provides with a shower, clean towels, bottled water, candles,music and free parking . | I’m traveling with my table to clients houses if needed.  |  | I’m happy to serve people and welcome everyone to my studio: gay/LGBT community. | Very friendly to everyone ,It’s important for me to get feedbacks about my work .  |  | Feel free to ask me any questions you may have . |  | 4 hands massage is available with AndresB. ask me for more details |  | I am fully vaccinated (COVID-19) |  | Monkey pox vaccinated. |  | COVID-19 Notice: I have always taken sanitization, disinfection and your safety as a top priority in my practice. Sheets and towels are washed with bleach, all surfaces are sanitized after every massage. I hope you are taking the proper steps to prevent the spread of viruses and dont let the fear stops getting your treatment.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#124 | RoyalTreatment | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=10 | gold=1 | available=0
+HEADLINE: Experience The Royal Treatment
+DESC: Welcome to The Royal Treatment. I am 6 foot 9, 220 pounds. Straight male. Professional massage therapist and fitness expert. I bring a unique blend of expertise and professionalism to every session.  |  | Indulge in a transformative wellness experience tailored for the discerning client. I am a highly skilled massage therapist specializing in a fusion of therapeutic touch and holistic healing using my proprietary blends of premium oils. These custom oil infusions are designed to restore, detoxify, and rejuvenate—supporting optimal health and vitality. |  | My practice focuses on relieving sore muscles, reducing the appearance of scar tissue and stretch marks, and stimulating lymphatic drainage to boost immunity and overall wellness. Every session is curated to awaken your body’s natural healing response, leaving you feeling stronger, lighter, and radiantly renewed. |  | For those seeking deeper relief or indulgent relaxation, I offer: | 	•	Deep Tissue & Swedish Massage – Precision techniques to target chronic tension and promote circulation. | 	•	Thai Massage – Assisted stretching and pressure point therapy to restore energy flow and flexibility. | 	•	Sensual  Massage – A luxurious
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#125 | Ssergey | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=18 | gold=1 | available=0
+HEADLINE: Back for a limited time
+DESC: Whether you are looking for a deep or relaxing session, I tailor each session to your comfort level and specific wants and needs. Feel my X LARGE hands all over your sore muscles and aching body. |  | Located in Downtown Manhattan. I can also travel within Manhattan and Downtown Brooklyn.  |  | 📲 TEXT MESSAGE is the best and quickest way to reach me. |  | My personal energy is healing and calming; I stay on TOP of my fitness and yoga practice. Come relax on my table and get more than just your kneads met 😘
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#126 | Nickhalden | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=40 | gold=1 | available=1
+HEADLINE: Blonde Masseur
+DESC: Hey guys, I’m back! Available to meet your needs, 170lbs of muscle from NYC. I provide long fluid strokes to completely relax your mind and body. I’m easy to communicate with and will do everything I can to make our time together special. Best way to contact me is through text message. You will get the quickest response that way.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#127 | BreatheOutNYC | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=9 | gold=1 | available=1
+HEADLINE: Licensed and stamped approval
+DESC: Hello!!  | I'm Mateo :) Hard day? Allow me to set you at ease. I am a TOP notch, LICENSED  professional and you deserve a bit of relaxation. Therapeutic/sensual/deep tissue/fully nude or clothed sessions. If you are not a premium member I kindly ask for you to not ask for private photos.🙈 All photos, contact information are up to date, All rates for private massage are final and are right here on my page:) I travel with my own table and hypoallergenic massage oils. I am also available for private parties and corporate events (different rates apply)   I also offer late night/early morning out-calls. 🌚✨. Text or call  for an immediate reply.  | Again  | TEXT OR CALL FOR AN IMMEDIATE REPLY | I hope to see you soon.  |  | All private 1 on 1 sessions start at rate below: | There is a $25 deposit for all bookings which is deducted from the massage price via Venmo or Zelle. Sorry, no exceptions or negotiations. |  | Deep tissue  | Or | Deep tissue sensual +$25 |  | In-call 60 min $150   | Out-call 60 min $175 |  | In-call 90 min $200 | Out-call 90min $225 |  | ** In calls are limited** |  | ** Covid✅ Monkey Pox✅ Meningitis✅  | Flu shot✅ vaccinations are up to date  |  | License obtained b
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#128 | CuteSmoothBobby | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=0
+HEADLINE: Deep Swedish and Relaxing Massage by Bobby
+DESC: *FULLY COVID VACCINATED/BOOSTERED* |  | *THOSE WHO REACH OUT WITH ONE WORD TEXTS WILL BE IGNORED AND BLOCKED. PLEASE START WITH A PROPER INTRODUCTION, YOUR NAME, AND WHERE YOU SAW MY AD* |  | Give yourself the pleasure of experiencing a very enjoyable and thorough Massage. Treat yourself to a wonderful experience with a full body, deep tissue massage with very experienced, professional hands, with an intuitive touch on my massage table. Sensual massage with the right amount of pressure to get out all of the kinks and have you feeling new. I have 20 years of experience and happen to be extremely good at what I do. All my years experience have gained me the foresight and given me the knowledge to know exactly how to deep to go and where you will need it the most. I fully massage from head to toe and thoroughly enjoy what I do.  |  | Bobby here, very young looking 50 year old Native New Yorker of Spanish and Italian descent. I stand at 5' 5"  145  42 chest 32 waist with a naturally smooth dancers build, light olive complexion, black hair brown eyes, cute tanned and naturally smooth. Have an active gym membership with a dancers/gymnast build and exercise daily. Short and fit here  :-) 
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#129 | Igor_Masseur | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=117 | gold=1 | available=1
+HEADLINE: Your best bet
+DESC: I have over five years of experience, mostly with body-to-body and tantric massage. I can host or meet you at your place. Currently, I am staying in Manhattan (Hell’s Kitchen)It’d be a pleasure to meet you and provide you a relaxing and ****** massage experience!
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#130 | AlvenH | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=12 | gold=1 | available=0
+HEADLINE: Happiness at fingertips
+DESC: Hey thanks for checking my profile my name is Alven I provide deep and sensual combination massage make sure u will have a wonderful experience  | Only SMS
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#131 | Arthurb | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=17 | gold=1 | available=0
+HEADLINE: Arthur
+DESC: Hello, I’m Arthur. Thank you for visiting my ad. 
+ | 
+ | I welcome anybody who wishes to experience my massage. I offer deep tissue, swedish, sports techniques and will help you to remove discomfort and back pain, restless legs and glutes. Each session is tailored to your personal needs and my goal is to make you feel relaxed by the end of massage.
+ | 
+ | Allow your body feel the touch of warm hands, get all the knots out and release all the tension and stress left during the day. Book your session now.
+ | 
+ | Texts preferred over the phone calls. Thank you, look forward to seeing you.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#132 | HelioStretch | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=5 | gold=1 | available=0
+HEADLINE: Daddy Hands: Body Renewal
+DESC: Indulge in personalized athletic recovery sessions with Body Renewal by Nick for premium recovery and injury prevention services.  |  | Techniques and services include myofascial release, passive/active stretching, guided meditation, and breathwork. |  | Add-on service options: heated jade mat, compression sleeves, and aromatherapy for the ultimate relaxation experience. |  | Certified Personal Trainer with additional coursework in in myofascial release, Alexander Technique, functional movement screening, and more... |  | * PHONE SPAM FILTER IN PLACE  * |  | Ask about discounts for personal trainers, massage therapists or those working in advocacy or the arts!
+SERVICES: None
+MEMBER SINCE: 
+
+#133 | DieterNY | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=7 | gold=1 | available=1
+HEADLINE: Big German Daddy Masseur in ft lauderdale right no
+DESC: hey  | i am a very sweet and nice man with huge hands, who knows how to work the kinks in your body  | i am 6'4"/ 193, 240#/112 kg and always have a smile on my face, i am trained all over the world and i am certified in NY State   |  | so come over and enjoy my work and let me enjoy working on you |  | Full COVID19 Vaccinated 3x
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#134 | CodyNYC | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=9 | gold=1 | available=0
+HEADLINE: A Relaxing Massage In Hells Kitchen
+DESC: I create a comfortable, welcoming space where you can relax and unwind. Every session is tailored to what feels best for you, whether that’s deeper pressure to release tension or a lighter, more soothing touch. My goal is simple: to help you feel relaxed, recharged, and taken care of. |  | I host in a private, discreet space in Hell’s Kitchen, or I can travel to you for added convenience.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#135 | MarcoPoloBig | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=11 | gold=1 | available=1
+HEADLINE: Mascular Europian Boy
+DESC: Hey there!  | In New York until 3rd July! | Provincetown MA 3rd July to 9th September  |  | Thank you for your interest in my services. I offer professional therapeutic, deep tissue, sensual, and/or eroti c full-body massages tailored to your unique needs and desires.  |  | I work on a professional massage table using your preferred heated, high-quality cream or oil.. | Incall sessions are conducted in my private studio; in a clean, soothing, and relaxing environment in Hell’s Kitchen NYC or outcalls to your place. |  | I am available to text to schedule anytime. And I prefer schedule in advance. The best way is to text on my persinal phone number.  |  | No phone calls please!  |  | Looking forward to meeting you! | Please note: I maintain a very strict client privacy & confidentiality policy!
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#136 | Ksander | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=12 | gold=1 | available=0
+HEADLINE: Originally from the Caucasus
+DESC: I am from the Caucasus part of the Russia .  |  | I was trained massage in Russia , and continue my study at New York.  |  | If you are interested my offer  | 4 types of massage. |  | 1. Sport massage  |  | 2. Therapeutic Swedish style massage. |  | 3. Sensual massage, which is also a relaxing Swedish style to more deep tissue if you prefer, the goal of this treatment, is to release all your tensions , with me focused on you. | and several other types of massages  |  | I work in West village private studio |  | I practice 4 hands massage  | If you have any questions, please write and I will be happy to answer.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#137 | Burk | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=10 | gold=1 | available=0
+HEADLINE: Healing arts
+DESC: A Touch of Class – Tailored Massage Therapy Just for You |  | If you’re seeking a truly skilled and rejuvenating deep tissue massage, your search ends here. With several years of experience in professional massage therapy, I focus on providing personalized treatments that respond to your body’s unique needs. |  | Each session is customized—whether you need therapeutic attention, light relaxation, or deep pressure relief, I’ve got you covered. Your comfort, satisfaction, and well-being are my top priorities, and I guarantee a 100% satisfying experience. |  | Proudly part of the LGBTQ+ community and from New York, I bring a welcoming, respectful, and affirming energy to every session. |  | Have questions, requests, or specific preferences? Don’t hesitate to reach out—I’m here to make your massage experience exceptional.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#138 | Mattlatino | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=0
+HEADLINE: Dominant massage
+DESC: Latino lad with strong hands to give you the greatest physical pleasure. Try me and you'll see. | I have a host in hell kitchen Manhattan 😉
+SERVICES: None
+MEMBER SINCE: 
+
+#139 | VladBrazilian | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=9 | gold=1 | available=1
+HEADLINE: Bruno
+DESC: Fully vaccinated + Booster and Monkeypox vaccinated  |  | Hi, I am a Brazilian masseur looking to provide a good experience and atmosphere to my clients.  |  | I enjoy making new connections and I am very open minded, tell me if you have a special request in your massage and we can make it happen. All ages welcome.  |  | I speak English/Spanish and Portuguese. |  | For more info or to set an appointment: Text me. | A text message is better!
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#140 | UNcutXL | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=36 | gold=1 | available=0
+HEADLINE: Unique All-Nude Massage Experience – Pure Bliss!
+DESC: Why Choose Me as Your Masseur? | My client described it best: | ‘If you have never had this kind of massage, my experience was I soon stopped trying to figure out what part of him was massaging me (chin, knee, hand, foot, arm, torso…) and just lost myself in the feeling of my skin alive with touch, sounds, and the smell of oils and sweat… it was the best massage I ever had, combined with the best orgasm!’” |  | I am an easy-going, charming, and educated massage professional with 14 years of experience. My technique is a unique blend of West Indian and Tantra styles infused with classical massage, creating a transformative, one-of-a-kind experience. Working completely nude, I use my entire body to bring you into a state of deep relaxation, connection, and bliss. |  | What i do? |  | My massage goes far beyond relieving aches and stress—it is a holistic ritual of healing and wellness that touches every aspect of your being. By incorporating the principles of Tantra into a conventional massage, I guide you toward surrender. This surrender—by both the giver and the recipient—is the foundation of the experience. |  | Whether or not there is genital touch depends on your desires, but eve
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#141 | LatinMiddleEast | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=15 | gold=1 | available=1
+HEADLINE: Latín/Middle eastern
+DESC: Hello!  My name is Alex, I’m a professional ******/Therapeutic Masseur, who specializes in deep tissue massages.  | Trained and certified by Hilton resorts and spa’s.  | Best of both worlds Half Omani/ half Mexican. | Educated, discrete, respectful, clean, and a professional person.  | Very open minded, just make your special request and we can make it happen.  | Let me use my magic hands to help you have a good time, you deserve it.  | Incall / Outcall  | Have my own  prived  studio, groun level, easy access and handicap friendly  👨🏼‍🦽 | Travel to Manhattan, Queens, Jersey and BK with no extra charge, SAME RATE!  | FULLY VACCINATED + BOOSTER🦠 | MONKEYPOX vaccinated 🐒✅ | Well care feets 👣 | Se habla español/English | For more pictures, info or to set an appointment, just Text me. | CALLS WILL BE IGNORED! Just text 🚫
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#142 | JhondDl | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=6 | gold=1 | available=0
+HEADLINE: The best way 🔥
+DESC: I offer a relaxing sensual, therapeutic, or ****** massage |  Discretion is priority   | Available to host or travel | 📞 Call or text for quickest response  
+SERVICES: None
+MEMBER SINCE: 
+
+#143 | Sebas_fit | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=9 | gold=1 | available=0
+HEADLINE: Sebastian_masseur
+DESC: Welcome everyone.  🙌 |  | Relax the mind, Renew the body, Revive the soul. |  | Young boy, very friendly, discreet and well educated. |  | Are you dealing with tight shoulders after long hours at your desk? 🖥️ A targeted Deep Tissue Massage can help release muscle tension and restore your mobility. 💆‍♂️ Book your session today and feel refreshed! 📅  |  | ⬜ Services : Sensual massage, Tantric massage, ****** massage, Intimate wellness , Deep relaxation. friendly massage, Male to male massage (M4M), Men's wellness. Stress relief, Mindful touch, Sensory awakening |   |  | ⬜ Let me make you feel special 😊
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#144 | ProMassuer | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=1
+HEADLINE: Best Massage in NYC
+DESC: 💪🏻 M4M Male Massage by Masculine Jock 👊🏻 |  | I offer a full body quality massage that will leave you totally relaxed and satisfied. With soothing hands and a very intuitive touch leaving you with a relaxing and therapeutic experience. |  | I'm a very friendly masculine and laid back guy who knows how to make another person feel comfortable. |  | In calls can provide massage table , soothing oils , relax music and clean hot towels in private place in midtown Manhattan  |  |  | Let me work on you and your body with my masculine and relaxing touch and provide you with a unique session of pampering your body. |  | Please text to set an appointment. If I don't answer please leave a message and I will get back to you.
+SERVICES: ['therapeutic', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#145 | DrewArmyVet | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=1
+HEADLINE: Ex-Military (US Army) Professional Masseur
+DESC: Friendly and well-spoken professional with excellent hygiene.  Multi-lingual. My mission is to ensure your complete satisfaction.  |  | Got them all vaccines, including the 2-regiment monkeypox jab. Drug and disease free. Avid athlete. Run, bike, gym. Nicest guy you'll ever meet.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#146 | LatinoUcXL | manhattan-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=0
+HEADLINE: Best hands in town
+DESC: Hello everyone; my name is Humberto.  |  | Let's start with a big thank you for checking out my ad. Here's now a little more about me: I'm a latin guy, originally from Mexico and living in New York City for the last few years (conveniently located near Columbus Circle). I have big strong hands, I’m tall, 6,2', with an athletic built, lightly haired body, I’m good at relaxin, deep tissue and ****** massages. |  | No discrimination here at all based on race, age or physical appearance or any other type. |  | • Massage (relaxing, Swedish, deep tissue). | • ****** massage ( ✊🏼🍆💦 ) | • MASSAGE PLUS ( 😈 🍆💦🍑). |  | Cash, Venmo and Zelle accepted. | Up to date with all of my vaccines including Covid and monkeypox. |  | If you feel like it take a look at my X |  | Best way to contact me is BY TEXT MESSAGE. Looking forward to hearing from you soon.
+SERVICES: ['sensual', 'deep tissue']
+MEMBER SINCE: 
+

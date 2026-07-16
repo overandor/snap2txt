@@ -1,800 +1,800 @@
-            row = json.loads(line)
-            if row.get("views_per_day", 0) > 0:
-                results["has_views_per_day"] += 1
-            else:
-                results["missing_views_per_day"] += 1
-            if row.get("visits", 0) > 0:
-                results["has_visits"] += 1
-            if row.get("member_since"):
-                results["has_member_since"] += 1
+Optimize: time-to-booking and qualified-client yield.
+Not: more scripts, more cron jobs, more visits, more scraping.
 
-    results["pass"] = results["has_views_per_day"] > 0
-    return results
-
-
-# ─── Gate 2: Enrichment (public visits + member-since) ───
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-
-def fetch_profile_views(username: str) -> dict:
-    """Fetch public visits and member-since from a profile page."""
-    result = {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
-    try:
-        r = requests.get(f"https://rentmasseur.com/{username}", headers=HEADERS, timeout=12)
-        if r.status_code != 200:
-            return result
-        if "CrowdSec" in r.text:
-            result["error"] = "captcha"
-            return result
-
-        member = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
-        member_since = member.group(1).strip() if member else ""
-
-        visit_values = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
-        visits = max(visit_values) if visit_values else 0
-
-        days_online = 0
-        if member_since:
-            try:
-                joined = datetime.strptime(member_since, "%b %d, %Y")
-                days_online = max(1, (datetime.now() - joined).days)
-            except ValueError:
-                pass
-
-        views_per_day = visits / days_online if days_online > 0 else 0
-
-        return {
-            "visits": visits,
-            "member_since": member_since,
-            "days_online": days_online,
-            "views_per_day": views_per_day,
-        }
-    except Exception as e:
-        result["error"] = str(e)
-        return result
-
-
-def enrich_bios(input_path: Path = RAW_PATH,
-                output_path: Path = ENRICHED_PATH,
-                workers: int = 16,
-                rate_limit: float = 0.5) -> dict:
-    """Enrich bios with public visits and member-since dates."""
-    bios = [json.loads(l) for l in input_path.open() if l.strip()]
-    total = len(bios)
-    result = {"total": total, "enriched": 0, "failed": 0, "captcha": False}
-
-    print(f"Enriching {total} bios with {workers} workers (rate_limit={rate_limit}s)...")
-
-    usernames = [b.get("username") for b in bios if b.get("username")]
-
-    # Check first request for captcha
-    test = fetch_profile_views(usernames[0])
-    if test.get("error") == "captcha":
-        result["captcha"] = True
-        result["error"] = "CrowdSec captcha active. Cannot enrich. Wait for ban to clear."
-        print(f"BLOCKED: {result['error']}")
-        return result
-
-    # If first works, proceed with batch
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(fetch_profile_views, u): u for u in usernames}
-        view_map = {}
-
-        for i, fut in enumerate(as_completed(futures)):
-            u = futures[fut]
-            try:
-                view_map[u] = fut.result()
-                if view_map[u].get("error") == "captcha":
-                    result["captcha"] = True
-                    print(f"Captcha detected at {u}. Stopping.")
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    break
-            except Exception as e:
-                view_map[u] = {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
-
-            if (i + 1) % 100 == 0:
-                print(f"  Progress: {i+1}/{total} ({result['enriched']} enriched)")
-
-    # Update bios
-    for b in bios:
-        v = view_map.get(b.get("username"), {})
-        b["visits"] = v.get("visits", 0)
-        b["member_since"] = v.get("member_since", "")
-        b["days_online"] = v.get("days_online", 0)
-        b["views_per_day"] = v.get("views_per_day", 0)
-        b["scraped_at"] = datetime.now(timezone.utc).isoformat()
-        if b["views_per_day"] > 0:
-            result["enriched"] += 1
-        else:
-            result["failed"] += 1
-
-    # Save
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w") as f:
-        for b in bios:
-            f.write(json.dumps(b, ensure_ascii=False, default=str) + "\n")
-
-    print(f"Done: {result['enriched']} enriched, {result['failed']} failed")
-    return result
-
-
-# ─── Rank by views/day ───
-
-def rank_by_views_per_day(input_path: Path = ENRICHED_PATH,
-                          output_path: Path = RANKED_PATH) -> dict:
-    """Rank real bios by views_per_day."""
-    if not input_path.exists():
-        return {"error": "Enriched file does not exist. Run enrich-views first."}
-
-    bios = [json.loads(l) for l in input_path.open() if l.strip()]
-    has_views = [b for b in bios if b.get("views_per_day", 0) > 0]
-
-    if not has_views:
-        return {"error": "No bios have views_per_day. Enrichment needed."}
-
-    has_views.sort(key=lambda b: b.get("views_per_day", 0), reverse=True)
-
-    with output_path.open("w") as f:
-        for i, b in enumerate(has_views, 1):
-            f.write(
-                f"#{i} | {b.get('username')} | {b.get('city')} | "
-                f"visits={b.get('visits',0)} | days={b.get('days_online',0)} | "
-                f"views/day={b.get('views_per_day',0):.2f} | "
-                f"rating={b.get('ratingAverage')} | reviews={b.get('reviewsCount')} | "
-                f"gold={b.get('isGold')} | available={b.get('isAvailable')} | "
-                f"certified={b.get('isCertified')}\n"
-            )
-            f.write(f"HEADLINE: {b.get('headline','')}\n")
-            desc = (b.get("description") or "").replace("\n", " | ")
-            f.write(f"DESC: {desc[:1200]}\n")
-            f.write(f"SERVICES: {b.get('services')}\n")
-            f.write(f"MEMBER SINCE: {b.get('member_since','N/A')}\n\n")
-
-    result = {
-        "total_bios": len(bios),
-        "ranked_bios": len(has_views),
-        "top_5": [{"username": b["username"], "views_per_day": b["views_per_day"],
-                    "headline": b.get("headline", "")}
-                  for b in has_views[:5]],
-        "output": str(output_path),
-    }
-    return result
-
-
-# ─── Corpus atomizer (feature extraction) ───
-
-def atomize_bios(input_path: Path = RAW_PATH,
-                 output_path: Path = DATA_DIR / "bio_atoms.jsonl") -> dict:
-    """Extract structural atoms from each bio."""
-    bios = [json.loads(l) for l in input_path.open() if l.strip()]
-    count = 0
-
-    with output_path.open("w") as f:
-        for b in bios:
-            headline = b.get("headline", "")
-            desc = b.get("description", "")
-            full = (headline + " " + desc).lower()
-
-            atom = {
-                "id": b.get("id"),
-                "username": b.get("username"),
-                "city": b.get("city"),
-                "headline_len": len(headline),
-                "desc_len": len(desc),
-                "word_count": len(full.split()),
-                "services_count": len(b.get("services") or []),
-                "rating": float(b.get("ratingAverage") or 0),
-                "reviews": b.get("reviewsCount", 0),
-                "is_gold": bool(b.get("isGold")),
-                "is_available": bool(b.get("isAvailable")),
-                "is_certified": bool(b.get("isCertified")),
-                "has_cta": any(w in full for w in ["text", "call", "message", "book", "contact", "reach", "email", "schedule"]),
-                "has_price": bool(re.search(r'\$\d+', full)),
-                "has_urgency": any(w in full for w in ["now", "today", "same-day", "available", "limited", "visiting", "this week"]),
-                "has_deep_tissue": "deep tissue" in full,
-                "has_sports": "sports" in full or "athletic" in full or "recovery" in full,
-                "has_trust": any(w in full for w in ["certified", "licensed", "trained", "professional", "discreet", "clean", "private"]),
-                "has_location": any(w in full for w in ["manhattan", "bronx", "brooklyn", "nyc", "new york", "studio", "incall", "outcall", "travel"]),
-                "has_hygiene": any(w in full for w in ["clean", "shower", "hygiene", "safe", "sanitized", "fresh", "towels"]),
-                "has_humor": any(w in full for w in ["wolf", "funny", "joke", "desk goblin", "posture", "laugh", "lol"]),
-                "has_explicit": any(w in full for w in ["naked", "nude", "sensual", "erotic", "sexual"]),
-                "newline_count": desc.count("\n"),
-                "sentence_count": max(1, desc.count(".") + desc.count("!") + desc.count("?")),
-            }
-            f.write(json.dumps(atom, ensure_ascii=False) + "\n")
-            count += 1
-
-    return {"atomized": count, "output": str(output_path)}
-
-
-# ─── Experiment measurement ───
-
-def compute_lift(before: dict, after: dict) -> dict:
-    """Compute real lift between before/after dashboard snapshots."""
-    bv = before.get("profile_views", 0)
-    av = after.get("profile_views", 0)
-    bc = before.get("contact_clicks", 0)
-    ac = after.get("contact_clicks", 0)
-    be = before.get("new_emails", 0)
-    ae = after.get("new_emails", 0)
-
-    before_ctr = bc / bv if bv > 0 else 0
-    after_ctr = ac / av if av > 0 else 0
-
-    return {
-        "lift_views": av - bv,
-        "lift_clicks": ac - bc,
-        "lift_emails": ae - be,
-        "before_ctr": before_ctr,
-        "after_ctr": after_ctr,
-        "ctr_lift": after_ctr - before_ctr,
-        "ctr_lift_pct": ((after_ctr - before_ctr) / before_ctr * 100) if before_ctr > 0 else 0,
-        "result": "winner" if after_ctr > before_ctr else "loser",
-    }
-
-
-# ─── Receipt ledger (SHA-256 chained) ───
-
-class ReceiptLedger:
-    def __init__(self, path: Path = DATA_DIR / "receipts" / "ledger.jsonl"):
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.entries: List[dict] = []
-        self._load()
-
-    def _load(self):
-        if self.path.exists():
-            for line in self.path.open():
-                if line.strip():
-                    self.entries.append(json.loads(line))
-
-    def add(self, action: str, description: str, data: dict) -> dict:
-        prev_hash = self.entries[-1]["hash"] if self.entries else "0" * 64
-        ts = datetime.now(timezone.utc).isoformat()
-        entry = {
-            "index": len(self.entries),
-            "timestamp": ts,
-            "action": action,
-            "description": description,
-            "data": data,
-            "prev_hash": prev_hash,
-        }
-        entry_str = json.dumps(entry, sort_keys=True)
-        entry["hash"] = hashlib.sha256(entry_str.encode()).hexdigest()
-        self.entries.append(entry)
-        with self.path.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
-        return entry
-
-    def verify(self) -> bool:
-        for i, entry in enumerate(self.entries):
-            prev = self.entries[i - 1]["hash"] if i > 0 else "0" * 64
-            if entry["prev_hash"] != prev:
-                return False
-            check = {k: v for k, v in entry.items() if k != "hash"}
-            expected = hashlib.sha256(json.dumps(check, sort_keys=True).encode()).hexdigest()
-            if entry["hash"] != expected:
-                return False
-        return True
-
-    def summary(self) -> dict:
-        return {
-            "total": len(self.entries),
-            "valid": self.verify(),
-            "last_action": self.entries[-1]["action"] if self.entries else None,
-        }
-
-```
-
-auth.py:
-```
-"""
-AuthSession — login, JWT, session health.
-
-Never stores raw password in code. Reads from env vars or keychain.
+Client Quantity = HighIntentSources × CaptureRate × QualificationRate
+Conversion Speed = DetectionLatency + DraftLatency + ApprovalLatency + ReplyLatency
+Revenue = ConfirmedBookings × AverageSessionValue × ShowRate × RepeatRate
 """
 
+import hashlib
 import json
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+
+
+# ─── Urgency tiers ─────────────────────────────────────────────────
+
+URGENCY_NOW = "NOW"          # booking language + today/tomorrow + NYC + direct question
+URGENCY_HOT = "HOT"          # profile visitor + prior message + location match
+URGENCY_WARM = "WARM"        # profile visitor only
+URGENCY_COLD = "COLD"        # social mention / search discovery
+URGENCY_IGNORE = "IGNORE"    # spam, competitor, unsafe, out-of-area
+
+URGENCY_ORDER = [URGENCY_NOW, URGENCY_HOT, URGENCY_WARM, URGENCY_COLD, URGENCY_IGNORE]
+
+# ─── Reply classes ─────────────────────────────────────────────────
+
+REPLY_BOOKING_NOW = "booking_now_reply"
+REPLY_PRICE_QUESTION = "price_question_reply"
+REPLY_LOCATION_QUESTION = "location_question_reply"
+REPLY_REPEAT_CLIENT = "repeat_client_reply"
+REPLY_INQUIRY = "inquiry_reply"
+REPLY_FOLLOW_UP = "follow_up_reply"
+REPLY_CLOSE_LOOP = "close_loop_reply"
+
+
+@dataclass
+class LeadState:
+    """One person in the funnel. Sorted by urgency, not by arrival time."""
+    lead_id: str = ""               # person_id_hash
+    username: str = ""
+    source: str = "rentmasseur"
+    first_seen_at: str = ""
+    last_touch_at: str = ""
+    intent_score: float = 0.0
+    urgency: str = URGENCY_COLD
+    location_match: bool = False
+    budget_match: Optional[bool] = None
+    time_urgency: bool = False      # "today", "tonight", "tomorrow"
+    repeat_client: bool = False
+    risk_flag: str = ""             # spam, competitor, unsafe, out_of_area, ""
+    classification: str = "unclassified"
+    recommended_reply_class: str = ""
+    recommended_reply_text: str = ""
+    approval_status: str = "pending"  # pending / approved / rejected / sent
+    booking_status: str = "inquiry"   # inquiry / requested / confirmed / completed / cancelled / no_show
+    collected_amount: float = 0.0
+    message_received: str = ""
+    message_sent: str = ""
+    consent_status: str = "unknown"
+    cooldown_until: str = ""
+    suppressed: bool = False
+    follow_up_due_at: str = ""      # when to send follow-up if no reply
+    close_loop_due_at: str = ""     # when to send close-loop if still no reply
+    first_reply_seconds: float = 0.0  # time from first_seen to first reply
+    is_premium: bool = False
+
+
+@dataclass
+class BookingEvent:
+    """The attribution table. One row per booking journey."""
+    booking_id: str = ""
+    lead_id: str = ""
+    source: str = "rentmasseur"
+    first_action: str = ""           # what triggered the lead
+    first_reply_seconds: float = 0.0
+    booking_requested_at: str = ""
+    booking_confirmed_at: str = ""
+    session_completed_at: str = ""
+    amount_collected: float = 0.0
+    repeat_booking: bool = False
+    attributed_action_id: str = ""
+
+
+@dataclass
+class RevenueMetrics:
+    """Hard revenue metrics. This is what the dashboard shows."""
+    # Lead funnel
+    total_leads: int = 0
+    qualified_leads: int = 0
+    booking_ready_leads: int = 0
+
+    # Conversion
+    reply_rate: float = 0.0
+    booking_request_rate: float = 0.0
+    booking_confirm_rate: float = 0.0
+    show_rate: float = 0.0
+
+    # Revenue
+    collected_revenue: float = 0.0
+    expected_revenue: float = 0.0
+    average_booking_value: float = 0.0
+    repeat_rate: float = 0.0
+
+    # Speed
+    median_reply_time_seconds: float = 0.0
+    median_time_to_booking_hours: float = 0.0
+
+    # Attribution
+    best_source: str = ""
+    worst_source: str = ""
+    source_roi: Dict[str, float] = field(default_factory=dict)
+
+    # Compliance
+    compliance_incidents: int = 0
+    suppressed_count: int = 0
+
+    # Drafts
+    drafts_pending: int = 0
+    drafts_approved: int = 0
+    drafts_sent: int = 0
+
+    # Secondary (upstream, not revenue)
+    total_views: int = 0
+    total_contacts: int = 0
+    ctr: float = 0.0
+    search_rank: int = 0
+
+    def compute(self, leads: List[LeadState], bookings: List[BookingEvent]):
+        self.total_leads = len(leads)
+        self.qualified_leads = sum(1 for l in leads if l.urgency in (URGENCY_NOW, URGENCY_HOT, URGENCY_WARM))
+        self.booking_ready_leads = sum(1 for l in leads if l.urgency == URGENCY_NOW)
+
+        replied = sum(1 for l in leads if l.message_sent)
+        self.reply_rate = round(replied / self.total_leads * 100, 1) if self.total_leads else 0.0
+
+        requested = [b for b in bookings if b.booking_requested_at]
+        confirmed = [b for b in bookings if b.booking_confirmed_at]
+        completed = [b for b in bookings if b.session_completed_at]
+
+        self.booking_request_rate = round(len(requested) / self.qualified_leads * 100, 1) if self.qualified_leads else 0.0
+        self.booking_confirm_rate = round(len(confirmed) / len(requested) * 100, 1) if requested else 0.0
+        self.show_rate = round(len(completed) / len(confirmed) * 100, 1) if confirmed else 0.0
+
+        self.collected_revenue = sum(b.amount_collected for b in completed)
+        self.expected_revenue = sum(b.amount_collected for b in confirmed if not b.session_completed_at)
+        paid = [b for b in completed if b.amount_collected > 0]
+        self.average_booking_value = round(sum(b.amount_collected for b in paid) / len(paid), 2) if paid else 0.0
+
+        repeat = sum(1 for l in leads if l.repeat_client)
+        self.repeat_rate = round(repeat / self.total_leads * 100, 1) if self.total_leads else 0.0
+
+        reply_times = [l.first_reply_seconds for l in leads if l.first_reply_seconds > 0]
+        self.median_reply_time_seconds = sorted(reply_times)[len(reply_times)//2] if reply_times else 0.0
+
+        self.suppressed_count = sum(1 for l in leads if l.suppressed)
+        self.drafts_pending = sum(1 for l in leads if l.approval_status == "pending")
+        self.drafts_approved = sum(1 for l in leads if l.approval_status == "approved")
+        self.drafts_sent = sum(1 for l in leads if l.approval_status == "sent")
+
+        # Source attribution
+        by_source: Dict[str, float] = {}
+        for b in completed:
+            by_source[b.source] = by_source.get(b.source, 0) + b.amount_collected
+        self.source_roi = by_source
+        if by_source:
+            self.best_source = max(by_source, key=by_source.get)
+            self.worst_source = min(by_source, key=by_source.get)
+
+
+@dataclass
+class ProfileSnapshot:
+    """Read-only profile state. Secondary signal."""
+    headline: str = ""
+    availability_option: int = 0
+    availability_label: str = ""
+    is_visible: bool = True
+    search_rank: int = 0
+    search_total: int = 0
+    active_rates: List[Dict] = field(default_factory=list)
+    avg_rate: float = 0.0
+
+
+@dataclass
+class TrafficOverclockIR:
+    """The canonical state object.
+
+    Client Quantity = HighIntentSources × CaptureRate × QualificationRate
+    Conversion Speed = DetectionLatency + DraftLatency + ApprovalLatency + ReplyLatency
+    Revenue = ConfirmedBookings × AverageSessionValue × ShowRate × RepeatRate
+    """
+    timestamp: str = ""
+    cycle_num: int = 0
+    login_ok: bool = False
+    login_error: str = ""
+
+    # Lane 1: Observe
+    profile: ProfileSnapshot = field(default_factory=ProfileSnapshot)
+    leads: List[LeadState] = field(default_factory=list)
+    mailbox_raw: List[Dict] = field(default_factory=list)
+
+    # Lane 2: Qualify + urgency sort
+    metrics: RevenueMetrics = field(default_factory=RevenueMetrics)
+
+    # Lane 3: Draft (fast reply templates, not LLM freestyle)
+    drafts_generated: int = 0
+
+    # Lane 4: Approve/Send
+    drafts_sent_count: int = 0
+
+    # Lane 5: Outcome
+    bookings: List[BookingEvent] = field(default_factory=list)
+
+    # Lane 6: Learn
+    attribution: Dict[str, float] = field(default_factory=dict)
+    learnings: List[str] = field(default_factory=list)
+
+    # Receipt
+    receipt_hash: str = ""
+    status: str = "GREEN"
+
+    _raw: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = datetime.now(timezone.utc).isoformat()
+
+    def compute_receipt(self) -> str:
+        data = self.to_json(include_raw=False)
+        self.receipt_hash = hashlib.sha256(data.encode()).hexdigest()[:16]
+        return self.receipt_hash
+
+    def to_json(self, include_raw: bool = False) -> str:
+        d = asdict(self)
+        if not include_raw:
+            d.pop("_raw", None)
+        return json.dumps(d, indent=2, default=str, sort_keys=True)
+
+    def to_dict(self, include_raw: bool = False) -> Dict:
+        d = asdict(self)
+        if not include_raw:
+            d.pop("_raw", None)
+        return d
+
+    def summary(self) -> str:
+        m = self.metrics
+        lines = [
+            f"TrafficOverclockIR — {self.timestamp}",
+            f"Status: {self.status}",
+            f"Login: {'OK' if self.login_ok else 'FAILED'}",
+            f"",
+            f"Today:",
+            f"  {m.total_leads} leads detected",
+            f"  {m.qualified_leads} qualified",
+            f"  {m.booking_ready_leads} booking-ready",
+            f"  {len([b for b in self.bookings if b.booking_confirmed_at])} confirmed",
+            f"  ${m.expected_revenue:.0f} expected",
+            f"  ${m.collected_revenue:.0f} collected",
+            f"  median reply time: {m.median_reply_time_seconds:.0f}s",
+            f"  best source: {m.best_source or '—'}",
+            f"  worst source: {m.worst_source or '—'}",
+            f"",
+            f"Revenue Metrics:",
+            f"  Reply rate: {m.reply_rate}%",
+            f"  Booking request rate: {m.booking_request_rate}%",
+            f"  Booking confirm rate: {m.booking_confirm_rate}%",
+            f"  Show rate: {m.show_rate}%",
+            f"  Avg booking value: ${m.average_booking_value:.0f}",
+            f"  Repeat rate: {m.repeat_rate}%",
+            f"  Compliance incidents: {m.compliance_incidents}",
+            f"  Suppressed: {m.suppressed_count}",
+            f"",
+            f"Drafts: {m.drafts_pending} pending, {m.drafts_approved} approved, {m.drafts_sent} sent",
+            f"",
+            f"Secondary (upstream):",
+            f"  Views: {m.total_views} (CTR: {m.ctr}%)",
+            f"  Search rank: #{m.search_rank}",
+            f"  Availability: {self.profile.availability_label}",
+            f"",
+            f"Leads by urgency:",
+        ]
+        for tier in URGENCY_ORDER:
+            count = sum(1 for l in self.leads if l.urgency == tier)
+            if count:
+                lines.append(f"  {tier}: {count}")
+
+        lines.append(f"\nBookings tracked: {len(self.bookings)}")
+        lines.append(f"Learnings: {len(self.learnings)}")
+        lines.append(f"\nReceipt: {self.receipt_hash}")
+        return "\n".join(lines)
+
+```
+
+interview_agent.py:
+```
+"""
+Interview Monitor — stable trust content. Draft only, manual approval.
+
+Confirmed: featureInterview status in dashboard.
+Not confirmed: interview edit endpoint.
+
+Policy: never auto-edit approved interview. Only draft improvements.
+"""
+
 import logging
-import os
-import subprocess
-from typing import Optional
+import time
+from typing import Dict
 
-import requests
-
+from .db import write_receipt, upsert_content_variant
+from .content_policy import check_bio_risk
 from .api_client import RentMasseurAPI
 
-log = logging.getLogger("profileops.auth")
+log = logging.getLogger("profileops.interview")
 
-
-def get_credential(name: str) -> Optional[str]:
-    """Read credential from environment or macOS keychain."""
-    val = os.environ.get(name)
-    if val:
-        return val
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", f"rm_profileops_{name}", "-w"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return None
-
-
-def save_token_to_keychain(token: str):
-    """Save access token to keychain (optional)."""
-    try:
-        subprocess.run(
-            ["security", "add-generic-password", "-s", "rm_profileops_access_token",
-             "-a", "rm_profileops", "-w", token, "-U"],
-            capture_output=True, text=True, timeout=5
-        )
-    except Exception as e:
-        log.warning("Could not save token to keychain: %s", e)
-
-
-def load_session_from_file(path: str) -> Optional[list]:
-    """Load cookies from a saved session JSON file."""
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        return data.get("cookies", [])
-    except Exception as e:
-        log.warning("Could not load session file: %s", e)
-        return None
-
-
-class AuthSession:
-    """Manages login and session state."""
-
-    def __init__(self, api: RentMasseurAPI, session_file: Optional[str] = None):
-        self.api = api
-        self.session_file = session_file
-        self.username = None
-
-    def login(self, username: Optional[str] = None, password: Optional[str] = None) -> bool:
-        """Login using credentials or saved session."""
-        self.username = username or get_credential("RM_USER")
-        password = password or get_credential("RM_PASS")
-
-        if not self.username or not password:
-            log.error("Credentials missing. Set RM_USER and RM_PASS environment variables.")
-            return False
-
-        # Try saved session first if available
-        if self.session_file:
-            cookies = load_session_from_file(self.session_file)
-            if cookies:
-                self.api.load_cookies(cookies)
-                log.info("Loaded saved session cookies")
-                # Test with a lightweight request
-                try:
-                    self.api.get_keeponline()
-                    log.info("Saved session is valid")
-                    return True
-                except Exception:
-                    log.info("Saved session expired, trying login")
-
-        return self.api.login(self.username, password)
-
-    def is_authenticated(self) -> bool:
-        try:
-            self.api.get_keeponline()
-            return True
-        except Exception:
-            return False
-
-```
-
-fast_enrich.py:
-```
-#!/usr/bin/env python3
-"""Fast multi-threaded enricher with global rate limiting."""
-
-import argparse
-import json
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
-from pathlib import Path
-from threading import Lock
-
-import requests
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
-SITE_WIDE_PHONES = {"1778766027", "6720911878"}
-
-rate_lock = Lock()
-last_request_time = 0.0
-
-
-def rate_limited_request(url: str, min_delay: float) -> requests.Response:
-    global last_request_time
-    with rate_lock:
-        elapsed = time.time() - last_request_time
-        if elapsed < min_delay:
-            time.sleep(min_delay - elapsed)
-        last_request_time = time.time()
-    return requests.get(url, headers=HEADERS, timeout=15)
-
-
-def extract_phone(text: str) -> str:
-    phones = PHONE_RE.findall(text)
-    for p in phones:
-        digits = re.sub(r"\D", "", p)
-        if len(digits) == 11 and digits.startswith("1"):
-            digits = digits[1:]
-        if len(digits) != 10:
-            continue
-        if digits in SITE_WIDE_PHONES:
-            continue
-        return digits
-    return ""
-
-
-def fetch_profile(username: str, min_delay: float) -> dict:
-    try:
-        r = rate_limited_request(f"https://rentmasseur.com/{username}", min_delay)
-        if r.status_code != 200:
-            return {"username": username, "error": f"HTTP {r.status_code}"}
-        if "CrowdSec" in r.text:
-            return {"username": username, "error": "captcha"}
-
-        m = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
-        member_since = m.group(1).strip() if m else ""
-
-        visit_values = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
-        visits = max(visit_values) if visit_values else 0
-
-        days_online = 0
-        if member_since:
-            try:
-                joined = datetime.strptime(member_since, "%b %d, %Y")
-                days_online = max(1, (datetime.now() - joined).days)
-            except ValueError:
-                pass
-
-        views_per_day = visits / days_online if days_online > 0 else 0.0
-        phone = extract_phone(r.text)
-
-        return {
-            "username": username,
-            "visits": visits,
-            "member_since": member_since,
-            "days_online": days_online,
-            "views_per_day": views_per_day,
-            "phone": phone,
-        }
-    except Exception as e:
-        return {"username": username, "error": str(e)}
-
-
-def enrich(input_path: Path, output_path: Path, workers: int = 5, min_delay: float = 0.5):
-    bios = [json.loads(l) for l in input_path.open() if l.strip()]
-    total = len(bios)
-
-    existing = {}
-    if output_path.exists():
-        for line in output_path.open():
-            if line.strip():
-                row = json.loads(line)
-                if row.get("views_per_day", 0) > 0 and row.get("phone", "") not in SITE_WIDE_PHONES and row.get("phone") is not None:
-                    existing[row.get("username")] = row
-        print(f"Resuming: {len(existing)} profiles already enriched")
-
-    todo = [b for b in bios if b.get("username") not in existing]
-    print(f"Total: {total} | Already enriched: {len(existing)} | To fetch: {len(todo)}")
-
-    results = {}
-    captcha_hit = False
-
-    def fetch_one(b):
-        nonlocal captcha_hit
-        if captcha_hit:
-            return None
-        u = b.get("username")
-        r = fetch_profile(u, min_delay)
-        if r.get("error") == "captcha":
-            captcha_hit = True
-            print(f"\nCAPTCHA at {u}. Stopping.")
-        return r
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(fetch_one, b): b for b in todo}
-        for i, fut in enumerate(futures):
-            if captcha_hit:
-                break
-            r = fut.result()
-            if r:
-                results[r.get("username")] = r
-            if (i + 1) % 50 == 0:
-                print(f"  Fetched {i+1}/{len(todo)}")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w") as out:
-        for b in bios:
-            u = b.get("username")
-            if u in existing:
-                out.write(json.dumps(existing[u], ensure_ascii=False) + "\n")
-            elif u in results:
-                v = results[u]
-                if "error" in v:
-                    b.update({"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0, "phone": "", "error": v["error"], "scraped_at": datetime.now(timezone.utc).isoformat()})
-                else:
-                    b.update(v)
-                    b["scraped_at"] = datetime.now(timezone.utc).isoformat()
-                out.write(json.dumps(b, ensure_ascii=False) + "\n")
-            else:
-                b.update({"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0, "phone": "", "scraped_at": datetime.now(timezone.utc).isoformat()})
-                out.write(json.dumps(b, ensure_ascii=False) + "\n")
-
-    print(f"\nDone. Fetched: {len(results)} | Captcha: {captcha_hit}")
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="rm_pri/data/real_bios_raw.jsonl")
-    ap.add_argument("--output", default="rm_pri/data/real_bios_with_views.jsonl")
-    ap.add_argument("--workers", type=int, default=5)
-    ap.add_argument("--delay", type=float, default=0.5)
-    args = ap.parse_args()
-    enrich(Path(args.input), Path(args.output), args.workers, args.delay)
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-enrich.py:
-```
-#!/usr/bin/env python3
-"""Robust public-profile enricher for RM-PRI.
-
-Fetches public visits and member-since dates for each profile in the corpus.
-Respects rate limits, resumes from partial runs, and writes a chained receipt.
-"""
-
-import argparse
-import json
-import re
-import time
-from datetime import datetime, timezone
-from pathlib import Path
-
-import requests
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+INTERVIEW_ANSWER_DRAFTS = {
+    "about_you": """I am a professional bodyworker based in Manhattan. My sessions are pressure-forward, focused on real relief for people who train hard, sit long hours, or carry stress in their body. I believe in clear communication, clean space, and practical results.""",
+    "your_style": """My style is direct and deliberate. I find the tension, apply sustained pressure, and work through the layers that contribute to tightness. Deep tissue, sports recovery, and targeted neck/shoulder work are the main focus areas.""",
+    "why_clients": """Clients come to me when they need more than a light massage. They want real pressure, a calm environment, and a therapist who listens. Many are desk workers, athletes, or travelers dealing with accumulated stiffness.""",
+    "boundaries": """I keep things professional. I work with the body as a whole, focus on therapeutic goals, and maintain clear boundaries. I expect the same respect in return.""",
 }
 
 
-PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
-SITE_WIDE_PHONES = {"1778766027", "6720911878"}
-
-
-def extract_phone(text: str) -> str:
-    """Extract profile-specific phone number, skipping site-wide template numbers."""
-    phones = PHONE_RE.findall(text)
-    for p in phones:
-        digits = re.sub(r"\D", "", p)
-        if len(digits) == 11 and digits.startswith("1"):
-            digits = digits[1:]
-        if len(digits) != 10:
-            continue
-        if digits in SITE_WIDE_PHONES:
-            continue
-        return digits
-    return ""
-
-
-def fetch_profile(username: str, retries: int = 2, delay: float = 2.0) -> dict:
-    result = {
-        "username": username,
-        "visits": 0,
-        "member_since": "",
-        "days_online": 0,
-        "views_per_day": 0.0,
-        "phone": "",
+def get_interview_status(dashboard: Dict) -> Dict:
+    """Extract interview status from dashboard."""
+    interview = dashboard.get("featureInterview", {})
+    return {
+        "is_completed": int(interview.get("isCompleted", 0)),
+        "is_pending_approved": int(interview.get("isPendingApproved", 0)),
+        "approved": int(interview.get("isApproved", 0)) if "isApproved" in interview else None,
+        "raw": interview,
     }
-    for attempt in range(retries + 1):
-        try:
-            r = requests.get(f"https://rentmasseur.com/{username}", headers=HEADERS, timeout=15)
-            if r.status_code != 200:
-                result["error"] = f"HTTP {r.status_code}"
-                return result
-            if "CrowdSec" in r.text:
-                result["error"] = "captcha"
-                return result
-
-            m = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
-            member_since = m.group(1).strip() if m else ""
-
-            visit_values = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
-            visits = max(visit_values) if visit_values else 0
-
-            days_online = 0
-            if member_since:
-                try:
-                    joined = datetime.strptime(member_since, "%b %d, %Y")
-                    days_online = max(1, (datetime.now() - joined).days)
-                except ValueError:
-                    pass
-
-            views_per_day = visits / days_online if days_online > 0 else 0.0
-
-            phone = extract_phone(r.text)
-
-            return {
-                "username": username,
-                "visits": visits,
-                "member_since": member_since,
-                "days_online": days_online,
-                "views_per_day": views_per_day,
-                "phone": phone,
-            }
-        except Exception as e:
-            if attempt < retries:
-                time.sleep(delay * (attempt + 1))
-            else:
-                result["error"] = str(e)
-    return result
 
 
-def enrich(
-    input_path: Path,
-    output_path: Path,
-    limit: int = None,
-    resume: bool = True,
-    min_delay: float = 1.0,
-):
-    bios = [json.loads(l) for l in input_path.open() if l.strip()]
-    if limit:
-        bios = bios[:limit]
-    total = len(bios)
-
-    # Resume: load existing output
-    existing = {}
-    if resume and output_path.exists():
-        for line in output_path.open():
-            if line.strip():
-                row = json.loads(line)
-                existing[row.get("username")] = row
-        print(f"Resuming: {len(existing)} profiles already enriched")
-
-    enriched_count = 0
-    failed_count = 0
-    captcha_hit = False
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_suffix(".tmp")
-
-    with tmp_path.open("w") as out:
-        for i, b in enumerate(bios, 1):
-            u = b.get("username")
-            if u in existing and existing[u].get("views_per_day", 0) > 0 and existing[u].get("phone", "") not in SITE_WIDE_PHONES and existing[u].get("phone") is not None:
-                out.write(json.dumps(existing[u], ensure_ascii=False) + "\n")
-                enriched_count += 1
-                continue
-
-            print(f"[{i}/{total}] Fetching {u}...", end=" ", flush=True)
-            v = fetch_profile(u)
-            if v.get("error") == "captcha":
-                print("CAPTCHA")
-                captcha_hit = True
-                # Write remaining as-is and stop
-                b.update({"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0, "scraped_at": datetime.now(timezone.utc).isoformat()})
-                out.write(json.dumps(b, ensure_ascii=False) + "\n")
-                failed_count += 1
-                break
-            elif "error" in v:
-                print(f"FAIL: {v['error']}")
-                b.update({"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0, "scraped_at": datetime.now(timezone.utc).isoformat()})
-                out.write(json.dumps(b, ensure_ascii=False) + "\n")
-                failed_count += 1
-            else:
-                print(f"visits={v['visits']}, days={v['days_online']}, v/day={v['views_per_day']:.1f}")
-                b.update(v)
-                b["scraped_at"] = datetime.now(timezone.utc).isoformat()
-                out.write(json.dumps(b, ensure_ascii=False) + "\n")
-                enriched_count += 1
-
-            if i < total:
-                time.sleep(min_delay)
-
-    tmp_path.rename(output_path)
-
-    print(f"\nDone: {enriched_count}/{total} enriched, {failed_count} failed")
-    if captcha_hit:
-        print("CAPTCHA triggered. Stop and wait before retrying.")
+def monitor_interview(api: RentMasseurAPI) -> Dict:
+    """Check interview status and write receipt."""
+    dashboard = api.get_dashboard()
+    status = get_interview_status(dashboard)
+    write_receipt("interview_monitor_v1", "monitor_interview", {}, status, verified=True)
+    log.info("Interview status: completed=%s pending=%s", status["is_completed"], status["is_pending_approved"])
+    return status
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="rm_pri/data/real_bios_raw.jsonl")
-    ap.add_argument("--output", default="rm_pri/data/real_bios_with_views.jsonl")
-    ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--no-resume", action="store_true")
-    ap.add_argument("--delay", type=float, default=1.0)
-    args = ap.parse_args()
-
-    enrich(
-        Path(args.input),
-        Path(args.output),
-        limit=args.limit,
-        resume=not args.no_resume,
-        min_delay=args.delay,
-    )
-
-
-if __name__ == "__main__":
-    main()
+def generate_interview_drafts() -> list:
+    """Generate improved interview answer drafts."""
+    drafts = []
+    for key, text in INTERVIEW_ANSWER_DRAFTS.items():
+        risk = check_bio_risk(text)
+        if risk > 0.7:
+            continue
+        variant_id = f"interview_{key}_{int(time.time())}"
+        upsert_content_variant(
+            variant_id, "interview",
+            title=key, body=text,
+            hypothesis="Professional interview answer draft.",
+            status="draft"
+        )
+        write_receipt(
+            "interview_draft_created_v1",
+            "generate_interview_draft",
+            {},
+            {"variant_id": variant_id, "question": key, "risk": risk},
+            verified=True,
+        )
+        drafts.append({"variant_id": variant_id, "question": key, "body": text, "risk": risk})
+        log.info("Interview draft created: %s", key)
+    return drafts
 
 ```
 
-cli.py:
+revenue_ir.py:
 ```
 #!/usr/bin/env python3
-"""RM-PRI CLI — RentMasseur Profile Revenue Intelligence.
+"""
+RevenueIR — Canonical business state object for the RentMasseur revenue optimizer.
 
-Commands:
-    validate          Gate 1: validate corpus schema
-    atomize           Extract structural atoms from bios
-    features          Build C++ feature file
-    train             Train views/day model (requires enrichment)
-    generate          Generate candidate bios
-    score             Score candidates with model
-    evolve            Run GA over scored candidates
-    select            Select top safe candidates
-    status            Show honest system status
-    api-check         Test API connectivity (requires credentials)
-    enrich-views      Enrich bios with public visits/member-since
-    rank-real         Rank bios by real views/day
-    snapshot          Take dashboard snapshot (requires credentials)
-    start-experiment  Apply approved variant and measure (requires credentials)
-    close-experiment  Close experiment and write receipt
-    receipts          Show receipt ledger
+Every pass reads and writes this object. No more loose dictionaries.
 
-Usage:
-    python3 -m rm_pri.py.cli status
-    python3 -m rm_pri.py.cli validate
-    python3 -m rm_pri.py.cli train --label reviews
+Flow:
+  raw_api → RevenueIR → scoring passes → action planner → policy gate → executor → after_snapshot → receipt
 """
 
-import argparse
+import json
+import hashlib
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+
+
+@dataclass
+class FunnelMetrics:
+    total_views: int = 0
+    total_contacts: int = 0
+    today_views: int = 0
+    emails_count: int = 0
+    unread_emails: int = 0
+    premium_senders: int = 0
+    booking_inquiries: int = 0
+    general_inquiries: int = 0
+    ctr: float = 0.0
+    email_rate: float = 0.0
+    avg_rate: float = 0.0
+
+    def compute(self):
+        if self.total_views > 0:
+            self.ctr = round(self.total_contacts / self.total_views * 100, 2)
+        if self.total_contacts > 0:
+            self.email_rate = round(self.emails_count / self.total_contacts * 100, 2)
+
+
+@dataclass
+class ProfileState:
+    headline: str = ""
+    description_len: int = 0
+    availability_option: int = 0
+    availability_label: str = ""
+    is_visible: bool = True
+    search_rank: int = 0
+    search_total: int = 0
+    active_rates: List[Dict] = field(default_factory=list)
+
+
+@dataclass
+class VisitorRecord:
+    username: str = ""
+    source: str = "who_saw_me"
+    location: str = ""
+    is_ny: bool = False
+    is_masseur: Optional[bool] = None
+    visited_back: bool = False
+    messaged: bool = False
+    is_premium: bool = False
+    email_classification: str = ""
+
+
+@dataclass
+class ActionItem:
+    action: str = ""
+    reason: str = ""
+    priority: int = 0
+    policy: str = "AUTO_OK"  # AUTO_OK, REVIEW_REQUIRED, BLOCKED
+    executed: bool = False
+    result: str = ""
+    impact: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RevenueIR:
+    """The canonical business state object. Every pass reads/writes this."""
+    timestamp: str = ""
+    cycle_num: int = 0
+    login_ok: bool = False
+    login_error: str = ""
+
+    # Lane 1: Read-only scan results
+    funnel: FunnelMetrics = field(default_factory=FunnelMetrics)
+    profile: ProfileState = field(default_factory=ProfileState)
+    visitors: List[VisitorRecord] = field(default_factory=list)
+    mailbox_preview: List[Dict] = field(default_factory=list)
+
+    # Lane 2: Safe actions executed
+    actions_executed: List[ActionItem] = field(default_factory=list)
+
+    # Lane 3: Risky actions queued for approval
+    actions_queued: List[ActionItem] = field(default_factory=list)
+
+    # Deltas vs last cycle
+    deltas: Dict[str, float] = field(default_factory=dict)
+
+    # Receipt
+    receipt_hash: str = ""
+    status: str = "GREEN"  # GREEN, YELLOW, RED
+
+    # Raw API responses kept for debugging (not committed to repo)
+    _raw: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = datetime.now(timezone.utc).isoformat()
+
+    def compute_receipt(self):
+        """Tamper-evident receipt hash over the entire state."""
+        data = self.to_json(include_raw=False)
+        self.receipt_hash = hashlib.sha256(data.encode()).hexdigest()[:16]
+        return self.receipt_hash
+
+    def to_json(self, include_raw: bool = False) -> str:
+        d = asdict(self)
+        if not include_raw:
+            d.pop("_raw", None)
+        return json.dumps(d, indent=2, default=str, sort_keys=True)
+
+    def to_dict(self, include_raw: bool = False) -> Dict:
+        d = asdict(self)
+        if not include_raw:
+            d.pop("_raw", None)
+        return d
+
+    def summary(self) -> str:
+        lines = [
+            f"RevenueIR — {self.timestamp}",
+            f"Status: {self.status}",
+            f"Login: {'OK' if self.login_ok else 'FAILED'}",
+            f"",
+            f"Funnel:",
+            f"  Views: {self.funnel.total_views} (today: {self.funnel.today_views})",
+            f"  Contacts: {self.funnel.total_contacts} (CTR: {self.funnel.ctr}%)",
+            f"  Emails: {self.funnel.emails_count} (unread: {self.funnel.unread_emails}, premium: {self.funnel.premium_senders})",
+            f"  Booking inquiries: {self.funnel.booking_inquiries}",
+            f"  Avg rate: ${self.funnel.avg_rate}",
+            f"",
+            f"Profile:",
+            f"  Headline: '{self.profile.headline}'",
+            f"  Availability: {self.profile.availability_label} ({self.profile.availability_option})",
+            f"  Visible: {self.profile.is_visible}",
+            f"  Search rank: #{self.profile.search_rank} of {self.profile.search_total}",
+            f"  Active rates: {len(self.profile.active_rates)}",
+            f"",
+            f"Visitors: {len(self.visitors)} total, {sum(1 for v in self.visitors if v.is_ny)} NYC",
+            f"Actions executed: {len(self.actions_executed)}",
+            f"Actions queued: {len(self.actions_queued)}",
+            f"",
+            f"Receipt: {self.receipt_hash}",
+        ]
+        return "\n".join(lines)
+
+```
+
+cdp_capture.py:
+```
+"""
+Selenium Action → API Endpoint Capture (v2)
+
+Uses CDP Network domain directly to capture ALL network requests,
+including XHR/fetch that happen during page load (before JS interceptor can run).
+
+Output: rm_traffic/action_api_map.json
+"""
+
 import json
 import os
-import subprocess
-import sys
+import re
+import time
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import OrderedDict
 
-ROOT = Path(__file__).resolve().parent.parent
-DATA = ROOT / "data"
-CPP = ROOT / "cpp" / "rm_pri"
-RAW = DATA / "real_bios_raw.jsonl"
-ENRICHED = DATA / "real_bios_with_views.jsonl"
-RECEIPTS = DATA / "receipts" / "ledger.jsonl"
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import (
+    NoSuchElementException, StaleElementReferenceException, WebDriverException,
+)
+
+BASE_URL = "https://rentmasseur.com"
+USERNAME = "karpathianwolf"
+PASSWORD = os.environ.get("RM_PASSWORD", "")
+CHROME_PROFILE = "/tmp/rm_cdp_api"
+OUT = Path(__file__).parent
+CAPTURE_FILE = OUT / "action_api_map.json"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("cdp_api")
 
 
-def _run_cpp(args: list) -> subprocess.CompletedProcess:
-    if not CPP.exists():
-        print("ERROR: C++ engine not compiled. Run: cd rm_pri/cpp && g++ -O3 -std=c++17 rm_pri.cpp -o rm_pri")
-        sys.exit(1)
+class CDPNetworkCapture:
+    """Capture network requests via CDP Network domain events."""
+
+    def __init__(self, driver):
+        self.driver = driver
+        self._requests = {}   # requestId -> request data
+        self._responses = {}  # requestId -> response data
+        self._bodies = {}     # requestId -> response body
+        self._marker = 0
+        self._all_entries = []
+        self._setup()
+
+    def _setup(self):
+        """Enable CDP Network domain and register listeners."""
+        # Enable network tracking
+        self.driver.execute_cdp_cmd("Network.enable", {})
+
+        # We can't use event listeners directly with selenium's CDP,
+        # so we'll use performance log entries instead.
+        # But we already enabled performance logging in driver setup.
+        # Alternative: use execute_cdp_cmd with Network.getRequestPostData
+
+    def mark(self):
+        """Mark current position — new entries after this are 'new'."""
+        self._marker = len(self._all_entries)
+        return self._marker
+
+    def capture_new(self):
+        """Get entries since last mark using performance log."""
+        entries = self._extract_perf_entries()
+        self._all_entries.extend(entries)
+        new = self._all_entries[self._marker:]
+        self._marker = len(self._all_entries)
+        return new
+
+    def capture_all(self):
+        entries = self._extract_perf_entries()
+        self._all_entries.extend(entries)
+        return self._all_entries
+
+    def _extract_perf_entries(self):
+        """Extract network requests from performance log."""
+        try:
+            logs = self.driver.get_log("performance")
+        except Exception:
+            return []
+
+        entries = []
+        for log_entry in logs:
+            try:
+                msg = json.loads(log_entry["message"])["message"]
+                method = msg.get("method", "")
+
+                if method == "Network.requestWillBeSent":
+                    params = msg["params"]
+                    req = params["request"]
+                    req_id = params["requestId"]
+
+                    # Store for later body retrieval
+                    self._requests[req_id] = {
+                        "url": req["url"],
+                        "method": req["method"],
+                        "headers": req.get("headers", {}),
+                        "post_data": req.get("postData"),
+                        "type": params.get("type", ""),
+                        "ts": params.get("timestamp", 0),
+                    }
+
+                elif method == "Network.responseReceived":
+                    params = msg["params"]
+                    req_id = params["requestId"]
+                    resp = params["response"]
+
+                    if req_id in self._requests:
+                        self._requests[req_id]["status"] = resp.get("status")
+                        self._requests[req_id]["mime_type"] = resp.get("mimeType", "")
+                        self._requests[req_id]["response_headers"] = resp.get("headers", {})
+
+                        # Try to get response body
+                        try:
+                            body = self.driver.execute_cdp_cmd(
+                                "Network.getResponseBody", {"requestId": req_id}
+                            )
+                            self._requests[req_id]["response_body"] = body.get("body", "")[:5000]
+                        except Exception:
+                            self._requests[req_id]["response_body"] = None
+
+            except (KeyError, json.JSONDecodeError):
+                continue
+
+        # Convert to list of entries
+        entries = []
+        for req_id, data in self._requests.items():
+            entries.append(data)
+        return entries
+
+
+def create_driver():
+    opts = Options()
+    opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument(f"--user-data-dir={CHROME_PROFILE}")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    # Enable performance logging for CDP network capture
+    opts.set_capability("goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
+    return webdriver.Chrome(options=opts)
+
+
+def dismiss_popups(driver):
+    time.sleep(1)
+    try:
+        driver.execute_script("""
+            document.querySelectorAll('.DialogOverlay, [class*="overlay"]').forEach(e => e.remove());
+        """)
+    except Exception:
+        pass
+    for xpath in [
+        "//button[contains(text(),'Not now')]",
+        "//button[contains(text(),'Accept all')]",
+        "//button[contains(text(),'Close')]",
+        "//*[contains(@aria-label,'Close')]",
+    ]:
+        try:
+            for el in driver.find_elements(By.XPATH, xpath):
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(0.5)
+        except Exception:
+            pass
+
+
+def login(driver):
+    log.info("Logging in...")
+    driver.get(f"{BASE_URL}/login")
+    time.sleep(4)
+    dismiss_popups(driver)
+
+    for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
+        itype = (inp.get_attribute("type") or "").lower()
+        iname = (inp.get_attribute("name") or "").lower()
+        if (itype == "email" or "email" in iname or "user" in iname) and inp.is_displayed():
+            inp.clear()
+            inp.send_keys(USERNAME)
+        if itype == "password" and inp.is_displayed():
+            inp.clear()
+            inp.send_keys(PASSWORD)
+
+    time.sleep(0.3)
+    for by, sel in [
+        (By.CSS_SELECTOR, "button[type='submit']"),
+        (By.XPATH, "//button[contains(text(),'LOG')]"),
+        (By.XPATH, "//button[contains(text(),'Log')]"),
+        (By.CSS_SELECTOR, "form button"),
+    ]:
+        for el in driver.find_elements(by, sel):
+            if el.is_displayed():
+                driver.execute_script("arguments[0].click();", el)
+                time.sleep(6)
+                break
+        else:
+            continue
+        break
+
+    dismiss_popups(driver)
+    ok = "/login" not in driver.current_url
+    log.info("Login: %s", "OK" if ok else "FAILED")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+def action_load_settings(cap):
+    cap.mark()
+    cap.driver.get(f"{BASE_URL}/settings")
+    time.sleep(6)
+    dismiss_popups(cap.driver)
+    time.sleep(2)  # extra time for async calls
+    return "load_settings", cap.capture_new()
+
+
+def action_open_availability_modal(cap):
+    cap.driver.get(f"{BASE_URL}/settings?availability=1")
+    time.sleep(5)
+    dismiss_popups(cap.driver)
+    cap.mark()
+    try:
+        panel = cap.driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
+        cap.driver.execute_script("arguments[0].click();", panel)
+        time.sleep(3)
+    except Exception:
+        pass
+    return "open_availability_modal", cap.capture_new()
+
+
+def action_set_availability(cap):
+    driver = cap.driver
+    driver.get(f"{BASE_URL}/settings?availability=1")
+    time.sleep(5)
+    dismiss_popups(driver)
+    try:
+        panel = driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
+        driver.execute_script("arguments[0].click();", panel)
+        time.sleep(2)
+    except Exception:
+        pass
+
+    cap.mark()
+
+    # Select Available
+    for by, sel in [
+        (By.XPATH, "//label[contains(text(),'Available')]"),
+        (By.XPATH, "//*[contains(text(),'Available') and not(contains(text(),'Not')) and not(contains(text(),'Status'))]"),
+        (By.CSS_SELECTOR, "input[type='radio']"),
+    ]:
+        try:
+            els = driver.find_elements(by, sel)
+            for el in els:
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(0.5)
+                    break
+        except Exception:
+            pass
+
+    # Duration
+    from selenium.webdriver.support.ui import Select
+    for sel_el in driver.find_elements(By.CSS_SELECTOR, "select"):
+        try:
+            s = Select(sel_el)

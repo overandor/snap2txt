@@ -1,800 +1,800 @@
-    conn.execute(
-        f"INSERT INTO stats ({','.join(cols)}) VALUES ({','.join(['?'] * len(cols))})",
-        vals
-    )
-    conn.commit()
-    conn.close()
-
-def record_alert(severity: str, atype: str, message: str):
-    ts = datetime.now(timezone.utc).isoformat()
-    conn = db()
-    conn.execute(
-        "INSERT INTO alerts (ts, severity, type, message) VALUES (?, ?, ?, ?)",
-        (ts, severity, atype, message)
-    )
-    conn.commit()
-    conn.close()
-    log.warning("ALERT [%s/%s]: %s", severity, atype, message)
-
-# ---------------------------------------------------------------------------
-# API Client
-# ---------------------------------------------------------------------------
-
-class RentMasseurAPI:
-    """Direct API client using confirmed endpoints."""
-
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/131.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": f"{BASE_URL}/settings",
-            "Origin": BASE_URL,
-        })
-        self.token = None
-        self.username = None
-        self.last_request = 0
-        self.request_count = 0
-        self.request_window_start = time.time()
-
-    def _rate_limit(self):
-        """Respectful rate limiting."""
-        now = time.time()
-        if now - self.request_window_start > 3600:
-            self.request_window_start = now
-            self.request_count = 0
-        if self.request_count >= MAX_REQUESTS_PER_HOUR:
-            sleep_time = 3600 - (now - self.request_window_start)
-            if sleep_time > 0:
-                log.warning("Hourly request limit reached, sleeping %.0fs", sleep_time)
-                time.sleep(sleep_time)
-        elapsed = now - self.last_request
-        if elapsed < MIN_REQUEST_INTERVAL:
-            time.sleep(MIN_REQUEST_INTERVAL - elapsed)
-        self.last_request = time.time()
-        self.request_count += 1
-
-    def _get_csrf(self) -> str:
-        resp = self.session.get(f"{BASE_URL}/login")
-        m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', resp.text)
-        if m:
-            return m.group(1)
-        return ""
-
-    def login_via_selenium(self, username: str, password: str, manual_captcha: bool = False) -> bool:
-        """Hybrid login using Selenium. If manual_captcha=True, opens visible browser for user to solve captcha."""
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.common.by import By
-
-        log.info("Attempting Selenium hybrid login...")
-        opts = Options()
-        opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument("--user-data-dir=/tmp/rm_profileops")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        if not manual_captcha:
-            opts.add_argument("--headless=new")
-        driver = None
-        try:
-            driver = webdriver.Chrome(options=opts)
-            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            })
-            driver.get(f"{BASE_URL}/login")
-            time.sleep(4)
-            # Dismiss popups
-            try:
-                driver.execute_script("document.querySelectorAll('.DialogOverlay,[class*=\"overlay\"]').forEach(e=>e.remove())")
-            except: pass
-            for xpath in ["//button[contains(text(),'Not now')]", "//button[contains(text(),'Accept all')]", "//button[contains(text(),'Close')]"]:
-                try:
-                    for el in driver.find_elements(By.XPATH, xpath):
-                        if el.is_displayed(): driver.execute_script("arguments[0].click()", el); time.sleep(0.5)
-                except: pass
-            # Fill login
-            for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
-                t = (inp.get_attribute("type") or "").lower()
-                n = (inp.get_attribute("name") or "").lower()
-                if (t == "email" or "email" in n or "user" in n) and inp.is_displayed():
-                    inp.clear(); inp.send_keys(username)
-                if t == "password" and inp.is_displayed():
-                    inp.clear(); inp.send_keys(password)
-            time.sleep(0.3)
-            for el in driver.find_elements(By.CSS_SELECTOR, "button[type='submit']"):
-                if el.is_displayed(): driver.execute_script("arguments[0].click()", el); break
-
-            # If manual captcha mode, wait for user
-            if manual_captcha:
-                print("\n*** CAPTCHA DETECTED ***")
-                print("A Chrome window is open. Please solve the captcha and complete login.")
-                print("Press ENTER here after you see the dashboard/settings page...")
-                input()
-            else:
-                time.sleep(6)
-
-            # Transfer cookies
-            if "/login" not in driver.current_url:
-                cookies = driver.get_cookies()
-                for c in cookies:
-                    self.session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
-                self.username = username
-                self.logged_in = True
-                log.info("Selenium login OK, cookies transferred")
-                return True
-            else:
-                log.error("Selenium login failed, still on login page")
-                return False
-        except Exception as e:
-            log.error("Selenium login failed: %s", e)
-            return False
-        finally:
-            if driver:
-                driver.quit()
-
-    def login_manual_captcha(self, username: str, password: str) -> bool:
-        """Open visible browser for manual captcha solve."""
-        return self.login_via_selenium(username, password, manual_captcha=True)
-
-    def login(self, username: str, password: str) -> bool:
-        self.username = username
-        csrf = self._get_csrf()
-        self._rate_limit()
-        resp = self.session.post(f"{API_URL}/login", json={
-            "email": username,
-            "password": password,
-            "csrf": csrf,
-            "remember": True,
-        })
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-            except Exception as e:
-                log.error("API login response not JSON (captcha/block?). Trying Selenium...")
-                return self.login_via_selenium(username, password)
-            self.token = data.get("accessToken")
-            if self.token:
-                self.session.headers["Authorization"] = f"Bearer {self.token}"
-            log.info("Login OK as %s", username)
-            return True
-        log.error("API login failed: %d %s", resp.status_code, resp.text[:200])
-        return self.login_via_selenium(username, password)
-
-    def _get(self, path: str, params: Optional[Dict] = None) -> requests.Response:
-        self._rate_limit()
-        return self.session.get(f"{API_URL}{path}", params=params, timeout=15)
-
-    def _post(self, path: str, json_data: Dict) -> requests.Response:
-        self._rate_limit()
-        return self.session.post(f"{API_URL}{path}", json=json_data, timeout=15)
-
-    def _put(self, path: str, json_data: Dict) -> requests.Response:
-        self._rate_limit()
-        return self.session.put(f"{API_URL}{path}", json=json_data, timeout=15)
-
-    def get_dashboard(self) -> Dict:
-        resp = self._get("/account/dashboard")
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_availability(self) -> Dict:
-        resp = self._get("/account/dashboard/availability")
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_stats(self) -> Dict:
-        resp = self._get("/account/dashboard/ad-statistics")
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_keeponline(self) -> Dict:
-        resp = self._get("/account/keeponline")
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_about(self) -> Dict:
-        resp = self._get("/settings/about")
-        resp.raise_for_status()
-        return resp.json()
-
-    def set_about(self, headline: str, description: str) -> Dict:
-        resp = self._put("/settings/about", json={
-            "headline": headline,
-            "description": description,
-        })
-        resp.raise_for_status()
-        return resp.json()
-
-    def set_visibility(self, visible: bool) -> Dict:
-        resp = self._put("/settings/visibility", json={"isAdHidden": not visible})
-        resp.raise_for_status()
-        return resp.json()
-
-    def set_sms(self, enabled: bool) -> Dict:
-        resp = self._put("/settings/sms", json={"sms": enabled})
-        resp.raise_for_status()
-        return resp.json()
-
-    def set_track_actions(self, enabled: bool) -> Dict:
-        resp = self._put("/settings/track-actions", json={"trackActions": enabled})
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_mailbox(self, page: int = 1, folder: int = 1, sort: int = 1) -> Dict:
-        resp = self._get("/mailbox", params={"page": page, "folder": folder, "sort": sort})
-        resp.raise_for_status()
-        return resp.json()
-
-    def search(self, city: str = "manhattan-ny", available_only: bool = True,
-               page: int = 1, skip: int = 0) -> Dict:
-        body = {"searchCity": city, "page": page, "skipUsers": str(skip)}
-        if available_only:
-            body["available"] = 1
-        resp = self._post("/search", body)
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_rates(self) -> Dict:
-        resp = self._get("/settings/rates")
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_locations(self) -> Dict:
-        resp = self._get("/locations", params={"withMasseurs": 1})
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_blogs(self, page: int = 1) -> Dict:
-        resp = self._get("/blogs", params={"page": page})
-        resp.raise_for_status()
-        return resp.json()
-
-    def full_status(self) -> Dict:
-        return {
-            "dashboard": self.get_dashboard(),
-            "availability": self.get_availability(),
-            "stats": self.get_stats(),
-            "keeponline": self.get_keeponline(),
-            "about": self.get_about(),
-            "mailbox": self.get_mailbox(),
+          "lng": 0,
+          "searchCity": "manhattan-ny",
+          "limit": 18
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJleHAiOjE3ODI0MTYyNjksIm5iZiI6MTc4MjQxNjA4OSwic3ViIjoiMjQ4NDc5IiwidXNlcm5hbWUiOiJLYXJwYXRoaWFud29sZiIsInVzZXJUeXBlIjoxLCJzdGFnZU5hbWUiOiJKb3NlcGgiLCJhcHByb3ZlZCI6MSwibG9jYXRpb25JZCI6MTAzNiwic2VhcmNoQ2l0eSI6Im1hbmhhdHRhbi1ueSIsImNvdW50cnlTaG9ydCI6IlVTIiwic2Vzc2lvbkNvdW50cnlDb250aW5lbnQiOiJOQSIsImlzRnJvemVuIjowLCJsb2NhdGlvbkxhYmVsIjoiTWFuaGF0dGFuLCBOWSIsImlzcyI6Imh0dHBzOi8vcmVudG1hc3NldXIuY29tIiwiaWF0IjoxNzgyNDE2MTQ5fQ.KlE_XDzq0aTE4W-UQIh5j9KVMKmSJjaAuzM8bYtwLbiTn7RX4AINjLSKU0luXxi4vc7jPJVvuLlYiNhn6UWoZA",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/gay-massage/manhattan-ny/?available=1",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/home/live-cams",
+        "full_url": "https://rentmasseur.com/api/v1/home/live-cams",
+        "request_body": {
+          "lat": 0,
+          "lng": 0,
+          "searchCity": "manhattan-ny"
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJleHAiOjE3ODI0MTYyNjksIm5iZiI6MTc4MjQxNjA4OSwic3ViIjoiMjQ4NDc5IiwidXNlcm5hbWUiOiJLYXJwYXRoaWFud29sZiIsInVzZXJUeXBlIjoxLCJzdGFnZU5hbWUiOiJKb3NlcGgiLCJhcHByb3ZlZCI6MSwibG9jYXRpb25JZCI6MTAzNiwic2VhcmNoQ2l0eSI6Im1hbmhhdHRhbi1ueSIsImNvdW50cnlTaG9ydCI6IlVTIiwic2Vzc2lvbkNvdW50cnlDb250aW5lbnQiOiJOQSIsImlzRnJvemVuIjowLCJsb2NhdGlvbkxhYmVsIjoiTWFuaGF0dGFuLCBOWSIsImlzcyI6Imh0dHBzOi8vcmVudG1hc3NldXIuY29tIiwiaWF0IjoxNzgyNDE2MTQ5fQ.KlE_XDzq0aTE4W-UQIh5j9KVMKmSJjaAuzM8bYtwLbiTn7RX4AINjLSKU0luXxi4vc7jPJVvuLlYiNhn6UWoZA",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/gay-massage/manhattan-ny/?available=1",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "PUT",
+        "path": "/api/v1/settings/visibility",
+        "full_url": "https://rentmasseur.com/api/v1/settings/visibility",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJleHAiOjE3ODI0MTYyNjksIm5iZiI6MTc4MjQxNjA4OSwic3ViIjoiMjQ4NDc5IiwidXNlcm5hbWUiOiJLYXJwYXRoaWFud29sZiIsInVzZXJUeXBlIjoxLCJzdGFnZU5hbWUiOiJKb3NlcGgiLCJhcHByb3ZlZCI6MSwibG9jYXRpb25JZCI6MTAzNiwic2VhcmNoQ2l0eSI6Im1hbmhhdHRhbi1ueSIsImNvdW50cnlTaG9ydCI6IlVTIiwic2Vzc2lvbkNvdW50cnlDb250aW5lbnQiOiJOQSIsImlzRnJvemVuIjowLCJsb2NhdGlvbkxhYmVsIjoiTWFuaGF0dGFuLCBOWSIsImlzcyI6Imh0dHBzOi8vcmVudG1hc3NldXIuY29tIiwiaWF0IjoxNzgyNDE2MTQ5fQ.KlE_XDzq0aTE4W-UQIh5j9KVMKmSJjaAuzM8bYtwLbiTn7RX4AINjLSKU0luXxi4vc7jPJVvuLlYiNhn6UWoZA",
+          "Referer": "https://rentmasseur.com/settings",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "message"
+          ],
+          "sample": "{\"message\": \"Your profile is now hidden from searches\"}"
         }
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/account/keeponline",
+        "full_url": "https://rentmasseur.com/api/v1/account/keeponline",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJleHAiOjE3ODI0MTYyNjksIm5iZiI6MTc4MjQxNjA4OSwic3ViIjoiMjQ4NDc5IiwidXNlcm5hbWUiOiJLYXJwYXRoaWFud29sZiIsInVzZXJUeXBlIjoxLCJzdGFnZU5hbWUiOiJKb3NlcGgiLCJhcHByb3ZlZCI6MSwibG9jYXRpb25JZCI6MTAzNiwic2VhcmNoQ2l0eSI6Im1hbmhhdHRhbi1ueSIsImNvdW50cnlTaG9ydCI6IlVTIiwic2Vzc2lvbkNvdW50cnlDb250aW5lbnQiOiJOQSIsImlzRnJvemVuIjowLCJsb2NhdGlvbkxhYmVsIjoiTWFuaGF0dGFuLCBOWSIsImlzcyI6Imh0dHBzOi8vcmVudG1hc3NldXIuY29tIiwiaWF0IjoxNzgyNDE2MTQ5fQ.KlE_XDzq0aTE4W-UQIh5j9KVMKmSJjaAuzM8bYtwLbiTn7RX4AINjLSKU0luXxi4vc7jPJVvuLlYiNhn6UWoZA",
+          "Referer": "https://rentmasseur.com/settings",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "newEmails",
+            "newVisits",
+            "issues",
+            "isFrozen",
+            "isAdHidden",
+            "userActivity"
+          ],
+          "sample": "{\"newEmails\": 0, \"newVisits\": 30, \"issues\": {\"totalItems\": 0, \"alerts\": {\"userProfile\": [], \"payments\": [], \"paymentCards\": [], \"photo\": [], \"age\": [], \"pendingBitcoinOrder\": [], \"customCharge\": []}}, \"isFrozen\": 0, \"isAdHidden\": 1, \"userActivity\": {\"available\": 1, \"message\": \"Available\", \"validTo\": 17187}}"
+        }
+      },
+      {
+        "method": "PUT",
+        "path": "/api/v1/settings/sms",
+        "full_url": "https://rentmasseur.com/api/v1/settings/sms",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJleHAiOjE3ODI0MTYyNjksIm5iZiI6MTc4MjQxNjA4OSwic3ViIjoiMjQ4NDc5IiwidXNlcm5hbWUiOiJLYXJwYXRoaWFud29sZiIsInVzZXJUeXBlIjoxLCJzdGFnZU5hbWUiOiJKb3NlcGgiLCJhcHByb3ZlZCI6MSwibG9jYXRpb25JZCI6MTAzNiwic2VhcmNoQ2l0eSI6Im1hbmhhdHRhbi1ueSIsImNvdW50cnlTaG9ydCI6IlVTIiwic2Vzc2lvbkNvdW50cnlDb250aW5lbnQiOiJOQSIsImlzRnJvemVuIjowLCJsb2NhdGlvbkxhYmVsIjoiTWFuaGF0dGFuLCBOWSIsImlzcyI6Imh0dHBzOi8vcmVudG1hc3NldXIuY29tIiwiaWF0IjoxNzgyNDE2MTQ5fQ.KlE_XDzq0aTE4W-UQIh5j9KVMKmSJjaAuzM8bYtwLbiTn7RX4AINjLSKU0luXxi4vc7jPJVvuLlYiNhn6UWoZA",
+          "Referer": "https://rentmasseur.com/settings",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "message"
+          ],
+          "sample": "{\"message\": \"SMS Notifications are now disabled\"}"
+        }
+      },
+      {
+        "method": "PUT",
+        "path": "/api/v1/settings/track-actions",
+        "full_url": "https://rentmasseur.com/api/v1/settings/track-actions",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJleHAiOjE3ODI0MTYyNjksIm5iZiI6MTc4MjQxNjA4OSwic3ViIjoiMjQ4NDc5IiwidXNlcm5hbWUiOiJLYXJwYXRoaWFud29sZiIsInVzZXJUeXBlIjoxLCJzdGFnZU5hbWUiOiJKb3NlcGgiLCJhcHByb3ZlZCI6MSwibG9jYXRpb25JZCI6MTAzNiwic2VhcmNoQ2l0eSI6Im1hbmhhdHRhbi1ueSIsImNvdW50cnlTaG9ydCI6IlVTIiwic2Vzc2lvbkNvdW50cnlDb250aW5lbnQiOiJOQSIsImlzRnJvemVuIjowLCJsb2NhdGlvbkxhYmVsIjoiTWFuaGF0dGFuLCBOWSIsImlzcyI6Imh0dHBzOi8vcmVudG1hc3NldXIuY29tIiwiaWF0IjoxNzgyNDE2MTQ5fQ.KlE_XDzq0aTE4W-UQIh5j9KVMKmSJjaAuzM8bYtwLbiTn7RX4AINjLSKU0luXxi4vc7jPJVvuLlYiNhn6UWoZA",
+          "Referer": "https://rentmasseur.com/settings",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 201,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "message"
+          ],
+          "sample": "{\"message\": \"Your profile is now hidden when visiting other profiles.\"}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/analytics",
+        "full_url": "https://rentmasseur.com/api/v1/analytics",
+        "request_body": {
+          "track": "",
+          "username": "ArmyMike"
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJleHAiOjE3ODI0MTYyNjksIm5iZiI6MTc4MjQxNjA4OSwic3ViIjoiMjQ4NDc5IiwidXNlcm5hbWUiOiJLYXJwYXRoaWFud29sZiIsInVzZXJUeXBlIjoxLCJzdGFnZU5hbWUiOiJKb3NlcGgiLCJhcHByb3ZlZCI6MSwibG9jYXRpb25JZCI6MTAzNiwic2VhcmNoQ2l0eSI6Im1hbmhhdHRhbi1ueSIsImNvdW50cnlTaG9ydCI6IlVTIiwic2Vzc2lvbkNvdW50cnlDb250aW5lbnQiOiJOQSIsImlzRnJvemVuIjowLCJsb2NhdGlvbkxhYmVsIjoiTWFuaGF0dGFuLCBOWSIsImlzcyI6Imh0dHBzOi8vcmVudG1hc3NldXIuY29tIiwiaWF0IjoxNzgyNDE2MTQ5fQ.KlE_XDzq0aTE4W-UQIh5j9KVMKmSJjaAuzM8bYtwLbiTn7RX4AINjLSKU0luXxi4vc7jPJVvuLlYiNhn6UWoZA",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/ArmyMike",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 204,
+        "response_mime": "text/plain",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/mailbox?page=1&folder=1&sort=1",
+        "full_url": "https://rentmasseur.com/api/v1/mailbox?page=1&folder=1&sort=1",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJleHAiOjE3ODI0MTYyNjksIm5iZiI6MTc4MjQxNjA4OSwic3ViIjoiMjQ4NDc5IiwidXNlcm5hbWUiOiJLYXJwYXRoaWFud29sZiIsInVzZXJUeXBlIjoxLCJzdGFnZU5hbWUiOiJKb3NlcGgiLCJhcHByb3ZlZCI6MSwibG9jYXRpb25JZCI6MTAzNiwic2VhcmNoQ2l0eSI6Im1hbmhhdHRhbi1ueSIsImNvdW50cnlTaG9ydCI6IlVTIiwic2Vzc2lvbkNvdW50cnlDb250aW5lbnQiOiJOQSIsImlzRnJvemVuIjowLCJsb2NhdGlvbkxhYmVsIjoiTWFuaGF0dGFuLCBOWSIsImlzcyI6Imh0dHBzOi8vcmVudG1hc3NldXIuY29tIiwiaWF0IjoxNzgyNDE2MTQ5fQ.KlE_XDzq0aTE4W-UQIh5j9KVMKmSJjaAuzM8bYtwLbiTn7RX4AINjLSKU0luXxi4vc7jPJVvuLlYiNhn6UWoZA",
+          "Referer": "https://rentmasseur.com/settings/mailbox",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "emails",
+            "pagination"
+          ],
+          "sample": "{\"emails\": [{\"id\": 47099739, \"unread\": 0, \"createdAt\": 1782397549, \"userCard\": {\"id\": 29718, \"username\": \"Joerocca\", \"status\": {\"isOnline\": false, \"message\": \"4 hours ago\"}, \"userPhoto\": \"/images/nophoto.jpg\", \"isPremium\": 0}, \"lastMessage\": \"And how you envision this sessio...\", \"tempAttachments\": 0}, {\"id\": 47064679, \"unread\": 0, \"createdAt\": 1782268610, \"userCard\": {\"id\": 173739, \"username\": \"RyanRypped\", \"status\": {\"available\": 1, \"message\": \"Available Now\"}, \"userPhoto\": \"https://cdn.rentmasseur.com/rmass/photos/6c/83/6c83a575-589c-43b9-9866-77a26b942d8a--h100.jpg\", \"isGold\": 1}, \"lastMessage\": \"How are you stud\", \"tempAttachments\": 0}, {\"id\": 47031080, \"unread\": 0, \"createdAt\": 1782166808, \"userCard\": {\"id\": 340420, \"username\": \"Brownbb\", \"status\": {\"isOnline\": false, \"message\": \"Today, 04:20\"}, \"userPhoto\": \"/images/nophoto.jpg\", \"isPremium\": 0}, \"lastMessage\": \"Definitely, sounds good Joseph. ...\", \"tempAttachments\": 0}, {\"id\": 47012651, \"unread\": 0, \"createdAt\": 1782115527, \"userCard\": {\"id\": 171885, \"username\": \"Blackcake\", \"status\": {\"isOnline\": false, \"message\": \"14 min ago\"}, \"userPhoto\": \"/images/nophoto.jpg\", \"isPremium\": 0}, \"lastMessage\": \"Hey sir\", \"tempAttachments\": 0}, {\"id\": 47011197, \"unread\": 0, \"createdAt\": 1782106477, \"userCard\": {\"id\": 255566, \"username\": \"Jodymuscle\", \"status\": {\"available\": 1, \"message\": \"Available Now\"}, \"userPhoto\": \"https://cdn.rentmasseur.com/rmass/photos/f3/8a/f38a330d-d589-4b24-bb38-f51900336d9f--h100.jpg\", \"isGold\": 0}, \"las"
+        }
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/account/dashboard/ad-statistics",
+        "full_url": "https://rentmasseur.com/api/v1/account/dashboard/ad-statistics",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJleHAiOjE3ODI0MTYyNjksIm5iZiI6MTc4MjQxNjA4OSwic3ViIjoiMjQ4NDc5IiwidXNlcm5hbWUiOiJLYXJwYXRoaWFud29sZiIsInVzZXJUeXBlIjoxLCJzdGFnZU5hbWUiOiJKb3NlcGgiLCJhcHByb3ZlZCI6MSwibG9jYXRpb25JZCI6MTAzNiwic2VhcmNoQ2l0eSI6Im1hbmhhdHRhbi1ueSIsImNvdW50cnlTaG9ydCI6IlVTIiwic2Vzc2lvbkNvdW50cnlDb250aW5lbnQiOiJOQSIsImlzRnJvemVuIjowLCJsb2NhdGlvbkxhYmVsIjoiTWFuaGF0dGFuLCBOWSIsImlzcyI6Imh0dHBzOi8vcmVudG1hc3NldXIuY29tIiwiaWF0IjoxNzgyNDE2MTQ5fQ.KlE_XDzq0aTE4W-UQIh5j9KVMKmSJjaAuzM8bYtwLbiTn7RX4AINjLSKU0luXxi4vc7jPJVvuLlYiNhn6UWoZA",
+          "Referer": "https://rentmasseur.com/settings",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "profileStatistics"
+          ],
+          "sample": "{\"profileStatistics\": {\"totalPageViews\": 2811, \"totalContactClicks\": 135, \"visits\": [{\"count\": 0, \"day\": \"Today\", \"percent\": 0}, {\"count\": 75, \"day\": \"Yesterday\", \"percent\": 84}, {\"count\": 54, \"day\": \"Wednesday\", \"percent\": 61}, {\"count\": 50, \"day\": \"Tuesday\", \"percent\": 56}, {\"count\": 89, \"day\": \"Monday\", \"percent\": 100}, {\"count\": 82, \"day\": \"Sunday\", \"percent\": 92}, {\"count\": 65, \"day\": \"Saturday\", \"percent\": 73}]}}"
+        }
+      }
+    ],
+    "call_count": 19
+  }
+}
+```
+
+visibility_guard.py:
+```
+"""
+Visibility Guard — ensure profile is shown in search.
+
+Confirmed endpoint:
+    GET /api/v1/account/keeponline
+    PUT /api/v1/settings/visibility
+"""
+
+import logging
+
+from .db import write_receipt
+from .api_client import RentMasseurAPI
+
+log = logging.getLogger("profileops.visibility")
 
 
-# ---------------------------------------------------------------------------
-# Bio Content Generator
-# ---------------------------------------------------------------------------
+def ensure_visible(api: RentMasseurAPI) -> bool:
+    """Check if profile is hidden and unhide it if needed."""
+    keep = api.get_keeponline()
+    is_hidden = bool(keep.get("isAdHidden", 0))
 
-BIO_HEADLINES = [
-    "You bring the smile, I bring the Wolf.",
-    "Manhattan bodywork. Deep. Intentional. Real.",
-    "Large hands. Clear purpose. Better movement.",
-    "Your shoulders called. The Wolf answered.",
-    "Deep tissue therapy, Chelsea to Midtown.",
-    "No crystals. No fluff. Just effective bodywork.",
-    "7 years of convincing muscles to behave.",
-    "The body keeps score. I audit the books.",
-    "Professional massage for people who sit too hard.",
-    "From desk goblin to functional human.",
+    before = {"isAdHidden": int(is_hidden)}
+
+    if is_hidden:
+        log.warning("Profile is hidden. Repairing visibility...")
+        result = api.set_visibility(True)
+        # Verify
+        keep = api.get_keeponline()
+        after_hidden = bool(keep.get("isAdHidden", 0))
+        after = {"isAdHidden": int(after_hidden)}
+        verified = not after_hidden
+        write_receipt(
+            "profile_visibility_repair_v1",
+            "ensure_visible",
+            before,
+            after,
+            verified=verified,
+        )
+        if verified:
+            log.info("Visibility repaired successfully")
+        else:
+            log.error("Visibility repair failed")
+        return verified
+    else:
+        log.info("Profile visibility OK")
+        write_receipt(
+            "profile_visibility_check_v1",
+            "check_visible",
+            before,
+            before,
+            verified=True,
+        )
+        return True
+
+```
+
+probe5.py:
+```
+import requests, re, json
+
+s = requests.Session()
+s.headers.update({
+    'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json',
+    'Referer': 'https://rentmasseur.com/settings', 'Origin': 'https://rentmasseur.com',
+})
+s.get('https://rentmasseur.com/login')
+m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', s.get('https://rentmasseur.com/login').text)
+csrf = m.group(1) if m else ''
+r = s.post('https://rentmasseur.com/api/v1/login', json={
+    'email': 'karpathianwolf', 'password': 'os.environ.get("RM_PASSWORD", "")', 'csrf': csrf, 'remember': True
+})
+s.headers['Authorization'] = 'Bearer ' + r.json()['accessToken']
+print('Login OK')
+
+# Blogs
+for p in ['?page=1', '?username=Karpathianwolf', '/list', '/user']:
+    r = s.get(f'https://rentmasseur.com/api/v1/blogs{p}', timeout=5)
+    print(f'GET blogs{p}: {r.status_code} {r.text[:200]}')
+
+# POST blog variants
+for path in ['/api/v1/blogs', '/api/v1/account/blogs', '/api/v1/settings/blog']:
+    r = s.post(f'https://rentmasseur.com{path}', json={'title': 'Test', 'content': 'Test'}, timeout=5)
+    print(f'POST {path}: {r.status_code} {r.text[:200]}')
+
+# Interview - try fetching the public profile page which has interview
+r = s.get('https://rentmasseur.com/api/v1/account/blogs', timeout=5)
+print(f'GET account/blogs: {r.status_code} {r.text[:200]}')
+
+# Rates
+r = s.get('https://rentmasseur.com/api/v1/settings/rates')
+d = r.json()
+print(f'GET rates keys: {list(d.keys())}')
+print(json.dumps(d, indent=2, default=str)[:1000])
+
+```
+
+probe2.py:
+```
+import requests, re, json
+
+s = requests.Session()
+s.headers.update({
+    'User-Agent': 'Mozilla/5.0',
+    'Accept': 'application/json',
+    'Referer': 'https://rentmasseur.com/settings',
+    'Origin': 'https://rentmasseur.com',
+})
+
+r = s.get('https://rentmasseur.com/login')
+m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', r.text)
+csrf = m.group(1) if m else ''
+r = s.post('https://rentmasseur.com/api/v1/login', json={
+    'email': 'karpathianwolf', 'password': 'os.environ.get("RM_PASSWORD", "")', 'csrf': csrf, 'remember': True
+})
+s.headers['Authorization'] = 'Bearer ' + r.json()['accessToken']
+print('Login OK')
+
+r = s.get('https://rentmasseur.com/api/v1/settings/about')
+d = r.json()
+h = d['userProps']['assets']['headline']
+desc = d['userProps']['assets']['description']
+
+# Try different payload structures
+payloads = [
+    {'headline': h, 'description': desc},
+    {'assets': {'headline': h, 'description': desc}},
+    {'userProps': {'assets': {'headline': h, 'description': desc}}},
+    {'headline': h, 'description': desc, 'isTextUnderReview': 0},
 ]
 
-BIO_VARIATIONS = [
-    """🐺 KARPATHIAN WOLF
-
-74,000+ profile views.
-
-7 years specializing in deep tissue, sports recovery, and mobility work.
-
-I work with desk professionals, gym athletes, frequent flyers, and anyone whose shoulders are trying to become earrings.
-
-Common feedback: "I can move my neck again," and "I didn't know I was carrying all that stress."
-
-Approach: find the restriction, address it directly, restore function.
-
-No gimmicks. No energy portals. Just clean, effective bodywork from a large Ukrainian therapist in Manhattan.
-
-📍 Manhattan, NYC
-""",
-    """🐺 KARPATHIAN WOLF
-
-Professional deep tissue and therapeutic bodywork in Manhattan.
-
-What I do: identify the real source of tension, work it with depth and precision, and help you move better.
-
-Who I see: office workers, athletes, travelers, and anyone with chronic tightness.
-
-What to expect: clear communication, firm pressure, and a session that actually changes how you feel.
-
-📍 Manhattan, NYC
-""",
-    """🐺 KARPATHIAN WOLF
-
-Your body keeps score. I help audit the books.
-
-7 years of hands-on experience. Deep tissue, sports recovery, stress relief.
-
-I work with people who sit too long, lift too hard, or fly too often. If your neck, shoulders, or back feel like they own you, we fix that.
-
-Sessions are professional, direct, and focused on results.
-
-📍 Manhattan, NYC
-""",
-]
-
-def suggest_bio(current_headline: str = "", current_description: str = "") -> Dict:
-    """Generate a new bio variant that is different from current."""
-    headline = random.choice([h for h in BIO_HEADLINES if h != current_headline])
-    desc = random.choice([d for d in BIO_VARIATIONS if d.strip()[:100] != current_description.strip()[:100]])
-    return {"headline": headline, "description": desc}
-
-def draft_blog() -> Dict:
-    """Draft a blog post. Returns draft only — does NOT publish."""
-    titles = [
-        "What to expect from your first deep tissue session",
-        "Why your shoulders hurt and what actually helps",
-        "Desk work vs. your neck: how to fight back",
-        "The difference between spa massage and therapeutic bodywork",
-        "Recovery tips for athletes who train hard",
-    ]
-    snippets = [
-        "Most people think massage is about relaxation. Therapeutic work is about restoring movement.",
-        "Your shoulders are not supposed to live next to your ears. If they do, we can fix that.",
-        "Deep tissue should not mean painful. It means precise, patient, and targeted.",
-        "The best recovery combines sleep, movement, water, and occasional professional bodywork.",
-        "If you fly often, your hips and lower back are paying for it. Regular sessions help.",
-    ]
-    title = random.choice(titles)
-    body = random.choice(snippets) + "\n\nThis is a draft. Review before publishing."
-    return {"title": title, "body": body}
-
-# ---------------------------------------------------------------------------
-# ProfileOps Engine
-# ---------------------------------------------------------------------------
-
-class ProfileOps:
-    """Main operations engine."""
-
-    def __init__(self, username: str, password: str, city: str = "manhattan-ny", manual_captcha: bool = False):
-        self.api = RentMasseurAPI()
-        self.username = username
-        self.password = password
-        self.city = city
-        self.manual_captcha = manual_captcha
-        self.last_visibility_check = 0
-        self.last_avail_check = 0
-        self.last_stats_check = 0
-        self.last_bio_check = 0
-        self.last_dashboard_print = 0
-        self.running = True
-        self.current_state = {}
-
-    def login(self) -> bool:
-        if self.manual_captcha:
-            ok = self.api.login_manual_captcha(self.username, self.password)
-            receipt("login", ok, "Manual captcha login")
-            return ok
-        ok = self.api.login(self.username, self.password)
-        receipt("login", ok, "API login")
-        return ok
-
-    def ensure_visible(self, force: bool = False):
-        """Guard profile visibility. Fix it if hidden."""
-        try:
-            keep = self.api.get_keeponline()
-            is_hidden = bool(keep.get("isAdHidden", 0))
-            if is_hidden or force:
-                before = {"isAdHidden": is_hidden}
-                result = self.api.set_visibility(True)
-                after = {"isAdHidden": 0, "response": result}
-                receipt("set_visibility", True, "Profile was hidden, now shown", before, after)
-                record_alert("critical", "visibility_hidden", "Profile was hidden from search. Auto-fixed.")
-                log.info("Profile visibility: HIDDEN → SHOWN")
-            else:
-                log.info("Profile visibility: shown")
-        except Exception as e:
-            receipt("ensure_visible", False, str(e))
-            log.error("Visibility check failed: %s", e)
-
-    def ensure_available(self):
-        """Refresh availability only if near expiry."""
-        try:
-            avail = self.api.get_availability()
-            selected = avail.get("selected", "")
-            countdown = avail.get("countdown", 0)
-            now = time.time()
-            remaining = max(0, int(countdown - now))
-
-            log.info("Availability: %s (remaining ~%ds)", selected, remaining)
-
-            if selected != "Available" or remaining < AVAIL_REFRESH_THRESHOLD:
-                before = {"selected": selected, "remaining": remaining}
-                # Try to set availability via dashboard about endpoint
-                # Note: the exact set-availability endpoint wasn't confirmed.
-                # We log that it needs refresh and attempt the best-known path.
-                # For now, we flag this as needing manual/agent confirmation.
-                receipt("ensure_available", False,
-                        f"Availability needs refresh ({selected}, {remaining}s left). Endpoint not confirmed.")
-                record_alert("warning", "availability_low",
-                             f"Availability low/expired: {selected}, {remaining}s remaining. Need refresh.")
-            else:
-                receipt("ensure_available", True, f"Availability OK: {selected}, {remaining}s left")
-        except Exception as e:
-            receipt("ensure_available", False, str(e))
-            log.error("Availability check failed: %s", e)
-
-    def collect_stats(self):
-        """Collect traffic and profile stats."""
-        try:
-            dash = self.api.get_dashboard()
-            stats = self.api.get_stats()
-            keep = self.api.get_keeponline()
-            about = self.api.get_about()
-            mail = self.api.get_mailbox()
-
-            prof_stats = stats.get("profileStatistics", {}) or {}
-            assets = about.get("userProps", {}).get("assets", {})
-
-            record_stats(
-                views=prof_stats.get("totalPageViews"),
-                contact_clicks=prof_stats.get("totalContactClicks"),
-                visits=keep.get("newVisits"),
-                bookmarks=dash.get("onlineBookmarks"),
-                new_emails=keep.get("newEmails"),
-                is_ad_hidden=keep.get("isAdHidden"),
-                available=dash.get("userSetting", {}).get("availability", {}).get("available"),
-                availability_remaining=str(dash.get("userSetting", {}).get("availability", {}).get("validTo", "")),
-                headline=assets.get("headline"),
-                description_len=len(assets.get("description", "")),
-                city=self.city,
-            )
-
-            log.info("Stats recorded: views=%s contacts=%s visits=%s bookmarks=%s",
-                     prof_stats.get("totalPageViews"),
-                     prof_stats.get("totalContactClicks"),
-                     keep.get("newVisits"),
-                     dash.get("onlineBookmarks"))
-
-            self.current_state = {
-                "views": prof_stats.get("totalPageViews"),
-                "contacts": prof_stats.get("totalContactClicks"),
-                "visits": keep.get("newVisits"),
-                "bookmarks": dash.get("onlineBookmarks"),
-                "is_ad_hidden": keep.get("isAdHidden"),
-                "available": dash.get("userSetting", {}).get("availability", {}).get("available"),
-                "headline": assets.get("headline"),
-            }
-            receipt("collect_stats", True, "Traffic stats collected")
-        except Exception as e:
-            receipt("collect_stats", False, str(e))
-            log.error("Stats collection failed: %s", e)
-
-    def check_search_position(self):
-        """Check search position for target city."""
-        try:
-            results = self.api.search(self.city, available_only=False, page=1)
-            avail_results = self.api.search(self.city, available_only=True, page=1)
-
-            # Find our position by looking for our username in result items
-            pos = self._find_position(results)
-            avail_pos = self._find_position(avail_results)
-
-            total = len(results.get("masseurs", [])) if isinstance(results.get("masseurs"), list) else 0
-            avail_total = len(avail_results.get("masseurs", [])) if isinstance(avail_results.get("masseurs"), list) else 0
-
-            record_stats(
-                city=self.city,
-                search_position=pos,
-                search_available_position=avail_pos,
-                search_total=total,
-                search_available_total=avail_total,
-            )
-            log.info("Search position: #%s/%s (available #%s/%s)", pos, total, avail_pos, avail_total)
-            receipt("check_search_position", True,
-                    f"Position #{pos}/{total}, available #{avail_pos}/{avail_total}")
-        except Exception as e:
-            receipt("check_search_position", False, str(e))
-            log.error("Search position check failed: %s", e)
-
-    def _find_position(self, results: Dict) -> Optional[int]:
-        masseurs = results.get("masseurs") if isinstance(results.get("masseurs"), list) else []
-        for i, m in enumerate(masseurs):
-            uname = (m.get("username") or m.get("userCard", {}).get("username") or "").lower()
-            if uname == self.username.lower():
-                return i + 1
-        return None
-
-    def bio_experiment(self, auto_apply: bool = False):
-        """Run controlled bio experiment with LLM-driven analysis. One change per day."""
-        try:
-            # Check if we already changed bio today
-            conn = db()
-            row = conn.execute(
-                "SELECT ts FROM bio_versions WHERE applied=1 ORDER BY ts DESC LIMIT 1"
-            ).fetchone()
-            conn.close()
-            if row:
-                last_change = datetime.fromisoformat(row["ts"])
-                if datetime.now(timezone.utc) - last_change < timedelta(days=1):
-                    log.info("Bio experiment: skipped — last change was within 24h")
-                    return
-
-            # Pull real profile data for LLM analysis
-            profile_data = self.api.full_status()
-            about = profile_data.get("about", {})
-            assets = about.get("userProps", {}).get("assets", {})
-            current_headline = assets.get("headline", "")
-            current_desc = assets.get("description", "")
-
-            # Get recent stats history
-            conn = db()
-            stats_history = [dict(r) for r in conn.execute(
-                "SELECT ts, views, contact_clicks, visits FROM stats ORDER BY ts DESC LIMIT 7"
-            ).fetchall()]
-            conn.close()
-
-            # Generate with LLM
-            from rm_traffic.llm_bio_writer import generate_bio_with_llm
-            suggestion = generate_bio_with_llm(
-                profile_data, stats_history, current_headline, current_desc,
-                city=self.city, provider=os.environ.get("LLM_PROVIDER"),
-                model=os.environ.get("LLM_MODEL")
-            )
-
-            # Fallback to templates if LLM fails
-            if not suggestion:
-                suggestion = suggest_bio(current_headline, current_desc)
-                log.warning("LLM bio generation failed, using template fallback")
-
-            stats = self.api.get_stats()
-            views_before = (stats.get("profileStatistics") or {}).get("totalPageViews")
-            contacts_before = (stats.get("profileStatistics") or {}).get("totalContactClicks")
-
-            conn = db()
-            conn.execute(
-                "INSERT INTO bio_versions (ts, headline, description, reason, applied, views_before, contacts_before) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (datetime.now(timezone.utc).isoformat(), suggestion["headline"],
-                 suggestion["bio"], "llm_daily_variant", 0, views_before, contacts_before)
-            )
-            conn.commit()
-            conn.close()
-
-            log.info("Bio experiment suggestion: headline='%s'", suggestion["headline"])
-
-            if auto_apply:
-                before = {"headline": current_headline, "description": current_desc[:200]}
-                self.api.set_about(suggestion["headline"], suggestion["bio"])
-                conn = db()
-                conn.execute(
-                    "UPDATE bio_versions SET applied=1 WHERE ts=(SELECT ts FROM bio_versions ORDER BY ts DESC LIMIT 1)"
-                )
-                conn.commit()
-                conn.close()
-                after = {"headline": suggestion["headline"], "description": suggestion["bio"][:200]}
-                receipt("bio_experiment", True, "Applied new LLM bio variant", before, after)
-                log.info("Bio experiment applied (auto)")
-            else:
-                receipt("bio_experiment", True,
-                        f"LLM bio variant drafted (not applied). Headline: {suggestion['headline']}")
-                record_alert("info", "bio_suggestion",
-                             f"New LLM bio variant drafted: {suggestion['headline']}")
-        except Exception as e:
-            receipt("bio_experiment", False, str(e))
-            log.error("Bio experiment failed: %s", e)
-
-    def draft_blog_post(self):
-        """Draft a blog post. Never auto-publish."""
-        draft = draft_blog()
-        receipt("draft_blog", True, f"Drafted blog: {draft['title']}")
-        log.info("Blog draft (not published): %s", draft["title"])
-        return draft
-
-    def print_dashboard(self):
-        """Print current status dashboard."""
-        try:
-            dash = self.api.get_dashboard()
-            stats = self.api.get_stats()
-            keep = self.api.get_keeponline()
-            about = self.api.get_about()
-            avail = self.api.get_availability()
-
-            prof = stats.get("profileStatistics", {}) or {}
-            assets = about.get("userProps", {}).get("assets", {})
-            us = dash.get("userSetting", {})
-
-            print(f"\n{'='*60}")
-            print(f"  PROFILEOPS DASHBOARD")
-            print(f"{'='*60}")
-            print(f"  Timestamp: {datetime.now(timezone.utc).isoformat()[:19]} UTC")
-            print(f"  Username:  {self.username}")
-            print(f"  Visibility: {'HIDDEN' if keep.get('isAdHidden') else 'SHOWN'}")
-            print(f"  Availability: {us.get('availability', {}).get('message', 'N/A')} "
-                  f"(validTo={us.get('availability', {}).get('validTo', 'N/A')})")
-            print(f"  Profile Views:   {prof.get('totalPageViews', 'N/A')}")
-            print(f"  Contact Clicks:  {prof.get('totalContactClicks', 'N/A')}")
-            print(f"  New Visits:      {keep.get('newVisits', 'N/A')}")
-            print(f"  New Emails:      {keep.get('newEmails', 'N/A')}")
-            print(f"  Bookmarks:       {dash.get('onlineBookmarks', 'N/A')}")
-            print(f"  Headline:        {assets.get('headline', 'N/A')}")
-            print(f"  Description:     {len(assets.get('description', ''))} chars")
-            print(f"  Track Actions:   {'ON' if us.get('trackActions') else 'OFF'}")
-            print(f"  SMS Alerts:      {'ON' if us.get('sms') else 'OFF'}")
-            print(f"{'='*60}\n")
-            receipt("print_dashboard", True, "Dashboard printed")
-        except Exception as e:
-            receipt("print_dashboard", False, str(e))
-            log.error("Dashboard print failed: %s", e)
-
-    def cycle(self):
-        """One daemon cycle."""
-        now = time.time()
-
-        if now - self.last_visibility_check >= VISIBILITY_CHECK_INTERVAL:
-            self.ensure_visible()
-            self.last_visibility_check = now
-
-        if now - self.last_avail_check >= AVAIL_CHECK_INTERVAL:
-            self.ensure_available()
-            self.last_avail_check = now
-
-        if now - self.last_stats_check >= STATS_INTERVAL:
-            self.collect_stats()
-            self.check_search_position()
-            self.last_stats_check = now
-
-        if now - self.last_bio_check >= BIO_EXPERIMENT_INTERVAL:
-            self.bio_experiment(auto_apply=False)
-            self.last_bio_check = now
-
-        if now - self.last_dashboard_print >= DASHBOARD_INTERVAL:
-            self.print_dashboard()
-            self.last_dashboard_print = now
-
-    def run_once(self):
-        if not self.login():
-            return
-        self.print_dashboard()
-        self.ensure_visible()
-        self.ensure_available()
-        self.collect_stats()
-        self.check_search_position()
-        self.bio_experiment(auto_apply=False)
-        draft = self.draft_blog_post()
-        print(f"\nBlog draft (not published):\n{draft['title']}\n{draft['body']}\n")
-
-    def run_daemon(self):
-        log.info("=== ProfileOps daemon starting ===")
-        if not self.login():
-            log.error("Initial login failed, retrying in 60s")
-            time.sleep(60)
-            if not self.login():
-                log.error("Login failed twice, exiting")
-                return
-
-        self.print_dashboard()
-        while self.running:
-            try:
-                self.cycle()
-            except KeyboardInterrupt:
-                log.info("Shutdown requested")
-                self.running = False
-                break
-            except Exception as e:
-                log.error("Cycle error: %s", e)
-                receipt("daemon_cycle", False, str(e))
-                time.sleep(30)
-            time.sleep(60)
-        log.info("ProfileOps daemon stopped")
-
-
-# ---------------------------------------------------------------------------
-# CLI commands
-# ---------------------------------------------------------------------------
-
-def cmd_status(ops: ProfileOps):
-    if not ops.login():
-        print("Login failed")
-        sys.exit(1)
-    ops.print_dashboard()
-
-
-def cmd_once(ops: ProfileOps):
-    ops.run_once()
-
-
-def cmd_history():
-    conn = db()
-    print("\n=== RECENT ACTIONS ===")
-    for r in conn.execute("SELECT * FROM receipts ORDER BY ts DESC LIMIT 30"):
-        print(f"  {r['ts'][:19]} | {'OK' if r['success'] else 'FAIL'} | {r['action']:25s} | {r['detail'][:60]}")
-    print("\n=== RECENT STATS ===")
-    for r in conn.execute("SELECT * FROM stats ORDER BY ts DESC LIMIT 10"):
-        print(f"  {r['ts'][:19]} | views={r['views'] or '-':6} contacts={r['contact_clicks'] or '-':4} "
-              f"visits={r['visits'] or '-':4} | visible={r['is_ad_hidden'] or 0} avail={r['available'] or '-'} "
-              f"| pos={r['search_position'] or '-':4}/{r['search_total'] or '-':4}")
-    print("\n=== BIO VERSIONS ===")
-    for r in conn.execute("SELECT * FROM bio_versions ORDER BY ts DESC LIMIT 10"):
-        print(f"  {r['ts'][:19]} | {'APPLIED' if r['applied'] else 'DRAFT'} | {r['headline'][:50]}")
-    print("\n=== UNACKED ALERTS ===")
-    for r in conn.execute("SELECT * FROM alerts WHERE acknowledged=0 ORDER BY ts DESC LIMIT 10"):
-        print(f"  {r['ts'][:19]} | [{r['severity']:8s}] {r['type']:20s} | {r['message']}")
-    conn.close()
-
-
-def cmd_suggest_bio(ops: ProfileOps):
-    if not ops.login():
-        print("Login failed")
-        sys.exit(1)
-    ops.bio_experiment(auto_apply=False)
-    # Print the latest draft
-    conn = db()
-    row = conn.execute("SELECT * FROM bio_versions ORDER BY ts DESC LIMIT 1").fetchone()
-    conn.close()
-    if row:
-        print(f"\n=== LLM BIO SUGGESTION ===")
-        print(f"Headline: {row['headline']}")
-        print(f"\nBio:\n{row['description']}")
-        print(f"\nApplied: {bool(row['applied'])}")
-        print(f"Views before: {row['views_before']}")
-        print(f"Contacts before: {row['contacts_before']}")
-
-
-
-def cmd_set_bio(ops: ProfileOps):
-    if not ops.login():
-        print("Login failed")
-        sys.exit(1)
-    about = ops.api.get_about()
-    assets = about.get("userProps", {}).get("assets", {})
-    before = {"headline": assets.get("headline"), "description": assets.get("description")}
-    print("Enter headline:")
-    headline = input("> ")
-    print("Enter description (Ctrl+D when done):")
-    desc_lines = []
-    try:
-        while True:
-            desc_lines.append(input())
-    except EOFError:
-        pass
-    description = "\n".join(desc_lines)
-    ops.api.set_about(headline, description)
-    after = {"headline": headline, "description": description}
-    receipt("set_bio", True, "Manual bio update", before, after)
-    print("Bio updated.")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="ProfileOps — RentMasseur Profile Operations Agent")
-    parser.add_argument("--daemon", action="store_true", help="Run as daemon")
-    parser.add_argument("--status", action="store_true", help="Print current status")
-    parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
-    parser.add_argument("--history", action="store_true", help="Show history and stats")
-    parser.add_argument("--suggest-bio", action="store_true", help="Generate bio variant draft via LLM")
-    parser.add_argument("--set-bio", action="store_true", help="Manually set bio via stdin")
-    parser.add_argument("--city", default="manhattan-ny", help="City to track search position")
-    parser.add_argument("--llm-provider", default="ollama", help="ollama/groq/openrouter")
-    parser.add_argument("--llm-model", help="Model name, e.g. llama-3.1-8b-instant")
-    parser.add_argument("--manual-captcha", action="store_true", help="Open visible browser for manual captcha solve")
-    args = parser.parse_args()
-
-    init_db()
-
-    username = os.environ.get("RM_USER")
-    password = os.environ.get("RM_PASS")
-    if not username or not password:
-        print("ERROR: Set RM_USER and RM_PASS environment variables.")
-        print("Do not hardcode credentials.")
-        sys.exit(1)
-
-    os.environ.setdefault("LLM_PROVIDER", args.llm_provider)
-    if args.llm_model:
-        os.environ.setdefault("LLM_MODEL", args.llm_model)
-
-    ops = ProfileOps(username, password, city=args.city, manual_captcha=args.manual_captcha)
-
+for i, p in enumerate(payloads):
+    r2 = s.put('https://rentmasseur.com/api/v1/settings/about', json=p)
+    print(f'PUT #{i} keys={list(p.keys())}: {r2.status_code} {r2.text[:150]}')
+    if r2.status_code == 200:
+        print('SUCCESS')
+        break
+
+# Also try POST
+r3 = s.post('https://rentmasseur.com/api/v1/settings/about', json={'headline': h, 'description': desc})
+print(f'POST: {r3.status_code} {r3.text[:150]}')
+
+# Try PATCH
+r4 = s.patch('https://rentmasseur.com/api/v1/settings/about', json={'headline': h, 'description': desc})
+print(f'PATCH: {r4.status_code} {r4.text[:150]}')
+
+```
+
+profileops.log:
+```
+2026-06-25 16:07:23,178 [INFO] Database initialized at /Users/alep/Downloads/windsurf-smoke/rm_traffic/profileops.db
+2026-06-25 16:07:25,868 [INFO] Database initialized at /Users/alep/Downloads/windsurf-smoke/rm_traffic/profileops.db
+2026-06-25 16:07:31,259 [INFO] Database initialized at /Users/alep/Downloads/windsurf-smoke/rm_traffic/profileops.db
+2026-06-25 16:07:32,050 [INFO] Login OK as karpathianwolf
+2026-06-25 16:07:32,052 [INFO] RECEIPT: login | API login
+2026-06-25 16:07:41,809 [INFO] RECEIPT: print_dashboard | Dashboard printed
+2026-06-25 16:07:43,906 [INFO] Profile visibility: shown
+2026-06-25 16:07:45,805 [INFO] Availability: Available (remaining ~15313s)
+2026-06-25 16:07:45,808 [INFO] RECEIPT: ensure_available | Availability OK: Available, 15313s left
+2026-06-25 16:08:01,638 [INFO] Database initialized at /Users/alep/Downloads/windsurf-smoke/rm_traffic/profileops.db
+2026-06-25 16:08:02,474 [INFO] Login OK as karpathianwolf
+2026-06-25 16:08:02,477 [INFO] RECEIPT: login | API login
+2026-06-25 16:08:12,020 [INFO] RECEIPT: print_dashboard | Dashboard printed
+2026-06-25 16:08:14,144 [INFO] Profile visibility: shown
+2026-06-25 16:08:16,052 [INFO] Availability: Available (remaining ~21568s)
+2026-06-25 16:08:16,057 [INFO] RECEIPT: ensure_available | Availability OK: Available, 21568s left
+2026-06-25 16:08:26,255 [INFO] Stats recorded: views=2808 contacts=135 visits=31 bookmarks=2
+2026-06-25 16:08:26,258 [INFO] RECEIPT: collect_stats | Traffic stats collected
+2026-06-25 16:08:30,324 [INFO] Search position: #None/0 (available #None/0)
+2026-06-25 16:08:30,326 [INFO] RECEIPT: check_search_position | Position #None/0, available #None/0
+2026-06-25 16:08:34,235 [INFO] Bio experiment suggestion: headline='Professional massage for people who sit too hard.'
+2026-06-25 16:08:34,236 [INFO] RECEIPT: bio_experiment | Draft bio variant generated (not applied). Headline: Professional massage for people who sit too hard.
+2026-06-25 16:08:34,238 [WARNING] ALERT [info/bio_suggestion]: New bio variant drafted: Professional massage for people who sit too hard.
+2026-06-25 16:08:34,239 [INFO] RECEIPT: draft_blog | Drafted blog: Why your shoulders hurt and what actually helps
+2026-06-25 16:08:34,239 [INFO] Blog draft (not published): Why your shoulders hurt and what actually helps
+2026-06-25 16:10:57,837 [INFO] Database initialized at /Users/alep/Downloads/windsurf-smoke/rm_traffic/profileops.db
+2026-06-25 16:11:29,477 [INFO] Database initialized at /Users/alep/Downloads/windsurf-smoke/rm_traffic/profileops.db
+2026-06-25 16:11:30,175 [ERROR] Login response not JSON (captcha/block?): <!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>CrowdSec Captcha</title>
+    <meta content="text/html; charset=utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>/*! tailwindcss v3.2.7 | MIT License | https://tailwindcss.com*/*,:after,:before{borde
+2026-06-25 16:11:30,179 [ERROR] RECEIPT FAIL: login | API login
+2026-06-25 16:11:54,789 [INFO] Database initialized at /Users/alep/Downloads/windsurf-smoke/rm_traffic/profileops.db
+2026-06-25 16:11:55,223 [ERROR] API login response not JSON (captcha/block?). Trying Selenium...
+2026-06-25 16:11:55,230 [INFO] Attempting Selenium hybrid login...
+2026-06-25 16:12:07,223 [ERROR] Selenium login failed, still on login page
+2026-06-25 16:12:07,364 [ERROR] RECEIPT FAIL: login | API login
+2026-06-25 16:21:56,945 [INFO] Database initialized at /Users/alep/Downloads/windsurf-smoke/rm_traffic/profileops.db
+2026-06-25 16:21:56,950 [INFO] Attempting Selenium hybrid login...
+
+```
+
+bio_tokenizer.py:
+```
+"""
+Bio tokenizer and vocabulary builder.
+
+Tokenizes every word in generated bios and builds frequency statistics.
+Used for speech-friendly optimization and vocabulary analysis.
+"""
+
+import re
+import json
+from collections import Counter
+from pathlib import Path
+from typing import List, Dict, Tuple
+
+
+def tokenize(text: str) -> List[str]:
+    """Simple word-level tokenizer. Lowercase, strip punctuation."""
+    return re.findall(r'\b[a-zA-Z\']+\b', text.lower())
+
+
+def build_vocab(bios: List[Dict], min_freq: int = 2) -> Dict:
+    """Build vocabulary from a list of bios."""
+    counter = Counter()
+    for bio in bios:
+        tokens = tokenize(bio["headline"] + " " + bio["description"])
+        counter.update(tokens)
+    return {
+        "total_tokens": sum(counter.values()),
+        "unique_tokens": len(counter),
+        "token_freq": dict(counter.most_common()),
+        "vocab": [t for t, c in counter.items() if c >= min_freq],
+    }
+
+
+def save_vocab(vocab: Dict, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(vocab, indent=2))
+
+
+def load_vocab(path: Path) -> Dict:
+    return json.loads(path.read_text())
+
+
+def _is_simple_word(word: str) -> bool:
+    """Simple words are short and phonetic."""
+    return len(word) <= 6 and word.isalpha()
+
+
+def _syllable_count(word: str) -> int:
+    """Rough syllable count for speech rhythm."""
+    word = word.lower()
+    vowels = "aeiouy"
+    count = 0
+    prev_was_vowel = False
+    for char in word:
+        is_vowel = char in vowels
+        if is_vowel and not prev_was_vowel:
+            count += 1
+        prev_was_vowel = is_vowel
+    if word.endswith("e"):
+        count -= 1
+    return max(1, count)
+
+
+def speech_features(text: str) -> Dict:
+    """Compute speech-friendliness features."""
+    tokens = tokenize(text)
+    sentences = re.split(r'[.!?]+', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    if not tokens:
+        return {"speech_score": 0.0}
+
+    avg_word_len = sum(len(t) for t in tokens) / len(tokens)
+    avg_syllables = sum(_syllable_count(t) for t in tokens) / len(tokens)
+    avg_sentence_len = len(tokens) / max(1, len(sentences))
+    simple_word_ratio = sum(1 for t in tokens if _is_simple_word(t)) / len(tokens)
+
+    # Speech score: shorter words, shorter sentences, fewer syllables = higher
+    speech_score = (
+        (1 - min(avg_word_len / 8, 1)) * 0.3
+        + (1 - min(avg_syllables / 2.5, 1)) * 0.3
+        + (1 - min(avg_sentence_len / 20, 1)) * 0.25
+        + simple_word_ratio * 0.15
+    )
+
+    return {
+        "avg_word_len": round(avg_word_len, 2),
+        "avg_syllables": round(avg_syllables, 2),
+        "avg_sentence_len": round(avg_sentence_len, 2),
+        "simple_word_ratio": round(simple_word_ratio, 2),
+        "speech_score": round(speech_score, 4),
+    }
+
+```
+
+bio_generator_v2.cpp:
+```
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <random>
+#include <chrono>
+#include <unordered_map>
+#include <algorithm>
+#include <cctype>
+#include <sstream>
+#include <iomanip>
+
+std::vector<std::string> headline_templates = {
+    "{adjective} {thing} — Manhattan",
+    "{name} Delivers {thing} in Manhattan",
+    "Manhattan {thing} for {person}",
+    "{thing} Without the Fluff — Manhattan",
+    "{body_part} {thing} in Manhattan",
+    "{city} {thing} for {person}",
+    "{adjective} {body_part} {thing} — Manhattan",
+    "{person} Choose {thing} in Manhattan",
+    "{name}: {thing} in Manhattan",
+    "Real {thing} for {person} in {city}",
+    "{thing} That Actually Works — Manhattan",
+    "Manhattan's {adjective} {thing}",
+    "{thing} for {person} — {city}",
+    "{adjective} {thing} for {body_part} Relief",
+    "{name} Does {thing} — {city}",
+    "{thing} in Manhattan, NYC",
+    "{body_part} Rescue in {city}",
+    "{person} Recovery in Manhattan",
+    "{thing} + {thing} in Manhattan",
+    "{adjective} {thing} for {person}",
+    "From {city} Stress to {thing}",
+    "{thing}: The Manhattan Edition",
+    "{name}'s {thing} — Manhattan",
+    "{person} Get {thing} in Manhattan",
+    "{thing} for {person} in NYC",
+    "{body_part} and {body_part} {thing} — Manhattan",
+    "{adjective} {thing} for {city} Clients",
+    "{thing} Made Simple — Manhattan",
+    "{person} Need {thing} — Manhattan",
+    "{name} Presents: {thing} in {city}",
+    "{thing} for {person} Who Train",
+    "{thing} for {person} Who Sit",
+    "{city} {thing} by {name}",
+    "{adjective} {thing} for {body_part} Pain",
+    "{thing} in {city} — {adjective}",
+    "{person} Prefer {thing} in Manhattan",
+    "Manhattan {thing} with {adjective} Pressure",
+    "{thing} for {person} in {city}",
+    "{body_part} {thing} for {person}",
+    "{name}: {adjective} {thing} in Manhattan",
+    "{thing} for {city}'s Busiest {person}",
+    "{adjective} {thing} — {city}",
+    "{thing} When You Need It — {city}",
+    "{person} Trust {name} for {thing}",
+    "{city} {thing} for {body_part} Recovery",
+    "{adjective} {thing} in {city}",
+    "{thing} for {person} in Manhattan",
+    "{name}'s {adjective} {thing}",
+    "{thing} in {city} for {person}",
+    "{body_part} {thing} in {city}",
+    "{adjective} {thing} for {city} {person}",
+    "{thing} for {person} — {name}",
+    "{city} {thing} with {name}",
+    "{thing} That {person} Recommend",
+    "{name}: {thing} for {city}",
+    "{adjective} {thing} — {person} Edition",
+    "{thing} for {body_part} and {body_part} in Manhattan",
+    "{person} Book {thing} in {city}",
+    "{name} Does {adjective} {thing}",
+    "{city} {thing} for {person} Recovery",
+    "{thing} in {city} — {adjective} {name}",
+    "{adjective} {thing} for {person} in {city}",
+    "{body_part} {thing} for {city} {person}",
+    "{thing} in Manhattan — {adjective}",
+    "{name}: {thing} for {person}",
+    "{thing} for {city} {person}",
+    "{adjective} {body_part} Work in {city}",
+    "{thing} for {person} — {city}",
+    "{city} {thing} by {name} — {adjective}",
+    "{thing} for {person} with {body_part} Issues",
+    "{name} {thing} in {city}",
+    "{adjective} {thing} for {city} Professionals",
+    "{thing} in {city} for {body_part} Relief",
+    "{person} Get {adjective} {thing} in Manhattan",
+    "{thing} — {city} {person}",
+    "{name}: {city} {thing} Specialist",
+    "{adjective} {thing} for {person} in {city}",
+    "{body_part} {thing} by {name} in {city}",
+    "{thing} for {person} Who Commute",
+    "{city} {thing} for {body_part} and {body_part}",
+    "{name} — {adjective} {thing} in {city}",
+    "{thing} for {person} in {city} — {name}",
+    "{adjective} {thing} for {city} {person}",
+    "{person} {thing} in {city} with {name}",
+    "{thing} for {body_part} Recovery in {city}",
+    "{name} {thing} — {adjective}",
+    "{city} {thing} for {person} Who Travel",
+    "{thing} for {person} in {city} — {adjective}",
+    "{adjective} {body_part} {thing} in {city}",
+    "{name}: {thing} for {city} {person}",
+    "{thing} in {city} — {person} Recommended",
+    "{city} {thing} for {person} with {body_part} Tension",
+    "{adjective} {thing} — {name} in {city}",
+    "{thing} for {person} in {city} — {body_part} Focus",
+    "{name} Does {thing} for {person} in {city}",
+    "{city} {thing} — {adjective} {body_part}",
+    "{thing} for {person} in {city} with {name}",
+    "{adjective} {thing} for {city} {body_part} Recovery",
+    "{person} in {city} Book {thing} with {name}",
+};
+
+std::vector<std::string> bio_templates = {
+    "{hook}\n\n{specialty}\n\n{client}\n\n{style}\n\n{cta}",
+    "{hook}\n\n{style}\n\n{specialty}\n\n{proof}\n\n{cta}",
+    "{specialty}\n\n{client}\n\n{hook}\n\n{style}\n\n{cta}",
+    "{hook}\n\n{proof}\n\n{specialty}\n\n{cta}",
+    "{hook}\n\n{specialty}\n\n{style}\n\n{proof}\n\n{cta}",
+    "{client}\n\n{hook}\n\n{specialty}\n\n{style}\n\n{cta}",
+    "{hook}\n\n{style}\n\n{client}\n\n{specialty}\n\n{cta}",
+    "{specialty}\n\n{style}\n\n{proof}\n\n{hook}\n\n{cta}",
+    "{proof}\n\n{specialty}\n\n{client}\n\n{style}\n\n{cta}",
+    "{hook}\n\n{client}\n\n{proof}\n\n{style}\n\n{cta}",
+};
+
+std::vector<std::string> hooks = {
+    "Your shoulders called. They want out of this meeting.",
+    "I don't do feathers. I do fixes.",
+    "You bring the stress, I bring the Wolf.",
+    "If your body were a group chat, your hips would be the one screaming.",
+    "Some people meditate. I prefer pressure.",
+    "Desk life: 1. Your posture: 0. I can fix that.",
+    "Your back is not a storage unit for stress.",
+    "I work on humans, not mannequins.",
+    "The gym builds muscle. I build recovery.",
+    "Tight neck? Tight shoulders? Tight everything? Same.",
+    "Wolf knows where the knots hide.",
+    "You can't out-train bad recovery, but you can out-massage it.",
+    "Manhattan is stressful. Your body doesn't have to be.",
+    "My hands are GPS for tension.",
+    "If your muscles wrote a Yelp review, it would not be five stars.",
+    "I find the thing that hurts and make it stop hurting.",
+    "Your body is a resume. Let's edit it.",
+    "Squats gave you glutes. I give them back their range of motion.",
+    "The only thing I ghost is tension.",
+    "I've got strong hands and zero patience for bad posture.",
+    "Your traps are not supposed to live next to your ears.",
+    "If stress had a body, I would work on it.",
+    "You can't hustle your way out of a locked hip.",
+    "Your body keeps the score. I keep the pressure.",
+    "Bad posture is the new smoking. I am the patch.",
+    "There are two types of people: those who recover and those who complain.",
+    "Your fascia is thirsty. I bring the water.",
+    "A stiff body is a stiff mind. Let's loosen both.",
+    "Your muscles are not dramatic. They are honest.",
+    "Tension is just a knot waiting for a wolf.",
+    "Your neck is not a coat hanger.",
+    "Sitting is the enemy. Pressure is the weapon.",
+    "Your lower back called. It said please.",
+    "If your body had a check engine light, it would be on.",
+    "I am the mechanic your body needs.",
+    "Muscles tighten. Wolves loosen.",
+    "Your shoulders are not earrings.",
+    "The chair wins every day. I can reverse the score.",
+    "You treat your car better than your spine.",
+    "Your hips are not supposed to feel like concrete.",
+    "If your body were a phone, it would be at 2% battery.",
+    "I don't fix people. I fix tension.",
+    "Your glutes forgot how to work. I remind them.",
+    "Tightness is not a personality trait.",
+    "Your spine is a stack. I straighten it.",
+    "If your body were a building, it needs a renovation.",
+    "I am not a magician. I am a pressure specialist.",
+    "Your hamstrings are not guitar strings.",
+    "A good session is cheaper than a bad back.",
+    "Your posture is a story. Let me help rewrite it.",
+};
+
+std::vector<std::string> specialties = {
+    "I specialize in deep tissue, sports recovery, and targeted relief for shoulders, neck, back, and hips.",
+    "My focus is pressure-forward work: slow, deliberate, and built around the muscle groups that actually need it.",
+    "I do deep tissue, recovery bodywork, and the kind of pressure that actually changes how you move.",
+    "Sports recovery, deep tissue, and hip/glute work are my main zones.",
+    "I work on the tension that builds from training, travel, and ten-hour desk days.",
+    "My sessions combine deep tissue, targeted pressure-point work, and movement-focused recovery.",
+    "I focus on the areas that hold stress: upper back, shoulders, neck, lower back, and hips.",
+    "My approach is practical: find the restriction, apply pressure, restore range.",
+    "I work with athletes, desk workers, travelers, and anyone whose body feels older than they are.",
+    "My sessions are built around your goals, not a routine.",
+    "I use deep tissue, myofascial work, and targeted pressure to address stubborn tightness.",
+    "My specialty is turning knotted muscle into relaxed, functional tissue.",
+    "I focus on shoulders, neck, lower back, hips, and glutes with strong, sustained pressure.",
+    "My work is built for people who need real pressure, not a gentle rub.",
+    "I combine deep tissue with active release techniques to improve mobility.",
+    "My sessions are customized: some days need strength, some days need precision.",
+    "I work on the muscle groups that carry your stress: traps, rhomboids, lats, QL, hip flexors.",
+    "My approach is thorough: I don't skip the parts that actually hurt.",
+    "I do the kind of work that makes you remember your body is connected.",
+    "My pressure is deep, my pace is intentional, and my targets are specific.",
+};
+
+std::vector<std::string> clients = {
+    "Best for lifters, runners, desk workers, and anyone who treats their body like a rental.",
+    "Great if you sit all day, train hard, or fly too much.",
+    "If your neck feels like a phone cord from 1997, you're my people.",
+    "For clients who want real pressure, clear communication, and a clean space.",
+    "You don't need to be an athlete. You need to be tight.",
+    "Ideal for Manhattan professionals who carry stress in their shoulders and back.",
+    "Perfect for gym regulars who need recovery between sessions.",
+    "If you are a frequent traveler, your body needs a reset.",
+    "For people who want a real session, not a spa day.",
+    "If you have tried light massages and left frustrated, come here.",
+    "Best for anyone who sits at a desk and wonders why their back hurts.",
+    "Great for runners, cyclists, and lifters with tight hips and legs.",
+    "If you wake up stiff and go to bed stiff, I can help.",
+    "For people who hold their stress in their upper back and neck.",
+    "Ideal if you need strong pressure and clear communication.",
+    "Perfect for those who want targeted work, not a generic massage.",
+    "If your body feels older than your age, you are the right client.",
+    "Great for people recovering from intense training blocks.",
+    "For clients who want to move better and hurt less.",
+    "If you are tired of being told to relax when you actually need pressure, come here.",
+};
+
+std::vector<std::string> styles = {
+    "My style is direct. I find the tension, apply pressure, and stay there until it releases.",
+    "No spa music required. No fluffy rituals. Just focused work.",
+    "I adjust pressure to your body, not a script.",
+    "Strong hands, calm presence, zero attitude.",
+    "I work with intention. Every minute has a target.",
+    "My pressure is firm, my pace is slow, and my focus is specific.",
+    "I communicate clearly and check in on pressure so the session stays productive.",
+    "My sessions are clean, professional, and built around results.",
+    "I don't guess. I listen to what you say and what your body shows.",
+    "The work is precise, the space is calm, and the goal is relief.",
+    "I work with pressure that matches your tolerance, not my ego.",
+    "My sessions are slow and deliberate. I don't rush the parts that need time.",
+    "I check in, but I also read your body. Quiet feedback is still feedback.",
+    "My approach is therapeutic first, everything else second.",
+    "I work on the tissue, not around it.",
+    "My hands are steady, my pressure is consistent, and my focus is yours.",
+    "I build trust through pressure that feels productive, not punishing.",
+    "My sessions are professional, private, and pressure-forward.",
+    "I move from area to area with purpose, not randomly.",
+    "My style is efficient: I find the problem and stay on it until it changes.",
+};
+
+std::vector<std::string> proofs = {
+    "Clients usually leave looser, taller, and less hostile toward their desk.",
+    "The feedback I get most: 'I should have done this months ago.'",
+    "One session won't fix ten years of bad posture, but it's a solid opening argument.",
+    "I don't promise magic. I promise real pressure in the right places.",
+    "Most clients notice improved range of motion after the first session.",
+    "The most common thing I hear is: 'That was exactly what I needed.'",
+    "My regulars book because they feel the difference in their training and daily life.",
+    "I have worked with office workers, athletes, and performers across Manhattan.",
+    "Clients often report sleeping better after a session.",
+    "Many of my clients say their posture feels taller after the first visit.",
+    "I have helped desk workers reduce their daily tension significantly.",
+    "Athletes I work with report faster recovery between training sessions.",
+    "My clients come back because they feel the results, not just the pampering.",
+    "I have a track record of helping people with chronic shoulder tightness.",
+    "Clients tell me they can finally turn their head without stiffness.",
+    "My sessions are designed to produce measurable changes in how you feel.",
+    "I have helped travelers reset their body after long flights.",
+    "Clients appreciate that I focus on their goals, not a routine.",
+    "My work has helped people return to training after tension-related setbacks.",
+    "I measure success by how much better you move, not by how relaxed you feel.",
+};
+
+std::vector<std::string> ctas = {
+    "Message me with your focus areas and we'll get you sorted.",
+    "Manhattan incall. Text or email to book.",
+    "Clean private space in Manhattan. DM me to set something up.",
+    "If your body is ready, so am I. Message for availability.",
+    "Book a session and let's make your muscles less dramatic.",
+    "Text or email with your preferred time and focus areas.",
+    "Reach out when you're ready to feel better.",
+    "Contact me to schedule a session in Manhattan.",
+    "Send me a message and tell me what needs work.",
+    "Let's get your body back on your side. Book now.",
+    "If you are ready to work on your body, I am ready to help.",
+    "Message me with your problem areas and let's plan a session.",
+    "Text me to check availability or ask questions.",
+    "Email or DM me to set up your session in Manhattan.",
+    "I respond quickly. Reach out and let's get started.",
+    "Send a message and tell me what hurts. I will do the rest.",
+    "Book your session and feel the difference.",
+    "If you are in Manhattan and need real bodywork, contact me.",
+    "Message me today. Your body will thank you tomorrow.",

@@ -1,719 +1,585 @@
-    contact_click_rate = contact_clicks / profile_views if profile_views > 0 else 0.0
-    email_rate = new_emails / profile_views if profile_views > 0 else 0.0
+        return resp.json()
 
-    conn.execute(
-        """INSERT INTO daily_profile_metrics
-           (date, bio_id, headline_hash, bio_hash, profile_views, contact_clicks,
-            new_visits, new_emails, availability_state, profile_visible, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (date, bio_id, headline_hash, bio_hash, profile_views, contact_clicks,
-         new_visits, new_emails, availability, visible, packet.get("notes", "")),
-    )
-    conn.commit()
+    def search(self, city: str = "manhattan-ny", available_only: bool = True,
+               page: int = 1, skip: int = 0) -> Dict:
+        body = {"searchCity": city, "page": page, "skipUsers": str(skip)}
+        if available_only:
+            body["available"] = 1
+        resp = self._post("/search", body)
+        resp.raise_for_status()
+        return resp.json()
 
-    decision = compute_decision(bio_id, profile_views, contact_clicks, new_emails,
-                                 availability, visible, conn)
-    conn.close()
+    def get_rates(self) -> Dict:
+        resp = self._get("/settings/rates")
+        resp.raise_for_status()
+        return resp.json()
 
-    write_receipt("metrics_ingest", {
-        "date": date, "bio_id": bio_id, "profile_views": profile_views,
-        "contact_clicks": contact_clicks, "contact_click_rate": contact_click_rate,
-        "decision": decision["status"], "reason": decision["reason"],
-    }, db_path)
+    def get_locations(self) -> Dict:
+        resp = self._get("/locations", params={"withMasseurs": 1})
+        resp.raise_for_status()
+        return resp.json()
 
-    return {
-        "ok": True,
-        "ingested": True,
-        "computed": {
-            "contact_click_rate": round(contact_click_rate, 4),
-            "email_rate": round(email_rate, 4),
-            "contact_clicks_per_100_views": round(contact_click_rate * 100, 2),
-        },
-        "decision": decision,
-    }
+    def get_blogs(self, page: int = 1) -> Dict:
+        resp = self._get("/blogs", params={"page": page})
+        resp.raise_for_status()
+        return resp.json()
 
-
-def compute_decision(bio_id: str, profile_views: int, contact_clicks: int,
-                     new_emails: int, availability: int, visible: int,
-                     conn: sqlite3.Connection) -> dict:
-    """Strict decision engine. No magic. Just rules."""
-
-    if not visible:
-        return {"status": "BLOCK_BAD_ACCOUNT_STATE",
-                "reason": "Profile is not visible.", "next_action": "make_visible"}
-
-    if not availability:
-        return {"status": "BLOCK_BAD_ACCOUNT_STATE",
-                "reason": "Profile is not available. Metrics not comparable.",
-                "next_action": "set_available"}
-
-    if profile_views == 0:
-        return {"status": "BLOCK_NO_METRICS",
-                "reason": "No profile metrics available.", "next_action": "ingest_metrics"}
-
-    # Check for running experiment
-    exp = conn.execute(
-        "SELECT * FROM experiments WHERE status = 'running' ORDER BY started_at DESC LIMIT 1"
-    ).fetchone()
-
-    if not exp:
-        # No experiment running — check if we have baseline data
-        baseline = conn.execute(
-            "SELECT profile_views, contact_clicks FROM daily_profile_metrics "
-            "WHERE bio_id = ? ORDER BY id DESC LIMIT 1", (bio_id,)
-        ).fetchone()
-        if not baseline:
-            return {"status": "BLOCK_NO_BASELINE_EXPERIMENT",
-                    "reason": "Real traffic exists, but no completed experiment exists yet. "
-                              "Start one controlled bio-only experiment.",
-                    "next_action": "start_experiment",
-                    "baseline": {"profile_views": profile_views, "contact_clicks": contact_clicks,
-                                 "contact_click_rate": round(contact_clicks / profile_views, 5) if profile_views > 0 else 0},
-                    "next_candidate": {"bio_id": "targeted_wolf_v1", "change_scope": "headline_and_bio_only",
-                                       "minimum_views": MIN_VIEWS_FOR_DECISION, "minimum_hours": MIN_HOURS_FOR_DECISION}}
-        return {"status": "READY_TO_TEST",
-                "reason": "Baseline established. No active experiment. Ready to start next test.",
-                "next_action": "start_experiment",
-                "baseline": {"profile_views": baseline[0], "contact_clicks": baseline[1],
-                             "contact_click_rate": round(baseline[1] / baseline[0], 5) if baseline[0] > 0 else 0}}
-
-    # Experiment is running — check exposure
-    exp_id, exp_bio_id, _, started_at, _, _, before_views, before_clicks, before_emails = exp[:9]
-
-    # Parse started_at
-    try:
-        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-        elapsed_hours = (datetime.now(timezone.utc) - start).total_seconds() / 3600
-    except Exception:
-        elapsed_hours = 0
-
-    delta_views = profile_views - (before_views or 0)
-    delta_clicks = contact_clicks - (before_clicks or 0)
-
-    min_views_met = delta_views >= MIN_VIEWS_FOR_DECISION
-    min_hours_met = elapsed_hours >= MIN_HOURS_FOR_DECISION
-
-    if not min_views_met and not min_hours_met:
-        return {"status": "BLOCK_LOW_EXPOSURE",
-                "reason": f"Only {delta_views} views in {elapsed_hours:.1f}h. "
-                          f"Need {MIN_VIEWS_FOR_DECISION} views or {MIN_HOURS_FOR_DECISION}h.",
-                "next_action": "wait",
-                "experiment_id": exp_id,
-                "elapsed_hours": round(elapsed_hours, 1),
-                "current_delta_views": delta_views}
-
-    # We have enough exposure — compute lift
-    before_ctr = before_clicks / before_views if before_views and before_views > 0 else 0
-    after_ctr = contact_clicks / profile_views if profile_views > 0 else 0
-    lift = after_ctr - before_ctr
-
-    # Severe drop check (can trigger before full window if CTR collapses)
-    if before_ctr > 0 and after_ctr < before_ctr * (1 - SEVERE_DROP_THRESHOLD):
-        return {"status": "REVERT_TO_BASELINE",
-                "reason": f"CTR dropped {abs(lift)*100:.1f}pp. Severe drop threshold exceeded.",
-                "next_action": "rollback",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
-
-    if not min_views_met or not min_hours_met:
-        return {"status": "TEST_RUNNING",
-                "reason": f"Experiment running: delta_views={delta_views}/{MIN_VIEWS_FOR_DECISION}, "
-                          f"hours={elapsed_hours:.1f}/{MIN_HOURS_FOR_DECISION}",
-                "next_action": "wait",
-                "experiment_id": exp_id}
-
-    # Enough exposure — decide
-    if lift > 0.01:
-        return {"status": "WINNER_FOUND",
-                "reason": f"CTR improved by {lift*100:.1f}pp.",
-                "next_action": "close_experiment_winner",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
-    elif lift < -0.01:
-        return {"status": "REVERT_TO_BASELINE",
-                "reason": f"CTR decreased by {abs(lift)*100:.1f}pp.",
-                "next_action": "rollback",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
-    else:
-        return {"status": "KEEP_CURRENT",
-                "reason": f"CTR flat ({lift*100:.1f}pp). No significant change.",
-                "next_action": "test_next_bio",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
+    def full_status(self) -> Dict:
+        return {
+            "dashboard": self.get_dashboard(),
+            "availability": self.get_availability(),
+            "stats": self.get_stats(),
+            "keeponline": self.get_keeponline(),
+            "about": self.get_about(),
+            "mailbox": self.get_mailbox(),
+        }
 
 
-def start_experiment(bio_id: str, variant_class: str, before_views: int,
-                     before_contact_clicks: int, before_emails: int,
-                     db_path: Path = DB_PATH) -> dict:
-    conn = get_conn(db_path)
-    exp_id = f"exp_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{variant_class}"
-    ts = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        """INSERT INTO experiments
-           (experiment_id, bio_id, variant_class, started_at, baseline_bio_id,
-            before_views, before_contact_clicks, before_emails, status)
-           VALUES (?, ?, ?, ?, 'current_live', ?, ?, ?, 'running')""",
-        (exp_id, bio_id, variant_class, ts, before_views, before_contact_clicks, before_emails),
-    )
-    conn.commit()
-    conn.close()
-    write_receipt("experiment_start", {
-        "experiment_id": exp_id, "bio_id": bio_id, "variant_class": variant_class,
-        "before_views": before_views, "before_contact_clicks": before_contact_clicks,
-    }, db_path)
-    return {"experiment_id": exp_id, "status": "running", "bio_id": bio_id}
+# ---------------------------------------------------------------------------
+# Bio Content Generator
+# ---------------------------------------------------------------------------
 
-
-def close_experiment(experiment_id: str, after_views: int, after_contact_clicks: int,
-                     after_emails: int, db_path: Path = DB_PATH) -> dict:
-    conn = get_conn(db_path)
-    exp = conn.execute("SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)).fetchone()
-    if not exp:
-        conn.close()
-        return {"error": "experiment not found"}
-    before_views = exp[6] or 0
-    before_clicks = exp[7] or 0
-    before_ctr = before_clicks / before_views if before_views > 0 else 0
-    after_ctr = after_contact_clicks / after_views if after_views > 0 else 0
-    lift = after_ctr - before_ctr
-    winner = "test_bio" if lift > 0.01 else ("baseline" if lift < -0.01 else "no_significant_change")
-    ts = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        """UPDATE experiments SET ended_at=?, after_views=?, after_contact_clicks=?,
-           after_emails=?, actual_lift=?, winner=?, status='closed' WHERE experiment_id=?""",
-        (ts, after_views, after_contact_clicks, after_emails, lift, winner, experiment_id),
-    )
-    conn.commit()
-    conn.close()
-    write_receipt("experiment_close", {
-        "experiment_id": experiment_id, "winner": winner, "lift": lift,
-        "before_ctr": before_ctr, "after_ctr": after_ctr,
-    }, db_path)
-    return {"experiment_id": experiment_id, "winner": winner, "lift": round(lift, 4),
-            "before_ctr": round(before_ctr, 4), "after_ctr": round(after_ctr, 4)}
-
-
-def generate_daily_evidence_packet(rm_traffic_db: str, bio_id: str = "karpathian_wolf_live",
-                                    db_path: Path = DB_PATH) -> dict:
-    """Generate daily_evidence_packet.json from rm_traffic profileops.db."""
-    traffic_conn = sqlite3.connect(rm_traffic_db)
-    snap = traffic_conn.execute(
-        "SELECT profile_views, contact_clicks, new_visits, new_emails, "
-        "is_hidden, is_available, headline, description_len "
-        "FROM traffic_snapshots ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    traffic_conn.close()
-
-    if not snap:
-        return {"error": "no traffic snapshot found"}
-
-    views, clicks, visits, emails, hidden, available, headline, desc_len = snap
-    visible = not hidden
-    avail = bool(available)
-    ctr = clicks / views if views > 0 else 0
-    email_rate = emails / views if views > 0 else 0
-
-    # Get current experiment
-    conn = get_conn(db_path)
-    exp = conn.execute(
-        "SELECT experiment_id, bio_id, status, started_at FROM experiments "
-        "WHERE status='running' ORDER BY started_at DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
-
-    date_str = datetime.now(timezone.utc).date().isoformat()
-    packet_id = f"rmep_{date_str.replace('-', '_')}_{datetime.now(timezone.utc).strftime('%H%M')}"
-
-    bio_text = headline or ""
-    bio_hash = "sha256:" + sha256_of(bio_text)
-
-    decision = compute_decision(bio_id, views, clicks, emails,
-                                1 if avail else 0, 1 if visible else 0,
-                                get_conn(db_path))
-
-    packet = {
-        "packet_id": packet_id,
-        "date": date_str,
-        "account": {
-            "profile_visible": visible,
-            "is_available": avail,
-            "gold_status": True,
-        },
-        "bio": {
-            "bio_id": bio_id,
-            "headline": bio_text,
-            "bio_hash": bio_hash,
-            "variant_class": "current_live",
-        },
-        "metrics": {
-            "profile_views": views,
-            "contact_clicks": clicks,
-            "new_visits": visits,
-            "new_emails": emails,
-            "booking_requests": None,
-            "confirmed_clients": None,
-            "revenue": None,
-        },
-        "derived": {
-            "contact_click_rate": round(ctr, 4),
-            "email_rate": round(email_rate, 4),
-            "contact_clicks_per_100_views": round(ctr * 100, 2),
-        },
-        "experiment": {
-            "experiment_id": exp[0] if exp else None,
-            "state": exp[2] if exp else "none",
-            "baseline_bio_id": "current_live",
-            "test_bio_id": exp[1] if exp else None,
-            "minimum_views_required": MIN_VIEWS_FOR_DECISION,
-            "minimum_hours_required": MIN_HOURS_FOR_DECISION,
-        },
-        "decision": decision,
-        "receipt": {
-            "source": "rm_traffic",
-            "created_by": "daily_promotion_script",
-            "source_db": rm_traffic_db,
-            "packet_hash": "sha256:" + sha256_of(packet_id + str(views) + str(clicks)),
-        },
-    }
-    return packet
-
-
-def get_latest_decision(db_path: Path = DB_PATH) -> dict:
-    conn = get_conn(db_path)
-    row = conn.execute(
-        "SELECT experiment_id, bio_id, decision, reason, profile_views, "
-        "contact_clicks, contact_click_rate, created_at "
-        "FROM experiment_decisions ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
-    if not row:
-        return {"status": "BLOCK_NO_SIGNAL", "reason": "No decisions yet."}
-    return {
-        "experiment_id": row[0], "bio_id": row[1], "decision": row[2],
-        "reason": row[3], "profile_views": row[4], "contact_clicks": row[5],
-        "contact_click_rate": row[6], "created_at": row[7],
-    }
-
-
-def get_metrics_history(limit: int = 30, db_path: Path = DB_PATH) -> list:
-    conn = get_conn(db_path)
-    rows = conn.execute(
-        "SELECT date, bio_id, profile_views, contact_clicks, new_visits, "
-        "new_emails, availability_state, profile_visible, created_at "
-        "FROM daily_profile_metrics ORDER BY id DESC LIMIT ?", (limit,)
-    ).fetchall()
-    conn.close()
-    return [{"date": r[0], "bio_id": r[1], "profile_views": r[2], "contact_clicks": r[3],
-             "new_visits": r[4], "new_emails": r[5], "available": bool(r[6]),
-             "visible": bool(r[7]), "created_at": r[8]} for r in rows]
-
-
-def get_experiments(db_path: Path = DB_PATH) -> list:
-    conn = get_conn(db_path)
-    rows = conn.execute(
-        "SELECT experiment_id, bio_id, variant_class, started_at, ended_at, "
-        "status, winner, actual_lift FROM experiments ORDER BY started_at DESC"
-    ).fetchall()
-    conn.close()
-    return [{"experiment_id": r[0], "bio_id": r[1], "variant_class": r[2],
-             "started_at": r[3], "ended_at": r[4], "status": r[5],
-             "winner": r[6], "actual_lift": r[7]} for r in rows]
-
-```
-
-content_generator.py:
-```
-#!/usr/bin/env python3
-"""Daily content generator for RentMasseur profile optimization.
-
-Generates bios, blog posts, and interview questions using Groq LLM.
-Runs mass analysis across all 30 strategies and collects the best versions.
-Designed to run daily in CI/CD.
-
-Usage:
-    python3 content_generator.py                    # generate all content
-    python3 content_generator.py --bios-only        # bios only
-    python3 content_generator.py --blogs-only       # blog posts only
-    python3 content_generator.py --questions-only   # interview questions only
-"""
-
-import argparse
-import json
-import os
-import sys
-import time
-import hashlib
-import logging
-from datetime import datetime, timezone
-from typing import Optional
-
-import requests
-from dotenv import load_dotenv
-
-LIVE_BIO=""
-try:
-    with open("content/reference/live_bio.md","r") as _f:
-        LIVE_BIO=_f.read().strip()
-except FileNotFoundError:
-    pass
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger(__name__)
-
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv()
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-
-CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
-BIOS_DIR = os.path.join(CONTENT_DIR, "bios")
-BLOGS_DIR = os.path.join(CONTENT_DIR, "blog_posts")
-QUESTIONS_DIR = os.path.join(CONTENT_DIR, "interview_questions")
-HISTORY_FILE = os.path.join(CONTENT_DIR, "content_history.json")
-
-STRATEGIES = [
-    ("sensory_luxury", "Luxurious sensory experience, premium oils, candlelight, high-end clientele"),
-    ("therapeutic_expert", "Clinical therapeutic massage, pain relief, certifications, back/neck focus"),
-    ("mystery_desire", "Mysterious, alluring, teases the experience, curiosity-driven bookings"),
-    ("local_hustle", "Manhattan local vibe, neighborhood energy, approachable, easy booking"),
-    ("transformation_story", "Story-based, stress-to-relief transformation, emotional hook"),
-    ("night_owl", "Late-night availability, after-hours, private evening sessions"),
-    ("athlete_recovery", "Gym-goers, pre/post-workout, muscle recovery, sports performance"),
-    ("ceo_executive", "Executive wellness, CEO/founder stress relief, time-efficient, premium"),
-    ("spiritual_healer", "Holistic, energy work, chakras, mindfulness, breathwork"),
-    ("traveler_companion", "Out-of-town visitors, jet lag, hotel-friendly, concierge service"),
-    ("medical_referral", "Doctor-recommended, clinical back pain, sciatica, posture correction"),
-    ("artist_soul", "Creative artistic approach, massage as art, intuitive touch"),
-    ("discrete_confidential", "Absolute privacy, VIP clients, judgment-free, confidential studio"),
-    ("first_timer", "Welcoming newcomers, gentle introduction, no experience needed"),
-    ("seasonal_special", "Seasonal themes, winter warmth, summer cool-down, holiday stress"),
-    ("couples_duo", "Couples, partners, duet sessions, romantic bonding experience"),
-    ("bodybuilder_therapy", "Heavy lifters, deep pressure, fascia release, intense muscle work"),
-    ("yoga_fusion", "Yoga + massage, stretching, flexibility, mind-body connection"),
-    ("luxury_concierge", "White-glove in-home/hotel service, elite concierge, effortless booking"),
-    ("recovery_addiction", "Sober wellness, recovery support, clean living, healthy coping"),
-    ("military_veteran", "Veteran-friendly, service member respect, PT recovery, brotherhood"),
-    ("lgbtq_pride", "Inclusive pride-forward, safe space, community, authentic expression"),
-    ("senior_gentle", "Senior-friendly, gentle touch, mobility, arthritis, circulation"),
-    ("office_relief", "Desk job recovery, neck pain, carpal tunnel, corporate warrior"),
-    ("dancer_flexibility", "Dancers/performers, flexibility maintenance, injury prevention"),
-    ("meditation_guide", "Guided meditation + massage, mindfulness, breath, tranquility"),
-    ("hot_stone_specialist", "Hot stone specialty, heat therapy, deep relaxation, indulgence"),
-    ("quick_lunch", "Express 30-45 min lunch-break massage, fast, effective, convenient"),
-    ("birthday_gift", "Gift-worthy special occasion, treat yourself, memorable experience"),
-    ("weekly_ritual", "Recurring weekly maintenance, body upkeep, long-term investment"),
+BIO_HEADLINES = [
+    "You bring the smile, I bring the Wolf.",
+    "Manhattan bodywork. Deep. Intentional. Real.",
+    "Large hands. Clear purpose. Better movement.",
+    "Your shoulders called. The Wolf answered.",
+    "Deep tissue therapy, Chelsea to Midtown.",
+    "No crystals. No fluff. Just effective bodywork.",
+    "7 years of convincing muscles to behave.",
+    "The body keeps score. I audit the books.",
+    "Professional massage for people who sit too hard.",
+    "From desk goblin to functional human.",
 ]
 
+BIO_VARIATIONS = [
+    """🐺 KARPATHIAN WOLF
 
-def _ensure_dirs():
-    for d in [CONTENT_DIR, BIOS_DIR, BLOGS_DIR, QUESTIONS_DIR]:
-        os.makedirs(d, exist_ok=True)
+74,000+ profile views.
 
+7 years specializing in deep tissue, sports recovery, and mobility work.
 
-def _load_history() -> list:
-    if os.path.exists(HISTORY_FILE):
+I work with desk professionals, gym athletes, frequent flyers, and anyone whose shoulders are trying to become earrings.
+
+Common feedback: "I can move my neck again," and "I didn't know I was carrying all that stress."
+
+Approach: find the restriction, address it directly, restore function.
+
+No gimmicks. No energy portals. Just clean, effective bodywork from a large Ukrainian therapist in Manhattan.
+
+📍 Manhattan, NYC
+""",
+    """🐺 KARPATHIAN WOLF
+
+Professional deep tissue and therapeutic bodywork in Manhattan.
+
+What I do: identify the real source of tension, work it with depth and precision, and help you move better.
+
+Who I see: office workers, athletes, travelers, and anyone with chronic tightness.
+
+What to expect: clear communication, firm pressure, and a session that actually changes how you feel.
+
+📍 Manhattan, NYC
+""",
+    """🐺 KARPATHIAN WOLF
+
+Your body keeps score. I help audit the books.
+
+7 years of hands-on experience. Deep tissue, sports recovery, stress relief.
+
+I work with people who sit too long, lift too hard, or fly too often. If your neck, shoulders, or back feel like they own you, we fix that.
+
+Sessions are professional, direct, and focused on results.
+
+📍 Manhattan, NYC
+""",
+]
+
+def suggest_bio(current_headline: str = "", current_description: str = "") -> Dict:
+    """Generate a new bio variant that is different from current."""
+    headline = random.choice([h for h in BIO_HEADLINES if h != current_headline])
+    desc = random.choice([d for d in BIO_VARIATIONS if d.strip()[:100] != current_description.strip()[:100]])
+    return {"headline": headline, "description": desc}
+
+def draft_blog() -> Dict:
+    """Draft a blog post. Returns draft only — does NOT publish."""
+    titles = [
+        "What to expect from your first deep tissue session",
+        "Why your shoulders hurt and what actually helps",
+        "Desk work vs. your neck: how to fight back",
+        "The difference between spa massage and therapeutic bodywork",
+        "Recovery tips for athletes who train hard",
+    ]
+    snippets = [
+        "Most people think massage is about relaxation. Therapeutic work is about restoring movement.",
+        "Your shoulders are not supposed to live next to your ears. If they do, we can fix that.",
+        "Deep tissue should not mean painful. It means precise, patient, and targeted.",
+        "The best recovery combines sleep, movement, water, and occasional professional bodywork.",
+        "If you fly often, your hips and lower back are paying for it. Regular sessions help.",
+    ]
+    title = random.choice(titles)
+    body = random.choice(snippets) + "\n\nThis is a draft. Review before publishing."
+    return {"title": title, "body": body}
+
+# ---------------------------------------------------------------------------
+# ProfileOps Engine
+# ---------------------------------------------------------------------------
+
+class ProfileOps:
+    """Main operations engine."""
+
+    def __init__(self, username: str, password: str, city: str = "manhattan-ny", manual_captcha: bool = False):
+        self.api = RentMasseurAPI()
+        self.username = username
+        self.password = password
+        self.city = city
+        self.manual_captcha = manual_captcha
+        self.last_visibility_check = 0
+        self.last_avail_check = 0
+        self.last_stats_check = 0
+        self.last_bio_check = 0
+        self.last_dashboard_print = 0
+        self.running = True
+        self.current_state = {}
+
+    def login(self) -> bool:
+        if self.manual_captcha:
+            ok = self.api.login_manual_captcha(self.username, self.password)
+            receipt("login", ok, "Manual captcha login")
+            return ok
+        ok = self.api.login(self.username, self.password)
+        receipt("login", ok, "API login")
+        return ok
+
+    def ensure_visible(self, force: bool = False):
+        """Guard profile visibility. Fix it if hidden."""
         try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
-
-
-def _save_history(history: list):
-    _ensure_dirs()
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history[-200:], f, indent=2)
-    except Exception as e:
-        logger.warning("Failed to save history: %s", e)
-
-
-def _content_hash(text: str) -> str:
-    return hashlib.md5(text.strip().lower().encode()).hexdigest()[:12]
-
-
-def _groq_chat(system_prompt: str, user_prompt: str, temperature: float = 0.9, max_tokens: int = 800, retries: int = 3) -> Optional[str]:
-    if not GROQ_API_KEY:
-        logger.error("No GROQ_API_KEY")
-        return None
-    for attempt in range(retries):
-        try:
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                },
-                timeout=90,
-            )
-            if resp.status_code == 429:
-                wait = 5 * (attempt + 1)
-                logger.warning("Groq rate limited, waiting %ds (attempt %d/%d)", wait, attempt + 1, retries)
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
-            return content
+            keep = self.api.get_keeponline()
+            is_hidden = bool(keep.get("isAdHidden", 0))
+            if is_hidden or force:
+                before = {"isAdHidden": is_hidden}
+                result = self.api.set_visibility(True)
+                after = {"isAdHidden": 0, "response": result}
+                receipt("set_visibility", True, "Profile was hidden, now shown", before, after)
+                record_alert("critical", "visibility_hidden", "Profile was hidden from search. Auto-fixed.")
+                log.info("Profile visibility: HIDDEN → SHOWN")
+            else:
+                log.info("Profile visibility: shown")
         except Exception as e:
-            logger.error("Groq API error: %s", e)
-            if attempt < retries - 1:
-                time.sleep(5 * (attempt + 1))
-    return None
+            receipt("ensure_visible", False, str(e))
+            log.error("Visibility check failed: %s", e)
+
+    def ensure_available(self):
+        """Refresh availability only if near expiry."""
+        try:
+            avail = self.api.get_availability()
+            selected = avail.get("selected", "")
+            countdown = avail.get("countdown", 0)
+            now = time.time()
+            remaining = max(0, int(countdown - now))
+
+            log.info("Availability: %s (remaining ~%ds)", selected, remaining)
+
+            if selected != "Available" or remaining < AVAIL_REFRESH_THRESHOLD:
+                before = {"selected": selected, "remaining": remaining}
+                # Try to set availability via dashboard about endpoint
+                # Note: the exact set-availability endpoint wasn't confirmed.
+                # We log that it needs refresh and attempt the best-known path.
+                # For now, we flag this as needing manual/agent confirmation.
+                receipt("ensure_available", False,
+                        f"Availability needs refresh ({selected}, {remaining}s left). Endpoint not confirmed.")
+                record_alert("warning", "availability_low",
+                             f"Availability low/expired: {selected}, {remaining}s remaining. Need refresh.")
+            else:
+                receipt("ensure_available", True, f"Availability OK: {selected}, {remaining}s left")
+        except Exception as e:
+            receipt("ensure_available", False, str(e))
+            log.error("Availability check failed: %s", e)
+
+    def collect_stats(self):
+        """Collect traffic and profile stats."""
+        try:
+            dash = self.api.get_dashboard()
+            stats = self.api.get_stats()
+            keep = self.api.get_keeponline()
+            about = self.api.get_about()
+            mail = self.api.get_mailbox()
+
+            prof_stats = stats.get("profileStatistics", {}) or {}
+            assets = about.get("userProps", {}).get("assets", {})
+
+            record_stats(
+                views=prof_stats.get("totalPageViews"),
+                contact_clicks=prof_stats.get("totalContactClicks"),
+                visits=keep.get("newVisits"),
+                bookmarks=dash.get("onlineBookmarks"),
+                new_emails=keep.get("newEmails"),
+                is_ad_hidden=keep.get("isAdHidden"),
+                available=dash.get("userSetting", {}).get("availability", {}).get("available"),
+                availability_remaining=str(dash.get("userSetting", {}).get("availability", {}).get("validTo", "")),
+                headline=assets.get("headline"),
+                description_len=len(assets.get("description", "")),
+                city=self.city,
+            )
+
+            log.info("Stats recorded: views=%s contacts=%s visits=%s bookmarks=%s",
+                     prof_stats.get("totalPageViews"),
+                     prof_stats.get("totalContactClicks"),
+                     keep.get("newVisits"),
+                     dash.get("onlineBookmarks"))
+
+            self.current_state = {
+                "views": prof_stats.get("totalPageViews"),
+                "contacts": prof_stats.get("totalContactClicks"),
+                "visits": keep.get("newVisits"),
+                "bookmarks": dash.get("onlineBookmarks"),
+                "is_ad_hidden": keep.get("isAdHidden"),
+                "available": dash.get("userSetting", {}).get("availability", {}).get("available"),
+                "headline": assets.get("headline"),
+            }
+            receipt("collect_stats", True, "Traffic stats collected")
+        except Exception as e:
+            receipt("collect_stats", False, str(e))
+            log.error("Stats collection failed: %s", e)
+
+    def check_search_position(self):
+        """Check search position for target city."""
+        try:
+            results = self.api.search(self.city, available_only=False, page=1)
+            avail_results = self.api.search(self.city, available_only=True, page=1)
+
+            # Find our position by looking for our username in result items
+            pos = self._find_position(results)
+            avail_pos = self._find_position(avail_results)
+
+            total = len(results.get("masseurs", [])) if isinstance(results.get("masseurs"), list) else 0
+            avail_total = len(avail_results.get("masseurs", [])) if isinstance(avail_results.get("masseurs"), list) else 0
+
+            record_stats(
+                city=self.city,
+                search_position=pos,
+                search_available_position=avail_pos,
+                search_total=total,
+                search_available_total=avail_total,
+            )
+            log.info("Search position: #%s/%s (available #%s/%s)", pos, total, avail_pos, avail_total)
+            receipt("check_search_position", True,
+                    f"Position #{pos}/{total}, available #{avail_pos}/{avail_total}")
+        except Exception as e:
+            receipt("check_search_position", False, str(e))
+            log.error("Search position check failed: %s", e)
+
+    def _find_position(self, results: Dict) -> Optional[int]:
+        masseurs = results.get("masseurs") if isinstance(results.get("masseurs"), list) else []
+        for i, m in enumerate(masseurs):
+            uname = (m.get("username") or m.get("userCard", {}).get("username") or "").lower()
+            if uname == self.username.lower():
+                return i + 1
+        return None
+
+    def bio_experiment(self, auto_apply: bool = False):
+        """Run controlled bio experiment with LLM-driven analysis. One change per day."""
+        try:
+            # Check if we already changed bio today
+            conn = db()
+            row = conn.execute(
+                "SELECT ts FROM bio_versions WHERE applied=1 ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+            conn.close()
+            if row:
+                last_change = datetime.fromisoformat(row["ts"])
+                if datetime.now(timezone.utc) - last_change < timedelta(days=1):
+                    log.info("Bio experiment: skipped — last change was within 24h")
+                    return
+
+            # Pull real profile data for LLM analysis
+            profile_data = self.api.full_status()
+            about = profile_data.get("about", {})
+            assets = about.get("userProps", {}).get("assets", {})
+            current_headline = assets.get("headline", "")
+            current_desc = assets.get("description", "")
+
+            # Get recent stats history
+            conn = db()
+            stats_history = [dict(r) for r in conn.execute(
+                "SELECT ts, views, contact_clicks, visits FROM stats ORDER BY ts DESC LIMIT 7"
+            ).fetchall()]
+            conn.close()
+
+            # Generate with LLM
+            from rm_traffic.llm_bio_writer import generate_bio_with_llm
+            suggestion = generate_bio_with_llm(
+                profile_data, stats_history, current_headline, current_desc,
+                city=self.city, provider=os.environ.get("LLM_PROVIDER"),
+                model=os.environ.get("LLM_MODEL")
+            )
+
+            # Fallback to templates if LLM fails
+            if not suggestion:
+                suggestion = suggest_bio(current_headline, current_desc)
+                log.warning("LLM bio generation failed, using template fallback")
+
+            stats = self.api.get_stats()
+            views_before = (stats.get("profileStatistics") or {}).get("totalPageViews")
+            contacts_before = (stats.get("profileStatistics") or {}).get("totalContactClicks")
+
+            conn = db()
+            conn.execute(
+                "INSERT INTO bio_versions (ts, headline, description, reason, applied, views_before, contacts_before) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (datetime.now(timezone.utc).isoformat(), suggestion["headline"],
+                 suggestion["bio"], "llm_daily_variant", 0, views_before, contacts_before)
+            )
+            conn.commit()
+            conn.close()
+
+            log.info("Bio experiment suggestion: headline='%s'", suggestion["headline"])
+
+            if auto_apply:
+                before = {"headline": current_headline, "description": current_desc[:200]}
+                self.api.set_about(suggestion["headline"], suggestion["bio"])
+                conn = db()
+                conn.execute(
+                    "UPDATE bio_versions SET applied=1 WHERE ts=(SELECT ts FROM bio_versions ORDER BY ts DESC LIMIT 1)"
+                )
+                conn.commit()
+                conn.close()
+                after = {"headline": suggestion["headline"], "description": suggestion["bio"][:200]}
+                receipt("bio_experiment", True, "Applied new LLM bio variant", before, after)
+                log.info("Bio experiment applied (auto)")
+            else:
+                receipt("bio_experiment", True,
+                        f"LLM bio variant drafted (not applied). Headline: {suggestion['headline']}")
+                record_alert("info", "bio_suggestion",
+                             f"New LLM bio variant drafted: {suggestion['headline']}")
+        except Exception as e:
+            receipt("bio_experiment", False, str(e))
+            log.error("Bio experiment failed: %s", e)
+
+    def draft_blog_post(self):
+        """Draft a blog post. Never auto-publish."""
+        draft = draft_blog()
+        receipt("draft_blog", True, f"Drafted blog: {draft['title']}")
+        log.info("Blog draft (not published): %s", draft["title"])
+        return draft
+
+    def print_dashboard(self):
+        """Print current status dashboard."""
+        try:
+            dash = self.api.get_dashboard()
+            stats = self.api.get_stats()
+            keep = self.api.get_keeponline()
+            about = self.api.get_about()
+            avail = self.api.get_availability()
+
+            prof = stats.get("profileStatistics", {}) or {}
+            assets = about.get("userProps", {}).get("assets", {})
+            us = dash.get("userSetting", {})
+
+            print(f"\n{'='*60}")
+            print(f"  PROFILEOPS DASHBOARD")
+            print(f"{'='*60}")
+            print(f"  Timestamp: {datetime.now(timezone.utc).isoformat()[:19]} UTC")
+            print(f"  Username:  {self.username}")
+            print(f"  Visibility: {'HIDDEN' if keep.get('isAdHidden') else 'SHOWN'}")
+            print(f"  Availability: {us.get('availability', {}).get('message', 'N/A')} "
+                  f"(validTo={us.get('availability', {}).get('validTo', 'N/A')})")
+            print(f"  Profile Views:   {prof.get('totalPageViews', 'N/A')}")
+            print(f"  Contact Clicks:  {prof.get('totalContactClicks', 'N/A')}")
+            print(f"  New Visits:      {keep.get('newVisits', 'N/A')}")
+            print(f"  New Emails:      {keep.get('newEmails', 'N/A')}")
+            print(f"  Bookmarks:       {dash.get('onlineBookmarks', 'N/A')}")
+            print(f"  Headline:        {assets.get('headline', 'N/A')}")
+            print(f"  Description:     {len(assets.get('description', ''))} chars")
+            print(f"  Track Actions:   {'ON' if us.get('trackActions') else 'OFF'}")
+            print(f"  SMS Alerts:      {'ON' if us.get('sms') else 'OFF'}")
+            print(f"{'='*60}\n")
+            receipt("print_dashboard", True, "Dashboard printed")
+        except Exception as e:
+            receipt("print_dashboard", False, str(e))
+            log.error("Dashboard print failed: %s", e)
+
+    def cycle(self):
+        """One daemon cycle."""
+        now = time.time()
+
+        if now - self.last_visibility_check >= VISIBILITY_CHECK_INTERVAL:
+            self.ensure_visible()
+            self.last_visibility_check = now
+
+        if now - self.last_avail_check >= AVAIL_CHECK_INTERVAL:
+            self.ensure_available()
+            self.last_avail_check = now
+
+        if now - self.last_stats_check >= STATS_INTERVAL:
+            self.collect_stats()
+            self.check_search_position()
+            self.last_stats_check = now
+
+        if now - self.last_bio_check >= BIO_EXPERIMENT_INTERVAL:
+            self.bio_experiment(auto_apply=False)
+            self.last_bio_check = now
+
+        if now - self.last_dashboard_print >= DASHBOARD_INTERVAL:
+            self.print_dashboard()
+            self.last_dashboard_print = now
+
+    def run_once(self):
+        if not self.login():
+            return
+        self.print_dashboard()
+        self.ensure_visible()
+        self.ensure_available()
+        self.collect_stats()
+        self.check_search_position()
+        self.bio_experiment(auto_apply=False)
+        draft = self.draft_blog_post()
+        print(f"\nBlog draft (not published):\n{draft['title']}\n{draft['body']}\n")
+
+    def run_daemon(self):
+        log.info("=== ProfileOps daemon starting ===")
+        if not self.login():
+            log.error("Initial login failed, retrying in 60s")
+            time.sleep(60)
+            if not self.login():
+                log.error("Login failed twice, exiting")
+                return
+
+        self.print_dashboard()
+        while self.running:
+            try:
+                self.cycle()
+            except KeyboardInterrupt:
+                log.info("Shutdown requested")
+                self.running = False
+                break
+            except Exception as e:
+                log.error("Cycle error: %s", e)
+                receipt("daemon_cycle", False, str(e))
+                time.sleep(30)
+            time.sleep(60)
+        log.info("ProfileOps daemon stopped")
 
 
-def _save_content(directory: str, strategy_name: str, content: str, ext: str = "md") -> str:
-    ts = datetime.now().strftime("%Y%m%d")
-    filename = f"{ts}_{strategy_name}.{ext}"
-    filepath = os.path.join(directory, filename)
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(content)
-    logger.info("Saved: %s (%d chars)", filepath, len(content))
-    return filepath
+# ---------------------------------------------------------------------------
+# CLI commands
+# ---------------------------------------------------------------------------
+
+def cmd_status(ops: ProfileOps):
+    if not ops.login():
+        print("Login failed")
+        sys.exit(1)
+    ops.print_dashboard()
 
 
-def generate_bios(history: list, used_hashes: set) -> list:
-    logger.info("=== Generating bios for all 30 strategies ===")
-    system_prompt = (
-        "You are an elite copywriter for massage therapy profiles on RentMasseur. "
-        "Each bio must be under 300 words, magnetic, SEO-friendly, and conversion-optimized. "
-        "Avoid explicit content. Include keywords: massage, therapeutic, deep tissue, relaxation, session, Manhattan. "
-        "CRITICAL: Every bio MUST end with a strong phone-call call-to-action like "
-        "'Call now to book your session' or 'Pick up the phone and call me today'. "
-        "The goal is MAXIMUM PHONE CALLS. Make the reader want to call immediately. "
-        "Include urgency words: today, now, available, waiting, ready. "
-        "Write ONLY the bio text."
-    )
-    results = []
-    for strategy_name, strategy_desc in STRATEGIES:
-        user_prompt = (
-            f"Strategy: {strategy_name}\n"
-            f"Description: {strategy_desc}\n"
-            f"Write a compelling profile bio for a male masseur in Manhattan, NYC. "
-            f"The bio MUST drive phone calls. End with a direct call-to-action "
-            f"telling the reader to CALL NOW to book. No labels, no quotes, no explanation. Just the bio."
-        )
-        bio = _groq_chat(system_prompt, user_prompt)
-        if bio:
-            h = _content_hash(bio)
-            if h in used_hashes:
-                logger.info("Skip duplicate bio: %s", strategy_name)
-                continue
-            used_hashes.add(h)
-            filepath = _save_content(BIOS_DIR, strategy_name, bio)
-            results.append({
-                "type": "bio",
-                "strategy": strategy_name,
-                "chars": len(bio),
-                "hash": h,
-                "file": filepath,
-                "preview": bio[:120],
-            })
-            history.append({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "type": "bio",
-                "strategy": strategy_name,
-                "hash": h,
-                "chars": len(bio),
-            })
-        time.sleep(1)
-    logger.info("Generated %d bios", len(results))
-    return results
+def cmd_once(ops: ProfileOps):
+    ops.run_once()
 
 
-def generate_blog_posts(history: list, used_hashes: set) -> list:
-    logger.info("=== Generating blog posts for all 30 strategies ===")
-    system_prompt = (
-        "You are an expert content writer for a massage therapy blog. "
-        "Write engaging, SEO-optimized blog posts (500-800 words) that attract clients. "
-        "Include a compelling title, subheadings, and a call-to-action. "
-        "Avoid explicit content. Use markdown formatting."
-    )
-    results = []
-    for strategy_name, strategy_desc in STRATEGIES:
-        user_prompt = (
-            f"Strategy: {strategy_name}\n"
-            f"Angle: {strategy_desc}\n"
-            f"Write a blog post for a male masseur in Manhattan, NYC. "
-            f"The post should be informative, engaging, and drive bookings. "
-            f"Use markdown with a # title, ## subheadings, and a CTA at the end."
-        )
-        post = _groq_chat(system_prompt, user_prompt, max_tokens=1200)
-        if post:
-            h = _content_hash(post)
-            if h in used_hashes:
-                logger.info("Skip duplicate blog: %s", strategy_name)
-                continue
-            used_hashes.add(h)
-            filepath = _save_content(BLOGS_DIR, strategy_name, post)
-            results.append({
-                "type": "blog_post",
-                "strategy": strategy_name,
-                "chars": len(post),
-                "hash": h,
-                "file": filepath,
-                "preview": post[:120],
-            })
-            history.append({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "type": "blog_post",
-                "strategy": strategy_name,
-                "hash": h,
-                "chars": len(post),
-            })
-        time.sleep(1)
-    logger.info("Generated %d blog posts", len(results))
-    return results
+def cmd_history():
+    conn = db()
+    print("\n=== RECENT ACTIONS ===")
+    for r in conn.execute("SELECT * FROM receipts ORDER BY ts DESC LIMIT 30"):
+        print(f"  {r['ts'][:19]} | {'OK' if r['success'] else 'FAIL'} | {r['action']:25s} | {r['detail'][:60]}")
+    print("\n=== RECENT STATS ===")
+    for r in conn.execute("SELECT * FROM stats ORDER BY ts DESC LIMIT 10"):
+        print(f"  {r['ts'][:19]} | views={r['views'] or '-':6} contacts={r['contact_clicks'] or '-':4} "
+              f"visits={r['visits'] or '-':4} | visible={r['is_ad_hidden'] or 0} avail={r['available'] or '-'} "
+              f"| pos={r['search_position'] or '-':4}/{r['search_total'] or '-':4}")
+    print("\n=== BIO VERSIONS ===")
+    for r in conn.execute("SELECT * FROM bio_versions ORDER BY ts DESC LIMIT 10"):
+        print(f"  {r['ts'][:19]} | {'APPLIED' if r['applied'] else 'DRAFT'} | {r['headline'][:50]}")
+    print("\n=== UNACKED ALERTS ===")
+    for r in conn.execute("SELECT * FROM alerts WHERE acknowledged=0 ORDER BY ts DESC LIMIT 10"):
+        print(f"  {r['ts'][:19]} | [{r['severity']:8s}] {r['type']:20s} | {r['message']}")
+    conn.close()
 
 
-def generate_interview_questions(history: list, used_hashes: set) -> list:
-    logger.info("=== Generating interview questions for all 30 strategies ===")
-    system_prompt = (
-        "You are an interview coach for massage therapists. "
-        "Generate 10 insightful interview questions that a journalist or blogger "
-        "would ask a male masseur, based on the given strategy angle. "
-        "Also include suggested answers that are professional, engaging, and on-brand. "
-        "Use markdown formatting with numbered questions and bullet-point answers."
-    )
-    results = []
-    for strategy_name, strategy_desc in STRATEGIES:
-        user_prompt = (
-            f"Strategy: {strategy_name}\n"
-            f"Angle: {strategy_desc}\n"
-            f"Generate 10 interview questions with suggested answers for a male masseur "
-            f"in Manhattan, NYC. Make the answers compelling and booking-oriented. "
-            f"Format: ## Q1: question? followed by **A:** answer."
-        )
-        questions = _groq_chat(system_prompt, user_prompt, max_tokens=1500)
-        if questions:
-            h = _content_hash(questions)
-            if h in used_hashes:
-                logger.info("Skip duplicate questions: %s", strategy_name)
-                continue
-            used_hashes.add(h)
-            filepath = _save_content(QUESTIONS_DIR, strategy_name, questions)
-            results.append({
-                "type": "interview_questions",
-                "strategy": strategy_name,
-                "chars": len(questions),
-                "hash": h,
-                "file": filepath,
-                "preview": questions[:120],
-            })
-            history.append({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "type": "interview_questions",
-                "strategy": strategy_name,
-                "hash": h,
-                "chars": len(questions),
-            })
-        time.sleep(1)
-    logger.info("Generated %d interview question sets", len(results))
-    return results
+def cmd_suggest_bio(ops: ProfileOps):
+    if not ops.login():
+        print("Login failed")
+        sys.exit(1)
+    ops.bio_experiment(auto_apply=False)
+    # Print the latest draft
+    conn = db()
+    row = conn.execute("SELECT * FROM bio_versions ORDER BY ts DESC LIMIT 1").fetchone()
+    conn.close()
+    if row:
+        print(f"\n=== LLM BIO SUGGESTION ===")
+        print(f"Headline: {row['headline']}")
+        print(f"\nBio:\n{row['description']}")
+        print(f"\nApplied: {bool(row['applied'])}")
+        print(f"Views before: {row['views_before']}")
+        print(f"Contacts before: {row['contacts_before']}")
 
 
-def generate_mass_analysis(bios: list, blogs: list, questions: list) -> Optional[str]:
-    logger.info("=== Running mass analysis across all generated content ===")
-    system_prompt = (
-        "You are a marketing analyst and content strategist. "
-        "Analyze the generated bios, blog posts, and interview questions across all strategies. "
-        "Produce a comprehensive report with: "
-        "1. Top 5 bios ranked by conversion potential "
-        "2. Top 5 blog posts ranked by SEO and engagement potential "
-        "3. Top 5 interview question sets ranked by PR value "
-        "4. Cross-strategy themes that perform best "
-        "5. Recommended posting schedule for the week "
-        "6. Best bio to use on the profile right now "
-        "Use markdown formatting."
-    )
 
-    bios_summary = "\n".join([f"- {b['strategy']} ({b['chars']} chars): {b['preview']}..." for b in bios])
-    blogs_summary = "\n".join([f"- {b['strategy']} ({b['chars']} chars): {b['preview']}..." for b in blogs])
-    questions_summary = "\n".join([f"- {q['strategy']} ({q['chars']} chars): {q['preview']}..." for q in questions])
-
-    user_prompt = (
-        f"Today's generated content:\n\n"
-        f"## Bios ({len(bios)} generated):\n{bios_summary}\n\n"
-        f"## Blog Posts ({len(blogs)} generated):\n{blogs_summary}\n\n"
-        f"## Interview Questions ({len(questions)} generated):\n{questions_summary}\n\n"
-        f"Produce the mass analysis report."
-    )
-
-    analysis = _groq_chat(system_prompt, user_prompt, temperature=0.7, max_tokens=2000)
-    if analysis:
-        ts = datetime.now().strftime("%Y%m%d")
-        filepath = os.path.join(CONTENT_DIR, f"mass_analysis_{ts}.md")
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(analysis)
-        logger.info("Mass analysis saved: %s (%d chars)", filepath, len(analysis))
-        return filepath
-    return None
+def cmd_set_bio(ops: ProfileOps):
+    if not ops.login():
+        print("Login failed")
+        sys.exit(1)
+    about = ops.api.get_about()
+    assets = about.get("userProps", {}).get("assets", {})
+    before = {"headline": assets.get("headline"), "description": assets.get("description")}
+    print("Enter headline:")
+    headline = input("> ")
+    print("Enter description (Ctrl+D when done):")
+    desc_lines = []
+    try:
+        while True:
+            desc_lines.append(input())
+    except EOFError:
+        pass
+    description = "\n".join(desc_lines)
+    ops.api.set_about(headline, description)
+    after = {"headline": headline, "description": description}
+    receipt("set_bio", True, "Manual bio update", before, after)
+    print("Bio updated.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Daily content generator for RentMasseur")
-    parser.add_argument("--bios-only", action="store_true")
-    parser.add_argument("--blogs-only", action="store_true")
-    parser.add_argument("--questions-only", action="store_true")
-    parser.add_argument("--no-analysis", action="store_true", help="Skip mass analysis")
+    parser = argparse.ArgumentParser(description="ProfileOps — RentMasseur Profile Operations Agent")
+    parser.add_argument("--daemon", action="store_true", help="Run as daemon")
+    parser.add_argument("--status", action="store_true", help="Print current status")
+    parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
+    parser.add_argument("--history", action="store_true", help="Show history and stats")
+    parser.add_argument("--suggest-bio", action="store_true", help="Generate bio variant draft via LLM")
+    parser.add_argument("--set-bio", action="store_true", help="Manually set bio via stdin")
+    parser.add_argument("--city", default="manhattan-ny", help="City to track search position")
+    parser.add_argument("--llm-provider", default="ollama", help="ollama/groq/openrouter")
+    parser.add_argument("--llm-model", help="Model name, e.g. llama-3.1-8b-instant")
+    parser.add_argument("--manual-captcha", action="store_true", help="Open visible browser for manual captcha solve")
     args = parser.parse_args()
 
-    _ensure_dirs()
-    history = _load_history()
-    used_hashes = {entry.get("hash", "") for entry in history}
+    init_db()
 
-    all_bios = []
-    all_blogs = []
-    all_questions = []
+    username = os.environ.get("RM_USER")
+    password = os.environ.get("RM_PASS")
+    if not username or not password:
+        print("ERROR: Set RM_USER and RM_PASS environment variables.")
+        print("Do not hardcode credentials.")
+        sys.exit(1)
 
-    if not args.blogs_only and not args.questions_only:
-        all_bios = generate_bios(history, used_hashes)
-    if not args.bios_only and not args.questions_only:
-        all_blogs = generate_blog_posts(history, used_hashes)
-    if not args.bios_only and not args.blogs_only:
-        all_questions = generate_interview_questions(history, used_hashes)
+    os.environ.setdefault("LLM_PROVIDER", args.llm_provider)
+    if args.llm_model:
+        os.environ.setdefault("LLM_MODEL", args.llm_model)
 
-    if not args.no_analysis and (all_bios or all_blogs or all_questions):
-        generate_mass_analysis(all_bios, all_blogs, all_questions)
+    ops = ProfileOps(username, password, city=args.city, manual_captcha=args.manual_captcha)
 
-    _save_history(history)
-
-    summary = {
-        "date": datetime.now(timezone.utc).isoformat(),
-        "bios_generated": len(all_bios),
-        "blog_posts_generated": len(all_blogs),
-        "interview_questions_generated": len(all_questions),
-        "total_strategies": len(STRATEGIES),
-    }
-    summary_path = os.path.join(CONTENT_DIR, "daily_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
-    logger.info("=== Daily content generation complete ===")
-    logger.info("Bios: %d | Blog posts: %d | Interview questions: %d",
-                len(all_bios), len(all_blogs), len(all_questions))
-    print(json.dumps(summary, indent=2))
+    if args.status:
+        cmd_status(ops)
+    elif args.once:
+        cmd_once(ops)
+    elif args.history:
+        cmd_history()
+    elif args.suggest_bio:
+        cmd_suggest_bio(ops)
+    elif args.set_bio:
+        cmd_set_bio(ops)
+    elif args.daemon:
+        ops.run_daemon()
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":
@@ -721,80 +587,214 @@ if __name__ == "__main__":
 
 ```
 
-rm_pri_spec.md:
+analyze_bios.py:
 ```
-# RM-PRI — RentMasseur Profile Revenue Intelligence
+import json
 
-## Definition
+bios = [json.loads(l) for l in open("rm_traffic/data/real_bios_with_views.jsonl")]
+bios.sort(key=lambda b: b.get("views_per_day", 0), reverse=True)
 
-RM-PRI is a C++/Python closed-loop profile optimization engine that uses
-real competitor bios, public visit velocity, authenticated dashboard stats,
-validated prediction, approval-gated profile mutation, and receipt-backed
-experiments to improve legitimate inbound demand.
+print("=" * 80)
+print("TOP 15 BIOS BY VIEWS/DAY")
+print("=" * 80)
+for i, b in enumerate(bios[:15]):
+    r = float(b.get("ratingAverage", 0) or 0)
+    vpd = b.get("views_per_day", 0)
+    print(f"\n#{i+1} {b['username']} | {b['city']} | {vpd:.1f} v/day | {b['visits']} visits | R={r} Rev={b['reviewsCount']}")
+    print(f"  HEADLINE: {b['headline']}")
+    print(f"  SINCE: {b['member_since']} ({b['days_online']} days)")
+    print(f"  SERVICES: {b.get('services', [])}")
+    desc = b["description"].replace("\n", " ")
+    print(f"  DESC: {desc[:500]}")
 
-## Versioning
+print("\n" + "=" * 80)
+print("BOTTOM 5")
+print("=" * 80)
+for i, b in enumerate(bios[-5:]):
+    r = float(b.get("ratingAverage", 0) or 0)
+    vpd = b.get("views_per_day", 0)
+    rank = len(bios) - 4 + i
+    print(f"\n#{rank} {b['username']} | {vpd:.1f} v/day | {b['visits']} visits | R={r} Rev={b['reviewsCount']}")
+    print(f"  HEADLINE: {b['headline']}")
+    desc = b["description"].replace("\n", " ")
+    print(f"  DESC: {desc[:300]}")
 
-- v0.1: Real Bio Corpus Analyzer
-- v0.2: Public Views/Day Enricher
-- v0.3: Views/Day Predictor
-- v0.4: Candidate Bio Generator + Risk Filter
-- v0.5: Approval Queue + Profile Snapshotter
-- v0.6: Live Experiment Runner
-- v0.7: Dashboard Feedback Learner
-- v1.0: Closed-Loop Profile Revenue Intelligence
+# Pattern analysis
+print("\n" + "=" * 80)
+print("PATTERN ANALYSIS")
+print("=" * 80)
 
-Only v1.0 deserves the "AGI-like" label.
+top10 = bios[:10]
+bot10 = bios[-10:]
 
-## 3-Layer Architecture
+def avg(lst):
+    return sum(lst) / len(lst) if lst else 0
 
-### Layer A — Python API Control Plane
-- Authentication, requests, snapshots, safe account mutation
-- Does NOT do heavy ML or generate bios
-- Talks to RentMasseur via direct API (not Selenium)
+# Headline length
+hl_top = avg([len(b["headline"]) for b in top10])
+hl_bot = avg([len(b["headline"]) for b in bot10])
+print(f"Avg headline length: TOP={hl_top:.0f} chars vs BOT={hl_bot:.0f} chars")
 
-### Layer B — C++ Intelligence Engine
-- Feature extraction, MLP predictor, GA optimizer, candidate scorer
-- Tokenization, n-gram indexing, readability, speech scoring
-- Walk-forward validation, baseline comparison
-- Commands: validate, atomize, features, train, generate, score, evolve, select, report
+# Description length
+dl_top = avg([len(b["description"]) for b in top10])
+dl_bot = avg([len(b["description"]) for b in bot10])
+print(f"Avg desc length: TOP={dl_top:.0f} chars vs BOT={dl_bot:.0f} chars")
 
-### Layer C — Experiment / Receipt Ledger
-- No mutation without receipt
-- No experiment without before/after stats
-- No "winner" without measurement
-- Rollback required
+# Emoji usage
+import re
+emoji_top = avg([len(re.findall(r'[\U0001F000-\U0001FFFF]|[\u2600-\u27BF]', b["description"])) for b in top10])
+emoji_bot = avg([len(re.findall(r'[\U0001F000-\U0001FFFF]|[\u2600-\u27BF]', b["description"])) for b in bot10])
+print(f"Avg emoji count: TOP={emoji_top:.1f} vs BOT={emoji_bot:.1f}")
 
-## Data Contracts
+# Price mentions
+price_top = sum([1 for b in top10 if re.search(r'\$\d+', b["description"])])
+price_bot = sum([1 for b in bot10 if re.search(r'\$\d+', b["description"])])
+print(f"Mentions price: TOP={price_top}/10 vs BOT={price_bot}/10")
 
-### Contract 1 — Raw Profile Record
-username, city, headline, description, isAvailable, isGold, ratingAverage, reviewsCount, isCertified, services, distance, travels
+# "Available now" / urgency
+urg_top = sum([1 for b in top10 if re.search(r'available|now|today|text|call', b["description"], re.I)])
+urg_bot = sum([1 for b in bot10 if re.search(r'available|now|today|text|call', b["description"], re.I)])
+print(f"Urgency/CTA: TOP={urg_top}/10 vs BOT={urg_bot}/10")
 
-### Contract 2 — Enriched Public Profile Record
-Adds: public_visits, member_since, days_online, views_per_day
+# Services count
+svc_top = avg([len(b.get("services") or []) for b in top10])
+svc_bot = avg([len(b.get("services") or []) for b in bot10])
+print(f"Avg services listed: TOP={svc_top:.1f} vs BOT={svc_bot:.1f}")
 
-### Contract 3 — Feature Vector
-headline_len, description_len, word_count, sentence_count, paragraph_count, services_count, has_cta, cta_score, trust_score, proof_score, location_score, urgency_score, service_specificity, body_area_specificity, humor_score, speech_score, risk_score, novelty_score, gold, available, certified, rating, reviews
+# Certified
+cert_top = sum([1 for b in top10 if b.get("isCertified")])
+cert_bot = sum([1 for b in bot10 if b.get("isCertified")])
+print(f"Certified: TOP={cert_top}/10 vs BOT={cert_bot}/10")
 
-### Contract 4 — Candidate Bio
-variant_id, headline, description, source, parent_ids, features, prediction, status
+# Gold
+gold_top = sum([1 for b in top10 if b.get("isGold")])
+gold_bot = sum([1 for b in bot10 if b.get("isGold")])
+print(f"Gold: TOP={gold_top}/10 vs BOT={gold_bot}/10")
 
-### Contract 5 — Experiment Label
-experiment_id, variant_id, window_hours, before{}, after{}, labels{}
+# Days online
+days_top = avg([b.get("days_online", 0) for b in top10])
+days_bot = avg([b.get("days_online", 0) for b in bot10])
+print(f"Avg days online: TOP={days_top:.0f} vs BOT={days_bot:.0f}")
 
-## Scoring Stages
+```
 
-### Stage 1: ReviewStrengthScore (available now)
-log(1 + reviewsCount) + 0.20 * ratingAverage + 0.40 * isGold + 0.25 * isAvailable + 0.50 * isCertified + 0.20 * trust_score + 0.15 * cta_score - 0.30 * risk_score
+data.zip:
+```
+version https://git-lfs.github.com/spec/v1
+oid sha256:bcc015cf01168bfd09b8909c40ba49aa0351a45ce57b9b2b52e583a6071f8233
+size 127354778
 
-### Stage 2: MarketDemandScore (after visit enrichment)
-0.50 * normalized_views_per_day + 0.20 * normalized_reviews_per_day + 0.10 * rating_score + 0.05 * isGold + 0.05 * isAvailable + 0.05 * trust_score + 0.05 * cta_score - 0.20 * risk_score
+```
 
-### Stage 3: ProfileConversionScore (after dashboard stats)
-0.45 * contact_click_rate + 0.25 * email_rate + 0.20 * contacts_per_available_hour + 0.10 * rank_lift - 0.30 * risk_score
+bio_ml.cpp:
+```
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <random>
+#include <cmath>
+#include <algorithm>
+#include <chrono>
+#include <unordered_map>
+#include <numeric>
+#include <iomanip>
 
-### Stage 4: ProfitBioScore (after bookings/revenue)
-0.30 * profile_view_lift + 0.25 * contact_click_lift + 0.20 * email_lift + 0.15 * phone_or_text_lift + 0.05 * novelty_score + 0.05 * speech_readability - 0.30 * risk_score - 0.15 * fake_claim_penalty - 0.10 * explicitness_penalty
+// ---------------------------------------------------------------------------
+// JSON parsing helpers (minimal)
+// ---------------------------------------------------------------------------
 
-## Model Validation
+std::string json_unescape(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char next = s[i+1];
+            if (next == 'n') out += '\n';
+            else if (next == 't') out += '\t';
+            else if (next == 'r') out += '\r';
+            else out += next;
+            i++;
+        } else if (s[i] != '"') {
+            out += s[i];
+        }
+    }
+    return out;
+}
 
-Must beat baselines:
+std::string extract_json_string(const std::string& line, const std::string& key) {
+    size_t pos = line.find("\"" + key + "\":");
+    if (pos == std::string::npos) return "";
+    pos = line.find("\"", pos + key.size() + 3);
+    if (pos == std::string::npos) return "";
+    size_t end = pos + 1;
+    while (end < line.size() && (line[end] != '"' || line[end-1] == '\\')) end++;
+    return json_unescape(line.substr(pos + 1, end - pos - 1));
+}
+
+// ---------------------------------------------------------------------------
+// Feature extraction
+// ---------------------------------------------------------------------------
+
+const std::vector<std::string> local_areas = {
+    "manhattan", "chelsea", "midtown", "hell's kitchen", "upper west side",
+    "upper east side", "tribeca", "soho", "west village", "east village",
+    "financial district", "flatiron", "gramercy", "murray hill", "nomad", "nyc", "new york"
+};
+
+const std::vector<std::string> service_words = {
+    "deep tissue", "sports", "recovery", "massage", "bodywork", "relief",
+    "therapy", "knots", "tension", "pressure", "shoulder", "back", "hip",
+    "neck", "glute", "stress", "desk", "travel", "athlete", "professional"
+};
+
+const std::vector<std::string> cta_words = {
+    "message", "text", "email", "book", "call", "contact", "dm", "schedule", "reach out"
+};
+
+const std::vector<std::string> trust_words = {
+    "professional", "clean", "private", "respect", "discreet", "boundaries", "communication"
+};
+
+const std::vector<std::string> humor_words = {
+    "wolf", "robot", "concrete", "phone cord", "group chat", "screaming", "dramatic", "hostile", "no fluff", "feather", "magic", "gps"
+};
+
+std::string to_lower(const std::string& s) {
+    std::string r = s;
+    std::transform(r.begin(), r.end(), r.begin(), ::tolower);
+    return r;
+}
+
+std::vector<std::string> tokenize(const std::string& text) {
+    std::vector<std::string> tokens;
+    std::string cur;
+    for (char c : text) {
+        if (std::isalpha(static_cast<unsigned char>(c)) || c == '\'') {
+            cur += std::tolower(c);
+        } else if (!cur.empty()) {
+            tokens.push_back(cur);
+            cur.clear();
+        }
+    }
+    if (!cur.empty()) tokens.push_back(cur);
+    return tokens;
+}
+
+std::vector<std::string> split_sentences(const std::string& text) {
+    std::vector<std::string> sents;
+    std::string cur;
+    for (char c : text) {
+        cur += c;
+        if (c == '.' || c == '!' || c == '?') {
+            if (!cur.empty()) {
+                sents.push_back(cur);
+                cur.clear();
+            }
+        }
+    }
+    if (!cur.empty()) sents.push_back(cur);
+    return sents;
+}
+
+int syllable_count(const std::string& word) {

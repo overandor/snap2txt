@@ -1,330 +1,565 @@
-    t.textContent='NO REAL METRICS. Funnel requires first-party data from extension or manual capture.';
-    metricsPanel.appendChild(t);
-  }
-  document.getElementById('prob').textContent = j.client_probability || 'unverified';
-}).catch(e=>metricsPanel.innerHTML='<pre>'+String(e)+'</pre>');
+        if self.path.exists():
+            for line in self.path.open():
+                if line.strip():
+                    self.entries.append(json.loads(line))
 
-fetch('/api/candidates').then(r=>r.json()).then(j=>{
-  candidatesPanel.innerHTML='<pre>'+JSON.stringify(j,null,2)+'</pre>';
-}).catch(e=>candidatesPanel.innerHTML='<pre>'+String(e)+'</pre>');
+    def add(self, action: str, description: str, data: dict) -> dict:
+        prev_hash = self.entries[-1]["hash"] if self.entries else "0" * 64
+        ts = datetime.now(timezone.utc).isoformat()
+        entry = {
+            "index": len(self.entries),
+            "timestamp": ts,
+            "action": action,
+            "description": description,
+            "data": data,
+            "prev_hash": prev_hash,
+        }
+        entry_str = json.dumps(entry, sort_keys=True)
+        entry["hash"] = hashlib.sha256(entry_str.encode()).hexdigest()
+        self.entries.append(entry)
+        with self.path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+        return entry
 
-fetch('/api/decision/latest').then(r=>r.json()).then(j=>{
-  decisionPanel.innerHTML='<pre>'+JSON.stringify(j,null,2)+'</pre>';
-}).catch(e=>decisionPanel.innerHTML='<pre>'+String(e)+'</pre>');
+    def verify(self) -> bool:
+        for i, entry in enumerate(self.entries):
+            prev = self.entries[i - 1]["hash"] if i > 0 else "0" * 64
+            if entry["prev_hash"] != prev:
+                return False
+            check = {k: v for k, v in entry.items() if k != "hash"}
+            check_str = json.dumps(check, sort_keys=True)
+            expected = hashlib.sha256(check_str.encode()).hexdigest()
+            if entry["hash"] != expected:
+                return False
+        return True
 
-fetch('/api/jobs').then(r=>r.json()).then(j=>{
-  const count = j.jobs?.length || 0;
-  jobsPanel.innerHTML='<pre>Jobs: '+count+'\n'+JSON.stringify(j.jobs?.slice(-3),null,2)+'</pre>';
-}).catch(e=>jobsPanel.innerHTML='<pre>'+String(e)+'</pre>');
+    def summary(self) -> dict:
+        return {
+            "total_receipts": len(self.entries),
+            "chain_valid": self.verify(),
+            "last_action": self.entries[-1]["action"] if self.entries else None,
+        }
 
-fetch('/api/cicd/runs').then(r=>r.json()).then(j=>{
-  const runs = j.workflow_runs||[];
-  cicdPanel.textContent = runs.slice(0,5).map(r=>r.name+': '+(r.conclusion||r.status)+' ('+r.created_at+')').join('\n');
-}).catch(e=>cicdPanel.textContent=String(e));
-</script>
-</body></html>)HTML";
-}
-static void handle_client(int client_socket) {
-    char buffer[16384];
-    int received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
-    if (received <= 0) { close(client_socket); return; }
-    buffer[received] = '\0';
-    std::string request(buffer);
-    std::string method = get_method(request);
-    std::string path = get_path(request);
-    std::string body = get_body(request);
-    std::string response;
-    std::string content_type = "application/json";
-    int code = 200;
 
-    ensure_dir(CONTENT_DIR);
-    ensure_dir(RECEIPTS_DIR);
+ledger = ReceiptLedger(PIPELINE_DIR / "pipeline_receipts.jsonl")
 
-    std::string auth_err = check_admin(request, path, method);
-    if (!auth_err.empty()) {
-        code = 403;
-        response = auth_err;
-        std::string w = http_response(code, content_type, response);
-        send(client_socket, w.c_str(), w.size(), 0);
-        close(client_socket);
-        return;
+
+def run_cmd(cmd: List[str], cwd: Optional[Path] = None, timeout: int = 300) -> tuple:
+    logger.info("RUN: %s (cwd=%s)", " ".join(cmd), cwd or ".")
+    try:
+        r = subprocess.run(
+            cmd, cwd=str(cwd) if cwd else None,
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode != 0:
+            logger.error("FAIL (%d): %s", r.returncode, r.stderr[:500])
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        logger.error("TIMEOUT after %ds", timeout)
+        return -1, "", "timeout"
+    except Exception as e:
+        logger.error("EXCEPTION: %s", e)
+        return -1, "", str(e)
+
+
+# ─── Stage 1: Live Scrape ───
+
+def stage_live_scrape() -> dict:
+    logger.info("=" * 60)
+    logger.info("STAGE 1: Live competitor availability scrape")
+    logger.info("=" * 60)
+    rc, out, err = run_cmd(
+        ["python3", "checker.py", "--output", "availability.json"],
+        cwd=SCRIPT_DIR, timeout=120,
+    )
+    result = {"stage": "live_scrape", "exit_code": rc, "timestamp": datetime.now(timezone.utc).isoformat()}
+    if rc == 0:
+        data = json.loads((SCRIPT_DIR / "availability.json").read_text())
+        result["mode"] = data.get("mode")
+        result["providers_scraped"] = data.get("count", 0)
+        result["errors"] = len(data.get("errors", []))
+        result["providers"] = [
+            {"slug": p.get("slug"), "status": p.get("status"), "location": p.get("location"), "rate": p.get("rate")}
+            for p in data.get("providers", [])
+        ]
+        logger.info("Scraped %d providers, %d errors, mode=%s", result["providers_scraped"], result["errors"], result["mode"])
+    else:
+        result["error"] = err[:500]
+        logger.error("Live scrape failed: %s", err[:200])
+    ledger.add("live_scrape", "Scraped real competitor availability from rentmasseur.com", result)
+    return result
+
+
+# ─── Stage 2: AGI Train ───
+
+def stage_agi_train(label: str = "reviews", cv: int = 5, walk_forward: bool = True, epochs: int = 100) -> dict:
+    logger.info("=" * 60)
+    logger.info("STAGE 2: Train C++ MLP on 2,723 real bios")
+    logger.info("=" * 60)
+    cmd = [str(AGI_BINARY), "train", str(REAL_BIOS), "--label", label, "--cv", str(cv), "--epochs", str(epochs)]
+    if walk_forward:
+        cmd.append("--walk-forward")
+    rc, out, err = run_cmd(cmd, cwd=WINDSURF_DIR, timeout=600)
+    result = {
+        "stage": "agi_train", "exit_code": rc, "label": label,
+        "corpus": str(REAL_BIOS), "cv": cv, "walk_forward": walk_forward,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if rc == 0:
+        result["output"] = out[:2000]
+        model_path = MODELS_DIR / "bio_model.bin"
+        result["model_path"] = str(model_path)
+        result["model_exists"] = model_path.exists()
+        if model_path.exists():
+            result["model_size_bytes"] = model_path.stat().st_size
+        logger.info("Training complete, model=%s", result.get("model_path"))
+    else:
+        result["error"] = err[:500]
+        logger.error("Training failed: %s", err[:200])
+    ledger.add("agi_train", "Trained MLP on real bio corpus", result)
+    return result
+
+
+# ─── Stage 3: AGI Generate + Score + Evolve + Select ───
+
+def stage_agi_pipeline(count: int = 100000, generations: int = 100, top: int = 25) -> dict:
+    logger.info("=" * 60)
+    logger.info("STAGE 3: AGI generate %d → score → evolve %d gen → select top %d", count, generations, top)
+    logger.info("=" * 60)
+    candidates_path = CANDIDATES_DIR / "pipeline_candidates.jsonl"
+    scored_path = CANDIDATES_DIR / "pipeline_scored.jsonl"
+    evolved_path = CANDIDATES_DIR / "pipeline_evolved.jsonl"
+    selected_path = CANDIDATES_DIR / f"pipeline_top_{top}.jsonl"
+    model_path = MODELS_DIR / "bio_model.bin"
+
+    # Generate
+    rc1, out1, err1 = run_cmd(
+        [str(AGI_BINARY), "generate", "--count", str(count), "--mode", "speech", "--out", str(candidates_path)],
+        cwd=WINDSURF_DIR, timeout=120,
+    )
+    gen_result = {"exit_code": rc1, "count": count}
+    if rc1 == 0 and candidates_path.exists():
+        gen_result["file_size"] = candidates_path.stat().st_size
+        logger.info("Generated %d candidates", count)
+    else:
+        gen_result["error"] = err1[:300]
+        logger.error("Generate failed")
+        result = {"stage": "agi_pipeline", "generate": gen_result, "exit_code": rc1}
+        ledger.add("agi_pipeline", "AGI generate/score/evolve/select", result)
+        return result
+
+    # Score
+    rc2, out2, err2 = run_cmd(
+        [str(AGI_BINARY), "score", str(candidates_path), "--model", str(model_path), "--out", str(scored_path)],
+        cwd=WINDSURF_DIR, timeout=300,
+    )
+    score_result = {"exit_code": rc2}
+    if rc2 == 0 and scored_path.exists():
+        score_result["file_size"] = scored_path.stat().st_size
+        logger.info("Scored candidates")
+    else:
+        score_result["error"] = err2[:300]
+        logger.error("Score failed")
+
+    # Evolve
+    rc3, out3, err3 = run_cmd(
+        [str(AGI_BINARY), "evolve", str(scored_path), "--population", "10000", "--generations", str(generations), "--elites", "50"],
+        cwd=WINDSURF_DIR, timeout=600,
+    )
+    evolve_result = {"exit_code": rc3, "generations": generations}
+    if rc3 == 0:
+        evolve_result["output"] = out3[:1000]
+        logger.info("Evolution complete")
+    else:
+        evolve_result["error"] = err3[:300]
+        logger.error("Evolve failed")
+
+    # Select
+    rc4, out4, err4 = run_cmd(
+        [str(AGI_BINARY), "select", str(evolved_path), "--top", str(top), "--diversity", "0.85", "--max-risk", "0.10"],
+        cwd=WINDSURF_DIR, timeout=120,
+    )
+    select_result = {"exit_code": rc4, "top": top}
+    agi_bios = []
+    if rc4 == 0 and selected_path.exists():
+        select_result["file_size"] = selected_path.stat().st_size
+        for line in selected_path.open():
+            if line.strip():
+                agi_bios.append(json.loads(line))
+        select_result["selected_count"] = len(agi_bios)
+        logger.info("Selected %d top bios", len(agi_bios))
+    else:
+        select_result["error"] = err4[:300]
+        logger.error("Select failed")
+
+    result = {
+        "stage": "agi_pipeline",
+        "generate": gen_result,
+        "score": score_result,
+        "evolve": evolve_result,
+        "select": select_result,
+        "agi_bios": agi_bios,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    ledger.add("agi_pipeline", "AGI generate→score→evolve→select on real corpus", result)
+    return result
+
+
+# ─── Stage 4: Groq Intent Router + LLM Bio Generation ───
+
+def stage_groq_bios(top_n: int = 5) -> dict:
+    logger.info("=" * 60)
+    logger.info("STAGE 4: Groq intent routing + LLM bio generation (top %d strategies)", top_n)
+    logger.info("=" * 60)
+
+    # Import from extension modules
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from intent_router import route_intents
+    from rentmasseur_core import groq_generate_bio
+
+    # Route intents
+    top_strategies = route_intents(top_n)
+    logger.info("Intent router selected: %s", top_strategies)
+
+    # Strategy prompts (from coordinator)
+    from rentmasseur_coordinator import STRATEGIES
+
+    groq_bios = []
+    for strategy_name in top_strategies:
+        prompt = STRATEGIES.get(strategy_name)
+        if not prompt:
+            continue
+        bio = groq_generate_bio(strategy_name, prompt, current_bio=None)
+        if bio:
+            groq_bios.append({
+                "strategy": strategy_name,
+                "bio": bio,
+                "chars": len(bio),
+                "source": "groq_llm",
+            })
+            logger.info("Generated Groq bio: strategy=%s chars=%d", strategy_name, len(bio))
+        time.sleep(1)
+
+    result = {
+        "stage": "groq_bios",
+        "top_strategies": top_strategies,
+        "bios_generated": len(groq_bios),
+        "groq_bios": groq_bios,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    ledger.add("groq_bios", "Groq LLM generated bios for top strategies", result)
+    return result
+
+
+# ─── Stage 5: Merge + Rank ───
+
+def stage_merge_rank(agi_result: dict, groq_result: dict) -> dict:
+    logger.info("=" * 60)
+    logger.info("STAGE 5: Merge AGI + Groq candidate pools, rank by score")
+    logger.info("=" * 60)
+
+    all_candidates = []
+
+    # AGI bios
+    for bio in agi_result.get("agi_bios", []):
+        all_candidates.append({
+            "source": "agi_cpp",
+            "bio": bio.get("bio", bio.get("description", "")),
+            "headline": bio.get("headline", ""),
+            "score": bio.get("score", 0),
+            "risk": bio.get("risk", 0),
+            "rank": bio.get("rank", 0),
+            "strategy": "agi_evolved",
+        })
+
+    # Groq bios
+    for bio in groq_result.get("groq_bios", []):
+        all_candidates.append({
+            "source": "groq_llm",
+            "bio": bio["bio"],
+            "headline": "",
+            "score": 0,
+            "risk": 0,
+            "rank": 0,
+            "strategy": bio["strategy"],
+            "chars": bio["chars"],
+        })
+
+    # Sort: AGI bios by score (higher=better), Groq bios by chars (proxy for content richness)
+    # Then interleave: best AGI first, then best Groq
+    agi_sorted = sorted([c for c in all_candidates if c["source"] == "agi_cpp"], key=lambda x: x["score"], reverse=True)
+    groq_sorted = sorted([c for c in all_candidates if c["source"] == "groq_llm"], key=lambda x: x.get("chars", 0), reverse=True)
+
+    # Pick best overall: prefer AGI if available (trained on real data), else Groq
+    merged = agi_sorted + groq_sorted
+
+    best = merged[0] if merged else None
+
+    result = {
+        "stage": "merge_rank",
+        "total_candidates": len(all_candidates),
+        "agi_count": len(agi_sorted),
+        "groq_count": len(groq_sorted),
+        "best_source": best["source"] if best else None,
+        "best_strategy": best["strategy"] if best else None,
+        "best_score": best["score"] if best else 0,
+        "best_bio_preview": best["bio"][:200] if best else "",
+        "all_candidates": merged,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    logger.info("Merged %d candidates (AGI=%d, Groq=%d). Best: %s/%s",
+                result["total_candidates"], result["agi_count"], result["groq_count"],
+                result["best_source"], result["best_strategy"])
+    ledger.add("merge_rank", "Merged and ranked AGI + Groq candidate pools", result)
+    return result
+
+
+# ─── Stage 6: Selenium — Login, Availability, Apply Bio ───
+
+def stage_selenium(merge_result: dict, skip_availability: bool = False, skip_bio: bool = False) -> dict:
+    logger.info("=" * 60)
+    logger.info("STAGE 6: Selenium — login, set 24/7 availability, apply best bio")
+    logger.info("=" * 60)
+
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from rentmasseur_core import setup_driver, login, set_availability_24_7, update_bio, save_bio_field
+
+    best = None
+    for c in merge_result.get("all_candidates", []):
+        if c.get("bio") and len(c["bio"]) > 50:
+            best = c
+            break
+
+    result = {
+        "stage": "selenium",
+        "login": False,
+        "availability": False,
+        "bio_applied": False,
+        "best_bio_source": best["source"] if best else None,
+        "best_bio_strategy": best["strategy"] if best else None,
+        "best_bio_chars": len(best["bio"]) if best else 0,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    if (method == "OPTIONS") {
-        response = "{}";
-    } else if (path == "/" || path == "/index.html") {
-        response = landing_page(); content_type = "text/html";
-    } else if (path == "/health" || path == "/api/health") {
-        response = "{\"status\":\"ok\",\"service\":\"rentmasseur-cpp-os\",\"mode\":\"evidence_only\",\"timestamp\":\"" + iso_timestamp() + "\"}";
-    } else if (path == "/api/report") {
-        int bios_count = count_files(CONTENT_DIR + "/bios");
-        bool metrics = file_exists(CONTENT_DIR + "/live_metrics.json") || file_exists(CONTENT_DIR + "/metrics_ingest.jsonl");
-        std::ostringstream ss;
-        ss << "{\"status\":\"" << (metrics ? "real_data_present" : "blocked_missing_metrics") << "\",";
-        ss << "\"rl_state\":" << read_json_or_block(CONTENT_DIR + "/rl_state.json", "rl_state") << ",";
-        ss << "\"ga_state\":" << read_json_or_block(CONTENT_DIR + "/ga_rl_state.json", "ga_state") << ",";
-        ss << "\"availability\":" << read_json_or_block(AVAILABILITY_FILE, "availability") << ",";
-        ss << "\"content_counts\":{\"bios\":" << bios_count << ",\"receipts\":" << count_files(RECEIPTS_DIR) << "},";
-        ss << "\"live_profile_update_allowed\":false,";
-        ss << "\"timestamp\":\"" << iso_timestamp() << "\"}";
-        response = ss.str();
-    } else if (path == "/api/bios") {
-        response = bios_json();
-    } else if (path == "/api/competitors") {
-        response = read_json_or_block(CONTENT_DIR + "/competitor_bios.json", "competitor_bios");
-    } else if (path == "/api/jobs") {
-        std::ostringstream ss;
-        ss << "{\"status\":\"ok\",\"jobs\":[";
-        DIR* d = opendir(RECEIPTS_DIR.c_str());
-        if (d) {
-            struct dirent* entry;
-            bool first = true;
-            while ((entry = readdir(d)) != nullptr) {
-                if (entry->d_type != DT_REG) continue;
-                std::string fname = entry->d_name;
-                if (!first) ss << ",";
-                first = false;
-                std::string fcontent = read_file(RECEIPTS_DIR + "/" + fname);
-                ss << fcontent;
-            }
-            closedir(d);
-        }
-        ss << "]}";
-        response = ss.str();
-    } else if (path.rfind("/api/jobs/", 0) == 0) {
-        std::string job_id = path.substr(10);
-        std::string job_path = RECEIPTS_DIR + "/" + job_id;
-        std::string fcontent = read_file(job_path);
-        if (fcontent.empty()) {
-            code = 404;
-            response = "{\"status\":\"failed\",\"reason\":\"job not found\",\"job_id\":\"" + json_escape(job_id) + "\"}";
-        } else {
-            response = fcontent;
-        }
-    } else if (path == "/api/audit/files") {
-        std::ostringstream ss;
-        ss << "{\"status\":\"ok\",\"files\":[";
-        const char* files_to_audit[] = {
-            "cpp_os_server.cpp", "rotator_engine.cpp", "ga_rl_optimizer.cpp",
-            "production_control_loop.cpp", "Dockerfile", "requirements.txt",
-            "orchestrator.py", "content_generator.py", "rl_feedback.py",
-            "interview_rotator.py", "blog_rotator.py", "metrics_collector.py",
-            "rentmasseur_availability.py", "hf_app.py", nullptr
-        };
-        bool first = true;
-        for (int i = 0; files_to_audit[i]; i++) {
-            std::string fname = files_to_audit[i];
-            bool exists = file_exists(fname);
-            std::string state;
-            if (!exists) state = "dead";
-            else if (fname.find(".cpp") != std::string::npos) state = "compiled";
-            else if (fname.find(".py") != std::string::npos) state = "imported";
-            else state = "present";
-            bool has_receipt = file_exists(std::string(RECEIPTS_DIR + "/hf_action_") + fname);
-            if (!first) ss << ",";
-            first = false;
-            ss << "{\"file\":\"" << json_escape(fname) << "\",\"state\":\"" << state << "\",\"exists\":" << (exists ? "true" : "false") << ",\"has_receipt\":" << (has_receipt ? "true" : "false") << "}";
-        }
-        ss << "]}";
-        response = ss.str();
-    } else if (path == "/api/receipts") {
-        response = "{\"status\":\"ok\",\"receipt_count\":" + std::to_string(count_files(RECEIPTS_DIR)) + "}";
-    } else if (path == "/api/ingest" && method == "POST") {
-        std::string ingest_path = CONTENT_DIR + "/metrics_ingest.jsonl";
-        std::ofstream f(ingest_path, std::ios::app);
-        if (!f) { code = 500; response = "{\"status\":\"failed\",\"reason\":\"could not open metrics_ingest.jsonl\"}"; }
-        else {
-            f << "{\"timestamp\":\"" << iso_timestamp() << "\",\"body\":\"" << json_escape(body) << "\"}\n";
-            std::string receipt = write_receipt("ingest", "success", 0, "metrics accepted", "\"output_file\": \"" + ingest_path + "\"");
-            response = "{\"status\":\"success\",\"output_file\":\"" + ingest_path + "\",\"receipt\":\"" + receipt + "\"}";
-        }
-    } else if (path == "/api/run/ga-rl") {
-        response = action_response("ga-rl", "./ga_rl_optimizer --population 12 --generations 5 --target 300 && ./ga_rl_optimizer --apply-winner");
-    } else if (path == "/api/run/orchestrator") {
-        response = action_response("orchestrator", "python3 orchestrator.py --all --dry-run");
-    } else if (path == "/api/run/availability") {
-        code = 403;
-        response = blocked_response("availability", "Live login automation is disabled because prior runs hit captcha/anti-bot. Use first-party metrics ingestion or a manually approved platform path.");
-    } else if (path.rfind("/api/rotate/", 0) == 0) {
-        std::string rotate_type = path.substr(12);
-        if (!(rotate_type == "bio" || rotate_type == "photo" || rotate_type == "price" || rotate_type == "interview" || rotate_type == "blog")) {
-            code = 404; response = "{\"status\":\"failed\",\"reason\":\"unknown rotate type\"}";
-        } else {
-            response = action_response("rotate_" + rotate_type, "./rotator_engine --rotate " + rotate_type);
-        }
-    } else if (path == "/api/rotator/report") {
-        response = action_response("rotator_report", "./rotator_engine --report");
-    } else if (path == "/api/cicd/list") {
-        response = gh_api("GET", "actions/workflows");
-    } else if (path == "/api/cicd/runs") {
-        response = gh_api("GET", "actions/runs?per_page=10");
-    } else if (path.rfind("/api/cicd/trigger/", 0) == 0) {
-        std::string wf = path.substr(18);
-        std::string raw = gh_api("POST", "actions/workflows/" + url_encode_workflow(wf) + "/dispatches", "{\"ref\":\"main\"}");
-        std::string receipt = write_receipt("cicd_trigger_" + wf, "dispatched", 0, raw);
-        response = "{\"status\":\"dispatched\",\"workflow\":\"" + json_escape(wf) + "\",\"github_response\":" + raw + ",\"receipt\":\"" + json_escape(receipt) + "\"}";
-    } else if (path.rfind("/api/cicd/status/", 0) == 0) {
-        response = gh_api("GET", "actions/runs/" + path.substr(16));
-    } else if (path == "/api/funnel/daily") {
-        std::string metrics = read_file(CONTENT_DIR + "/metrics_ingest.jsonl");
-        int metric_count = 0;
-        long total_views = 0, total_clicks = 0, total_emails = 0, total_visits = 0;
-        if (!metrics.empty()) {
-            std::istringstream ms(metrics);
-            std::string line;
-            while (std::getline(ms, line)) {
-                if (line.empty()) continue;
-                metric_count++;
-                size_t vp = line.find("\"profile_views\"");
-                if (vp != std::string::npos) { size_t vn = line.find(":", vp); if (vn != std::string::npos) total_views += std::atol(line.c_str() + vn + 1); }
-                size_t cp = line.find("\"contact_clicks\"");
-                if (cp != std::string::npos) { size_t cn = line.find(":", cp); if (cn != std::string::npos) total_clicks += std::atol(line.c_str() + cn + 1); }
-                size_t ep = line.find("\"new_emails\"");
-                if (ep != std::string::npos) { size_t en = line.find(":", ep); if (en != std::string::npos) total_emails += std::atol(line.c_str() + en + 1); }
-                size_t np = line.find("\"new_visits\"");
-                if (np != std::string::npos) { size_t nn = line.find(":", np); if (nn != std::string::npos) total_visits += std::atol(line.c_str() + nn + 1); }
-            }
-        }
-        double ctr = total_views > 0 ? (double)total_clicks / total_views : 0.0;
-        char ctr_buf[16]; std::snprintf(ctr_buf, sizeof(ctr_buf), "%.4f", ctr);
-        const char* status = metric_count == 0 ? "gray_no_data" : (total_views < 100 ? "no_signal" : "real_data");
-        std::ostringstream ss;
-        ss << "{\"status\":\"" << status << "\",\"metric_entries\":" << metric_count
-           << ",\"profile_views\":" << total_views
-           << ",\"contact_clicks\":" << total_clicks
-           << ",\"new_visits\":" << total_visits
-           << ",\"new_emails\":" << total_emails
-           << ",\"contact_click_rate\":" << ctr_buf
-           << ",\"email_clicks\":0,\"phone_clicks\":0,\"booking_requests\":0,\"confirmed_bookings\":0,\"gross_revenue\":0"
-           << ",\"client_target\":1,\"client_probability\":\"unverified_no_real_metrics\""
-           << ",\"note\":\"Funnel requires first-party metrics from extension or manual dashboard capture\""
-           << ",\"timestamp\":\"" << iso_timestamp() << "\"}";
-        response = ss.str();
-    } else if (path == "/api/leads") {
-        std::string leads = read_file(CONTENT_DIR + "/leads.jsonl");
-        int lead_count = 0;
-        if (!leads.empty()) {
-            for (size_t i = 0; i < leads.size(); i++) if (leads[i] == '\n') lead_count++;
-        }
-        response = "{\"status\":\"" + std::string(lead_count > 0 ? "ok" : "gray_no_data") + "\",\"lead_count\":" + std::to_string(lead_count) + ",\"note\":\"Leads are tracked from first-party contact events only\"}";
-    } else if (path == "/api/decision/latest") {
-        std::string decision = read_file(CONTENT_DIR + "/decisions/latest_decision.json");
-        if (decision.empty()) {
-            response = "{\"status\":\"gray_no_data\",\"reason\":\"no production gate decision has been made yet\",\"note\":\"Run master-rotator with production_control_loop --evaluate to generate a decision\"}";
-        } else {
-            response = decision;
-        }
-    } else if (path == "/api/candidates") {
-        std::ostringstream ss;
-        ss << "{\"status\":\"ok\",\"candidates\":{";
-        const char* types[] = {"bios", "interviews", "blogs", "photos", "prices", nullptr};
-        bool first = true;
-        for (int i = 0; types[i]; i++) {
-            if (!first) ss << ",";
-            first = false;
-            ss << "\"" << types[i] << "\":" << count_files(CONTENT_DIR + "/" + types[i]);
-        }
-        ss << "}}";
-        response = ss.str();
-    } else if (path == "/api/metrics/ingest" && method == "POST") {
-        std::string lower_body = body;
-        for (char& c : lower_body) c = (char)tolower(c);
-        const char* secret_keys[] = {"cookie", "cookies", "token", "accesstoken", "refreshtoken", "authorization", "password", "session", "bearer", nullptr};
-        bool has_secret = false;
-        std::string secret_found = "";
-        for (int i = 0; secret_keys[i]; i++) {
-            if (lower_body.find(secret_keys[i]) != std::string::npos) {
-                has_secret = true;
-                secret_found = secret_keys[i];
-                break;
-            }
-        }
-        if (has_secret) {
-            code = 400;
-            std::string receipt = write_receipt("metrics_ingest_rejected", "rejected", 0, "payload contains secret-bearing key", "\"rejected_key\": \"" + secret_found + "\"");
-            response = "{\"status\":\"rejected\",\"reason\":\"payload contains secret-bearing field\",\"field\":\"" + secret_found + "\",\"receipt\":\"" + json_escape(receipt) + "\"}";
-        } else {
-            std::string ingest_path = CONTENT_DIR + "/metrics_ingest.jsonl";
-            std::ofstream f(ingest_path, std::ios::app);
-            if (!f) { code = 500; response = "{\"status\":\"failed\",\"reason\":\"could not write metrics file\"}"; }
-            else {
-                f << body << "\n";
-                f.close();
-                std::string latest_path = CONTENT_DIR + "/metrics/latest_metrics.json";
-                ensure_dir(CONTENT_DIR + "/metrics");
-                std::ofstream lf(latest_path);
-                if (lf) { lf << body; lf.close(); }
-                std::string receipt = write_receipt("metrics_ingest", "success", 0, "first-party metrics accepted",
-                    "\"output_file\": \"" + ingest_path + "\", \"latest_file\": \"" + latest_path + "\"");
-                response = "{\"status\":\"success\",\"output_file\":\"" + ingest_path + "\",\"latest_file\":\"" + latest_path + "\",\"receipt\":\"" + json_escape(receipt) + "\",\"note\":\"first-party metrics only, no automated login\"}";
-            }
-        }
-    } else if (path == "/api/config" && method == "POST") {
-        std::string config_path = CONTENT_DIR + "/system_config.json";
-        std::ofstream f(config_path);
-        if (!f) { code = 500; response = "{\"status\":\"failed\",\"reason\":\"could not write config\"}"; }
-        else {
-            f << body;
-            std::string receipt = write_receipt("config", "success", 0, "config saved", "\"output_file\": \"" + config_path + "\"");
-            response = "{\"status\":\"success\",\"output_file\":\"" + config_path + "\",\"receipt\":\"" + receipt + "\"}";
-        }
-    } else {
-        code = 404;
-        response = "{\"status\":\"failed\",\"error\":\"not found\"}";
+    driver = setup_driver(headless=True)
+    try:
+        if not login(driver):
+            result["error"] = "Login failed"
+            logger.error("Login failed — cannot proceed")
+            ledger.add("selenium", "Selenium automation (login failed)", result)
+            return result
+        result["login"] = True
+        logger.info("Login successful")
+
+        if not skip_availability:
+            result["availability"] = set_availability_24_7(driver)
+            logger.info("Availability 24/7: %s", result["availability"])
+
+        if not skip_bio and best:
+            bio_text = best["bio"]
+            bio_res = update_bio(driver, "")
+            if bio_res and not (isinstance(bio_res, dict) and bio_res.get("error")):
+                field_info, current_bio = bio_res
+                logger.info("Current bio: %d chars", len(current_bio))
+                result["previous_bio_chars"] = len(current_bio)
+                result["previous_bio_preview"] = current_bio[:200]
+                saved = save_bio_field(driver, field_info, bio_text)
+                result["bio_applied"] = saved
+                if saved:
+                    result["new_bio_preview"] = bio_text[:200]
+                    logger.info("Bio updated on live profile")
+                else:
+                    logger.error("Bio save failed")
+            else:
+                logger.error("Could not find bio field")
+                result["bio_error"] = "no_bio_field"
+        elif skip_bio:
+            result["bio_applied"] = "skipped"
+
+    finally:
+        driver.quit()
+
+    ledger.add("selenium", "Selenium: login + availability + bio update on live rentmasseur.com", result)
+    return result
+
+
+# ─── Stage 7: Save + Summary ───
+
+def stage_save(scrape_res, agi_train_res, agi_pipe_res, groq_res, merge_res, selenium_res) -> dict:
+    logger.info("=" * 60)
+    logger.info("STAGE 7: Save all results + receipt summary")
+    logger.info("=" * 60)
+
+    summary = {
+        "pipeline_run": datetime.now(timezone.utc).isoformat(),
+        "stages": {
+            "live_scrape": {"providers": scrape_res.get("providers_scraped", 0), "mode": scrape_res.get("mode")},
+            "agi_train": {"exit_code": agi_train_res.get("exit_code"), "model": agi_train_res.get("model_exists", False)},
+            "agi_pipeline": {
+                "generate": agi_pipe_res.get("generate", {}).get("exit_code"),
+                "score": agi_pipe_res.get("score", {}).get("exit_code"),
+                "evolve": agi_pipe_res.get("evolve", {}).get("exit_code"),
+                "select": agi_pipe_res.get("select", {}).get("exit_code"),
+                "selected_count": agi_pipe_res.get("select", {}).get("selected_count", 0),
+            },
+            "groq_bios": {"strategies": groq_res.get("top_strategies", []), "bios_generated": groq_res.get("bios_generated", 0)},
+            "merge": {"total": merge_res.get("total_candidates", 0), "best_source": merge_res.get("best_source")},
+            "selenium": {
+                "login": selenium_res.get("login", False),
+                "availability": selenium_res.get("availability", False),
+                "bio_applied": selenium_res.get("bio_applied", False),
+            },
+        },
+        "receipts": ledger.summary(),
     }
 
-    std::string wire = http_response(code, content_type, response);
-    send(client_socket, wire.c_str(), wire.size(), 0);
-    close(client_socket);
-}
+    summary_path = PIPELINE_DIR / "pipeline_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=str))
 
-static int start_server(int port) {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) { std::cerr << "Socket creation failed\n"; return 1; }
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-    if (bind(server_fd, (sockaddr*)&address, sizeof(address)) < 0) { std::cerr << "Bind failed\n"; close(server_fd); return 1; }
-    if (listen(server_fd, 10) < 0) { std::cerr << "Listen failed\n"; close(server_fd); return 1; }
-    std::cout << "RentMasseur C++ OS listening on port " << port << std::endl;
-    while (true) {
-        sockaddr_in client_addr{};
-        socklen_t addr_len = sizeof(client_addr);
-        int client_socket = accept(server_fd, (sockaddr*)&client_addr, &addr_len);
-        if (client_socket < 0) continue;
-        handle_client(client_socket);
-    }
-    close(server_fd);
-    return 0;
-}
+    # Save all candidates
+    candidates_path = PIPELINE_DIR / "all_candidates.json"
+    candidates_path.write_text(json.dumps(merge_res.get("all_candidates", []), indent=2, default=str))
 
-int main(int argc, char* argv[]) {
-    int port = PORT;
-    if (argc > 1) port = std::atoi(argv[1]);
-    std::cout << "Starting RentMasseur C++ OS evidence-only mode on port " << port << std::endl;
-    return start_server(port);
-}
+    # Save best bio
+    best_bio_path = PIPELINE_DIR / "best_bio.txt"
+    for c in merge_res.get("all_candidates", []):
+        if c.get("bio") and len(c["bio"]) > 50:
+            best_bio_path.write_text(c["bio"])
+            break
+
+    logger.info("Summary saved: %s", summary_path)
+    logger.info("Candidates saved: %s", candidates_path)
+    logger.info("Best bio saved: %s", best_bio_path)
+    logger.info("Receipts: %d total, chain valid: %s", ledger.summary()["total_receipts"], ledger.summary()["chain_valid"])
+
+    ledger.add("pipeline_complete", "Full production pipeline completed", summary)
+    return summary
+
+
+# ─── Main ───
+
+def main():
+    parser = argparse.ArgumentParser(description="RentMasseur Production Pipeline")
+    parser.add_argument("--skip-scrape", action="store_true", help="Skip live competitor scrape")
+    parser.add_argument("--skip-selenium", action="store_true", help="Skip Selenium automation (login/availability/bio)")
+    parser.add_argument("--skip-availability", action="store_true", help="Skip availability setting in Selenium")
+    parser.add_argument("--skip-bio", action="store_true", help="Skip bio update in Selenium")
+    parser.add_argument("--agi-only", action="store_true", help="Only run AGI pipeline (no Groq, no Selenium)")
+    parser.add_argument("--groq-only", action="store_true", help="Only run Groq bios (no AGI, no Selenium)")
+    parser.add_argument("--count", type=int, default=100000, help="AGI generate count")
+    parser.add_argument("--generations", type=int, default=100, help="GA generations")
+    parser.add_argument("--top", type=int, default=25, help="Top N to select")
+    parser.add_argument("--strategies", type=int, default=5, help="Top N strategies for Groq")
+    parser.add_argument("--label", default="reviews", choices=["reviews", "views_per_day", "rating"])
+    parser.add_argument("--epochs", type=int, default=100, help="MLP training epochs")
+    args = parser.parse_args()
+
+    start = time.time()
+    logger.info("=" * 60)
+    logger.info("RENTMASSEUR PRODUCTION PIPELINE — ALL REAL, NO MOCK")
+    logger.info("=" * 60)
+
+    # Check prerequisites
+    if not AGI_BINARY.exists():
+        logger.error("AGI binary not found at %s — compile with: g++ -O3 -std=c++17 rm_agi.cpp -o rm_agi", AGI_BINARY)
+        sys.exit(1)
+    if not REAL_BIOS.exists():
+        logger.error("Real bios corpus not found at %s", REAL_BIOS)
+        sys.exit(1)
+
+    # Stage 1: Live scrape
+    scrape_res = {"providers_scraped": 0}
+    if not args.skip_scrape:
+        scrape_res = stage_live_scrape()
+
+    # Stage 2: AGI train
+    agi_train_res = stage_agi_train(label=args.label, epochs=args.epochs)
+
+    # Stage 3: AGI pipeline
+    agi_pipe_res = stage_agi_pipeline(count=args.count, generations=args.generations, top=args.top)
+
+    # Stage 4: Groq bios
+    groq_res = {"groq_bios": [], "top_strategies": [], "bios_generated": 0}
+    if not args.agi_only:
+        groq_res = stage_groq_bios(top_n=args.strategies)
+
+    # Stage 5: Merge + rank
+    merge_res = stage_merge_rank(agi_pipe_res, groq_res)
+
+    # Stage 6: Selenium
+    selenium_res = {"login": False, "availability": False, "bio_applied": False}
+    if not args.skip_selenium and not args.agi_only and not args.groq_only:
+        selenium_res = stage_selenium(merge_res, skip_availability=args.skip_availability, skip_bio=args.skip_bio)
+
+    # Stage 7: Save
+    summary = stage_save(scrape_res, agi_train_res, agi_pipe_res, groq_res, merge_res, selenium_res)
+
+    elapsed = time.time() - start
+    logger.info("=" * 60)
+    logger.info("PIPELINE COMPLETE in %.1fs", elapsed)
+    logger.info("=" * 60)
+    logger.info("Receipts: %d (chain valid: %s)", ledger.summary()["total_receipts"], ledger.summary()["chain_valid"])
+    logger.info("Output: %s", PIPELINE_DIR)
+    print(json.dumps(summary, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()
 
 ```
 
-seo_keywords.py:
+popup.html:
+```
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { width: 260px; padding: 14px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a1f; color: #f0f0f5; margin: 0; }
+    h2 { margin: 0 0 10px 0; font-size: 15px; }
+    .field { margin-bottom: 10px; }
+    label { display: block; font-size: 11px; color: #9a9aa3; margin-bottom: 3px; }
+    input { width: 100%; padding: 6px; background: #0f0f12; border: 1px solid #333; border-radius: 6px; color: #f0f0f5; font-size: 13px; }
+    button { width: 100%; padding: 8px; background: #cc8b4a; border: none; border-radius: 6px; color: #fff; font-weight: 600; cursor: pointer; margin-top: 6px; }
+    button:hover { background: #e09d5a; }
+    .status { font-size: 12px; color: #9a9aa3; margin-top: 10px; text-align: center; }
+    .status.ok { color: #4caf50; }
+    .status.err { color: #f44336; }
+  </style>
+</head>
+<body>
+  <h2>RentMasseur Booker</h2>
+  <div class="field">
+    <label>Booking Server URL</label>
+    <input type="text" id="serverUrl" value="http://localhost:3000" placeholder="http://localhost:3000">
+  </div>
+  <button id="saveBtn">Save Settings</button>
+  <button id="openBookings" style="background:#2a2a30;margin-top:6px;">Open Booking Page</button>
+  <div class="status" id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
+
+```
+
+social_media_generator.py:
 ```
 #!/usr/bin/env python3
-"""SEO keyword research generator — produces keyword sets for each strategy.
+"""Social media post generator — creates platform-specific posts from daily content.
 
-Generates primary keywords, long-tail keywords, search volume estimates,
-and content recommendations for SEO optimization.
+Generates posts for Twitter/X, Instagram, Facebook, and LinkedIn based on
+the daily bios, blog posts, and interview questions.
 
 Usage:
-    python3 seo_keywords.py
+    python3 social_media_generator.py
+    python3 social_media_generator.py --platform twitter
 """
 
+import argparse
 import json
 import os
 import sys
+import glob
 import time
 import logging
 from datetime import datetime, timezone
@@ -347,7 +582,14 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
-SEO_DIR = os.path.join(CONTENT_DIR, "seo_keywords")
+SOCIAL_DIR = os.path.join(CONTENT_DIR, "social_posts")
+
+PLATFORMS = {
+    "twitter": {"max_chars": 280, "style": "concise, punchy, with hashtags"},
+    "instagram": {"max_chars": 2200, "style": "visual, emoji-rich, story-driven, with hashtags"},
+    "facebook": {"max_chars": 5000, "style": "conversational, community-focused, engaging"},
+    "linkedin": {"max_chars": 3000, "style": "professional, thought-leadership, industry-focused"},
+}
 
 STRATEGIES = [
     "sensory_luxury", "therapeutic_expert", "mystery_desire", "local_hustle",
@@ -361,7 +603,7 @@ STRATEGIES = [
 ]
 
 
-def _groq_chat(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> Optional[str]:
+def _groq_chat(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> Optional[str]:
     if not GROQ_API_KEY:
         logger.error("No GROQ_API_KEY")
         return None
@@ -375,7 +617,7 @@ def _groq_chat(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> O
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "temperature": 0.7,
+                "temperature": 0.9,
                 "max_tokens": max_tokens,
             },
             timeout=60,
@@ -387,54 +629,52 @@ def _groq_chat(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> O
         return None
 
 
+def generate_social_posts(platform: str, strategy: str) -> Optional[str]:
+    """Generate social media posts for a specific platform and strategy."""
+    config = PLATFORMS[platform]
+    system_prompt = (
+        f"You are a social media manager for a male massage therapist in Manhattan, NYC. "
+        f"Create a {platform} post that is {config['style']}. "
+        f"Maximum {config['max_chars']} characters. "
+        f"Avoid explicit content. Include relevant hashtags. "
+        f"Drive bookings to the RentMasseur profile. Write ONLY the post text."
+    )
+    user_prompt = (
+        f"Strategy angle: {strategy}\n"
+        f"Create a compelling {platform} post for a massage therapist. "
+        f"Make it engaging and booking-oriented."
+    )
+    return _groq_chat(system_prompt, user_prompt)
+
+
 def main():
-    os.makedirs(SEO_DIR, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Generate social media posts from daily content")
+    parser.add_argument("--platform", choices=list(PLATFORMS.keys()), help="Generate for specific platform only")
+    parser.add_argument("--strategies", nargs="*", default=STRATEGIES, help="Strategies to generate for")
+    args = parser.parse_args()
+
+    os.makedirs(SOCIAL_DIR, exist_ok=True)
     today = datetime.now().strftime("%Y%m%d")
+    platforms = [args.platform] if args.platform else list(PLATFORMS.keys())
     total = 0
 
-    system_prompt = (
-        "You are an SEO expert for massage therapy businesses in Manhattan, NYC. "
-        "Generate keyword research in JSON format with: "
-        "primary_keywords (array of 10), long_tail_keywords (array of 15), "
-        "local_seo_keywords (array of 10 with NYC neighborhoods), "
-        "content_recommendations (array of 5 blog post ideas), "
-        "meta_description (150 chars), and "
-        "title_tag (60 chars). "
-        "Return ONLY valid JSON, no markdown."
-    )
+    for platform in platforms:
+        platform_dir = os.path.join(SOCIAL_DIR, platform)
+        os.makedirs(platform_dir, exist_ok=True)
+        logger.info("=== Generating %s posts ===", platform)
 
-    all_keywords = {}
+        for strategy in args.strategies:
+            post = generate_social_posts(platform, strategy)
+            if post:
+                filepath = os.path.join(platform_dir, f"{today}_{strategy}.md")
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(post)
+                total += 1
+                logger.info("%s/%s: %d chars", platform, strategy, len(post))
+            time.sleep(0.5)
 
-    for strategy in STRATEGIES:
-        logger.info("Generating SEO keywords: %s", strategy)
-        user_prompt = f"Generate SEO keyword research for strategy: {strategy}"
-        result = _groq_chat(system_prompt, user_prompt, max_tokens=600)
-
-        if result:
-            try:
-                if result.startswith("```"):
-                    result = result.split("```")[1]
-                    if result.startswith("json"):
-                        result = result[4:]
-                keywords = json.loads(result)
-            except json.JSONDecodeError:
-                keywords = {"raw": result}
-
-            all_keywords[strategy] = keywords
-            filepath = os.path.join(SEO_DIR, f"{today}_{strategy}.json")
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(keywords, f, indent=2)
-            total += 1
-            logger.info("Saved: %s", filepath)
-        time.sleep(1)
-
-    # Save combined file
-    combined_path = os.path.join(SEO_DIR, f"{today}_all_strategies.json")
-    with open(combined_path, "w", encoding="utf-8") as f:
-        json.dump(all_keywords, f, indent=2)
-
-    logger.info("=== Generated SEO keywords for %d strategies ===", total)
-    print(json.dumps({"total_strategies": total, "date": today}, indent=2))
+    logger.info("=== Generated %d social media posts ===", total)
+    print(json.dumps({"total_posts": total, "platforms": platforms, "date": today}, indent=2))
 
 
 if __name__ == "__main__":
@@ -442,32 +682,105 @@ if __name__ == "__main__":
 
 ```
 
-providers.json:
+.gitignore:
 ```
-{
-  "providers": [
-    {
-      "slug": "Preston_Banks",
-      "url": "https://rentmasseur.com/Preston_Banks",
-      "name": "Preston_Banks"
-    },
-    {
-      "slug": "Tonyxxxx",
-      "url": "https://rentmasseur.com/Tonyxxxx",
-      "name": "Tonyxxxx"
-    },
-    {
-      "slug": "MickeyCuteBoy",
-      "url": "https://rentmasseur.com/MickeyCuteBoy",
-      "name": "MickeyCuteBoy"
-    },
-    {
-      "slug": "ExoticYoungGuy",
-      "url": "https://rentmasseur.com/ExoticYoungGuy",
-      "name": "ExoticYoungGuy"
-    }
-  ]
-}
+__pycache__/
+*.pyc
+jobs.sqlite
+revenue_ops.db
+.env
+*.env
+*.sqlite
+*.db
+cookies*.json
+session*.json
+.DS_Store
+__MACOSX/
+rm_traffic/
+content/daily_evidence_packet.json
+private_secrets_quarantine/
+api_map.json
+*.secret.json
+
+```
+
+_diag_login.py:
+```
+#!/usr/bin/env python3
+"""Quick screenshot of rentmasseur login page to diagnose what's there."""
+import time, os
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+
+opts = Options()
+opts.add_argument("--no-sandbox")
+opts.add_argument("--disable-dev-shm-usage")
+opts.add_argument("--window-size=1280,900")
+
+driver = webdriver.Chrome(options=opts)
+try:
+    driver.set_page_load_timeout(90)
+    driver.get("https://rentmasseur.com/login")
+    time.sleep(10)
+    
+    # Screenshot
+    shot_path = "/Users/alep/Downloads/rentmasseur-optimizer/login_screenshot.png"
+    driver.save_screenshot(shot_path)
+    print(f"Screenshot saved: {shot_path}")
+    
+    # Dump page source
+    html_path = "/Users/alep/Downloads/rentmasseur-optimizer/login_page.html"
+    with open(html_path, "w") as f:
+        f.write(driver.page_source)
+    print(f"HTML saved: {html_path}")
+    
+    # List all inputs
+    inputs = driver.execute_script("""
+        return Array.from(document.querySelectorAll('input')).map(i => ({
+            type: i.type, name: i.name, id: i.id, placeholder: i.placeholder,
+            class: i.className, visible: i.offsetParent !== null
+        }));
+    """)
+    print(f"\nInputs found: {len(inputs)}")
+    for inp in inputs:
+        print(f"  type={inp['type']} name={inp['name']} id={inp['id']} placeholder={inp['placeholder']} visible={inp['visible']}")
+    
+    # List all buttons
+    buttons = driver.execute_script("""
+        return Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]')).map(b => ({
+            tag: b.tagName, text: (b.innerText||b.value||'').substring(0,50), type: b.type||''
+        }));
+    """)
+    print(f"\nButtons found: {len(buttons)}")
+    for btn in buttons:
+        print(f"  {btn['tag']} text={btn['text']} type={btn['type']}")
+    
+    # Check for iframes
+    iframes = driver.find_elements(By.TAG_NAME, "iframe")
+    print(f"\nIframes: {len(iframes)}")
+    for i, iframe in enumerate(iframes):
+        print(f"  iframe[{i}] src={iframe.get_attribute('src')} id={iframe.get_attribute('id')}")
+    
+    # Current URL and title
+    print(f"\nURL: {driver.current_url}")
+    print(f"Title: {driver.title}")
+    
+    # Check for CAPTCHA
+    captcha = driver.execute_script("""
+        const el = document.querySelector('[class*="captcha"]') || 
+                   document.querySelector('[id*="captcha"]') ||
+                   document.querySelector('iframe[src*="captcha"]') ||
+                   document.querySelector('iframe[src*="recaptcha"]') ||
+                   document.querySelector('.g-recaptcha') ||
+                   document.querySelector('#g-recaptcha');
+        return el ? {tag: el.tagName, id: el.id, class: el.className, src: el.src||''} : null;
+    """)
+    print(f"\nCAPTCHA: {captcha}")
+    
+finally:
+    driver.quit()
+
 ```
 
 gen_icons.py:
@@ -484,317 +797,4 @@ for size in [16, 48, 128]:
     r = size // 5
     d.ellipse([cx-r, cy-r, cx+r, cy+r], fill=(255, 255, 255, 255))
     img.save(f'/Users/alep/Downloads/02_AI_Agents/rentmasseur-extension/icon{size}.png')
-
-print('Icons generated')
-
-```
-
-metrics_collector.py:
-```
-#!/usr/bin/env python3
-"""
-Metrics collector — accepts first-party data from the Chrome extension or manual uploads.
-No automated login. No Selenium. No captcha-bypassing.
-
-Data sources:
-  1. Chrome extension sends metrics to HF Space /api/ingest (user-approved, first-party)
-  2. Manual JSON upload via CI/CD workflow_dispatch inputs
-  3. Dashboard screenshot OCR (user-provided, not automated)
-
-This script processes ingested metrics and updates the availability/RL state files.
-"""
-
-import argparse
-import json
-import os
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-CONTENT_DIR = Path("content")
-AVAILABILITY_FILE = Path("availability.json")
-METRICS_INGEST = CONTENT_DIR / "metrics_ingest.jsonl"
-
-
-def process_ingested_metrics():
-    """Read all ingested metrics and produce a summary."""
-    if not METRICS_INGEST.exists():
-        print("[metrics] No ingested metrics file found.")
-        return {"status": "no_data", "message": "No metrics ingested yet."}
-
-    metrics = []
-    with open(METRICS_INGEST, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-                metrics.append(entry)
-            except json.JSONDecodeError:
-                continue
-
-    if not metrics:
-        return {"status": "no_data", "message": "Metrics file is empty."}
-
-    latest = metrics[-1]
-    summary = {
-        "status": "ok",
-        "total_ingested": len(metrics),
-        "latest_timestamp": latest.get("timestamp", ""),
-        "latest_metrics": latest,
-        "processed_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    # Update availability file if metrics contain availability info
-    body = latest.get("body", {})
-    if isinstance(body, str):
-        try:
-            body = json.loads(body)
-        except json.JSONDecodeError:
-            body = {}
-
-    if "is_available" in body or "availability" in body:
-        avail = {
-            "status": "available" if body.get("is_available") else "unknown",
-            "checked_at": latest.get("timestamp", ""),
-            "source": "extension_first_party",
-            "mode": "user_approved",
-        }
-        with open(AVAILABILITY_FILE, "w") as f:
-            json.dump(avail, f, indent=2)
-        print(f"[metrics] Updated availability: {avail['status']}")
-
-    # Save metrics summary
-    CONTENT_DIR.mkdir(exist_ok=True)
-    with open(CONTENT_DIR / "metrics_summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
-
-    print(f"[metrics] Processed {len(metrics)} ingested metric entries.")
-    return summary
-
-
-def generate_proof():
-    """Generate a proof/receipt file for this run."""
-    receipts_dir = Path("receipts")
-    receipts_dir.mkdir(exist_ok=True)
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    proof = {
-        "action": "metrics-collector",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "source": "first_party_extension_or_manual",
-        "automated_login": False,
-        "captcha_bypassed": False,
-        "metrics_processed": 0,
-        "availability_updated": AVAILABILITY_FILE.exists(),
-        "status": "completed",
-    }
-
-    summary = process_ingested_metrics()
-    proof["metrics_processed"] = summary.get("total_ingested", 0)
-    proof["summary"] = summary
-
-    proof_path = receipts_dir / f"metrics_{timestamp}.json"
-    with open(proof_path, "w") as f:
-        json.dump(proof, f, indent=2)
-
-    print(f"[proof] Receipt written: {proof_path}")
-    return proof
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="RentMasseur first-party metrics collector")
-    parser.add_argument("--process", action="store_true", help="Process ingested metrics")
-    parser.add_argument("--proof", action="store_true", help="Generate proof file only")
-    args = parser.parse_args()
-
-    if args.proof or args.process or not sys.argv[1:]:
-        result = generate_proof()
-        print(json.dumps(result, indent=2))
-
-```
-
-_deploy_bio_uc.py:
-```
-#!/usr/bin/env python3
-"""Login + deploy bio using undetected-chromedriver to bypass CAPTCHA detection."""
-import time, os, sys
-import undetected_chromedriver as uc
-from dotenv import load_dotenv
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv()
-
-USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
-LOGIN_URL = "https://rentmasseur.com/login"
-PROFILE_URL = "https://rentmasseur.com/profile"
-BIO_URL = "https://rentmasseur.com/profile/edit"
-
-BIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "bios", "controlled_wolf_v1.md")
-
-print(f"Username: {USERNAME}")
-print(f"Bio file: {BIO_FILE}")
-
-with open(BIO_FILE, "r") as f:
-    BIO_TEXT = f.read().strip()
-print(f"Bio length: {len(BIO_TEXT)} chars")
-
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,900")
-
-driver = uc.Chrome(options=options, version_main=149)
-try:
-    print("\n[1] Navigating to login...")
-    driver.set_page_load_timeout(90)
-    driver.get(LOGIN_URL)
-    time.sleep(8)
-    
-    print(f"  Title: {driver.title}")
-    print(f"  URL: {driver.current_url}")
-    
-    # Check if CAPTCHA is present
-    captcha = driver.execute_script("""
-        return !!document.querySelector('.g-recaptcha, #captcha, iframe[src*="recaptcha"], iframe[src*="captcha"]');
-    """)
-    print(f"  CAPTCHA present: {captcha}")
-    
-    if captcha:
-        print("\n[2] CAPTCHA detected. Waiting up to 120s for it to be solved...")
-        for i in range(24):
-            time.sleep(5)
-            captcha_still = driver.execute_script("""
-                const iframe = document.querySelector('iframe[src*="recaptcha"]');
-                if (!iframe) return false;
-                // Check if recaptcha response is filled
-                try {
-                    return !grecaptcha.getResponse();
-                } catch(e) {
-                    return true;
-                }
-            """)
-            if not captcha_still:
-                print("  CAPTCHA solved!")
-                break
-            print(f"  Waiting for CAPTCHA solve... ({(i+1)*5}s)")
-        else:
-            print("  CAPTCHA not solved in time. Trying to proceed anyway...")
-    
-    # Wait for login form to appear
-    print("\n[3] Looking for login form...")
-    for attempt in range(10):
-        time.sleep(3)
-        inputs = driver.execute_script("""
-            return Array.from(document.querySelectorAll('input')).map(i => ({
-                type: i.type, name: i.name, id: i.id, placeholder: i.placeholder,
-                visible: i.offsetParent !== null
-            }));
-        """)
-        print(f"  Attempt {attempt+1}: {len(inputs)} inputs found")
-        for inp in inputs:
-            print(f"    type={inp['type']} name={inp['name']} id={inp['id']} placeholder={inp['placeholder']} visible={inp['visible']}")
-        
-        pwd = driver.execute_script("""
-            return document.querySelector('input[type="password"]') ||
-                   document.querySelector('input[name*="pass" i]') ||
-                   document.querySelector('input[placeholder*="pass" i]');
-        """)
-        if pwd:
-            print("  Password field found!")
-            break
-    else:
-        print("  No login form found after waiting. Dumping page...")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/login_after_captcha.png")
-        with open("/Users/alep/Downloads/rentmasseur-optimizer/login_after.html", "w") as f:
-            f.write(driver.page_source)
-        sys.exit(1)
-    
-    # Fill login form
-    print("\n[4] Filling login form...")
-    driver.execute_script(f"""
-        const pwd = document.querySelector('input[type="password"]') ||
-                    document.querySelector('input[name*="pass" i]');
-        const user = document.querySelector('input[type="text"]') ||
-                     document.querySelector('input[type="email"]') ||
-                     document.querySelector('input[name*="user" i]') ||
-                     document.querySelector('input[name*="email" i]');
-        if (user) {{ user.value = '{USERNAME}'; user.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-        if (pwd) {{ pwd.value = '{PASSWORD}'; pwd.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-    """)
-    time.sleep(2)
-    
-    # Click submit
-    driver.execute_script("""
-        const btn = document.querySelector('button[type="submit"]') ||
-                    document.querySelector('input[type="submit"]') ||
-                    Array.from(document.querySelectorAll('button')).find(b => /login|sign.in|submit/i.test(b.innerText));
-        if (btn) btn.click();
-    """)
-    time.sleep(8)
-    
-    print(f"  After login URL: {driver.current_url}")
-    if "login" in driver.current_url.lower():
-        print("  Login may have failed. Screenshot saved.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/login_failed.png")
-        sys.exit(1)
-    
-    print("  Login successful!")
-    
-    # Navigate to profile edit
-    print("\n[5] Navigating to profile edit...")
-    driver.get(BIO_URL)
-    time.sleep(5)
-    
-    # Find bio textarea
-    print("  Looking for bio textarea...")
-    bio_field = driver.execute_script("""
-        const textareas = Array.from(document.querySelectorAll('textarea'));
-        let best = null, bestScore = 0;
-        for (const ta of textareas) {
-            const score = (ta.value || '').length;
-            if (score > bestScore) { bestScore = score; best = ta; }
-        }
-        if (!best && textareas.length > 0) best = textareas[0];
-        if (best) {
-            best.value = arguments[0];
-            best.dispatchEvent(new Event('input', {bubbles: true}));
-            best.dispatchEvent(new Event('change', {bubbles: true}));
-            return true;
-        }
-        return false;
-    """, BIO_TEXT)
-    
-    if bio_field:
-        print("  Bio field updated!")
-        time.sleep(2)
-        
-        # Click save
-        saved = driver.execute_script("""
-            const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-            const saveBtn = buttons.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'') + ' ' + (b.value||'')));
-            if (saveBtn) { saveBtn.click(); return true; }
-            return false;
-        """)
-        print(f"  Save clicked: {saved}")
-        time.sleep(5)
-        print("\n  BIO DEPLOYED SUCCESSFULLY!")
-    else:
-        print("  No textarea found. Screenshot saved.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/profile_edit.png")
-    
-finally:
-    driver.quit()
-    print("\nDone.")
-
-```
-
-make-icons.js:
-```
-const fs = require('fs');
-const zlib = require('zlib');
 

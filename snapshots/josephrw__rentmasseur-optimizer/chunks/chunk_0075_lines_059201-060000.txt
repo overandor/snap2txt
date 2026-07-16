@@ -1,800 +1,800 @@
-    else:
-        log.error("Bio apply verification failed: %s", variant_id)
-    return verified
-
-
-def evaluate_open_experiments(api: RentMasseurAPI) -> list:
-    """End any open experiments that have run for 24+ hours."""
-    results = []
-    open_exps = get_open_experiments()
-    now = time.time()
-    for exp in open_exps:
-        started = datetime.fromisoformat(exp["started_at"]).timestamp()
-        if now - started < 24 * 60 * 60:
-            continue
-        current = get_latest_traffic_snapshot(1)
-        final_views = current[0]["profile_views"] if current else 0
-        final_clicks = current[0]["contact_clicks"] if current else 0
-        delta_views = final_views - (exp["baseline_views"] or 0)
-        delta_clicks = final_clicks - (exp["baseline_clicks"] or 0)
-        result = {
-            "experiment_id": exp["experiment_id"],
-            "variant_id": exp["variant_id"],
-            "delta_views": delta_views,
-            "delta_clicks": delta_clicks,
-            "baseline_views": exp["baseline_views"],
-            "baseline_clicks": exp["baseline_clicks"],
-            "final_views": final_views,
-            "final_clicks": final_clicks,
-        }
-        end_experiment(exp["experiment_id"], final_views, final_clicks, result)
-        results.append(result)
-        log.info("Experiment ended: %s", result)
-    return results
-
-
-def run_daily_draft_cycle(api: RentMasseurAPI) -> dict:
-    """Generate bio and headline drafts. Do not apply."""
-    bio = draft_bio_variant(api)
-    return {
-        "bio_draft": bio,
-        "experiments_evaluated": evaluate_open_experiments(api),
-    }
-
-```
-
-probe5.py:
-```
-import requests, re, json
-
-s = requests.Session()
-s.headers.update({
-    'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json',
-    'Referer': 'https://rentmasseur.com/settings', 'Origin': 'https://rentmasseur.com',
-})
-s.get('https://rentmasseur.com/login')
-m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', s.get('https://rentmasseur.com/login').text)
-csrf = m.group(1) if m else ''
-r = s.post('https://rentmasseur.com/api/v1/login', json={
-    'email': 'karpathianwolf', 'password': 'os.environ.get("RM_PASSWORD", "")', 'csrf': csrf, 'remember': True
-})
-s.headers['Authorization'] = 'Bearer ' + r.json()['accessToken']
-print('Login OK')
-
-# Blogs
-for p in ['?page=1', '?username=Karpathianwolf', '/list', '/user']:
-    r = s.get(f'https://rentmasseur.com/api/v1/blogs{p}', timeout=5)
-    print(f'GET blogs{p}: {r.status_code} {r.text[:200]}')
-
-# POST blog variants
-for path in ['/api/v1/blogs', '/api/v1/account/blogs', '/api/v1/settings/blog']:
-    r = s.post(f'https://rentmasseur.com{path}', json={'title': 'Test', 'content': 'Test'}, timeout=5)
-    print(f'POST {path}: {r.status_code} {r.text[:200]}')
-
-# Interview - try fetching the public profile page which has interview
-r = s.get('https://rentmasseur.com/api/v1/account/blogs', timeout=5)
-print(f'GET account/blogs: {r.status_code} {r.text[:200]}')
-
-# Rates
-r = s.get('https://rentmasseur.com/api/v1/settings/rates')
-d = r.json()
-print(f'GET rates keys: {list(d.keys())}')
-print(json.dumps(d, indent=2, default=str)[:1000])
-
-```
-
-blog_interview_endpoints.json:
-```
-{
-  "blog": [],
-  "interview": [],
-  "timestamp": 1782419231.202249
-}
-```
-
-engine.py:
-```
-"""
-RentMasseur Traffic Engine — persistent daemon that:
-1. Maintains authenticated session (re-login on expiry)
-2. Auto-refreshes availability before expiry (default: every 55 min)
-3. Tracks profile stats (views, contacts, online bookmarks)
-4. Logs search position for target city
-5. Persists everything to SQLite for trend analysis
-6. Sends alerts on status changes (visibility, membership, ranking drops)
-
-Usage:
-    python -m rm_traffic.engine                    # run daemon
-    python -m rm_traffic.engine --once              # single cycle
-    python -m rm_traffic.engine --stats             # print stats summary
-    python -m rm_traffic.engine --watch "Manhattan, NY"  # track search position
-"""
-
-import argparse
-import json
-import os
-import re
-import sqlite3
-import subprocess
-import sys
-import time
-import logging
-from datetime import datetime, timezone
-from pathlib import Path
-
-# Selenium
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.common.exceptions import (
-    StaleElementReferenceException,
-    NoSuchElementException,
-    TimeoutException,
-    WebDriverException,
-)
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-USERNAME = "karpathianwolf"
-PASSWORD = os.environ.get("RM_PASSWORD", "")
-BASE_URL = "https://rentmasseur.com"
-DB_PATH = Path(__file__).parent / "traffic.db"
-LOG_PATH = Path(__file__).parent / "traffic.log"
-CHROME_PROFILE = "/tmp/rm_traffic_chrome"
-REFRESH_INTERVAL = 55 * 60  # 55 minutes — refresh before 1h expiry
-STAT_INTERVAL = 5 * 60      # check stats every 5 min
-SEARCH_CHECK_INTERVAL = 30 * 60  # check search position every 30 min
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger("rm_traffic")
-
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
-
-def db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-def init_db():
-    conn = db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS availability_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        action TEXT NOT NULL,
-        status TEXT,
-        hours INTEGER,
-        minutes INTEGER,
-        duration_set INTEGER,
-        success INTEGER,
-        detail TEXT
-    );
-    CREATE TABLE IF NOT EXISTS stats_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        profile_views INTEGER,
-        contact_clicks INTEGER,
-        online_bookmarks INTEGER,
-        who_saw_me INTEGER,
-        membership_status TEXT,
-        visibility TEXT,
-        availability_status TEXT,
-        availability_remaining TEXT
-    );
-    CREATE TABLE IF NOT EXISTS search_position (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        city TEXT NOT NULL,
-        position INTEGER,
-        total_results INTEGER,
-        available_now INTEGER,
-        username TEXT
-    );
-    CREATE TABLE IF NOT EXISTS alerts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        type TEXT NOT NULL,
-        severity TEXT,
-        message TEXT,
-        acknowledged INTEGER DEFAULT 0
-    );
-    CREATE INDEX IF NOT EXISTS idx_avail_ts ON availability_log(ts);
-    CREATE INDEX IF NOT EXISTS idx_stats_ts ON stats_log(ts);
-    CREATE INDEX IF NOT EXISTS idx_search_ts ON search_position(ts);
-    """)
-    conn.commit()
-    conn.close()
-    log.info("DB initialized at %s", DB_PATH)
-
-def log_availability(action, status=None, hours=None, minutes=None,
-                     duration_set=None, success=True, detail=""):
-    conn = db()
-    conn.execute(
-        "INSERT INTO availability_log (ts, action, status, hours, minutes, duration_set, success, detail) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), action, status, hours, minutes,
-         duration_set, int(success), detail)
-    )
-    conn.commit()
-    conn.close()
-
-def log_stats(views, contacts, bookmarks, who_saw, membership, visibility,
-              avail_status, avail_remaining):
-    conn = db()
-    conn.execute(
-        "INSERT INTO stats_log (ts, profile_views, contact_clicks, online_bookmarks, "
-        "who_saw_me, membership_status, visibility, availability_status, availability_remaining) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), views, contacts, bookmarks,
-         who_saw, membership, visibility, avail_status, avail_remaining)
-    )
-    conn.commit()
-    conn.close()
-
-def log_search_position(city, position, total, available_now, username):
-    conn = db()
-    conn.execute(
-        "INSERT INTO search_position (ts, city, position, total_results, available_now, username) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), city, position, total, available_now, username)
-    )
-    conn.commit()
-    conn.close()
-
-def log_alert(atype, severity, message):
-    conn = db()
-    conn.execute(
-        "INSERT INTO alerts (ts, type, severity, message) VALUES (?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), atype, severity, message)
-    )
-    conn.commit()
-    conn.close()
-    log.warning("ALERT [%s] %s: %s", severity, atype, message)
-
-# ---------------------------------------------------------------------------
-# Browser
-# ---------------------------------------------------------------------------
-
-class Browser:
-    """Managed Chrome instance with session persistence."""
-
-    def __init__(self):
-        self.driver = None
-        self.logged_in = False
-        self.last_login = 0
-
-    def start(self):
-        opts = Options()
-        opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument(f"--user-data-dir={CHROME_PROFILE}")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        self.driver = webdriver.Chrome(options=opts)
-        # Remove webdriver flag
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        })
-        log.info("Browser started (profile: %s)", CHROME_PROFILE)
-
-    def stop(self):
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-        self.driver = None
-        self.logged_in = False
-        log.info("Browser stopped")
-
-    def _dismiss_popups(self):
-        time.sleep(1)
-        for xpath in [
-            "//button[contains(text(),'Not now')]",
-            "//button[contains(text(),'Accept all')]",
-            "//button[contains(text(),'Close')]",
-            "//*[contains(@aria-label,'Close')]",
-        ]:
-            try:
-                for el in self.driver.find_elements(By.XPATH, xpath):
-                    if el.is_displayed():
-                        el.click()
-                        time.sleep(0.5)
-            except Exception:
-                pass
-
-    def login(self, force=False):
-        if self.logged_in and not force and (time.time() - self.last_login < 3600):
-            return True
-        if not self.driver:
-            self.start()
-
-        log.info("Logging in as %s...", USERNAME)
-        self.driver.get(f"{BASE_URL}/login")
-        time.sleep(4)
-        self._dismiss_popups()
-
-        # Find login fields
-        email = None
-        pwd = None
-        for inp in self.driver.find_elements(By.CSS_SELECTOR, "input"):
-            itype = (inp.get_attribute("type") or "").lower()
-            iname = (inp.get_attribute("name") or "").lower()
-            if itype == "email" or "email" in iname or "user" in iname:
-                if inp.is_displayed():
-                    email = inp
-            if itype == "password" and inp.is_displayed():
-                pwd = inp
-
-        if not email or not pwd:
-            log.error("Login fields not found")
-            log_availability("login", success=False, detail="fields not found")
-            return False
-
-        email.clear()
-        email.send_keys(USERNAME)
-        pwd.clear()
-        pwd.send_keys(PASSWORD)
-        time.sleep(0.3)
-
-        # Click login button
-        clicked = False
-        for by, sel in [
-            (By.CSS_SELECTOR, "button[type='submit']"),
-            (By.XPATH, "//button[contains(text(),'LOG')]"),
-            (By.XPATH, "//button[contains(text(),'Log')]"),
-            (By.CSS_SELECTOR, "form button"),
-        ]:
-            for el in self.driver.find_elements(by, sel):
-                if el.is_displayed():
-                    el.click()
-                    clicked = True
-                    break
-            if clicked:
-                break
-
-        if not clicked:
-            log.error("Login button not found")
-            return False
-
-        time.sleep(6)
-        self._dismiss_popups()
-
-        # Verify login
-        url = self.driver.current_url
-        if "/login" in url:
-            log.error("Login failed — still on login page")
-            log_availability("login", success=False, detail="redirected back to login")
-            return False
-
-        self.logged_in = True
-        self.last_login = time.time()
-        log.info("Login successful. URL: %s", url)
-        log_availability("login", success=True, detail=url)
-        return True
-
-    def ensure_session(self):
-        """Check if session is still valid, re-login if not."""
-        if not self.driver:
-            return self.login()
-        try:
-            self.driver.get(f"{BASE_URL}/settings")
-            time.sleep(3)
-            if "/login" in self.driver.current_url:
-                log.info("Session expired, re-logging in...")
-                return self.login(force=True)
-            return True
-        except WebDriverException as e:
-            log.warning("Session check failed: %s", e)
-            return self.login(force=True)
-
-    def get_settings_data(self):
-        """Fetch settings page and extract all profile data."""
-        if not self.ensure_session():
-            return None
-        self.driver.get(f"{BASE_URL}/settings")
-        time.sleep(5)
-        self._dismiss_popups()
-        try:
-            body = self.driver.find_element(By.TAG_NAME, "body").text
-        except Exception:
-            return None
-        return body
-
-    def set_available(self, duration=1):
-        """Set availability to 'Available' with given duration (hours)."""
-        if not self.ensure_session():
-            return False
-
-        log.info("Setting availability: Available, %dh", duration)
-        self.driver.get(f"{BASE_URL}/settings?availability=1")
-        time.sleep(5)
-        self._dismiss_popups()
-
-        # Check current status first
-        body = self.driver.find_element(By.TAG_NAME, "body").text
-        match = re.search(r'Status:\s*Available\s*(\d+)h\s*:\s*(\d+)m', body)
-        if match:
-            hours = int(match.group(1))
-            mins = int(match.group(2))
-            total_mins = hours * 60 + mins
-            if total_mins > 10:
-                log.info("Already available (%dh:%dm remaining), skipping", hours, mins)
-                log_availability("skip", status="Available", hours=hours,
-                                 minutes=mins, success=True, detail="sufficient time remaining")
-                return True
-
-        # Click the availability panel to open modal
-        try:
-            avail_panel = self.driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
-            avail_panel.click()
-            time.sleep(2)
-        except (NoSuchElementException, StaleElementReferenceException):
-            log.warning("Could not click availability panel")
-            log_availability("set", success=False, detail="panel not found")
-            return False
-
-        # Wait for modal and find "Available" option
-        time.sleep(1)
-        clicked_available = False
-        for by, sel in [
-            (By.XPATH, "//label[contains(text(),'Available')]"),
-            (By.XPATH, "//*[contains(text(),'Available') and not(contains(text(),'Not')) and not(contains(text(),'Status'))]"),
-            (By.CSS_SELECTOR, "input[type='radio'][value='1']"),
-            (By.CSS_SELECTOR, "input[type='radio']"),
-        ]:
-            try:
-                els = self.driver.find_elements(by, sel)
-                for el in els:
-                    if el.is_displayed():
-                        el.click()
-                        clicked_available = True
-                        log.info("Selected 'Available'")
-                        break
-            except Exception:
-                pass
-            if clicked_available:
-                break
-
-        if not clicked_available:
-            log.warning("Could not select 'Available' option")
-            log_availability("set", success=False, detail="could not select Available")
-            return False
-
-        # Select duration
-        time.sleep(0.5)
-        for sel_el in self.driver.find_elements(By.CSS_SELECTOR, "select"):
-            try:
-                from selenium.webdriver.support.ui import Select
-                sel = Select(sel_el)
-                options = [o.text for o in sel.options]
-                target = f"{duration} Hour" if duration == 1 else f"{duration} Hours"
-                if target in options:
-                    sel.select_by_visible_text(target)
-                    log.info("Selected duration: %s", target)
-                    break
-            except Exception:
-                pass
-
-        # Click SET button
-        time.sleep(0.5)
-        set_clicked = False
-        for by, sel in [
-            (By.XPATH, "//button[contains(text(),'SET')]"),
-            (By.XPATH, "//button[contains(text(),'Set')]"),
-        ]:
-            try:
-                els = self.driver.find_elements(by, sel)
-                for el in els:
-                    if el.is_displayed():
-                        el.click()
-                        set_clicked = True
-                        log.info("Clicked SET")
-                        break
-            except Exception:
-                pass
-            if set_clicked:
-                break
-
-        if not set_clicked:
-            log.warning("SET button not found")
-            log_availability("set", success=False, detail="SET button not found")
-            return False
-
-        time.sleep(3)
-        # Verify
-        body = self.driver.find_element(By.TAG_NAME, "body").text
-        if "Status: Available" in body:
-            match = re.search(r'Status:\s*Available\s*(\d+)h\s*:\s*(\d+)m', body)
-            if match:
-                h, m = int(match.group(1)), int(match.group(2))
-                log.info("Availability confirmed: %dh:%dm", h, m)
-                log_availability("set", status="Available", hours=h, minutes=m,
-                                 duration_set=duration, success=True)
-                return True
-
-        log.warning("Availability set but could not verify")
-        log_availability("set", success=True, detail="could not verify")
-        return True
-
-    def get_stats(self):
-        """Extract profile statistics from settings page."""
-        body = self.get_settings_data()
-        if not body:
-            return None
-
-        stats = {
-            "profile_views": None,
-            "contact_clicks": None,
-            "online_bookmarks": None,
-            "who_saw_me": None,
-            "membership_status": None,
-            "visibility": None,
-            "availability_status": None,
-            "availability_remaining": None,
-        }
-
-        # Profile Views: 77999
-        m = re.search(r'Profile Views:\s*([\d,]+)', body)
-        if m:
-            stats["profile_views"] = int(m.group(1).replace(",", ""))
-
-        # Who Saw Me: 30
-        m = re.search(r'Who Saw Me\s*(\d+)', body)
-        if m:
-            stats["who_saw_me"] = int(m.group(1))
-
-        # Online bookmarks
-        m = re.search(r'(\d+)\s*online', body)
-        if m:
-            stats["online_bookmarks"] = int(m.group(1))
-
-        # Membership
-        m = re.search(r'Profile Status:\s*(\w+)', body)
-        if m:
-            stats["membership_status"] = m.group(1)
-
-        # Visibility
-        if "Profile hidden" in body:
-            stats["visibility"] = "hidden"
-        elif "Profile shown" in body:
-            stats["visibility"] = "shown"
-
-        # Availability
-        m = re.search(r'Status:\s*(Available|Not Available|Not Set)\s*(\d+h\s*:\s*\d+m)?', body)
-        if m:
-            stats["availability_status"] = m.group(1)
-            stats["availability_remaining"] = m.group(2) or ""
-
-        # Contact clicks from ad statistics
-        m = re.search(r'Contact Me\s*clicks\s*([\d,]+)', body)
-        if m:
-            stats["contact_clicks"] = int(m.group(1).replace(",", ""))
-
-        return stats
-
-    def check_search_position(self, city="Manhattan, NY"):
-        """Check profile position in search results for a city."""
-        if not self.ensure_session():
-            return None
-
-        city_slug = city.lower().replace(", ", "-").replace(" ", "-")
-        url = f"{BASE_URL}/gay-massage/{city_slug}/"
-        log.info("Checking search position at %s", url)
-        self.driver.get(url)
-        time.sleep(5)
-        self._dismiss_popups()
-
-        # Find all masseur profile links
-        body = self.driver.find_element(By.TAG_NAME, "body").text
-
-        # Find profile cards/links
-        profile_links = []
-        for el in self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/']"):
-            href = el.get_attribute("href") or ""
-            text = el.text.strip().lower()
-            # Profile links are like /Username
-            if href.startswith(f"{BASE_URL}/") and not any(x in href for x in [
-                "login", "settings", "search", "blog", "reviews", "interviews",
-                "available", "find-massage", "live-cams", "sitemap", "advertise",
-                "mailbox", "static", "_next", "images",
-            ]):
-                parts = href.replace(f"{BASE_URL}/", "").split("/")
-                if parts and parts[0] and len(parts) == 1:
-                    profile_links.append((parts[0].lower(), href))
-
-        # Find our position
-        username_lower = USERNAME.lower()
-        position = None
-        for i, (uname, href) in enumerate(profile_links):
-            if uname == username_lower:
-                position = i + 1
-                break
-
-        # Check available now filter
-        avail_url = f"{url}?available=1"
-        self.driver.get(avail_url)
-        time.sleep(4)
-        self._dismiss_popups()
-
-        avail_links = []
-        for el in self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/']"):
-            href = el.get_attribute("href") or ""
-            if href.startswith(f"{BASE_URL}/") and not any(x in href for x in [
-                "login", "settings", "search", "blog", "reviews", "interviews",
-                "available", "find-massage", "live-cams", "sitemap", "advertise",
-                "mailbox", "static", "_next", "images",
-            ]):
-                parts = href.replace(f"{BASE_URL}/", "").split("/")
-                if parts and parts[0] and len(parts) == 1:
-                    avail_links.append(parts[0].lower())
-
-        avail_position = None
-        for i, uname in enumerate(avail_links):
-            if uname == username_lower:
-                avail_position = i + 1
-                break
-
-        total = len(profile_links)
-        total_avail = len(avail_links)
-
-        result = {
-            "city": city,
-            "position": position,
-            "total": total,
-            "available_position": avail_position,
-            "available_total": total_avail,
-        }
-
-        log.info("Search position: #%d/%d (available: #%s/%d) in %s",
-                 position or -1, total,
-                 avail_position or "N/A", total_avail, city)
-
-        log_search_position(city, position or 0, total, total_avail, USERNAME)
-
-        if position and position > 20:
-            log_alert("ranking_drop", "warning",
-                      f"Position dropped to #{position} in {city}")
-
-        return result
-
-# ---------------------------------------------------------------------------
-# Daemon
-# ---------------------------------------------------------------------------
-
-class TrafficEngine:
-    """Main daemon loop."""
-
-    def __init__(self, watch_city=None):
-        self.browser = Browser()
-        self.watch_city = watch_city
-        self.running = True
-        self.last_refresh = 0
-        self.last_stats = 0
-        self.last_search = 0
-        self.prev_stats = None
-
-    def cycle(self):
-        """One daemon cycle — check what needs doing."""
-        now = time.time()
-
-        # Availability refresh
-        if now - self.last_refresh >= REFRESH_INTERVAL:
-            try:
-                self.browser.set_available(duration=1)
-                self.last_refresh = now
-            except Exception as e:
-                log.error("Availability refresh failed: %s", e)
-                log_availability("set", success=False, detail=str(e))
-                # Reset browser on error
-                self.browser.stop()
-                time.sleep(5)
-
-        # Stats collection
-        if now - self.last_stats >= STAT_INTERVAL:
-            try:
-                stats = self.browser.get_stats()
-                if stats:
-                    log_stats(
-                        stats["profile_views"],
-                        stats["contact_clicks"],
-                        stats["online_bookmarks"],
-                        stats["who_saw_me"],
-                        stats["membership_status"],
-                        stats["visibility"],
-                        stats["availability_status"],
-                        stats["availability_remaining"],
-                    )
-                    log.info("Stats: views=%s contacts=%s bookmarks=%s who_saw=%s | %s | vis=%s | avail=%s %s",
-                             stats["profile_views"],
-                             stats["contact_clicks"],
-                             stats["online_bookmarks"],
-                             stats["who_saw_me"],
-                             stats["membership_status"],
-                             stats["visibility"],
-                             stats["availability_status"],
-                             stats["availability_remaining"])
-
-                    # Alert on changes
-                    if self.prev_stats:
-                        if stats["visibility"] == "hidden" and self.prev_stats.get("visibility") != "hidden":
-                            log_alert("visibility_hidden", "critical",
-                                      "Profile is HIDDEN — traffic will drop to zero")
-                        if stats["availability_status"] != "Available":
-                            log_alert("not_available", "warning",
-                                      f"Availability is {stats['availability_status']}")
-
-                    self.prev_stats = stats
-                self.last_stats = now
-            except Exception as e:
-                log.error("Stats collection failed: %s", e)
-
-        # Search position check
-        if self.watch_city and (now - self.last_search >= SEARCH_CHECK_INTERVAL):
-            try:
-                self.browser.check_search_position(self.watch_city)
-                self.last_search = now
-            except Exception as e:
-                log.error("Search position check failed: %s", e)
-
-    def run_once(self):
-        """Single cycle — for --once mode."""
-        log.info("=== Single cycle ===")
-        if not self.browser.login():
-            log.error("Login failed, aborting")
-            return
-        self.last_refresh = 0
-        self.last_stats = 0
-        self.last_search = 0
-        self.cycle()
-        self.browser.stop()
-
-    def run_daemon(self):
-        """Main daemon loop."""
-        log.info("=== Traffic Engine starting (daemon mode) ===")
-        log.info("Refresh interval: %d min | Stats: %d min | Search: %d min",
-                 REFRESH_INTERVAL // 60, STAT_INTERVAL // 60, SEARCH_CHECK_INTERVAL // 60)
-        if self.watch_city:
-            log.info("Watching search position in: %s", self.watch_city)
-
-        if not self.browser.login():
-            log.error("Initial login failed, retrying in 60s...")
-            time.sleep(60)
-            if not self.browser.login():
-                log.error("Login failed twice, exiting")
-                return
-
-        self.last_refresh = time.time() - REFRESH_INTERVAL + 10  # refresh soon
-        self.last_stats = time.time() - STAT_INTERVAL + 10
-        if self.watch_city:
-            self.last_search = time.time() - SEARCH_CHECK_INTERVAL + 10
-
-        while self.running:
-            try:
-                self.cycle()
-            except KeyboardInterrupt:
-                log.info("Shutdown requested")
-                self.running = False
-                break
-            except Exception as e:
-                log.error("Cycle error: %s", e)
-                self.browser.stop()
+
+#528 | RicardoSmith | syracuse-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=0
+HEADLINE: Strong Masseur for you
+DESC: Welcome to my massage services. | I use slow, gentle and sensitivity touch with the emphasis on comfort, presence and relaxation.  For the deep tissue massage I know that some people have tension in the neck area , shoulders and lower back and also, some of us have demanding jobs. Firstly, I ease the client in a comfort level and ask if the pressure applied is fine and then let my magical hands do it's amazing work. Let's not forget the therapeutic massage where I use certain techniques to ease tension and stiffness in the muscle areas that need special attention, With all of these massage services communication is key as I want the client to feel special and appreciated. For the massage services: I utilize slow, intentional strokes that heighten sensitivity and relaxation. Also, I use oils or lotions to increase comfort and glide. For a relaxing atmosphere, I use soft lighting, music, and pleasant scents.  |  | Please be respectful and kind. Please be polite and respectful with my time if you contact me, as I'll be with yours |  | Same day appointments require minimum 2 hours notice.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#529 | Sweetheartlll | syracuse-ny | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=1
+HEADLINE: Try my hands
+DESC: I’m pleased to offer my extra relaxing therapeutic massage, which includes strong hands, full-body massage, only out calls for regular clients and new  | If you’re interested in a wonderful, rejuvenating time, feel free to contact me so we can make a plan. Thank you, and have a great day!  | (Be STI Free )respectful and courteous with me thank you.  don’t miss it. Your sessions. Of masages together. Booked with me answe faster on my cell phone +******************
+SERVICES: ['therapeutic', 'sensual', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#530 | EdsBlissfulHands | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=11 | gold=1 | available=1
+HEADLINE: Eds Blissful Hands (Discreet) Text Me!
+DESC: Hello and welcome to my page! | 100% natural man here with really versatile energetic hands for a unique experience. |  | Grounded pro (7+ years) offering an intuitive blend of flowing Swedish and deep, attentive energetic bodywork.  |  | Texting is preferred. | Please include name, availability, location, and what kind of experience you’re seeking so I can respond intentionally. | My sessions are slow, present, and deeply connective hands that explore tension with care, confidence, and sensitivity. | This is a body-positive, judgment-free space for men who enjoy relaxation with a little extra attention when there’s mutual comfort and chemistry. | 🐻 Warm energy. Strong hands. Unrushed touch. | ✨ 4 hands available upon request for those who enjoy amplified sensation and shared presence. | Please be realistic with expectations. I always aim to accommodate within what feels aligned, mutually respectful, and feasible. |  😎. | Please no picture collectors or time wasters. Thank you kindly.
+SERVICES: ['sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#531 | THECHAMPISHERE | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=44 | gold=1 | available=0
+HEADLINE: Catch Me If You Can Before Its Too Late! -TheChamp
+DESC: A LEGEND IN TOWN, WHAT YOU NEED? |  | -The Champ 💪🏽🫶🏾 | AKA Quan
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#532 | Miamilamont | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=0 | available=0
+HEADLINE: ⭐️⭐️⭐️⭐️⭐️YOUNG, MASCULINE & PROFESSIONAL😈
+DESC: Let Me Take Your Mind Away With My Hands & Much More. -BOOK TODAY!  | Handsome, Young & Genuine | NO PAGE WATCHERS! YOU WILL BE BLOCKED!  | +>FASTER RESPONSE ON MY NUMBER LISTED! | Laidback Guy For Upscale Clientele | No Drama or Bs | Check Twitter For Verification @Miamilamont | Perfectly experienced masseuse, My Hands Are Heavenly 😉 | Mild or Wild Experience | Older Guys My Preference, But Don’t Mind Around My Age | Into Water Sports? 😈  | I BLOCK TIME WASTERS!! 🚫 | Preferably Text Your From RentMasseur! | Got Reviews On RentMen as well! Check me out!
+SERVICES: None
+MEMBER SINCE: 
+
+#533 | theonlytomforyou | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=0 | available=0
+HEADLINE: I am your fantasy massager
+DESC: I was a model at Seancody named Tom and now I give pleasure so you feel emotionally and physically relaxed, I would like to make your fantasy come true. Let me be at your service. it is very important to me to take care of someone and make sure that the individual I am with has an amazing time, feels comfortable, and safe, and is open to exploring and just getting lost in the experience and enjoying themselves and me.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#534 | Davenyc | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=31 | gold=0 | available=1
+HEADLINE: Sensual Massage
+DESC: VACCINATED FOR COVID AND MONKEYPOX. I take good care of my clients, because I love what I do. I am offering a full body massage with the added benefit of being a skilled professional. I give a massage that is focused on the individual person and their total well-being. I rebalance the body’s energy and take it from a place of stress to one of deep relaxation and pleasure. |  | I pay close attention to my client’s every breath and movement to decipher their underlying emotional energy so I can provide them with what they want and need I work on a table using high quality massage oil, I have a clean comfortable location in the West Village, close to the Highline. 5' 9”tall, 180 lbs. Italian, hairy, strong hands and interested in giving you my attention 100%, making your time with me pure bliss. Call me, I have my cell phone on me at all times. My hours are from 10AM to 10PM 7 days a week, and I work by appointment, so you should try to plan ahead if you can.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#535 | tiagomasseurbr | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=15 | gold=1 | available=1
+HEADLINE: Brazilian Masseur  🇧🇷
+DESC: 👋🏼  What’s up! | 🇧🇷 I’m Tiago, offer a relaxing and personalized massage experience focused on comfort, care, and attention to detail. My goal is to help you release stress, relax your body, and feel renewed after each session. I work by appointment and always aim to create a calm, respectful, and comfortable atmosphere for every client. |  | I can adjust the pressure according to your preference, from light and relaxing to deeper and more focused. If you’re looking for a professional, friendly, and attentive massage experience, I’ll be happy to welcome you. |  | 📲 Text me for more details and to organize your appointment today. +1 **************
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#536 | DannyTwink | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=6 | gold=1 | available=0
+HEADLINE: Boyish Latin Twink. HOSTING
+DESC: Hey there! Need to unwind and relax? I’ve got you covered with relaxing, feel-good massages that melt away stress. Whether you’re looking to chill or recharge, I’m here to help you feel your best. Hit me up to book a session—I’m a nice, easygoing guy here to make time for you. ☺️
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#537 | maximeAb | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=0
+HEADLINE: Max__
+DESC: discreet guy here.  |  | i’m fairly new to this but have only had positive feedback so far. i do sensual massages I am also open to specific requests.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#538 | BrendenV | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=27 | gold=1 | available=0
+HEADLINE: Sensual, Erotic and Healing Massage
+DESC: I tailor every massage to each individual's personal needs and desires. Having practiced massage in New York for the past 5 years, I have perfected my craft to provide an experience that takes one into a relaxing euphoria, leaving the body feeling healed and refreshed. I will create a pleasant, welcoming atmosphere where relaxation & healing is our goal. I strive to make every person comfortable, whether you’re gay, straight, or anything in between!  |  | I know I can bring you extended mobility and overall mental clarity while providing a pleasant atmosphere where relaxation & healing is our ultimate goal. |  | My studio is conveniently located in Union Square, with a heated table and a private room. I can also travel anywhere in the five boroughs and New Jersey. |  | Fully Vaccinated and Clean!
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#539 | KevinDevin | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=6 | gold=1 | available=0
+HEADLINE: Talented and Sweet
+DESC: There’s something irresistible about surrender—letting go of tension, melting into skilled hands, and feeling every inch of your body awaken under expert touch. With six years of experience as a licensed massage therapist, I know exactly how to guide you into that perfect state of deep relaxation and bliss. |  | I specialize in deep tissue, Thai, neuromuscular, and sensual massage—seamlessly blending firm, therapeutic pressure with slow, tantalizing strokes that tease and entice. My touch is intuitive, knowing when to soothe, when to ignite, and when to leave you breathless with anticipation. Every session is an exploration of sensation, designed to unravel stress and heighten pleasure. |  | But true indulgence isn’t just physical—it’s about connection. I don’t just work with my hands; I read energy, emotions, and unspoken desires. I know how to make you feel seen, understood, and completely at ease in my presence. The way you feel under my touch, the way your body responds, the way time seems to stand still—it’s all part of the experience. |  | Let yourself be taken care of. Let go. Breathe me in. Because when you’re in my hands, the only thing that matters is how good you feel.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#540 | colombiaxlMSG | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=7 | gold=1 | available=0
+HEADLINE: Hello.  expert Colombian** masseur available 24/7
+DESC: offer LEGITIMATE deep tissue ****** THERAPEUTIC and SENSUAL massages  |  full Vaccinated  | latin** guy  here, I invite you to come and relax your body and mind with me and trust that i am actually skilled and won’t just rub your body. My massages are guaranteed to be relaxing, therapeutic, pleasurable and sensual to say the least. I am always discreet, respectful, genuine, and friendly.  |  | Feel free to contact me anytime through phone/text as I do not check messages on this website. I accept clients of all backgrounds, ages(18+), sizes, and ethnicities. |  | I live in QUEENS NEW YORK  I can travel or host to provide the best massage experience for you. |  | Best way to contact me is through phone text
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#541 | TopMascXL | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: Sensual masseuse, top Latino, with a big ****
+DESC: Latino guy, ***y, masseur with a big ****, ready to fulfill your most intimate desires.
+SERVICES: None
+MEMBER SINCE: 
+
+#542 | mosesmass | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=5 | gold=1 | available=1
+HEADLINE: Private Hands | Confidential Care
+DESC: Need to reset? | Your space. Your pace. |  | Sensual bodywork combo: tantric + deep tissue modality fusion. 90 MIN Full body hot oil treatment. Check out our ad reviews for details on client experiences during sessions. IN/OUT. |  | Professional therapeutic options: swedish (basic rub) or deep tissue (Sports: medical table massage) & (Thai: yoga stretching floor massage). 1 HOUR Full body hot oil treatment. IN/OUT. |  | Safe, private, rustic studio — table-ready. |  | Studio Amenities: |  | Bathroom & shower | Fresh towels & linens | Calming ambiance (candlelight, aromatherapy) | Refreshment provided |  | By appointment. | 📍 SW Bronx, NYC: In-call | (Near 161st Street & Yankee Stadium) |  | Friendly, straightforward masculine cis-man servicing exclusively male---of all ages, races, and body types. |  | 📱 Text only (no calls) | Thanks--Masseur Toraph |  | Vaccinated + STI-free as of March 2026.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#543 | BrownBoyy | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=29 | gold=1 | available=1
+HEADLINE: Compassionate and healing relaxation
+DESC: Please reach out via text message for faster responses! (see contact info section on profile)  |  | Studio located on 5th Ave; or travel to you |  | Thank you for checking out my profile! If you’re looking for a relaxing/healing massage with a down-to-earth compassionate guy, you’re in the right place :) |  | I am based in NYC but was born and raised in the Jersey City area.  |  | I have over 10 years of experience performing deep tissue, trigger point, and Ayurvedic style massages..and I work intuitively with each client for customized treatment.  |  | About me: | 30 years old, Indian Caribbean/ Pakistani mix born in the US; | I live an active and spiritual life which is why I love giving massages as it combines both!  |  | Please feel welcomed to contact me with any questions! I am currently learning some Tantric practices..ask for more information!
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#544 | MigueLlo | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=45 | gold=1 | available=1
+HEADLINE: MigueLlo
+DESC: 4 hands available 🙌🏻🙌🏻  | My goal is to make each client feel refreshed and rejuvenated from head to toe, after every session through transmitting positive vibes. I will achieve this by touching and connecting with your body, mind and consciousness.  | I am latin and I am open to working with any and all ethnic backgrounds as well as all communities and self identifications. Please let me know how I can make your days better!  | Worship my feet 😈
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#545 | BrentG | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=10 | gold=1 | available=1
+HEADLINE: Healing Hands, Release All Tension & Relax Deeply✨
+DESC: There’s something irresistible about surrender—releasing tension and melting into skilled, attentive hands. My name is Brent, a young, intuitive therapist known for truly healing hands. |  | I’m a licensed massage therapist offering grounding, restorative, and genuinely nurturing massage experiences, each session designed to help you fully relax and reconnect with your body. |  | True indulgence goes beyond the physical—it’s about presence and connection. I don’t just work with my hands; I read energy, emotions, and what’s left unspoken, creating a space where you feel seen, understood, and completely at ease. |  | The way your body responds, the deep calm that settles in, the sense of time slowing down—it’s all part of the experience. |  | If you have any questions or inquiries, feel free to text me. I’ll be happy to connect (:
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#546 | EduardNight | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: Full Body Massage in a Private Setting
+DESC: For info & booking arrangements, contact me on WhatsApp or Telegram. |  | Whether you’re looking to unwind, enjoy quality company, or explore your personal interests in a respectful and open-minded atmosphere, I provide a tailored experience designed around your preferences. |  | Services available: | • Relaxing & sensual full-body massages | • Role-play & fantasy exploration | • Fetish-friendly sessions | • BDSM-friendly experiences based on communication and mutual comfort |  | Every session is personalized, discreet and judgment-free. Simply tell me what you’re looking for, and together we’ll create an experience you’ll truly enjoy.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#547 | JamieMack | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=10 | gold=1 | available=0
+HEADLINE: For fastest response, please text me 929 256 4873.
+DESC: Happy to Travel Anywhere in NYC: BK, BX, NJ, etc.
+ | 
+ | For fastest response, please text me 929 256 4873. 
+ | 
+ | I can do In-calls near Union Square, and am more than happy to travel for Out-calls anywhere in the 5 boroughs, Jersey City, or further (if you're really far we might have to work out travel, but please get in touch anyways, I'm happy to accommodate). 
+ | 
+ | 
+ | Happy to answer any questions:
+ | 
+ | Heya!
+ | 
+ | Nice guy here. Athletic with a big butt.
+ | 
+ | I offer a truly relaxing experience. A solid massage with lots of intimate touch. Clients tend to mention how attentive and generous I am.
+ | 
+ | I focus on sensual and ****** massage. I have some diverse therapeutic experience, so we can take some time to focus on any trouble spots you might have.
+ | 
+ | I like to give a lot of space for more intimate backrub/boyfriend moments, so please feel welcome to ask for a more close/cuddly experience or other suggestions/questions. I'm extremely chill, living in NY so long almost nothing surprises me.
+ | 
+ | Happy to work with anyone regardless of age/body type :).
+ | If you don't have access to my privates just send a message here and ask for 'em!
+ | 
+ | Hope you're ha
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#548 | LeoXL | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=56 | gold=1 | available=1
+HEADLINE: PROFESIONAL MASSAGE THERAPIST
+DESC: Hello❗️ | My name is Leo, a Latin-European guy kind and with magical hands.  ready to relieve tension, stress and above all. inhale peace and exhale tension. you are only one massage - message away to be happy. I help your body and mind.  | Certified masseur and Yoga teacher 400 hours.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#549 | Salomonn | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=66 | gold=1 | available=1
+HEADLINE: Passion for massages
+DESC: ¡ Visiting the city ! ¡Masseur master!. I am Salomon and I am here to give you a unique and unparalleled experience with my hands and through my energy. An experience where your senses relax and your body is renewed, where energy and good vibes adorn the moment. With 7 years of experience being a masseur  you can enjoy magical and relaxing sensations. I always provide the best service as if I were to receive it. Everyone is welcome . The universe is diverse and I like diversity. Good hygiene characterizes me and I expect the same from my amazing  clients. Thanks for visiting my profile . ¡You deserve a really good massage ! ¡Let's relax! . 💆🏻‍♂️ 💆🏻‍♂️ no calls  | In calls ✅ | Out calls✅ | Ask for my OF✅ | 30 minutes | 60 minutes | 90 minutes
+SERVICES: ['therapeutic', 'sensual', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#550 | ManuelLATINO | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=29 | gold=1 | available=1
+HEADLINE: Manuel
+DESC: I provide a good blend of deep tissue, sports and sensual massage experience (Both naked, Intensive body2body contact, Muscle worship, Touching all over allowed) I use strong, specific and relaxing techniques to adapt to your needs.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#551 | Gabrielgarv | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=115 | gold=1 | available=0
+HEADLINE: Ayurveda & Marma Therapy 107 pressure points
+DESC: -Please only text or email (I don’t answer phone calls) and let me know which city you’re texting me from, and what dates and times you’re available for an appointment. Any details from massage are best addressed in person (read my reviews 🙏).  |  | Any talk or questions out of context will be ignored.   |  |  Texting is just to SET UP appointments.  |  |  |  Masculine, outgoing, friendly, Latino. No drugs |  | - Have a heated table and when traveling have a Face cradle that adjusts to bed (same feel as table)  | -Trained and certified in Ayurvedic Therapy & Massage in India ( Over 7 styles) | -Faster response for serious inquiries : date/time/location  |  |  | My massages are based on Swedish, Deep Tissue or  Lomi Lomi pressure, massage from head to toe.  |  | If you have any major back pain, knee or joints pain, I can help you relieve the pain and stiffness.  |  | Have always received compliments for my therapy, very professional and excellent at deep tissue  |  | The photos on this site are recent and accurate, check my reviews . Thank you!  |  | Namaste
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#552 | TonyBlac | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=37 | gold=1 | available=1
+HEADLINE: Healing & Tranquility by Tony
+DESC: Greetings and thank you for visiting my profile.  I work in main locations which are Atlanta, Ga and Brooklyn, NY.  I also travel when possible to other cities.  With over 21 years of experience servicing locally and abroad, I have learned to never underestimate the power of the human touch. I am very passionate about massages and the exchange of positive energy and I am always learning new techniques by taking additional courses while traveling overseas. |  | I believe a massage is not only a physical need but also a mental break and an opportunity to let go of your troubles and release your tensions. |  | I practice Bhakti Massage, which is a combination of many techniques, focuses on a slow, gentle movement style that calms the nervous system, so that deep work can be achieved without pain. However, I also offer Swedish and/or Deep Tissue. |  | I understand the everybody has different need and therefore I do not rush my services and let my big firm hands listen to the body of each individual needs as it glides and penetrates your tensions away!  My hope is to win you over as regular client so that I can continue to learn your body and provide your needs. |  | ***FOR FASTER RESPO
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#553 | softsenses | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=0
+HEADLINE: Brooklyn's softest hands
+DESC: Hey there 👋 I'm Leo |  | I'm a Brooklyn based healer with experience in Swedish -style body work. For me, it's all about intimacy and comfort. I provide a private, one-on-one experience, accompanied by soft music, ambient lighting, and warmed up massage lotion and oils.  |  | 𖥸 First-timers are always welcome.  | ☯ I have experience with all different body types and ages.  | ✴︎ Able to accommodate for same day appointments. |  | Fully vaccinated (COVID & Monkeypox) |  | 📲 Best way to reach me: Text message, Telegram, or Snapchat.  |  | In-calls and Outcall available.  |  | Lay back, relax, and let my hands do the rest.  |  | Have a question? Feel free to text me! I do not accept phone calls without texting first.
+SERVICES: ['therapeutic', 'sensual', 'swedish']
+MEMBER SINCE: 
+
+#554 | JOAOcariocab | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=6 | gold=1 | available=1
+HEADLINE: JOAOdasousa
+DESC: Mixed Colombian/Brazilian with a fat booty |  | I am a good looking Colombian/Brazilian guy on here looking to meet new people and have some fun while making your wishes a reality. I'm fun, outgoing, and really looking to have some great amazing experiences.  |  | I love to work out and I'm in the gym 5-6 days a week and always take care of my body. I've always wanted to do this because I enjoy and get pleasure out of making my clients feel good. I love anything from good conversation to giving a nice strong massage which leads to the real fun. What ever I can do to make you happy I am here to do.  |  | You can email, text, or call me at any time as I have a very open flexible schedule and I'm a night person so up all night doesn't matter what time. I am also available for travel throughout the United States and surrounding countries as long as travel is covered in advance. Hope to talk and meet you soon!!
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#555 | LeviNYC | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: Sexual massages 🔥🔥
+DESC: "I’m levi | I’m a massage therapist and I love what I do. If you want to have a great time with someone who enjoys it too, contact me. Im very open-minded and I’m into almost all kinds of scenes. Whatever you are looking for, from a passionate session in bed to the perfect boyfriend experience for a night out, I’m here for you. I also love cuddling! I’m available for nights, dinners, weekends, trips, friendship, casual encounters, short or long-term relationships, companionship—in a word, FUN!"
+SERVICES: ['sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#556 | Scottchas | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=8 | gold=1 | available=1
+HEADLINE: Hi Everyone!
+DESC: Hey everyone,thank you for your interest in my massage service.I am 28years old. I’m a professional massage therapist in Swedish and deep tissue massage. I’m using a unique European style technique that provides full body stress relief for every body type.  |  | I’m very friendly and open to all genders. |  | I offer 60-90 minutes. |  |  | I’m pretty open and easy going just but don’t make intimate connections with any clients, my main goals are your relaxation. If you wanna make an appointment please let me know at least couple hours before.Have a great time and see you soon! |  | Do not hesitate to contact me.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#557 | Brooklyhands | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=1
+HEADLINE: Relax with me.
+DESC: ** Discretion is key and privacy is important. I will sign your NDA with no problem** |  | Nothing better than taking some time out of your day to relax with me.  | I offer a therapeutic or sensual touch and can tailor the experience to fit your needs.  | Hit me up let's chat! |  | 🚨🚨 4 Hand massage available - he’s the guy in the pic with me - his profile is here > https://rentmasseur.com/Dadbodnine    . 🚨🚨 |  | *Other services available upon request*
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#558 | PureTouchMassage | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=15 | gold=1 | available=1
+HEADLINE: The Best Touch
+DESC: The Best Touch |  | Enter a world where touch becomes temptation and time moves to your rhythm. My hands explore with intention—gliding, pressing, and lingering just long enough to melt tension and awaken the senses. Every movement is deliberate, every moment immersive, inviting you to fully let go. This is a deeply personal massage experience, designed to seduce your senses and leave you feeling relaxed, invigorated, and wanting more. |  | 4 ✋🏾🤚🏾hands massage also available, ask if needed.  |  | ✅ 100% Authentic | ✅ Discreet. Reliable. Unforgettable. |  | I value mutual safety, respect, and exceptional, high-quality experiences. |  | All photos are CURRENT
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#559 | MJack | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=9 | gold=1 | available=1
+HEADLINE: Relax. Reset. Recover.
+DESC: Hosting Near Union Square | I’m a professional with experience and expertise in stretching as well as full body massages to help alleviate pain and built up tension throughout the body. |  | Please be respectful and considerate in scheduling all appointments ahead of time. Due to way too many last minute cancellations a deposit is required at the time of booking.  Deposit is non-negotiable.  | Please text me. Thank you! | Monkeypox/ Covid Vaccinated
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#560 | Niccollo | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=13 | gold=1 | available=1
+HEADLINE: colombiano masculine
+DESC: Welcome Gentlemen, |  | Come experience the best massage of your life. I specialize to all different technics and always have the best attitude.I will accommodate to the specific pressure needed to relax you and relieve all your stress and tension. I host in a very nice and clean space, has plenty of privacy. Come relax and enjoy my strong hands while they melt your stress. |  | I enjoy and get pleasure out of making my clients feel good. I love anything from good conversation to giving a nice strong massage which leads to the real fun.
+SERVICES: None
+MEMBER SINCE: 
+
+#561 | CamiloxCalor | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=1
+HEADLINE: Friendly and playful masseuse for your pleasure
+DESC: Hi, I'm Camilo Calor. Based in Brooklyn, I am trained in MyoFascial Release, Tui Na, and Swedish techniques. Welcoming of everybody regardless of race or age. I am easy to talk to and aim to provide you with the ultimate relaxation. Your pleasure is my own. I aim to please and can modify pressure and modalities to fit your needs.  |  | I offer $20 off first time clients.  |  |  | Tambien hablo Español :) |  | ********************
+SERVICES: ['therapeutic', 'sensual', 'swedish']
+MEMBER SINCE: 
+
+#562 | andrewUS | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=24 | gold=1 | available=0
+HEADLINE: Healthy hygiene love sports and friendly.
+DESC: I am from Malaysia，I’ve been doing massage for 2 year ,  if you like deep tissue massage or Thai massage I'll give you a satisfying experience. If you looking for professional Waxing and trim shaving reach me out .
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#563 | Muscltomuscl | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=9 | gold=1 | available=1
+HEADLINE: Rejuvenate, Heal and Experience Joy
+DESC: Greeting and welcome to our profile! Onyx and Kris are a dynamic duo with a passion for the power of touch therapy. With over a decade of experience and a combined 20 years of expertise, our goal is to promote healing, relaxation, and overall well-being through the art of massage. Our dynamic synergy creates a massage experience that drives healing, joy, and rejuvenation. |  | We understand the importance of touch and pressure in the healing process, particularly when it comes to muscle-to-muscle healing. As advanced body builders, we have honed our skills to specifically target deep tissues and muscles, promoting the release of tension and reducing inflammation while increasing blood flow to the affected areas. Our goal is to help bring oxygen and nutrients to the affected areas, aiding in the healing process and reducing recovery time after an injury or intense workout. |  | Our massage services are offered in a comfortable and private setting, providing a peaceful escape where you can unwind, reenergize, and heal. Whether you are an athlete, gym-goer, or simply looking for a way to alleviate pain and improve your overall health, our muscle-to-muscle massages are an excellent opt
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#564 | ZaidNY | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=8 | gold=1 | available=1
+HEADLINE: Best masseur ever 😋
+DESC: Hey, I’m Zaid . |  | I don’t just work with my hands — I speak through them. | And trust me… they have a lot to say. |  | Trained in Russian sports massage, fine-tuned in New York’s top spas, I offer a luxury Swedish massage experience — deep, intuitive, and just the right amount of indulgent. Each session is a slow conversation between your body and my touch — and some things are better said without words. |  | You carry tension. I find it. | You try to resist. I don’t let you. |  | Come for the massage. Stay for the way it makes you feel — in your muscles, your mind, and maybe somewhere a little deeper.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#565 | GladiatorXL | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: European muscle man
+DESC: Hi, I’m new to this website. I’m muscled hairy tall **** European man. Masculine and Discreet with good attitude. I provide good service and make sure my clients are satisfied. The best way to contact me is to send message to my number.
+SERVICES: None
+MEMBER SINCE: 
+
+#566 | Braulio | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=4 | gold=1 | available=0
+HEADLINE: Braulio
+DESC: Alethic,muscular and  clean
+ | Relax time 
+ | I lost my old phone 
+ | But you can text me to this phone 
+ | *********
+SERVICES: None
+MEMBER SINCE: 
+
+#567 | Ianlatino | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=1
+HEADLINE: HIGH  CLASS ⭐️⭐️⭐️⭐️⭐️
+DESC: I offer an exclusive sens… massage experience where elegance, pleasure, and discretion meet.”
+SERVICES: None
+MEMBER SINCE: 
+
+#568 | HandsOfRyan | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=12 | gold=1 | available=0
+HEADLINE: Good Vibes, Strong Hands
+DESC: I have been practicing massage and body work for over 10 years, specializing in helping men to relax into their bodies through the healing power of firm touch.  |  | My style incorporates different modalities, from gentle Swedish repetition to deep tissue massage. Let’s work together to tailor the experience to your specific needs. |  | INCALLS in my private studio in Manhattan 🏡 | OUTCALLS in NYC Metro Area 🚊 | TRAVEL often! Check out my travel schedule ✈️ |  | Text me (NO CALLS) for a fast response 🫶 | 📲 ******************
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#569 | MynameisEros | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=4 | gold=1 | available=1
+HEADLINE: “Confidence is my favorite scent”
+DESC: Smooth hands, strong touch, and intuitive energy. Every session is unique — relaxing, intimate, and unforgettable. Discretion and comfort always come first. ⭐️⭐️⭐️⭐️⭐️
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#570 | Camilourib | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Latin boy
+DESC: New guy on the page  |  | Latin boy with a slim, athletic, sensual physical appearance, with many hot desires to make you happy   |  |  I like role-playing, giving professional and ****** massages, giving and receiving pleasure.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#571 | CourageColorado | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=0
+HEADLINE: Masculine Touch That Awakens the Body
+DESC: I offer somatic and ****** bodywork for men who crave more than just release—they want to be seen and deeply touched. My sessions invite your whole self—mind, body, heart, and manhood—to relax, open, and receive. |  | You’ll be met with warmth, eye contact, and a grounded, open presence. Sessions begin slow—attuning breath to touch, building trust, and tuning into the unspoken conversation between our bodies. The energy builds naturally, whether you're looking for emotional release, sensual awakening, or simply the experience of being deeply seen and held by another man. |  | I work semi-nude or nude depending on your comfort level. I have a naturally ****** energy, and I don't hide it—clients often comment on the peacefulness of my space and the intensity of my presence. |  | I’m athletic with a dancer’s awareness and a gym bro’s build—broad chest, ***** thighs. My touch is generally slow and intuitive. I know how to listen with my hands and follow the energy between us. |  | We’ll talk boundaries and desires before your session to make sure you feel safe and fully seen. I love offering high-end ****** sessions that bring both pleasure and emotional release. |  | Whether you're so
+SERVICES: ['therapeutic', 'sensual', 'swedish']
+MEMBER SINCE: 
+
+#572 | HectorNYC | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=1
+HEADLINE: Special on 4-Hand Message today
+DESC: Hello! I am a massage therapist dedicated to helping you find relief from chronic pain, muscle tension, and everyday stress. |  | Every session is fully customized to your body’s specific needs, combining firm, therapeutic pressure with targeted stretching to improve mobility and alleviate tension. I pride myself on providing a professional, clean, and deeply restorative experience. Book a session today, and let’s work together to get your body feeling its absolute best. |  | Please text me only at *****************
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#573 | olivervalentine | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=5 | gold=1 | available=1
+HEADLINE: Forest
+DESC: creative person with experience in thai/ oil massage. Creates a healing atmosphere where you can take a load off and allow your body and mind to reset from the stresses of life. I am covid-19 vaccinated and am happy to accommodate any needs you may have based on physicality. I look forward to touching soothing you.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#574 | Ferasferas | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=16 | gold=1 | available=1
+HEADLINE: Expert Masseur Tailored Relaxation and sensual
+DESC: "My name is Firas I am a skilled and experienced professional masseur dedicated to helping you feel your best. Whether you’re looking to ease tension, relieve pain, or simply unwind, my personalized massage sessions are designed to meet your unique needs. I specialize in deep tissue, ******  ensuring each session is both relaxing and satisfied. | Your comfort and well-being are my top priorities, and I create a calming and professional environment where you can fully relax and rejuvenate. Let me help you release stress, improve circulation, and restore balance to your body and mind. |  | Book your session today and experience the ultimate in care and relaxation!"
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#575 | Asian_greathands | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=60 | gold=1 | available=0
+HEADLINE: Asian Spa Quality Comes to You
+DESC: My name is Jason | Asian hot masseur | One of the best masseurs in town! |  | I have 7 years’ experience as a massage professional and have spa training. I have strong but soft hands and provide a variety of techniques to soothe the body and give my clients the best experience. Please see my reviews on the service I provide.  |  | Looking forward to hearing from you and offer a range of massage options. I can also use my touch to feel out your body and give you the massage experience it craves.  |  | WhatsApp or Text is the best way to reach me!  | No calls! Thanks | I will respond as soon as I am available. | I am also on WeChat 微信 as fitguy5.  |  | For a great massage, | Jason
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#576 | JUNZEN | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=1
+HEADLINE: I am a handsome boy from Asain .  (Call.or text )
+DESC: I think massage is an interesting thing. I like massages. It's not just massages that are fun. I like it, too. I like deep tissue massage. Oil push. And I'm a professional masseuse. I also want to communicate and learn from my clients. I can give my clients the massage services they like nude massage touch massage and services to meet their different needs。welcome everyone
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#577 | FemboyFey | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Genderfluid Femboy Offering Rejuvinating Touch
+DESC: Life can be hard on the mind, body, and soul. Oftentimes our daily lives require us to be mentally (and physically) tough in ways that can be equally tough on our bodies. My technique (a combination of swedish and sensual massage) meets this toughness with a softness that melts this daily stress away. My sessions are relaxing, rejuvenating, stimulating, and cleansing, leaving you ready to take on whatever challenges may await you. |  | When you're ready to pamper yourself with a restorative and relaxing fantasy getaway from the monotony of the daily grind, My name is Fey. I'm here for you. |  | - Nude, Clothed, or Femme | - Mutual Touch Okay |  | Locations: | Manhattan - Union Sq. | Queens - Ridgewood
+SERVICES: ['sensual', 'swedish']
+MEMBER SINCE: 
+
+#578 | MarkoMassuer | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=8 | gold=1 | available=1
+HEADLINE: New in town
+DESC: Hi! My name is Marko, welcome to my page. |  | I am a latino guy with 2 years of experience as a masseur. |  | I am passionate about fitness and sports.  |  | Take a look at my services and book an appointment today!
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#579 | RelaxwithJordan | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=35 | gold=1 | available=0
+HEADLINE: Relaxation and release with Jordan
+DESC: Let me help you feel better. Easy going guy with a love for customer care. Good conversations are always on the menu. I will treat you the way I like to be treated. I offer lite sensual touches to rip your muscles to shreds massages. I know the body and the common pains that come from everyday living. Especially from the gym or physically active jobs. A nice and quiet environment will be provided for you. Located right in Hells Kitchen. Shower available upon request with fresh towels. I know getting a massage from a stranger can be a little nerve racking. We’ve all been there. But I want you to have a good experience and have you come back for more. I’ve always enjoyed this as a hobby and seeing a person feel better from my care always makes me smile. Contact me through text message for fastest response.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#580 | TwinsBros | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: Good vibes, no drama , full massage
+DESC: Visits are by appointment only. | Contact via whatsapp or telegram  |  | Experienced and dedicated  offering a relaxing full body massage in a clean, comfortable and private environment. | unforgettable and intimate massages with everything included , bdsm /fetish , special time with TWINS , ready to explore everything  | Let's do IT  |  | You are curious? We are just a message away ! Reserve your spot and get addicted for the twins scene.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#581 | NateStrokes | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=7 | gold=1 | available=0
+HEADLINE: I Want to Make You Feel Good
+DESC: I enjoy giving pleasure with my hands and my body, and I love to tailor our sessions to any specific needs or desires you have. My goal is to create an oasis for you, where you can feel completely comfortable and can forget all of the stress of your daily life.  |  | I want nothing more than for you to enjoy the total ecstasy and complete relaxation of a fantastic sensual massage. I will give every inch of your body the attention it deserves, and together we will build to a conclusion that will leave you beyond satisfied.  |  | My rates: |  | 60 min incall: $180 | 90 min incall: $240 | 60 min outcall: $220 | 90 min outcall: $280 |  | I host in a new, luxury apartment in Brooklyn, two minutes’ walk from the Franklin Ave 2,3,4,5 stop. I have a dedicated massage room with its own private shower.  |  | Please text me for availability and appointments, and please feel free to inquire about any other services you might be interested in. |  | All genders, ages, and body types enthusiastically welcomed.
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#582 | LVM | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=8 | gold=1 | available=0
+HEADLINE: Breathe, Relaxation Will Follow
+DESC: Special rates for first-time session and students.  * Please text. Given the proliferation of robocalls, I'm no longer taking calls. Email is best for people with international phone numbers. * |  | If the daily New York hustle for status, money, or love has gotten the best of you; if your work, school or family has knocked the wind out of you; if the AI whirlwind has you dizzy, a sensible massage will help you realign your body and reorient your emotions, will help you refocus on what is most important to you. |  | I offer intuitive body work based on years of learning from master masseurs in Rio de Janeiro, Argentina, London, Paris, Barcelona, Morocco, Sicily, Greece, Istanbul, Cairo, Dubai, India, Bali, Japan. I know how to stimulate and sooth a man's body with mindful intent and a caring touch. |  | Catering to men for whom relaxation is elusive, exploration is a special treat, and prudence is essential. |  | Your private session with me incorporates classic Swedish technique: long gliding strokes with light pressure that only increases gradually to provide a healthy stretch to your muscles, and kneading strokes to roll soft tissue and enhance energy flow. It also combines Shia
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#583 | RNYCD | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=15 | gold=1 | available=1
+HEADLINE: Trained to Serve Through Touch.
+DESC: Trained & Experienced Masseur with talented hands. Are you in search of a passionate masseur? Who is able to take his time with you? |  | All humans need to be touched, whether they think so or not. Book yourself a massage with a masculine man who knows the importance of physical touch to the human body. |  | Its your decision. Do you want to be massaged from neck to toe? Massaged the way you need in your life?  |  | Now that you're here, contact me. Book me for an hour or more if you like. Treat yourself to an excellent sensusal massage.  This could be what you need. Hosting in The Bronx, I have a nice space complete with hue lighting ambiance and appropriate mellow & relaxing music. |  | Yes, Im trained in the male body and masseuse technique to work out all of the tension in your muscles. The skills necessary to take care of all your needs. |  | Book your appointment with me today!
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#584 | LowkeyMasseur | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: http://masquerademassage.com
+DESC: I believe massage is most effective when it is understood as more than a physical treatment. The body reflects the ***ulative effects of work, movement, stress, training, travel, and daily life. My approach combines deep tissue techniques, sports massage principles, and restorative bodywork to help clients recover from physical strain while cultivating a greater sense of ease and presence. |  | http://masquerademassage.com |  | Each session is tailored to the individual, I have been practicing massage and bodywork since 2018.  Some clients seek focused work on chronic tension patterns, athletic recovery, mobility, and muscular performance. Others are looking for a quieter experience—an opportunity to slow down, disconnect from external demands, and reconnect with themselves through intentional touch and relaxation. |  | I maintain a semi private studio in Midtown Manhattan and regularly travel throughout New York City, New Jersey, and Connecticut to accommodate clients when appropriate. Whether working with professionals, athletes, creatives, entrepreneurs, or individuals simply seeking high-quality bodywork, my goal remains the same: to create an experience that is restorative, at
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#585 | RomanHayes | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=0
+HEADLINE: Muscular, Tattooed Masseuse, PS ⭐️
+DESC: Come get a massage 😉 |  | Please text me for a quicker response |  | Social Media 🔥
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#586 | BigHandsHK | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=48 | gold=1 | available=1
+HEADLINE: 💪 You tried the rest…. Now get 💪
+DESC: ⭐️ ⭐️⭐️⭐️⭐️ - THE BEST |  | 6’4” Legendary Glute & Thigh Specialist |  | STOP HERE. CHECK OUT MY REVIEWS. THEN COME BACK. |  | 🔥 Powerful Deep Tissue • Sensual Recovery Experience | ⭐ Trusted by Athletes • Performers • High-Level Professionals.  |  | ⸻ |  | Welcome! | I run Zenergy Men’s Massage in Hell’s Kitchen where I specialize in a powerfully sensual blend of Deep Tissue, Swedish, and Thai stretching designed to release deep tension and restore mobility. |  | ✅ 6’4” former football player | ✅ 16 years experience working deep into problem areas | ✅ Trusted by athletes, executives, Broadway dancers, and high-performance professionals |  | ⸻ |  | 🔥 Your session begins with a eucalyptus steam shower, followed by treatment on my heated massage table with warm oils in a calm candlelit environment. |  | ✨ Every session is customized to what your body needs most that day. |  | ⸻ |  | ⭐️ LIFE CHANGING SESSION RATES | (Tips are not necessary! But of course welcomed) |  | ✅ 60 min  —  $199 (the warm-up) | ✅ 90 min  —  $249 (Full Body) | ✅ 90 min+ —$299 (+Pelvic Floor) |  | Deep Intensive Recovery for Athletes | ✅ 2 Hours —$329  | ✅ 3 Hours —$499 |  | ⸻ |  | 📍 Hell’s Kitchen — 9th Ave & 5
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#587 | MuscledJim | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=29 | gold=1 | available=1
+HEADLINE: Sensual Massage, and MORE
+DESC: I am a muscular and hairy native Midwesterner of Middle Eastern descent. I am very strong and give a great professional massage.  If there is anything else on your mind we definitely should talk about that too. I am a non-smoker, drug free, and healthy. I'm very friendly, no attitude and very open-minded. All ages and body types are welcome. Whether for a short meeting or for a weekend on the town, I am your man. I am available both for same day calls or if you like to plan for advance meetings. I can meet you anywhere in NYC or you can come to my apartment on the Upper East Side. I also can travel/fly to meet you. If you're looking for a massage, dinner, or a night to remember, give me a call. I'd like to know what your dreams are, and try to fulfill your wishes. I can be cuddly, affectionate, passionate, or go the other extreme and be wild. am considerate, fun, unforgettable, and I look forward to meeting you. Thanks.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#588 | ricardooven | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=15 | gold=1 | available=0
+HEADLINE: Outcall only
+DESC: Hi, my name is Ricardo. I’m a professional soccer player, an economics student |  | My passion for sports led me to develop a deep appreciation for massage therapy and its benefits for the body and mind. I specialize in providing personalized massage sessions tailored to each client’s needs, whether you’re looking for relaxation, or relief from muscle tension. I work with clients from all backgrounds and am committed to helping you feel your best. |  | Let’s work together to restore balance, energy, and well-being to your body.
+SERVICES: ['therapeutic']
+MEMBER SINCE: 
+
+#589 | Eliuguzman | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=3 | reviews=4 | gold=1 | available=0
+HEADLINE: Latinboy
+DESC: Hey everyone I’m eliu 28 years old | Very nice guys easy going  , I’m here To please you in all ur needs , if ur looking for a nice relaxing time just give me a call , I promise u won’t regret it . Call me or text me anytime!
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#590 | Dominicanxxl | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=1
+HEADLINE: DOMINICAN***1985
+DESC: NEWS. HELLO! I AM A ***Y GUY. FRIENDLY DOMINICAN WILLING TO SATISFY ALL YOUR WISHES. EDUCATE, WITH MANY TASTE, ENJOY AN ****** MASSAGE. an intimate connection, KISSES, A PARTY OR MORE COMPANION TRIPS INSIDE AND OUTSIDE THE COUNTRY, NATIONAL AND INTERNATIONAL. JUST TELL ME WHAT IT SAYS. GET IN TOUCH WITH ME. 24 HOURS A DAY, 7 DAYS A WEEK, I AM HERE FOR YOU. IF YOU WANT YOUR ****** MASSAGE WHO AM I TO PLEASE
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#591 | DaddyMelt | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=10 | gold=1 | available=1
+HEADLINE: Rugged Somatic Bodywork  w/ Sensual Intuition
+DESC: Hey Fellas, |  | Thanks for taking a peek here. I’m flattered. I know it’s a lot scrolling through a site like this. So, I’ll keep the pitch simple: |  | I like intimacy with men and exploring erogenous pathways through touch.  |  | I believe every man’s body has a story. Many of which are rarely heard with compassion & others completely neglected or suppressed. My kink is to provoke that vulnerability and create a safe space for that expression.  |  | We have enough performative roles built into our community. Being typecast and having our desires defined by others (though very arousing) neglects the diversity within our unique intimacy.   |  | I do prioritize the bodywork in every session — deep tissue, full body. The sensual bond unfolds organically from there. I work on a floor mat so we have more contact, more weight exchange, allowing more room for mutual connection to develop.  |  | I do have set boundaries and am more than happy to discuss those directly in a separate chat.  |  | Hope to see you soon. | Foster |  | Take a quick look at DaddyMelt.com for more info.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#592 | NickyS | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Exactly what you need
+DESC: What’s up guys… |  | Brooklyn-born Italian living in Manhattan.  |  | I haven’t completed any formal training yet but I know what you need to walk away feeling great. I’m very good at reading your energy and figuring out how to give you the best experience possible. I have been practicing massage for over 15 years.  |  | Let me know what it is you’re looking for and I’ll do my best to make it happen. I offer all types of massage, don’t be afraid to ask for what you want.  |  | I do both incalls and outcalls. I’m available at all times both day and night. Weekdays and weekends.  |  | Hope to hear from you soon.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#593 | Jessiepo | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=0
+HEADLINE: WelcometoMyWork.Be Nice
+DESC: Hello there!!! |  | Thanks for visiting my profile. My name is Jessie ( I'm located at Flushing Queens NY) |  | I've been in the massage business for over eight years, utilizing my own unique blend of Swedish and deep-tissue massage techniques. I care about what I do, and I really enjoy my work and always do my Best. I welcome everyone of all ages, races, body types, and gender identities. It’s all about positive energy and a relaxing massage. | I can do In-calls as well as out-calls. |  | The best way to contact me is to text. If I don't reply back right away, I am probably in the session, so give it some time, and I will get back to you ASAP ( Please, when you text me, text your name and the rentmasseur so I know where it's from, thank you} |  | My available only Thursday  |  | Looking forward to getting my hands on you!
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#594 | IslandCharley | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=14 | gold=1 | available=1
+HEADLINE: Pacific island touch. Grounded energy.
+DESC: Advanced booking is highly advised.  | My schedule varies depending on school and day job. Incall: Manhattan- Uptown in Harlem. Outcalls: NYC and Westchester |  | Worldly, intuitive, and emotionally intelligent, I create experiences where a man feels fully seen, heard, and understood. My background in aviation, art, fashion, and design shapes the way I move through the world: attentive, cultured, discreet, and intentional. |  | I speak multiple languages, appreciate thoughtful conversation, and understand both refinement and depth. Whether we’re sharing wine, meaningful dialogue, or an immersive sensual escape, I bring warmth, safety, and genuine connection — along with touch that is slow and intentional. |  | For the man who values chemistry and discretion, our time together will feel seamless. |  | ✨ Signature Touch |  | • 🌀 Lomi Lomi–inspired full-body flow | • 💪 Deep Tissue & Swedish blend | • 🔥 Masculine sensual energy & grounding presence | • 🫧 Body-to-body glide (optional) | • 🧘 Gentle stretching + breath-led calming |  | Every session is crafted to your comfort — slow, attentive, and always present. |  | ⸻ |  | Clients describe me as warm and deeply present. I prioritize pr
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#595 | STEPHANOXL | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=4 | gold=1 | available=0
+HEADLINE: Relaxing Moment
+DESC: I specialize Swedish and Deep Tissue massage as well. I provide massage oil, clean towels, and a relaxing environment. Guest are welcome to use the shower before and/or after the massage.  My goal is to provide you the ultimate relaxing time. |  | Feel free to contact me for more information or to set an appointment.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#596 | izzytantra | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=51 | gold=1 | available=0
+HEADLINE: In NYC till end of July 2026.
+DESC: I’m relocating abroad, seeing patients in NYC till July 30th, 2026, contact me for details for a special farewell discount. Refer to my contact info where you will find my direct number and a link to my own page.  |  | I’d like to invite you to explore my heart centered approach to tantra. What I offer is a supportive, safe container free of judgement, to learn tantric tools of sensuality, playfulness, communication, permission and consent, think of it as learning tools no one taught you prior to diving into your intimate life. Part of my offering is to help you raise your awareness, by working as a team, to find out what tools you are currently using are not serving you well, or have served a purpose. |  | While my therapeutic bodywork technique has blossomed organically over the past 20+ years as a tantra healer, my experience comes from being in the field, my training also consists of the body electric modality & Jason Tantra from the UK. Additionally, I am certified in harm reduction through the Zendo project. If this resonates with you but still have questions, I also offer a 15 min, free of charge, FaceTime chat to answer all your questions. Out of transparency I have more ex
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#597 | Simonwellness | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: Relaxation & Sensual Massage | NY
+DESC: I offer a relaxing and personalized experience designed to help you unwind, recharge, and reconnect with yourself. |  | Colombian — warm, attentive, and easy to feel comfortable with. My approach focuses on helping you slow down, release stress, and enjoy a moment entirely dedicated to you. |  |  | Discreet, clean, respectful — always. |  | Services: | • Stress Release | • Relaxation Massage | • Sensory Sensual Experience | • Fully Customized Sessions |  | 📍 East Village, NYC
+SERVICES: ['sensual', 'swedish']
+MEMBER SINCE: 
+
+#598 | HazelGold | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=1
+HEADLINE: Hedonistic Healing
+DESC: A professional providing pleasurable full bodywork services including therapeutic, deep tissue, sensual, ******. All fully tailored to your immediate needs and wants. I work with high quality heating cream and oils and always willing to accommodate to your preference.  |  | I'm an athlete who understands the complex ways our bodies function. Open to gym sessions, gym accountability, and workout/nutrition guides. I love meeting new people, striking up conversations, and making connections.  |  | **Rest assured I maintain a strict client confidentiality and privacy policy. ** |  | 🟩 I'm available for outcall patients and can travel to you upon request.  | 🟩 Text for availability and rates.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#599 | LeviStarlo | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: Sexy Levi ready to rock your world
+DESC: Tall, handsome, ***y mixed Latino with great hands ready to service your body
+SERVICES: None
+MEMBER SINCE: 
+
+#600 | Tasteyhandz | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=1 | reviews=1 | gold=1 | available=1
+HEADLINE: Sexy mixed verse ready for play
+DESC: Sexy mixed verse ready for play contact now for a huge surprise ending
+SERVICES: None
+MEMBER SINCE: 
+
+#601 | petebodyworks | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=16 | gold=1 | available=1
+HEADLINE: Skilled & Professional Therapist💆‍♂️
+DESC: Hey, I’m Pete.  |  | 📍I'm based in New York City | ✈️Upcoming Travel Schedule: | San Francisco, CA • July 9–12 | Portland, OR • July 13–14 | Los Angeles, CA • July 15–17 |  | I’m a trained masseur with 4 years of experience. If you’re looking for a professional massage from someone who knows exactly what he’s doing, you’ve found the right guy. |  | My style combines deep tissue and Swedish techniques with attentive, body-responsive touch that releases tension and leaves you floating. |  | My studio’s in Midtown East, Manhattan. Easy to get to with plenty of subway lines nearby. I use a professional massage table and set everything up for your comfort from the moment you walk in, so it feels just like a real spa experience. |  | Whether you’ve had a long week or just need a moment to escape, I’ll take you on a slow, sensual journey that melts away tension and leaves you feeling completely renewed. |  | Send me a message anytime!
+SERVICES: ['sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#602 | LGFDIMPisik | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=1 | reviews=1 | gold=1 | available=0
+HEADLINE: Leon The European Beast
+DESC: VISITING ALL MAY AND JUNE | Incall in Brooklyn | AVAILABLE FOR OUTCALLS 🔥🔥🔥 |  | My name is Leon, I’m a youthful man with strong, yet, gentle hands and a dominant top nature. I’ll offer you an escape from the mundane, let my energy consume you. An experience with me is both comforting and electrifying. |  | Discretion and mutual respect are always given.
+SERVICES: None
+MEMBER SINCE: 
+
+#603 | worldtravelJ | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=54 | gold=1 | available=1
+HEADLINE: Perfect Asian Masseur
+DESC: Hi everyone! I’m based in Los Angeles, but I currently travel around the U.S. offering professional massage services. Feel free to message me when I’m visiting your city! I hold a Master’s degree in Business from a top business school in the U.S. and currently offer massage as a part-time profession driven by passion and genuine interest. I’ve traveled to over 50 countries and truly enjoy meeting new people and sharing stories and experiences. |  | I specialize in a wide range of techniques, including Deep Tissue, Swedish, and Traditional Thai massage, and I am a trained massage therapist with over 3 years of hands-on experience. I understand how to use the right pressure and techniques to help your body fully relax, release tension, and feel renewed. I am clean, fit, well-educated, and maintain excellent personal hygiene. I genuinely enjoy giving massages and creating a comfortable, respectful, and relaxing experience for every client. |  | For more information or to book an appointment, please text the phone number listed only. Gay/LGBTQ+ clients are always warmly welcomed.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#604 | Slowstrokes | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=0
+HEADLINE: Hell’s Kitchen Sensual Massage
+DESC: Location: Hells Kitchen |  | Ready for a great massage from a licensed masseur? I get the best of both worlds, relaxing and fun 😘. Message me to unwind… or to turn up the heat. 🔥😈
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#605 | TouchJayNYC | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=5 | gold=1 | available=1
+HEADLINE: Session of your dreams
+DESC: I am a classy and educated man who thoroughly enjoys touch and connection with men. A session with me is a combination of relaxing touch and massage with sensual and ***ual elements. I love helping men relax so let me know what your ideal session would include. Mutual nudity, body contact and touching are encouraged. Tell me your fantasies. I want to design the perfect experience for you.  I can host near Union Square Park. Outcalls available.
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#606 | Brunnoxxx | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=1
+HEADLINE: Calm energy. Real presence. Total well-being
+DESC: Hi, I’m Bruno. |  |  Im 22 years, European-Latino twink, kind, respectful cute and fit. | I’m vers **🍆🍑. I’d rather you imagine first…The mind is the best prelude to pleasure.If curiosity gets the best of you, ask me for my face photo. 😌 |  | Professional massage therapist with a calm, kind, and deeply connected energy. I’m passionate about creating experiences where body and mind find balance, rest, and complete well-being. |  | Each session is a private, comfortable, and safe space designed to release stress, ease tension, and help you reconnect with your inner energy. I work with deep relaxation techniques, intuitive touch, and energy therapy, adapting every movement to your personal needs and rhythm. |  | My approach is always respectful, discreet, and genuine. I believe in the power of human touch when it’s offered with presence, intention, and professionalism. |  |  | 📩 Book your moment. | Tell me how you’d like to feel, and together we’ll create a customized session  relaxing, authentic, and deeply restorative. |  | I accept, cash, zelle, cash app, venmo.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#607 | BigboyJoey | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=10 | gold=1 | available=0
+HEADLINE: Texts only
+DESC: Manly touch  |  | Vaccinated  |  | TEXTS ONLY PLEASE |  | Welcome!  | My name is Joey and I welcome you to my page. I am truly passionate about working with the male physique. Fitness, Yoga and Massage have been my passions for the past 8 years. While mastering developing other body’s through fitness this has allowed me to take a specific and unique approach to massage. A combination of deep tissue, sports and Swedish massage catering to your wants and needs.  |  |  | I work by appointment. Advance notice is definitely appreciated. |  |  | Just shoot me a text so we can set up your appointment and get to work!  I look forward to seeing you.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#608 | Louisbas | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=11 | gold=1 | available=0
+HEADLINE: Massage therapy
+DESC: Hi |  | If you are looking for a respectful, polite, clean, discreet and masculine Latino guy, you just found the right one. |  | GREAT MASSAGE If you are looking for a relaxing time after a long day of work, I’m the right guy for you.  |  | I'm trained in Deep Tissue and Muscle Relaxation techniques and have experience working with men of all ages and needs. |   | I'm excited to offer you a personalized and relaxing massage that adapts to your needs and preferences. | Please only contact me by TEXT. | Available!!  | Incall and outcall  | Pretty open minded
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#609 | Ghenessis | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=6 | gold=1 | available=0
+HEADLINE: Total relaxation and satisfaction guaranteed
+DESC: More than 6 years of experience offering relaxation massages. Magic hands, as my clients say, at your service to give you a unique relaxation experience. Available overnight at my place. Your session includes a drink for enjoy during the massage. Ask me for the offer of the month. | Amenities in my place Bronx | - One free alcoholic ****tail, beer or water | - Shower | - Offers and promotions
+SERVICES: ['sensual', 'swedish']
+MEMBER SINCE: 
+
+#610 | TrentLan | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=0
+HEADLINE: Genuine Hands
+DESC: How do you relax after a hard day? 🤔 Let's figure it out together! I believe in releasing stress at its source and providing an intimate touch to make a long lasting, genuinely comfortable experience. 🤗 |  | I Enjoy a nice conversation or keeping things quiet and serene. I'm an open book and you should feel comfortable to be yourself around me.  |  | I love making people feel good. I'm an aspiring therapist so please feel free to let it all out around me. Discretion is most important. I have additional photos available upon request. Don't be shy! |  | Ask me about my rates! |  | Disclaimers: Outcalls only. I'll travel anywhere In reach of the NYC Subway or PATH trains. Please be direct and prepared to book. Cash only.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#611 | CalebBlanco | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=10 | gold=1 | available=0
+HEADLINE: Caleb
+DESC: Hi, my name is Caleb, I'm Latino and I am passionate about everything I do.  | I pride myself on offering a unique experience in massage therapy—healing not only your body, but also your soul through touch. All massages are customized to fit your individuals needs and I pay special attention to areas where specific pain or muscle problems persist.  |  | I’m available for outcalls citywide or at a private apartment in Hells Kitchen.  |  | Come and book a massage with me today, text me or call me to the number attached.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#612 | RobYaeger | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: You Are in Good Hands with Me
+DESC: Hello everyone!  I am Rob Yaeger.  I have been an adult performer, companion, model and all-around figure in NY's queer scene for many years.  I am also a huge believer in the healing power of bodywork, and I'm here to offer my own special brand of massage therapy.   As an endurance athlete my whole adult life, I know what it's like to have sore muscles, and I use my experience to help you cope with similar tensions.  I have been getting massages for decades, and during that time, I have learned a lot about how to give them, too.  For me, massage is about both physical and emotional care. |  | Treat yourself to some genuine self-care at my cozy Chelsea home. Whether you are sore from athletic training, tense from a long day at work, or just looking for some soothing, gentle touch from an experienced, empathic person, please don't hesitate to set something up with me.  My style ranges from deep tissue sports work, to relaxing rubdowns, to sensual touch, to targeted work on specific problem areas.  I am here to listen to your needs and help-- just tell me how.  The power of touch has restored me for years; now I want to provide some of that healing power to others. |  | I am also ava
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#613 | LUKENY | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Deep Relaxation. Total Comfort
+DESC: Private massage experience in a calm and sophisticated environment located in Hudson Yards, Manhattan. | My sessions combine relaxation, body awareness, warm oils, deep touch, and a personalized experience designed to help you disconnect from stress and reconnect with your body. | The atmosphere is intimate, clean, masculine, and discreet — inspired by luxury spa environments with soft lighting, music, candles, and a peaceful setting. | I offer: | • Relaxing massage | • Deep tissue inspired techniques | • Sensory body touch | • Customized sessions based on your energy and comfort level | Discretion, hygiene, comfort, and good energy are very important to me. | Available by appointment only. | Private upscale location.
+SERVICES: ['sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#614 | Barehaands | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=0
+HEADLINE: 4-Hand Sensual Massage Experience
+DESC: RATE : $400 | Two experienced guys teaming up for relaxing 4-hand massages, double the hands, perfectly synced moves, hot oil, and a blend of Swedish + deep tissue for complete relaxation and pampering. Professional, chill, and discreet. Our rates are transparent and listed on our profile.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#615 | JosephMass | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=0
+HEADLINE: Renew your mind and body masaje 💆🏻‍♂️
+DESC: Hi, I’m Joseph. I’m from Colombia, I bring a professional and attentive approach to both physical well-being and pleasure. My goal is to create a safe, relaxing, and personalized space for every session. |  | I offer sensual massage with a warm, grounded, and respectful touch, if that’s what you prefer. | I’m very flexible and always adapt to your boundaries. Whether you want a massage focused entirely on relaxation or you’re open to more intimate experiences, we’ll talk everything through clearly beforehand. |  | I’m friendly, respectful, and easy to connect with. I believe a great session is part technique and part genuine human connection. |  | If you’re interested, we can discuss additional levels of service with mutual respect and clear boundaries. Your comfort and safety always come first. |  | I’m Available 24/7 for In/Out Calls | For quickest response; text me, no calls.
+SERVICES: ['sensual', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#616 | Aaronlatin | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: AARÓN LATINO
+DESC: Hello, I’m Aarón, a sociable student looking to meet new and interesting people, have exciting but relaxing body experiences. The time with me will always be interpersonal, a safe space, free of judgment and at the client’s discretion. Communication and transparency are key!
+ | 
+ | ALSO AVAILABLE TO PROVIDE 4 HANDS MASSAGE WITH A COUPLE.
+ | 
+ | I love traveling and creating new memories in new cities and countries.
+ | 
+ | Therapeutic, sensual and intimate body contact, so any knots, tension or discomfort you may have thought you had before a session with me will almost certainly be eliminated with my techniques and approaches when you leave our session.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#617 | VelvetLover | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=0
+HEADLINE: Where your skin loses its calm
+DESC: This is not a place you come just to relax… | This is a place you come to surrender. |  | My hands don’t look for tension — they look for reaction. | Every movement is slow, firm, and intentional, so your body anticipates before it receives. Your breathing intensifies, your skin responds, and desire begins to set the rhythm. |  | There’s no rush. | No distractions. | Just you, your body… and what awakens when you let yourself be touched.
+SERVICES: None
+MEMBER SINCE: 
+
+#618 | TwoLatinoMachos | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: 4 Hands. 2 Guys. Twice the Strength.
+DESC: Why settle for one set of hands when you can experience the synchronized power of two? We are a professional duo offering a premium four-hands experience designed for men who appreciate a firm, commanding touch and a high pressure technique. |  | OUR SESSIONS are a choreographed dance of deep tissue and recovery, hitting every muscle group simultaneously to shut down your "fight or flight" response. It's a masculine, no ego-environment where you can finally drop your guard and melt into the table. |  | Options: Duo (4-Hands) or Individual (2-Hands) available. |  | **Can travel to NJ and surrounding NYC areas.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#619 | izanMasseur | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Just kiss me, we´ll talk later
+DESC: Just shaved my balls
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#620 | AleMassage | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=0
+HEADLINE: It's time to relax your body
+DESC: Hey! |  For quick communication, write to me at my phone number 📞📲 | Leo  here, A relaxed body means a relaxed mind. Allow your body feel the touch of my warm hands, get all the knots out of your body and release all the tension left during the day with deep tissue and Swedish massage techniques, offering all the comfort of a bodywork. I emphasize on the small details of the human body. Those tense spots that need relieve from pain and stress, with a therapeutic and relaxing massage, stretching and pressure. | Remember that my work is all about you, and your satisfaction and comfort are mine as well. Every session is unique and tailored made according to your needs and wishes. My goal for the session is your satisfaction. I'm an easy person to get along with. I offer the quality you're looking for, and for sure you will enjoy it.
+SERVICES: None
+MEMBER SINCE: 
+
+#621 | Daniellin | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=0
+HEADLINE: Professional Massage Therapy
+DESC: Male massage therapist with 3 years of hands-on experience. Standing at 175cm (5'9") with an athletic and muscular build — bringing both strength and warmth to every session. |  | My focus is on deep tissue massage and aromatic oil massage — helping you release tension, soothe sore muscles, and truly relax. I listen to your body and adjust pressure based on what you need that day. |  | I create a calm, clean, and welcoming space where you can let go of stress without any awkwardness. Whether you have tight shoulders, lower back pain, or just need a mental reset — I'm here to help. |  | What I offer: |  | · Deep Tissue Massage | · Swedish Massage | · Aromatic Oil Massage | · Gentle relaxation massage (always respectful) |  | I am not a certified therapist, but my technique comes from real practice and a genuine passion for healing through touch. My style is warm, grounded, and intuitive. |  | Let me help you feel better — body and mind. Message me to book a session.
+SERVICES: None
+MEMBER SINCE: 
+
+#622 | SergUA | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=17 | gold=1 | available=0
+HEADLINE: Relaxing Therapeutic massage with sensual touch
+DESC: Have a great massage experience with me, I ll make you forget about day routine and stress. |  | My techniques consist several therapeutic massage modalities: Deep Tissue, Swedish, Thai and Tantric Massage, Acupressure and Reflexology, blended with stretching and sensual elements (mutual touch allowed).   It begins with compression, kneading, rocking and stretching techniques, to warm up the body and promote circulation, this helps me identify any areas that may need particular attention. As the massage progresses I use a combination of soft but deep and relaxing techniques. My touch will find all of your tension points, that need release.   4 Hands experience also available be request. |  | About me:  have athletic body, friendly, well educated , masculine, professional, polite. Speak English, Russian, Ukrainian.   Have worked in busiest and well known men spa in the city for a few years. I work with all ages, race, body types and gender identities. Very discreet for those that need the reassurance, that your privacy is very important.  I always dedicated to do best job and give best experience to my costumers. My goal is you to be fully relaxed and satisfied in the end. Connectio
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#623 | centfami | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=3 | gold=1 | available=0
+HEADLINE: Feel Every Moment
+DESC: Hello, my name is Rémy. I’m from Belgium and have been traveling the world for work over the last 10 years. I first learned how to massage in my country and I have continued to develop my massage techniques through my travels in Africa, the Middle East, and California – learning from each of their respective cultures. |  | My massages are a perfect combination of Swedish and relaxing techniques, adjusting pressure accordingly to release knots and tension. Each massage is unique, as I let my intuition guide me to give what your body needs. I also provide deep tissue and hot stones massages if requested and am currently learning Lomi Lomi techniques. |  | I come equipped with a massage table, hot stones, relaxing oils, music, towels, and sheets; everything I need to make you feel comfortable and relaxed. |  | I’m fully vaccinated and boosted against Covid-19 and Monkeypox. |  | I welcome all types of people, regardless of race, age, gender, and ***ual orientation. Please feel free to reach out and schedule a massage with me. I am available in Honolulu (Makiki area) for incalls and outcalls.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#624 | fabiofitcardoso | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=4 | gold=1 | available=0
+HEADLINE: FABIO CARDOSO FIT
+DESC: ▫️SAN FRANCISCO UNTIL APRIL 16▫️ |  | Hey, Fabio here! | I'm a very relaxed guy, always willing to new experiences and open minded. | I'm very good at giving sensual and relaxing massages and I will always make your time unforgettable! | Your privacy and satisfactions are always guaranteed with me.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#625 | MrrJason | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=14 | gold=1 | available=0
+HEADLINE: Strong Hands💪Smooth Touch 🙌🏼 Unforgettable
+DESC: Oh, you found me. Good choice. We’re off to a great start already. 😉 | *Bilingual* |  | I’m a charismatic first-gen Italian/Spanish professional, regimentally fit, adventurous, and naturally captivating. My presence pulls you in before I’ve even laid a hand on you, settling your nerves, heightening your curiosity, and making you feel like you’re exactly where you’re supposed to be. Relaxation isn’t something you force with me.. it happens the moment you respond to my calm, genuine aura. You’re not just safe in my hands… you’re understood, unraveled, and ultimately healed in them. |  | And what comes after that relaxation? Well… that’s the cherry on top you’re just gonna have to taste yourself. 🍒😌 |  | I specialize in everything from deep tissue to gentle relaxation, incorporating Thai and Swedish techniques seamlessly throughout my sessions. Whether you need strong, intentional pressure or a slow, soothing touch, I tailor every moment to your body and your energy. I take immense pride in what I do; no matter the time, the mood, or the request, I give you my full focus and effort. Clients consistently leave impressed, renewed, and completely satisfied—just check the reviews. It’s no
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#626 | HungMasseurNYC | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Hung Masseur with strong hands for your body
+DESC: NO PRIVATE CALLS PLEASE  |  | Over 15 years experience in the industry. I perform a combination of deep tissue massage along with different modalities depending on your needs. |  | Many clients are regulars because they love how relaxed I make them feel during and after a session. |  | Please don't hesitate in reaching out and asking any questions. Prefer texts or WhatsApp versus calls as I usually have a busy schedule but I promise to get back to you. |  | Currently only traveling within Manhattan. Hosting in HK
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#627 | DaimonRex | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Strong and Sensual Hands
+DESC: Hi, my name is Daimon. I'm an athlete, performer, and bodyworker. I'm tall and lean with a hairy, muscular, tattooed body, and I have big, strong, sensual hands. All bodies are welcome -- I'm here to put you at ease, release tension, and feel better in this stressful world. Just tell me what kind of touch you prefer and where your tightest areas are.  |  | Please text me rather than calling first. I look forward to hearing from you!  |  | (I am fully vaccinated against covid and mpox)
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#628 | Frenchpapii | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Experience your French fantasy
+DESC: The best IN TOWN! All the way from North Africa... | Morrocan, Frenchi mixed with black. | I'm not just a masseur but an athlete as well and I understand the body and how to apply the right touch to achieve the best results in relaxation. I can apply soft pressure, medium or deep tissue based on your needs. |  | Book you session today and begin your transformation into a more relaxed, balanced version of yourself | Text my number for faster response.
+SERVICES: None
+MEMBER SINCE: 
+
+#629 | Olimp | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=4 | gold=1 | available=0
+HEADLINE: 🔹 Professional massage therapist with royal hands
+DESC: Hello I’m Vladlen 👋 here to help revitalize your inner core. Offering Swedish, Deep Tissue Full Body Massages combination that will leave you in relaxation. I have strong hands with a soothing stimulating touch. Applying direct pressure to high tension areas, tight muscles, and pressure points.The massage is done on a professional table. Here to make you feel Good, Safe, Comfortable and HOT! Always aiming to please. I give awesome Complete male Massages, Conversation & Much More. I'm excellent with first timers/beginners. Very flexible schedule for both in calls in a private setting or out calls at your request. Customized Massages catered to meet each clients specific needs Available 7 days a week, Relaxing atmosphere Shower available for before/after the massage. Fresh linen and Soothing music. |  | I have many certificates, graduated from the massage federation, my experience is 7 years! | I do not answer calls please leave a message. |  | I don't answer calls, please leave a message. |  | I take CASH zelle, Venmo ,
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#630 | FelixRodriguez | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=0
+HEADLINE: Reach me by text.
+DESC: NYC-based. If I’m elsewhere, it’s a quick trip. I follow your energy  allowing my hands to flow with your body, becoming attuned to your needs. If it’s deep tissue that you desire to relieve tension, I work into your hotspots like a sports pro. You’ll leave feeling totally relaxed, limber and deliciously undone in the most satisfying way. |  | Mutual touch? Just ask. Edging? Expected. Control? Absolutely. Couples welcome—3-hand and 4-hand sessions available.
+SERVICES: ['sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#631 | Sergio_Masseur | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=30 | gold=1 | available=0
+HEADLINE: Sergio - New 📞 📱 #
+DESC: I’m Sergio from Colombia, professionally trained in multiple massage styles. Each session is tailored to your pressure preference — from light and relaxing to deep and intense. | My specialty combines deep tissue with sensual, intuitive touch for a unique, full-body experience.  | 4-hands massage is also available for a truly immersive session. | Available for in-calls and out-calls. Let’s create a relaxing and memorable experience together!
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#632 | WrestlerMatt | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=7 | gold=1 | available=0
+HEADLINE: Wrestler’s Touch
+DESC: I’m a grounded, intuitive gay male masseur and wrestler who blends technical skill with a relaxed, sensual presence. My sessions are slow, connected, and body-aware — the kind that pull you out of your head and into a calm, full-body experience. I use deep pressure and long, rhythmic strokes to release tension while staying tuned into how your body responds. |  | Ideal for guys who want: | • real relaxation, not just routine | • slow build, deep muscle relief | • a chill, respectful space with chemistry and ease |  | Warm, discreet, clean, and very present. Message me with what you’re looking for, how you like to be touched, and the kind of energy you want to feel when you leave.
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#633 | HairyHealing | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=15 | gold=1 | available=0
+HEADLINE: Thai, Deep Tissue, Swedish, Sports
+DESC: Thank you for checking out my profile! I'd describe my demeanor as relaxed, intentional, and passionate. I am an experienced and current student studying massage therapy, looking to offer a relaxing, sensual massage experience within an inviting atmosphere. I provide deep tissue and a more eased massage, and I am happy to discuss what you want to cater to your needs. My approach focuses on whole body and mind healing, aiming to leave you feeling refreshed, energized, and deeply relaxed with a holistic intention. I am here to guide you through a mindful, uplifting experience that addresses the whole person; you are in good hands! |  | A professional massage table and shower are available.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#634 | Brandongood | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=19 | gold=1 | available=0
+HEADLINE: Smooth Asian boy with magic hands 🙌
+DESC: “ FULLY VACCINATED “ | Monkey pox Vaccinated 2 doses ✅ | On prep+ doxy ✅ |  |  | I'm very friendly and open to everyone, you’ll be greeted warmly every time.  My clients are treated with kindness and respectfully and an open, non-judgmental and honest environment.  |  | Book yourself an incredible body massage today. |  | I was trained for  Thai massage combination with deep tissue ,Swedish Lomi Lomi and Stretching combined with my own situations! I have more than 8 years experience so I promise you will be in good hands 🙌  |  | dim lighting, warm oil,biotone cream music featuring cinematic orchestra and low-tempo tropical house, ensuring a relaxing experience. |  |  | Private studio. Shower, Bottled Water, Massage Table, Music, Candles, Aromatherapy Enhanced.  |  | I'm very passionate about my work.  | I truly enjoy what I do, and my clients
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#635 | JimmyEayon | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=11 | gold=1 | available=0
+HEADLINE: Relax body work. Waxing and trimming
+DESC: Thank you for visiting my page ,My name is JimmyEayon from here  , I love my job  its full of interesting and warming things,  I enjoy the company of all types of men and I'm open to engaging in different types of fantasies ,I have worked in massage parlor three years , I will give you good massage and good service ,Big on hygiene ,keep safe don't worries, I respond quickest to texts, so feel free to hit me up anytime.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#636 | Eliron | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=41 | gold=1 | available=0
+HEADLINE: MASSAGE BY ELIRON
+DESC: I specialize in deep-tissue, light relaxing  | practicing massage more then 7 years, | I offer full body massage treatments. I understand the body and where to apply my therapeutic, deep tissue holds or relaxing muscle kneading techniques to achieve the best  | I offer full body massage treatments | In calls or out-calls to the comfort of your home or hotel, |  | Im a  Dad to a beautiful two boys  | So booking will be the best to get me. |   |  | My studio is located in Chelsea. |  100% private studio. It’s a very relaxing space with a calm ambience. |  | I also work fourth hands with  | https://rentmasseur.com/KingdelRey
+SERVICES: None
+MEMBER SINCE: 
+
+#637 | MrJoey | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=42 | gold=1 | available=0
+HEADLINE: Big hands, deep relief
+DESC: ✨ Relax • Recharge • Unwind ✨ |  | Professional Latin bodyworker providing relaxing sessions designed to help you release stress, relax your body, and restore your energy in a private and comfortable environment. |  | Every session is tailored to create a calm, soothing, and respectful experience where you can fully disconnect and feel renewed. |  | ✔ Private studio & outcalls | ✔ Professional, discreet, and friendly | ✔ Fully vaccinated | ✔ Clean, comfortable atmosphere |  | Specializing in: | • Deep relaxation techniques | • Stretching & mobility work | • Energy balancing & stress relief |  | Perfect for anyone looking to unwind and recharge after a long day. |  | Serious and respectful inquiries only.
+SERVICES: None
+MEMBER SINCE: 
+
+#638 | TJ_SEA | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=6 | gold=1 | available=0
+HEADLINE: Therapeutic Art - MASSAGE & BODY GROOMING
+DESC: FULLY VACINATED |  | WELCOME TO MY PROFILE  |  | I specialize in body work  full body session and created a therapeutic skills and  you will find strong hands and complete relaxation since I started so that you achieve complete relaxation. |  | Also I do manscaping body trimming and shaving  for men, full body male grooming, and trimming/shaving body hairs from head to toe. Ask me for more details. |  | I do outcall only  |  | Friendly and open to All. | I do not discriminate on age, race, or physical status. |  | Let me know if you have any questions.  | NO calls, TEXT only! |  | Hit me up. Let’s set up an appointment.Looking forward to hear from you guys!
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#639 | LatinromeoNYC | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=8 | gold=1 | available=0
+HEADLINE: The Best Massage in Town
+DESC: I am a very friendly Latino guy, atletic, and with big strong hands . I am the real deal in every way...  My gold is that you leave very satify, so you can conback soon...
+SERVICES: ['therapeutic', 'sensual', 'deep tissue']
+MEMBER SINCE: 
+
+#640 | Pattersonxxx | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Chico bonito
+DESC: I consider myself a spontaneous, confident, passionate and discreet young man; always open to new experiences. The most important thing is that I will make sure you have the best time from the moment you come to my world. |  | Also, if you are interested in threesomes and orgies, then I will be your boy. Ideal |  | AVAILABLE NOW  🧳 |  | Available for vacations, trips, dinners and more (CALLS IN AND OUT)✨
+SERVICES: None
+MEMBER SINCE: 
+
+#641 | Ritual | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Called to this craft
+DESC: I'm a trained philosopher called to the art and science of massage. |  | My understanding of, and respect for, the male body informs my work as a masseur and personal trainer here in Brooklyn/NYC; for years now, I’ve supported the development, recovery, and physical flourishing of men through this craft. |  | If you’re looking for a provider who can sense not only what feels good for you, but what is actually helpful for your muscles, please don’t hesitate to reach out. Feel free to text me any time. |  | I start every session with a quick consultation to determine what approach/massage style will best suit your needs. My base rate is $280/hr.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'hot stone', 'deep tissue']
+MEMBER SINCE: 
+
+#642 | Jacobthejock | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=0
+HEADLINE: Jacob’s Relaxing Hands
+DESC: Inquire today for summer specials! :) |  | Hi, I’m Jacob — a passionate, dedicated massage therapist committed to your total well-being. With a background spanning spas, gyms, and my own private studio on the Upper West Side on West 72nd St. & Columbus Ave in Manhattan. I bring both expertise and a personal touch to every session. I craft individualized treatment plans tailored to your unique needs, whether you’re battling stress, muscle tension, or simply craving a moment of restoration. My approach is holistic — leaving you feeling renewed physically, mentally, and energetically. I proudly serve a diverse and inclusive clientele, including gay men, women, and all members of the LGBTQIA+ community, in a space where everyone is welcomed and respected. Your comfort, privacy, and transformation are my top priorities. Ready to bring your body back to life? Reach out by text for the quickest response — I look forward to building the perfect experience just for you.​​​​​​​​​​​​​​​​
+SERVICES: ['therapeutic', 'sensual', 'swedish']
+MEMBER SINCE: 
+
+#643 | DaddyRetreat | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=21 | gold=1 | available=0
+HEADLINE: Experience what over 10k people have in NYC!
+DESC: Hello, I want to thank you for visiting my profile and look forward to providing you with the best massage experience in NYC. I have worked with over 10,000 people on their healing and pleasure journeys. |  | A little about me, I am a Brazilian/Puerto Rican mix, extremely fit/atheltic, positive energy and warm guy. I genuinely love what I do and it shows in my work. |  | Licensed Massage Therapist for over 15 years, Wellness Studio Owner, Pro Dom, Intimacy and Alternative lifestyle/kink educator/coach. I apply all my knowledge gained from my training at SI Massage School in NYC and various continuing education courses to give the best therapeutic treatment and professional service available in NYC.  |  | Specialties are deep tissue, sports, Thai, Tantric, sensual and ****** massage with the unique ability to combine all those modalities into a full body session you won’t find elsewhere. I also can combine BDSM elements for those curious gents out there. Massage can be done in the nude, body gliding and mutual touch are also part of the experience. Body scrubs are also available. |  | Sessions can be 60/90/120 minutes ($175/245/320) and outcall available($25 fee depending on locatio
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#644 | Chrislatin | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Hot men
+DESC: Hey guys I’m Chris  | relaxing soothing , soothing , unforgettable and intimate massages  | Text me if u want have fun time
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#645 | CalmingHands | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=7 | gold=1 | available=0
+HEADLINE: Restore. Relax. Release.
+DESC: ✨ About Me |  | Relaxing, masculine, and athletic — I bring a grounded, friendly energy to every session. With a strong, muscular build and years of experience taking care of my body, I know exactly how to use my hands to release tension, melt stress, and help you feel completely at ease. |  | 👐 My Approach |  | I combine deep tissue, relaxing full-body, sensual, and therapeutic techniques into a smooth, intuitive flow. | My touch is firm, confident, and attentive — designed to help your body unwind while keeping you fully present and comfortable. |  | Whether you’re looking to clear your mind, loosen up after the gym, or simply feel taken care of, I tailor every session to what your body needs. |  | 💆‍♂️ What You Can Expect | 	•	Warm, welcoming, discreet atmosphere | 	•	Slow, relaxing pressure with deep muscle work | 	•	Strong hands with a controlled, masculine touch | 	•	A friendly, calming vibe that lets you fully relax | 	•	Athletic, muscular therapist focused on your comfort |  | 🤝 Your Session |  | Your time with me is all about you — your comfort, your pace, your relaxation. | Book a session and let me help you reset, recharge, and feel your best.
+SERVICES: None
+MEMBER SINCE: 
+
+#646 | Tony_latino | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=7 | gold=1 | available=0
+HEADLINE: MASSAGE BY TONY_LATINO
+DESC: MASSAGE BY TONY | ☑️ I am fully vaccinated for COVID including boosters. | ☑️ I am fully vaccinated for Monkeypox. |  |  | -5’8” ,190lbs 34 y/o, light hairy, athletic,  OUTCALLS and INCALLS | Available Monday to Sunday 10:00 am to 10:00 pm. Please contact me by TEXT only. |  | Thanks for checking out my profile. |  | I provide a professional therapeutic and sensual full-body massage that is both holistic and relaxing for men only -- gay or straight. Welcome all ages, all body type.  I know the importance of healing the body with an incredible medium to deep tissue bodywork session using different techniques with my strong Latin hands. I am professional and talented and I do my best to create a relaxing environment in order to perform the best professional massage for you. |  | Done in the nude, ****** massage or sensuous massage is the use of touching techniques to achieve and/or enhance ***ual arousal. | Thank you for choosing me. |  | Advance notice is always appreciated. No emails, No blocked or private numbers. Text only please.
+SERVICES: ['therapeutic', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#647 | MarcoNapoli | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=2
+HEADLINE: Italian-American muscle masseur
+DESC: ** sweet guy, great hands, here to satisfy you ** |  | Yes, the profile here is new, but I am not new to massage.  I have a table and oils set up in a private room in my apartment, for a relaxing session.  I offer a strong therapeutic full body massage, focused on the areas that you specify. |  | You may have seen me online in more adult settings, but my private encounters tend to be much more sensual and touch-oriented.
+SERVICES: ['sensual']
+MEMBER SINCE: 
+
+#648 | JudeNYC | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Relax and release
+DESC: I want to emphasize here that my massage services are primarily in the sensual, tantric realm. Please be advised in reaching out to me, as it will save us some time! |  | Please feel free to ask any questions you may have, and I can share what I have to offer. I am available primarily for Out-call sessions. Please message/text for inquiries about rates and availability. |  | I am based in NYC, so understand if I am being displayed to you in another city it is because I am planning a visit. I might not be in your city yet at the time you reach out, so please check the dates on my profile!  |  | When texting my number, please be clear about how you are reaching me. I am on 2 platforms referred to as RM, which hopefully gives you further clarity about the above details. It is helpful to know you are contacting via RentMasseur and not the other platform. Thank you! |  | I am very discreet. The privacy and security of my clients is very important to me.
+SERVICES: None
+MEMBER SINCE: 
+
+#649 | ChristiansHands | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=0
+HEADLINE: Intentional Touch
+DESC: I approach bodywork with a simple philosophy: be intentional, respectful, and fully present. With close to two decades of experience, I’ve learned that the most profound sessions happen when you drop the rigid routines and truly connect with what the body is asking for. |  | My style is calm, deeply intuitive, and unhurried—combining strong hands and targeted pressure to explore and release tension where it counts. Whether you're looking to melt away deep-seated stress or completely surrender to a restorative, full-body experience, I provide a grounded, intimate space where you can fully unwind and recharge. Midtown NYC. Text to connect and let's align on what your body needs.
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#650 | MITIGATE | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=2 | gold=1 | available=0
+HEADLINE: Red Light Therapy
+DESC: Once upon a time there was a snake, a snake made of metal.  It stealthily slithered its way, like a parasite, into the human body, disrupting the bio-field and compromising health and well-being.  Introducing 5-4 Mitigation Therapy, a 4-step protocol based on 5-element theory.  This 90-minute treatment helps to mitigate the effects of environmental toxicity, and the resultant damaging inflammaging; chronic, low-grade inflammation, I call “the snake.” 
+ | 
+ | Step 1: Bake the Snake (Fire)
+ | 
+ | Light Therapy (photobiomodulation), specifically red (660 nm) and near infrared (850 nm), penetrates nearly 2 inches into the body, and promotes tissue repair, reduces inflammation, and induces analgesia.
+ | 
+ | Step 2: Shake the Snake (Earth)
+ | 
+ | Kenbiki Therapy (western equivalent, jostling) addresses twisting and misalignment of tendons and muscles, and fillips them into optimal positions, adjusts nerve lines, and improves blood circulation.
+ | 
+ | Step 3: Shield the Field (Air)
+ | 
+ | Piloerection and it’s close cousins, horripilation and knismesis, is literally the erection of hairs due to the involuntary contraction of the small muscles at the base of hair follicles.  This light, fe
+SERVICES: ['therapeutic', 'sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#651 | russiawithlove | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=5 | reviews=1 | gold=1 | available=0
+HEADLINE: From Russia with Love
+DESC: I’m a skilled and intuitive massage professional with years of experience in bodywork, offering sessions in Chelsea massage studio or traveling (based in Bushwick). |  | My unique massage approach blends a variety of techniques. Each session is tailored to your body, guided by intuition, open communication, and a deep understanding of energy work. My goal is to leave you feeling relaxed, revitalized, and in a balanced state of well-being. |  | To book an appointment, text me with your preferred time, and I’ll reply promptly with availability. | Swedish, Deep tissue, Intimacy coaching and tantra practice.
+SERVICES: ['sensual', 'swedish', 'deep tissue']
+MEMBER SINCE: 
+
+#652 | BranHugo | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Andy B
+DESC: Experienced masseur specialized in the male body. | Technique proven to reach a new level of relaxation, deep tissue, Thai and Swedish. |  | Let me help you unwind and attend your body muscle by muscle to complete satisfaction. |  | Mind, body and spirit climax.
+SERVICES: ['therapeutic', 'sensual']
+MEMBER SINCE: 
+
+#653 | Guycontact | newark-nj | visits=0 | days=0 | views/day=0.00 | rating=0 | reviews=0 | gold=1 | available=0
+HEADLINE: Slow and firm
+DESC: Slow, attentive bodywork blending relaxation, recovery, and focused muscular attention. Informed by a lifelong background in athletics and movement, I work intuitively with my hands, forearms, and full body to help release tension and restore balance. Sessions may be therapeutic, restorative, or sensual in nature, always guided by comfort, connection, and intention.
+SERVICES: None
+MEMBER SINCE: 
