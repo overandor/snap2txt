@@ -1,800 +1,800 @@
-Optimize: time-to-booking and qualified-client yield.
-Not: more scripts, more cron jobs, more visits, more scraping.
-
-Client Quantity = HighIntentSources × CaptureRate × QualificationRate
-Conversion Speed = DetectionLatency + DraftLatency + ApprovalLatency + ReplyLatency
-Revenue = ConfirmedBookings × AverageSessionValue × ShowRate × RepeatRate
-"""
-
-import hashlib
-import json
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
-
-
-# ─── Urgency tiers ─────────────────────────────────────────────────
-
-URGENCY_NOW = "NOW"          # booking language + today/tomorrow + NYC + direct question
-URGENCY_HOT = "HOT"          # profile visitor + prior message + location match
-URGENCY_WARM = "WARM"        # profile visitor only
-URGENCY_COLD = "COLD"        # social mention / search discovery
-URGENCY_IGNORE = "IGNORE"    # spam, competitor, unsafe, out-of-area
-
-URGENCY_ORDER = [URGENCY_NOW, URGENCY_HOT, URGENCY_WARM, URGENCY_COLD, URGENCY_IGNORE]
-
-# ─── Reply classes ─────────────────────────────────────────────────
-
-REPLY_BOOKING_NOW = "booking_now_reply"
-REPLY_PRICE_QUESTION = "price_question_reply"
-REPLY_LOCATION_QUESTION = "location_question_reply"
-REPLY_REPEAT_CLIENT = "repeat_client_reply"
-REPLY_INQUIRY = "inquiry_reply"
-REPLY_FOLLOW_UP = "follow_up_reply"
-REPLY_CLOSE_LOOP = "close_loop_reply"
-
-
-@dataclass
-class LeadState:
-    """One person in the funnel. Sorted by urgency, not by arrival time."""
-    lead_id: str = ""               # person_id_hash
-    username: str = ""
-    source: str = "rentmasseur"
-    first_seen_at: str = ""
-    last_touch_at: str = ""
-    intent_score: float = 0.0
-    urgency: str = URGENCY_COLD
-    location_match: bool = False
-    budget_match: Optional[bool] = None
-    time_urgency: bool = False      # "today", "tonight", "tomorrow"
-    repeat_client: bool = False
-    risk_flag: str = ""             # spam, competitor, unsafe, out_of_area, ""
-    classification: str = "unclassified"
-    recommended_reply_class: str = ""
-    recommended_reply_text: str = ""
-    approval_status: str = "pending"  # pending / approved / rejected / sent
-    booking_status: str = "inquiry"   # inquiry / requested / confirmed / completed / cancelled / no_show
-    collected_amount: float = 0.0
-    message_received: str = ""
-    message_sent: str = ""
-    consent_status: str = "unknown"
-    cooldown_until: str = ""
-    suppressed: bool = False
-    follow_up_due_at: str = ""      # when to send follow-up if no reply
-    close_loop_due_at: str = ""     # when to send close-loop if still no reply
-    first_reply_seconds: float = 0.0  # time from first_seen to first reply
-    is_premium: bool = False
-
-
-@dataclass
-class BookingEvent:
-    """The attribution table. One row per booking journey."""
-    booking_id: str = ""
-    lead_id: str = ""
-    source: str = "rentmasseur"
-    first_action: str = ""           # what triggered the lead
-    first_reply_seconds: float = 0.0
-    booking_requested_at: str = ""
-    booking_confirmed_at: str = ""
-    session_completed_at: str = ""
-    amount_collected: float = 0.0
-    repeat_booking: bool = False
-    attributed_action_id: str = ""
-
-
-@dataclass
-class RevenueMetrics:
-    """Hard revenue metrics. This is what the dashboard shows."""
-    # Lead funnel
-    total_leads: int = 0
-    qualified_leads: int = 0
-    booking_ready_leads: int = 0
-
-    # Conversion
-    reply_rate: float = 0.0
-    booking_request_rate: float = 0.0
-    booking_confirm_rate: float = 0.0
-    show_rate: float = 0.0
-
-    # Revenue
-    collected_revenue: float = 0.0
-    expected_revenue: float = 0.0
-    average_booking_value: float = 0.0
-    repeat_rate: float = 0.0
-
-    # Speed
-    median_reply_time_seconds: float = 0.0
-    median_time_to_booking_hours: float = 0.0
-
-    # Attribution
-    best_source: str = ""
-    worst_source: str = ""
-    source_roi: Dict[str, float] = field(default_factory=dict)
-
-    # Compliance
-    compliance_incidents: int = 0
-    suppressed_count: int = 0
-
-    # Drafts
-    drafts_pending: int = 0
-    drafts_approved: int = 0
-    drafts_sent: int = 0
-
-    # Secondary (upstream, not revenue)
-    total_views: int = 0
-    total_contacts: int = 0
-    ctr: float = 0.0
-    search_rank: int = 0
-
-    def compute(self, leads: List[LeadState], bookings: List[BookingEvent]):
-        self.total_leads = len(leads)
-        self.qualified_leads = sum(1 for l in leads if l.urgency in (URGENCY_NOW, URGENCY_HOT, URGENCY_WARM))
-        self.booking_ready_leads = sum(1 for l in leads if l.urgency == URGENCY_NOW)
-
-        replied = sum(1 for l in leads if l.message_sent)
-        self.reply_rate = round(replied / self.total_leads * 100, 1) if self.total_leads else 0.0
-
-        requested = [b for b in bookings if b.booking_requested_at]
-        confirmed = [b for b in bookings if b.booking_confirmed_at]
-        completed = [b for b in bookings if b.session_completed_at]
-
-        self.booking_request_rate = round(len(requested) / self.qualified_leads * 100, 1) if self.qualified_leads else 0.0
-        self.booking_confirm_rate = round(len(confirmed) / len(requested) * 100, 1) if requested else 0.0
-        self.show_rate = round(len(completed) / len(confirmed) * 100, 1) if confirmed else 0.0
-
-        self.collected_revenue = sum(b.amount_collected for b in completed)
-        self.expected_revenue = sum(b.amount_collected for b in confirmed if not b.session_completed_at)
-        paid = [b for b in completed if b.amount_collected > 0]
-        self.average_booking_value = round(sum(b.amount_collected for b in paid) / len(paid), 2) if paid else 0.0
-
-        repeat = sum(1 for l in leads if l.repeat_client)
-        self.repeat_rate = round(repeat / self.total_leads * 100, 1) if self.total_leads else 0.0
-
-        reply_times = [l.first_reply_seconds for l in leads if l.first_reply_seconds > 0]
-        self.median_reply_time_seconds = sorted(reply_times)[len(reply_times)//2] if reply_times else 0.0
-
-        self.suppressed_count = sum(1 for l in leads if l.suppressed)
-        self.drafts_pending = sum(1 for l in leads if l.approval_status == "pending")
-        self.drafts_approved = sum(1 for l in leads if l.approval_status == "approved")
-        self.drafts_sent = sum(1 for l in leads if l.approval_status == "sent")
-
-        # Source attribution
-        by_source: Dict[str, float] = {}
-        for b in completed:
-            by_source[b.source] = by_source.get(b.source, 0) + b.amount_collected
-        self.source_roi = by_source
-        if by_source:
-            self.best_source = max(by_source, key=by_source.get)
-            self.worst_source = min(by_source, key=by_source.get)
-
-
-@dataclass
-class ProfileSnapshot:
-    """Read-only profile state. Secondary signal."""
-    headline: str = ""
-    availability_option: int = 0
-    availability_label: str = ""
-    is_visible: bool = True
-    search_rank: int = 0
-    search_total: int = 0
-    active_rates: List[Dict] = field(default_factory=list)
-    avg_rate: float = 0.0
-
-
-@dataclass
-class TrafficOverclockIR:
-    """The canonical state object.
-
-    Client Quantity = HighIntentSources × CaptureRate × QualificationRate
-    Conversion Speed = DetectionLatency + DraftLatency + ApprovalLatency + ReplyLatency
-    Revenue = ConfirmedBookings × AverageSessionValue × ShowRate × RepeatRate
-    """
-    timestamp: str = ""
-    cycle_num: int = 0
-    login_ok: bool = False
-    login_error: str = ""
-
-    # Lane 1: Observe
-    profile: ProfileSnapshot = field(default_factory=ProfileSnapshot)
-    leads: List[LeadState] = field(default_factory=list)
-    mailbox_raw: List[Dict] = field(default_factory=list)
-
-    # Lane 2: Qualify + urgency sort
-    metrics: RevenueMetrics = field(default_factory=RevenueMetrics)
-
-    # Lane 3: Draft (fast reply templates, not LLM freestyle)
-    drafts_generated: int = 0
-
-    # Lane 4: Approve/Send
-    drafts_sent_count: int = 0
-
-    # Lane 5: Outcome
-    bookings: List[BookingEvent] = field(default_factory=list)
-
-    # Lane 6: Learn
-    attribution: Dict[str, float] = field(default_factory=dict)
-    learnings: List[str] = field(default_factory=list)
-
-    # Receipt
-    receipt_hash: str = ""
-    status: str = "GREEN"
-
-    _raw: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self):
-        if not self.timestamp:
-            self.timestamp = datetime.now(timezone.utc).isoformat()
-
-    def compute_receipt(self) -> str:
-        data = self.to_json(include_raw=False)
-        self.receipt_hash = hashlib.sha256(data.encode()).hexdigest()[:16]
-        return self.receipt_hash
-
-    def to_json(self, include_raw: bool = False) -> str:
-        d = asdict(self)
-        if not include_raw:
-            d.pop("_raw", None)
-        return json.dumps(d, indent=2, default=str, sort_keys=True)
-
-    def to_dict(self, include_raw: bool = False) -> Dict:
-        d = asdict(self)
-        if not include_raw:
-            d.pop("_raw", None)
-        return d
-
-    def summary(self) -> str:
-        m = self.metrics
-        lines = [
-            f"TrafficOverclockIR — {self.timestamp}",
-            f"Status: {self.status}",
-            f"Login: {'OK' if self.login_ok else 'FAILED'}",
-            f"",
-            f"Today:",
-            f"  {m.total_leads} leads detected",
-            f"  {m.qualified_leads} qualified",
-            f"  {m.booking_ready_leads} booking-ready",
-            f"  {len([b for b in self.bookings if b.booking_confirmed_at])} confirmed",
-            f"  ${m.expected_revenue:.0f} expected",
-            f"  ${m.collected_revenue:.0f} collected",
-            f"  median reply time: {m.median_reply_time_seconds:.0f}s",
-            f"  best source: {m.best_source or '—'}",
-            f"  worst source: {m.worst_source or '—'}",
-            f"",
-            f"Revenue Metrics:",
-            f"  Reply rate: {m.reply_rate}%",
-            f"  Booking request rate: {m.booking_request_rate}%",
-            f"  Booking confirm rate: {m.booking_confirm_rate}%",
-            f"  Show rate: {m.show_rate}%",
-            f"  Avg booking value: ${m.average_booking_value:.0f}",
-            f"  Repeat rate: {m.repeat_rate}%",
-            f"  Compliance incidents: {m.compliance_incidents}",
-            f"  Suppressed: {m.suppressed_count}",
-            f"",
-            f"Drafts: {m.drafts_pending} pending, {m.drafts_approved} approved, {m.drafts_sent} sent",
-            f"",
-            f"Secondary (upstream):",
-            f"  Views: {m.total_views} (CTR: {m.ctr}%)",
-            f"  Search rank: #{m.search_rank}",
-            f"  Availability: {self.profile.availability_label}",
-            f"",
-            f"Leads by urgency:",
-        ]
-        for tier in URGENCY_ORDER:
-            count = sum(1 for l in self.leads if l.urgency == tier)
-            if count:
-                lines.append(f"  {tier}: {count}")
-
-        lines.append(f"\nBookings tracked: {len(self.bookings)}")
-        lines.append(f"Learnings: {len(self.learnings)}")
-        lines.append(f"\nReceipt: {self.receipt_hash}")
-        return "\n".join(lines)
-
-```
-
-interview_agent.py:
-```
-"""
-Interview Monitor — stable trust content. Draft only, manual approval.
-
-Confirmed: featureInterview status in dashboard.
-Not confirmed: interview edit endpoint.
-
-Policy: never auto-edit approved interview. Only draft improvements.
-"""
-
-import logging
-import time
-from typing import Dict
-
-from .db import write_receipt, upsert_content_variant
-from .content_policy import check_bio_risk
-from .api_client import RentMasseurAPI
-
-log = logging.getLogger("profileops.interview")
-
-INTERVIEW_ANSWER_DRAFTS = {
-    "about_you": """I am a professional bodyworker based in Manhattan. My sessions are pressure-forward, focused on real relief for people who train hard, sit long hours, or carry stress in their body. I believe in clear communication, clean space, and practical results.""",
-    "your_style": """My style is direct and deliberate. I find the tension, apply sustained pressure, and work through the layers that contribute to tightness. Deep tissue, sports recovery, and targeted neck/shoulder work are the main focus areas.""",
-    "why_clients": """Clients come to me when they need more than a light massage. They want real pressure, a calm environment, and a therapist who listens. Many are desk workers, athletes, or travelers dealing with accumulated stiffness.""",
-    "boundaries": """I keep things professional. I work with the body as a whole, focus on therapeutic goals, and maintain clear boundaries. I expect the same respect in return.""",
-}
-
-
-def get_interview_status(dashboard: Dict) -> Dict:
-    """Extract interview status from dashboard."""
-    interview = dashboard.get("featureInterview", {})
-    return {
-        "is_completed": int(interview.get("isCompleted", 0)),
-        "is_pending_approved": int(interview.get("isPendingApproved", 0)),
-        "approved": int(interview.get("isApproved", 0)) if "isApproved" in interview else None,
-        "raw": interview,
-    }
-
-
-def monitor_interview(api: RentMasseurAPI) -> Dict:
-    """Check interview status and write receipt."""
-    dashboard = api.get_dashboard()
-    status = get_interview_status(dashboard)
-    write_receipt("interview_monitor_v1", "monitor_interview", {}, status, verified=True)
-    log.info("Interview status: completed=%s pending=%s", status["is_completed"], status["is_pending_approved"])
-    return status
-
-
-def generate_interview_drafts() -> list:
-    """Generate improved interview answer drafts."""
-    drafts = []
-    for key, text in INTERVIEW_ANSWER_DRAFTS.items():
-        risk = check_bio_risk(text)
-        if risk > 0.7:
-            continue
-        variant_id = f"interview_{key}_{int(time.time())}"
-        upsert_content_variant(
-            variant_id, "interview",
-            title=key, body=text,
-            hypothesis="Professional interview answer draft.",
-            status="draft"
-        )
-        write_receipt(
-            "interview_draft_created_v1",
-            "generate_interview_draft",
-            {},
-            {"variant_id": variant_id, "question": key, "risk": risk},
-            verified=True,
-        )
-        drafts.append({"variant_id": variant_id, "question": key, "body": text, "risk": risk})
-        log.info("Interview draft created: %s", key)
-    return drafts
-
-```
-
-revenue_ir.py:
-```
-#!/usr/bin/env python3
-"""
-RevenueIR — Canonical business state object for the RentMasseur revenue optimizer.
-
-Every pass reads and writes this object. No more loose dictionaries.
-
-Flow:
-  raw_api → RevenueIR → scoring passes → action planner → policy gate → executor → after_snapshot → receipt
-"""
-
-import json
-import hashlib
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
-
-
-@dataclass
-class FunnelMetrics:
-    total_views: int = 0
-    total_contacts: int = 0
-    today_views: int = 0
-    emails_count: int = 0
-    unread_emails: int = 0
-    premium_senders: int = 0
-    booking_inquiries: int = 0
-    general_inquiries: int = 0
-    ctr: float = 0.0
-    email_rate: float = 0.0
-    avg_rate: float = 0.0
-
-    def compute(self):
-        if self.total_views > 0:
-            self.ctr = round(self.total_contacts / self.total_views * 100, 2)
-        if self.total_contacts > 0:
-            self.email_rate = round(self.emails_count / self.total_contacts * 100, 2)
-
-
-@dataclass
-class ProfileState:
-    headline: str = ""
-    description_len: int = 0
-    availability_option: int = 0
-    availability_label: str = ""
-    is_visible: bool = True
-    search_rank: int = 0
-    search_total: int = 0
-    active_rates: List[Dict] = field(default_factory=list)
-
-
-@dataclass
-class VisitorRecord:
-    username: str = ""
-    source: str = "who_saw_me"
-    location: str = ""
-    is_ny: bool = False
-    is_masseur: Optional[bool] = None
-    visited_back: bool = False
-    messaged: bool = False
-    is_premium: bool = False
-    email_classification: str = ""
-
-
-@dataclass
-class ActionItem:
-    action: str = ""
-    reason: str = ""
-    priority: int = 0
-    policy: str = "AUTO_OK"  # AUTO_OK, REVIEW_REQUIRED, BLOCKED
-    executed: bool = False
-    result: str = ""
-    impact: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class RevenueIR:
-    """The canonical business state object. Every pass reads/writes this."""
-    timestamp: str = ""
-    cycle_num: int = 0
-    login_ok: bool = False
-    login_error: str = ""
-
-    # Lane 1: Read-only scan results
-    funnel: FunnelMetrics = field(default_factory=FunnelMetrics)
-    profile: ProfileState = field(default_factory=ProfileState)
-    visitors: List[VisitorRecord] = field(default_factory=list)
-    mailbox_preview: List[Dict] = field(default_factory=list)
-
-    # Lane 2: Safe actions executed
-    actions_executed: List[ActionItem] = field(default_factory=list)
-
-    # Lane 3: Risky actions queued for approval
-    actions_queued: List[ActionItem] = field(default_factory=list)
-
-    # Deltas vs last cycle
-    deltas: Dict[str, float] = field(default_factory=dict)
-
-    # Receipt
-    receipt_hash: str = ""
-    status: str = "GREEN"  # GREEN, YELLOW, RED
-
-    # Raw API responses kept for debugging (not committed to repo)
-    _raw: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self):
-        if not self.timestamp:
-            self.timestamp = datetime.now(timezone.utc).isoformat()
-
-    def compute_receipt(self):
-        """Tamper-evident receipt hash over the entire state."""
-        data = self.to_json(include_raw=False)
-        self.receipt_hash = hashlib.sha256(data.encode()).hexdigest()[:16]
-        return self.receipt_hash
-
-    def to_json(self, include_raw: bool = False) -> str:
-        d = asdict(self)
-        if not include_raw:
-            d.pop("_raw", None)
-        return json.dumps(d, indent=2, default=str, sort_keys=True)
-
-    def to_dict(self, include_raw: bool = False) -> Dict:
-        d = asdict(self)
-        if not include_raw:
-            d.pop("_raw", None)
-        return d
-
-    def summary(self) -> str:
-        lines = [
-            f"RevenueIR — {self.timestamp}",
-            f"Status: {self.status}",
-            f"Login: {'OK' if self.login_ok else 'FAILED'}",
-            f"",
-            f"Funnel:",
-            f"  Views: {self.funnel.total_views} (today: {self.funnel.today_views})",
-            f"  Contacts: {self.funnel.total_contacts} (CTR: {self.funnel.ctr}%)",
-            f"  Emails: {self.funnel.emails_count} (unread: {self.funnel.unread_emails}, premium: {self.funnel.premium_senders})",
-            f"  Booking inquiries: {self.funnel.booking_inquiries}",
-            f"  Avg rate: ${self.funnel.avg_rate}",
-            f"",
-            f"Profile:",
-            f"  Headline: '{self.profile.headline}'",
-            f"  Availability: {self.profile.availability_label} ({self.profile.availability_option})",
-            f"  Visible: {self.profile.is_visible}",
-            f"  Search rank: #{self.profile.search_rank} of {self.profile.search_total}",
-            f"  Active rates: {len(self.profile.active_rates)}",
-            f"",
-            f"Visitors: {len(self.visitors)} total, {sum(1 for v in self.visitors if v.is_ny)} NYC",
-            f"Actions executed: {len(self.actions_executed)}",
-            f"Actions queued: {len(self.actions_queued)}",
-            f"",
-            f"Receipt: {self.receipt_hash}",
-        ]
-        return "\n".join(lines)
-
-```
-
-cdp_capture.py:
-```
-"""
-Selenium Action → API Endpoint Capture (v2)
-
-Uses CDP Network domain directly to capture ALL network requests,
-including XHR/fetch that happen during page load (before JS interceptor can run).
-
-Output: rm_traffic/action_api_map.json
-"""
-
-import json
-import os
-import re
-import time
-import logging
-from datetime import datetime, timezone
-from pathlib import Path
-from collections import OrderedDict
-
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.common.exceptions import (
-    NoSuchElementException, StaleElementReferenceException, WebDriverException,
-)
-
-BASE_URL = "https://rentmasseur.com"
-USERNAME = "karpathianwolf"
-PASSWORD = os.environ.get("RM_PASSWORD", "")
-CHROME_PROFILE = "/tmp/rm_cdp_api"
-OUT = Path(__file__).parent
-CAPTURE_FILE = OUT / "action_api_map.json"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("cdp_api")
-
-
-class CDPNetworkCapture:
-    """Capture network requests via CDP Network domain events."""
-
-    def __init__(self, driver):
-        self.driver = driver
-        self._requests = {}   # requestId -> request data
-        self._responses = {}  # requestId -> response data
-        self._bodies = {}     # requestId -> response body
-        self._marker = 0
-        self._all_entries = []
-        self._setup()
-
-    def _setup(self):
-        """Enable CDP Network domain and register listeners."""
-        # Enable network tracking
-        self.driver.execute_cdp_cmd("Network.enable", {})
-
-        # We can't use event listeners directly with selenium's CDP,
-        # so we'll use performance log entries instead.
-        # But we already enabled performance logging in driver setup.
-        # Alternative: use execute_cdp_cmd with Network.getRequestPostData
-
-    def mark(self):
-        """Mark current position — new entries after this are 'new'."""
-        self._marker = len(self._all_entries)
-        return self._marker
-
-    def capture_new(self):
-        """Get entries since last mark using performance log."""
-        entries = self._extract_perf_entries()
-        self._all_entries.extend(entries)
-        new = self._all_entries[self._marker:]
-        self._marker = len(self._all_entries)
-        return new
-
-    def capture_all(self):
-        entries = self._extract_perf_entries()
-        self._all_entries.extend(entries)
-        return self._all_entries
-
-    def _extract_perf_entries(self):
-        """Extract network requests from performance log."""
+        if m:
+            return m.group(1)
+        return ""
+
+    def login_via_selenium(self, username: str, password: str, manual_captcha: bool = False) -> bool:
+        """Hybrid login using Selenium. If manual_captcha=True, opens visible browser for user to solve captcha."""
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.common.by import By
+
+        log.info("Attempting Selenium hybrid login...")
+        opts = Options()
+        opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument("--user-data-dir=/tmp/rm_profileops")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        if not manual_captcha:
+            opts.add_argument("--headless=new")
+        driver = None
         try:
-            logs = self.driver.get_log("performance")
-        except Exception:
-            return []
-
-        entries = []
-        for log_entry in logs:
+            driver = webdriver.Chrome(options=opts)
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            })
+            driver.get(f"{BASE_URL}/login")
+            time.sleep(4)
+            # Dismiss popups
             try:
-                msg = json.loads(log_entry["message"])["message"]
-                method = msg.get("method", "")
+                driver.execute_script("document.querySelectorAll('.DialogOverlay,[class*=\"overlay\"]').forEach(e=>e.remove())")
+            except: pass
+            for xpath in ["//button[contains(text(),'Not now')]", "//button[contains(text(),'Accept all')]", "//button[contains(text(),'Close')]"]:
+                try:
+                    for el in driver.find_elements(By.XPATH, xpath):
+                        if el.is_displayed(): driver.execute_script("arguments[0].click()", el); time.sleep(0.5)
+                except: pass
+            # Fill login
+            for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
+                t = (inp.get_attribute("type") or "").lower()
+                n = (inp.get_attribute("name") or "").lower()
+                if (t == "email" or "email" in n or "user" in n) and inp.is_displayed():
+                    inp.clear(); inp.send_keys(username)
+                if t == "password" and inp.is_displayed():
+                    inp.clear(); inp.send_keys(password)
+            time.sleep(0.3)
+            for el in driver.find_elements(By.CSS_SELECTOR, "button[type='submit']"):
+                if el.is_displayed(): driver.execute_script("arguments[0].click()", el); break
 
-                if method == "Network.requestWillBeSent":
-                    params = msg["params"]
-                    req = params["request"]
-                    req_id = params["requestId"]
-
-                    # Store for later body retrieval
-                    self._requests[req_id] = {
-                        "url": req["url"],
-                        "method": req["method"],
-                        "headers": req.get("headers", {}),
-                        "post_data": req.get("postData"),
-                        "type": params.get("type", ""),
-                        "ts": params.get("timestamp", 0),
-                    }
-
-                elif method == "Network.responseReceived":
-                    params = msg["params"]
-                    req_id = params["requestId"]
-                    resp = params["response"]
-
-                    if req_id in self._requests:
-                        self._requests[req_id]["status"] = resp.get("status")
-                        self._requests[req_id]["mime_type"] = resp.get("mimeType", "")
-                        self._requests[req_id]["response_headers"] = resp.get("headers", {})
-
-                        # Try to get response body
-                        try:
-                            body = self.driver.execute_cdp_cmd(
-                                "Network.getResponseBody", {"requestId": req_id}
-                            )
-                            self._requests[req_id]["response_body"] = body.get("body", "")[:5000]
-                        except Exception:
-                            self._requests[req_id]["response_body"] = None
-
-            except (KeyError, json.JSONDecodeError):
-                continue
-
-        # Convert to list of entries
-        entries = []
-        for req_id, data in self._requests.items():
-            entries.append(data)
-        return entries
-
-
-def create_driver():
-    opts = Options()
-    opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument(f"--user-data-dir={CHROME_PROFILE}")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    # Enable performance logging for CDP network capture
-    opts.set_capability("goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
-    return webdriver.Chrome(options=opts)
-
-
-def dismiss_popups(driver):
-    time.sleep(1)
-    try:
-        driver.execute_script("""
-            document.querySelectorAll('.DialogOverlay, [class*="overlay"]').forEach(e => e.remove());
-        """)
-    except Exception:
-        pass
-    for xpath in [
-        "//button[contains(text(),'Not now')]",
-        "//button[contains(text(),'Accept all')]",
-        "//button[contains(text(),'Close')]",
-        "//*[contains(@aria-label,'Close')]",
-    ]:
-        try:
-            for el in driver.find_elements(By.XPATH, xpath):
-                if el.is_displayed():
-                    driver.execute_script("arguments[0].click();", el)
-                    time.sleep(0.5)
-        except Exception:
-            pass
-
-
-def login(driver):
-    log.info("Logging in...")
-    driver.get(f"{BASE_URL}/login")
-    time.sleep(4)
-    dismiss_popups(driver)
-
-    for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
-        itype = (inp.get_attribute("type") or "").lower()
-        iname = (inp.get_attribute("name") or "").lower()
-        if (itype == "email" or "email" in iname or "user" in iname) and inp.is_displayed():
-            inp.clear()
-            inp.send_keys(USERNAME)
-        if itype == "password" and inp.is_displayed():
-            inp.clear()
-            inp.send_keys(PASSWORD)
-
-    time.sleep(0.3)
-    for by, sel in [
-        (By.CSS_SELECTOR, "button[type='submit']"),
-        (By.XPATH, "//button[contains(text(),'LOG')]"),
-        (By.XPATH, "//button[contains(text(),'Log')]"),
-        (By.CSS_SELECTOR, "form button"),
-    ]:
-        for el in driver.find_elements(by, sel):
-            if el.is_displayed():
-                driver.execute_script("arguments[0].click();", el)
+            # If manual captcha mode, wait for user
+            if manual_captcha:
+                print("\n*** CAPTCHA DETECTED ***")
+                print("A Chrome window is open. Please solve the captcha and complete login.")
+                print("Press ENTER here after you see the dashboard/settings page...")
+                input()
+            else:
                 time.sleep(6)
+
+            # Transfer cookies
+            if "/login" not in driver.current_url:
+                cookies = driver.get_cookies()
+                for c in cookies:
+                    self.session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
+                self.username = username
+                self.logged_in = True
+                log.info("Selenium login OK, cookies transferred")
+                return True
+            else:
+                log.error("Selenium login failed, still on login page")
+                return False
+        except Exception as e:
+            log.error("Selenium login failed: %s", e)
+            return False
+        finally:
+            if driver:
+                driver.quit()
+
+    def login_manual_captcha(self, username: str, password: str) -> bool:
+        """Open visible browser for manual captcha solve."""
+        return self.login_via_selenium(username, password, manual_captcha=True)
+
+    def login(self, username: str, password: str) -> bool:
+        self.username = username
+        csrf = self._get_csrf()
+        self._rate_limit()
+        resp = self.session.post(f"{API_URL}/login", json={
+            "email": username,
+            "password": password,
+            "csrf": csrf,
+            "remember": True,
+        })
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except Exception as e:
+                log.error("API login response not JSON (captcha/block?). Trying Selenium...")
+                return self.login_via_selenium(username, password)
+            self.token = data.get("accessToken")
+            if self.token:
+                self.session.headers["Authorization"] = f"Bearer {self.token}"
+            log.info("Login OK as %s", username)
+            return True
+        log.error("API login failed: %d %s", resp.status_code, resp.text[:200])
+        return self.login_via_selenium(username, password)
+
+    def _get(self, path: str, params: Optional[Dict] = None) -> requests.Response:
+        self._rate_limit()
+        return self.session.get(f"{API_URL}{path}", params=params, timeout=15)
+
+    def _post(self, path: str, json_data: Dict) -> requests.Response:
+        self._rate_limit()
+        return self.session.post(f"{API_URL}{path}", json=json_data, timeout=15)
+
+    def _put(self, path: str, json_data: Dict) -> requests.Response:
+        self._rate_limit()
+        return self.session.put(f"{API_URL}{path}", json=json_data, timeout=15)
+
+    def get_dashboard(self) -> Dict:
+        resp = self._get("/account/dashboard")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_availability(self) -> Dict:
+        resp = self._get("/account/dashboard/availability")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_stats(self) -> Dict:
+        resp = self._get("/account/dashboard/ad-statistics")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_keeponline(self) -> Dict:
+        resp = self._get("/account/keeponline")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_about(self) -> Dict:
+        resp = self._get("/settings/about")
+        resp.raise_for_status()
+        return resp.json()
+
+    def set_about(self, headline: str, description: str) -> Dict:
+        resp = self._put("/settings/about", json={
+            "headline": headline,
+            "description": description,
+        })
+        resp.raise_for_status()
+        return resp.json()
+
+    def set_visibility(self, visible: bool) -> Dict:
+        resp = self._put("/settings/visibility", json={"isAdHidden": not visible})
+        resp.raise_for_status()
+        return resp.json()
+
+    def set_sms(self, enabled: bool) -> Dict:
+        resp = self._put("/settings/sms", json={"sms": enabled})
+        resp.raise_for_status()
+        return resp.json()
+
+    def set_track_actions(self, enabled: bool) -> Dict:
+        resp = self._put("/settings/track-actions", json={"trackActions": enabled})
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_mailbox(self, page: int = 1, folder: int = 1, sort: int = 1) -> Dict:
+        resp = self._get("/mailbox", params={"page": page, "folder": folder, "sort": sort})
+        resp.raise_for_status()
+        return resp.json()
+
+    def search(self, city: str = "manhattan-ny", available_only: bool = True,
+               page: int = 1, skip: int = 0) -> Dict:
+        body = {"searchCity": city, "page": page, "skipUsers": str(skip)}
+        if available_only:
+            body["available"] = 1
+        resp = self._post("/search", body)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_rates(self) -> Dict:
+        resp = self._get("/settings/rates")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_locations(self) -> Dict:
+        resp = self._get("/locations", params={"withMasseurs": 1})
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_blogs(self, page: int = 1) -> Dict:
+        resp = self._get("/blogs", params={"page": page})
+        resp.raise_for_status()
+        return resp.json()
+
+    def full_status(self) -> Dict:
+        return {
+            "dashboard": self.get_dashboard(),
+            "availability": self.get_availability(),
+            "stats": self.get_stats(),
+            "keeponline": self.get_keeponline(),
+            "about": self.get_about(),
+            "mailbox": self.get_mailbox(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Bio Content Generator
+# ---------------------------------------------------------------------------
+
+BIO_HEADLINES = [
+    "You bring the smile, I bring the Wolf.",
+    "Manhattan bodywork. Deep. Intentional. Real.",
+    "Large hands. Clear purpose. Better movement.",
+    "Your shoulders called. The Wolf answered.",
+    "Deep tissue therapy, Chelsea to Midtown.",
+    "No crystals. No fluff. Just effective bodywork.",
+    "7 years of convincing muscles to behave.",
+    "The body keeps score. I audit the books.",
+    "Professional massage for people who sit too hard.",
+    "From desk goblin to functional human.",
+]
+
+BIO_VARIATIONS = [
+    """🐺 KARPATHIAN WOLF
+
+74,000+ profile views.
+
+7 years specializing in deep tissue, sports recovery, and mobility work.
+
+I work with desk professionals, gym athletes, frequent flyers, and anyone whose shoulders are trying to become earrings.
+
+Common feedback: "I can move my neck again," and "I didn't know I was carrying all that stress."
+
+Approach: find the restriction, address it directly, restore function.
+
+No gimmicks. No energy portals. Just clean, effective bodywork from a large Ukrainian therapist in Manhattan.
+
+📍 Manhattan, NYC
+""",
+    """🐺 KARPATHIAN WOLF
+
+Professional deep tissue and therapeutic bodywork in Manhattan.
+
+What I do: identify the real source of tension, work it with depth and precision, and help you move better.
+
+Who I see: office workers, athletes, travelers, and anyone with chronic tightness.
+
+What to expect: clear communication, firm pressure, and a session that actually changes how you feel.
+
+📍 Manhattan, NYC
+""",
+    """🐺 KARPATHIAN WOLF
+
+Your body keeps score. I help audit the books.
+
+7 years of hands-on experience. Deep tissue, sports recovery, stress relief.
+
+I work with people who sit too long, lift too hard, or fly too often. If your neck, shoulders, or back feel like they own you, we fix that.
+
+Sessions are professional, direct, and focused on results.
+
+📍 Manhattan, NYC
+""",
+]
+
+def suggest_bio(current_headline: str = "", current_description: str = "") -> Dict:
+    """Generate a new bio variant that is different from current."""
+    headline = random.choice([h for h in BIO_HEADLINES if h != current_headline])
+    desc = random.choice([d for d in BIO_VARIATIONS if d.strip()[:100] != current_description.strip()[:100]])
+    return {"headline": headline, "description": desc}
+
+def draft_blog() -> Dict:
+    """Draft a blog post. Returns draft only — does NOT publish."""
+    titles = [
+        "What to expect from your first deep tissue session",
+        "Why your shoulders hurt and what actually helps",
+        "Desk work vs. your neck: how to fight back",
+        "The difference between spa massage and therapeutic bodywork",
+        "Recovery tips for athletes who train hard",
+    ]
+    snippets = [
+        "Most people think massage is about relaxation. Therapeutic work is about restoring movement.",
+        "Your shoulders are not supposed to live next to your ears. If they do, we can fix that.",
+        "Deep tissue should not mean painful. It means precise, patient, and targeted.",
+        "The best recovery combines sleep, movement, water, and occasional professional bodywork.",
+        "If you fly often, your hips and lower back are paying for it. Regular sessions help.",
+    ]
+    title = random.choice(titles)
+    body = random.choice(snippets) + "\n\nThis is a draft. Review before publishing."
+    return {"title": title, "body": body}
+
+# ---------------------------------------------------------------------------
+# ProfileOps Engine
+# ---------------------------------------------------------------------------
+
+class ProfileOps:
+    """Main operations engine."""
+
+    def __init__(self, username: str, password: str, city: str = "manhattan-ny", manual_captcha: bool = False):
+        self.api = RentMasseurAPI()
+        self.username = username
+        self.password = password
+        self.city = city
+        self.manual_captcha = manual_captcha
+        self.last_visibility_check = 0
+        self.last_avail_check = 0
+        self.last_stats_check = 0
+        self.last_bio_check = 0
+        self.last_dashboard_print = 0
+        self.running = True
+        self.current_state = {}
+
+    def login(self) -> bool:
+        if self.manual_captcha:
+            ok = self.api.login_manual_captcha(self.username, self.password)
+            receipt("login", ok, "Manual captcha login")
+            return ok
+        ok = self.api.login(self.username, self.password)
+        receipt("login", ok, "API login")
+        return ok
+
+    def ensure_visible(self, force: bool = False):
+        """Guard profile visibility. Fix it if hidden."""
+        try:
+            keep = self.api.get_keeponline()
+            is_hidden = bool(keep.get("isAdHidden", 0))
+            if is_hidden or force:
+                before = {"isAdHidden": is_hidden}
+                result = self.api.set_visibility(True)
+                after = {"isAdHidden": 0, "response": result}
+                receipt("set_visibility", True, "Profile was hidden, now shown", before, after)
+                record_alert("critical", "visibility_hidden", "Profile was hidden from search. Auto-fixed.")
+                log.info("Profile visibility: HIDDEN → SHOWN")
+            else:
+                log.info("Profile visibility: shown")
+        except Exception as e:
+            receipt("ensure_visible", False, str(e))
+            log.error("Visibility check failed: %s", e)
+
+    def ensure_available(self):
+        """Refresh availability only if near expiry."""
+        try:
+            avail = self.api.get_availability()
+            selected = avail.get("selected", "")
+            countdown = avail.get("countdown", 0)
+            now = time.time()
+            remaining = max(0, int(countdown - now))
+
+            log.info("Availability: %s (remaining ~%ds)", selected, remaining)
+
+            if selected != "Available" or remaining < AVAIL_REFRESH_THRESHOLD:
+                before = {"selected": selected, "remaining": remaining}
+                # Try to set availability via dashboard about endpoint
+                # Note: the exact set-availability endpoint wasn't confirmed.
+                # We log that it needs refresh and attempt the best-known path.
+                # For now, we flag this as needing manual/agent confirmation.
+                receipt("ensure_available", False,
+                        f"Availability needs refresh ({selected}, {remaining}s left). Endpoint not confirmed.")
+                record_alert("warning", "availability_low",
+                             f"Availability low/expired: {selected}, {remaining}s remaining. Need refresh.")
+            else:
+                receipt("ensure_available", True, f"Availability OK: {selected}, {remaining}s left")
+        except Exception as e:
+            receipt("ensure_available", False, str(e))
+            log.error("Availability check failed: %s", e)
+
+    def collect_stats(self):
+        """Collect traffic and profile stats."""
+        try:
+            dash = self.api.get_dashboard()
+            stats = self.api.get_stats()
+            keep = self.api.get_keeponline()
+            about = self.api.get_about()
+            mail = self.api.get_mailbox()
+
+            prof_stats = stats.get("profileStatistics", {}) or {}
+            assets = about.get("userProps", {}).get("assets", {})
+
+            record_stats(
+                views=prof_stats.get("totalPageViews"),
+                contact_clicks=prof_stats.get("totalContactClicks"),
+                visits=keep.get("newVisits"),
+                bookmarks=dash.get("onlineBookmarks"),
+                new_emails=keep.get("newEmails"),
+                is_ad_hidden=keep.get("isAdHidden"),
+                available=dash.get("userSetting", {}).get("availability", {}).get("available"),
+                availability_remaining=str(dash.get("userSetting", {}).get("availability", {}).get("validTo", "")),
+                headline=assets.get("headline"),
+                description_len=len(assets.get("description", "")),
+                city=self.city,
+            )
+
+            log.info("Stats recorded: views=%s contacts=%s visits=%s bookmarks=%s",
+                     prof_stats.get("totalPageViews"),
+                     prof_stats.get("totalContactClicks"),
+                     keep.get("newVisits"),
+                     dash.get("onlineBookmarks"))
+
+            self.current_state = {
+                "views": prof_stats.get("totalPageViews"),
+                "contacts": prof_stats.get("totalContactClicks"),
+                "visits": keep.get("newVisits"),
+                "bookmarks": dash.get("onlineBookmarks"),
+                "is_ad_hidden": keep.get("isAdHidden"),
+                "available": dash.get("userSetting", {}).get("availability", {}).get("available"),
+                "headline": assets.get("headline"),
+            }
+            receipt("collect_stats", True, "Traffic stats collected")
+        except Exception as e:
+            receipt("collect_stats", False, str(e))
+            log.error("Stats collection failed: %s", e)
+
+    def check_search_position(self):
+        """Check search position for target city."""
+        try:
+            results = self.api.search(self.city, available_only=False, page=1)
+            avail_results = self.api.search(self.city, available_only=True, page=1)
+
+            # Find our position by looking for our username in result items
+            pos = self._find_position(results)
+            avail_pos = self._find_position(avail_results)
+
+            total = len(results.get("masseurs", [])) if isinstance(results.get("masseurs"), list) else 0
+            avail_total = len(avail_results.get("masseurs", [])) if isinstance(avail_results.get("masseurs"), list) else 0
+
+            record_stats(
+                city=self.city,
+                search_position=pos,
+                search_available_position=avail_pos,
+                search_total=total,
+                search_available_total=avail_total,
+            )
+            log.info("Search position: #%s/%s (available #%s/%s)", pos, total, avail_pos, avail_total)
+            receipt("check_search_position", True,
+                    f"Position #{pos}/{total}, available #{avail_pos}/{avail_total}")
+        except Exception as e:
+            receipt("check_search_position", False, str(e))
+            log.error("Search position check failed: %s", e)
+
+    def _find_position(self, results: Dict) -> Optional[int]:
+        masseurs = results.get("masseurs") if isinstance(results.get("masseurs"), list) else []
+        for i, m in enumerate(masseurs):
+            uname = (m.get("username") or m.get("userCard", {}).get("username") or "").lower()
+            if uname == self.username.lower():
+                return i + 1
+        return None
+
+    def bio_experiment(self, auto_apply: bool = False):
+        """Run controlled bio experiment with LLM-driven analysis. One change per day."""
+        try:
+            # Check if we already changed bio today
+            conn = db()
+            row = conn.execute(
+                "SELECT ts FROM bio_versions WHERE applied=1 ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+            conn.close()
+            if row:
+                last_change = datetime.fromisoformat(row["ts"])
+                if datetime.now(timezone.utc) - last_change < timedelta(days=1):
+                    log.info("Bio experiment: skipped — last change was within 24h")
+                    return
+
+            # Pull real profile data for LLM analysis
+            profile_data = self.api.full_status()
+            about = profile_data.get("about", {})
+            assets = about.get("userProps", {}).get("assets", {})
+            current_headline = assets.get("headline", "")
+            current_desc = assets.get("description", "")
+
+            # Get recent stats history
+            conn = db()
+            stats_history = [dict(r) for r in conn.execute(
+                "SELECT ts, views, contact_clicks, visits FROM stats ORDER BY ts DESC LIMIT 7"
+            ).fetchall()]
+            conn.close()
+
+            # Generate with LLM
+            from rm_traffic.llm_bio_writer import generate_bio_with_llm
+            suggestion = generate_bio_with_llm(
+                profile_data, stats_history, current_headline, current_desc,
+                city=self.city, provider=os.environ.get("LLM_PROVIDER"),
+                model=os.environ.get("LLM_MODEL")
+            )
+
+            # Fallback to templates if LLM fails
+            if not suggestion:
+                suggestion = suggest_bio(current_headline, current_desc)
+                log.warning("LLM bio generation failed, using template fallback")
+
+            stats = self.api.get_stats()
+            views_before = (stats.get("profileStatistics") or {}).get("totalPageViews")
+            contacts_before = (stats.get("profileStatistics") or {}).get("totalContactClicks")
+
+            conn = db()
+            conn.execute(
+                "INSERT INTO bio_versions (ts, headline, description, reason, applied, views_before, contacts_before) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (datetime.now(timezone.utc).isoformat(), suggestion["headline"],
+                 suggestion["bio"], "llm_daily_variant", 0, views_before, contacts_before)
+            )
+            conn.commit()
+            conn.close()
+
+            log.info("Bio experiment suggestion: headline='%s'", suggestion["headline"])
+
+            if auto_apply:
+                before = {"headline": current_headline, "description": current_desc[:200]}
+                self.api.set_about(suggestion["headline"], suggestion["bio"])
+                conn = db()
+                conn.execute(
+                    "UPDATE bio_versions SET applied=1 WHERE ts=(SELECT ts FROM bio_versions ORDER BY ts DESC LIMIT 1)"
+                )
+                conn.commit()
+                conn.close()
+                after = {"headline": suggestion["headline"], "description": suggestion["bio"][:200]}
+                receipt("bio_experiment", True, "Applied new LLM bio variant", before, after)
+                log.info("Bio experiment applied (auto)")
+            else:
+                receipt("bio_experiment", True,
+                        f"LLM bio variant drafted (not applied). Headline: {suggestion['headline']}")
+                record_alert("info", "bio_suggestion",
+                             f"New LLM bio variant drafted: {suggestion['headline']}")
+        except Exception as e:
+            receipt("bio_experiment", False, str(e))
+            log.error("Bio experiment failed: %s", e)
+
+    def draft_blog_post(self):
+        """Draft a blog post. Never auto-publish."""
+        draft = draft_blog()
+        receipt("draft_blog", True, f"Drafted blog: {draft['title']}")
+        log.info("Blog draft (not published): %s", draft["title"])
+        return draft
+
+    def print_dashboard(self):
+        """Print current status dashboard."""
+        try:
+            dash = self.api.get_dashboard()
+            stats = self.api.get_stats()
+            keep = self.api.get_keeponline()
+            about = self.api.get_about()
+            avail = self.api.get_availability()
+
+            prof = stats.get("profileStatistics", {}) or {}
+            assets = about.get("userProps", {}).get("assets", {})
+            us = dash.get("userSetting", {})
+
+            print(f"\n{'='*60}")
+            print(f"  PROFILEOPS DASHBOARD")
+            print(f"{'='*60}")
+            print(f"  Timestamp: {datetime.now(timezone.utc).isoformat()[:19]} UTC")
+            print(f"  Username:  {self.username}")
+            print(f"  Visibility: {'HIDDEN' if keep.get('isAdHidden') else 'SHOWN'}")
+            print(f"  Availability: {us.get('availability', {}).get('message', 'N/A')} "
+                  f"(validTo={us.get('availability', {}).get('validTo', 'N/A')})")
+            print(f"  Profile Views:   {prof.get('totalPageViews', 'N/A')}")
+            print(f"  Contact Clicks:  {prof.get('totalContactClicks', 'N/A')}")
+            print(f"  New Visits:      {keep.get('newVisits', 'N/A')}")
+            print(f"  New Emails:      {keep.get('newEmails', 'N/A')}")
+            print(f"  Bookmarks:       {dash.get('onlineBookmarks', 'N/A')}")
+            print(f"  Headline:        {assets.get('headline', 'N/A')}")
+            print(f"  Description:     {len(assets.get('description', ''))} chars")
+            print(f"  Track Actions:   {'ON' if us.get('trackActions') else 'OFF'}")
+            print(f"  SMS Alerts:      {'ON' if us.get('sms') else 'OFF'}")
+            print(f"{'='*60}\n")
+            receipt("print_dashboard", True, "Dashboard printed")
+        except Exception as e:
+            receipt("print_dashboard", False, str(e))
+            log.error("Dashboard print failed: %s", e)
+
+    def cycle(self):
+        """One daemon cycle."""
+        now = time.time()
+
+        if now - self.last_visibility_check >= VISIBILITY_CHECK_INTERVAL:
+            self.ensure_visible()
+            self.last_visibility_check = now
+
+        if now - self.last_avail_check >= AVAIL_CHECK_INTERVAL:
+            self.ensure_available()
+            self.last_avail_check = now
+
+        if now - self.last_stats_check >= STATS_INTERVAL:
+            self.collect_stats()
+            self.check_search_position()
+            self.last_stats_check = now
+
+        if now - self.last_bio_check >= BIO_EXPERIMENT_INTERVAL:
+            self.bio_experiment(auto_apply=False)
+            self.last_bio_check = now
+
+        if now - self.last_dashboard_print >= DASHBOARD_INTERVAL:
+            self.print_dashboard()
+            self.last_dashboard_print = now
+
+    def run_once(self):
+        if not self.login():
+            return
+        self.print_dashboard()
+        self.ensure_visible()
+        self.ensure_available()
+        self.collect_stats()
+        self.check_search_position()
+        self.bio_experiment(auto_apply=False)
+        draft = self.draft_blog_post()
+        print(f"\nBlog draft (not published):\n{draft['title']}\n{draft['body']}\n")
+
+    def run_daemon(self):
+        log.info("=== ProfileOps daemon starting ===")
+        if not self.login():
+            log.error("Initial login failed, retrying in 60s")
+            time.sleep(60)
+            if not self.login():
+                log.error("Login failed twice, exiting")
+                return
+
+        self.print_dashboard()
+        while self.running:
+            try:
+                self.cycle()
+            except KeyboardInterrupt:
+                log.info("Shutdown requested")
+                self.running = False
                 break
-        else:
-            continue
-        break
-
-    dismiss_popups(driver)
-    ok = "/login" not in driver.current_url
-    log.info("Login: %s", "OK" if ok else "FAILED")
-    return ok
+            except Exception as e:
+                log.error("Cycle error: %s", e)
+                receipt("daemon_cycle", False, str(e))
+                time.sleep(30)
+            time.sleep(60)
+        log.info("ProfileOps daemon stopped")
 
 
 # ---------------------------------------------------------------------------
-# Actions
+# CLI commands
 # ---------------------------------------------------------------------------
 
-def action_load_settings(cap):
-    cap.mark()
-    cap.driver.get(f"{BASE_URL}/settings")
-    time.sleep(6)
-    dismiss_popups(cap.driver)
-    time.sleep(2)  # extra time for async calls
-    return "load_settings", cap.capture_new()
+def cmd_status(ops: ProfileOps):
+    if not ops.login():
+        print("Login failed")
+        sys.exit(1)
+    ops.print_dashboard()
 
 
-def action_open_availability_modal(cap):
-    cap.driver.get(f"{BASE_URL}/settings?availability=1")
-    time.sleep(5)
-    dismiss_popups(cap.driver)
-    cap.mark()
+def cmd_once(ops: ProfileOps):
+    ops.run_once()
+
+
+def cmd_history():
+    conn = db()
+    print("\n=== RECENT ACTIONS ===")
+    for r in conn.execute("SELECT * FROM receipts ORDER BY ts DESC LIMIT 30"):
+        print(f"  {r['ts'][:19]} | {'OK' if r['success'] else 'FAIL'} | {r['action']:25s} | {r['detail'][:60]}")
+    print("\n=== RECENT STATS ===")
+    for r in conn.execute("SELECT * FROM stats ORDER BY ts DESC LIMIT 10"):
+        print(f"  {r['ts'][:19]} | views={r['views'] or '-':6} contacts={r['contact_clicks'] or '-':4} "
+              f"visits={r['visits'] or '-':4} | visible={r['is_ad_hidden'] or 0} avail={r['available'] or '-'} "
+              f"| pos={r['search_position'] or '-':4}/{r['search_total'] or '-':4}")
+    print("\n=== BIO VERSIONS ===")
+    for r in conn.execute("SELECT * FROM bio_versions ORDER BY ts DESC LIMIT 10"):
+        print(f"  {r['ts'][:19]} | {'APPLIED' if r['applied'] else 'DRAFT'} | {r['headline'][:50]}")
+    print("\n=== UNACKED ALERTS ===")
+    for r in conn.execute("SELECT * FROM alerts WHERE acknowledged=0 ORDER BY ts DESC LIMIT 10"):
+        print(f"  {r['ts'][:19]} | [{r['severity']:8s}] {r['type']:20s} | {r['message']}")
+    conn.close()
+
+
+def cmd_suggest_bio(ops: ProfileOps):
+    if not ops.login():
+        print("Login failed")
+        sys.exit(1)
+    ops.bio_experiment(auto_apply=False)
+    # Print the latest draft
+    conn = db()
+    row = conn.execute("SELECT * FROM bio_versions ORDER BY ts DESC LIMIT 1").fetchone()
+    conn.close()
+    if row:
+        print(f"\n=== LLM BIO SUGGESTION ===")
+        print(f"Headline: {row['headline']}")
+        print(f"\nBio:\n{row['description']}")
+        print(f"\nApplied: {bool(row['applied'])}")
+        print(f"Views before: {row['views_before']}")
+        print(f"Contacts before: {row['contacts_before']}")
+
+
+
+def cmd_set_bio(ops: ProfileOps):
+    if not ops.login():
+        print("Login failed")
+        sys.exit(1)
+    about = ops.api.get_about()
+    assets = about.get("userProps", {}).get("assets", {})
+    before = {"headline": assets.get("headline"), "description": assets.get("description")}
+    print("Enter headline:")
+    headline = input("> ")
+    print("Enter description (Ctrl+D when done):")
+    desc_lines = []
     try:
-        panel = cap.driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
-        cap.driver.execute_script("arguments[0].click();", panel)
-        time.sleep(3)
-    except Exception:
+        while True:
+            desc_lines.append(input())
+    except EOFError:
         pass
-    return "open_availability_modal", cap.capture_new()
+    description = "\n".join(desc_lines)
+    ops.api.set_about(headline, description)
+    after = {"headline": headline, "description": description}
+    receipt("set_bio", True, "Manual bio update", before, after)
+    print("Bio updated.")
 
 
-def action_set_availability(cap):
-    driver = cap.driver
-    driver.get(f"{BASE_URL}/settings?availability=1")
-    time.sleep(5)
-    dismiss_popups(driver)
-    try:
-        panel = driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
-        driver.execute_script("arguments[0].click();", panel)
-        time.sleep(2)
-    except Exception:
-        pass
+def main():
+    parser = argparse.ArgumentParser(description="ProfileOps — RentMasseur Profile Operations Agent")
+    parser.add_argument("--daemon", action="store_true", help="Run as daemon")
+    parser.add_argument("--status", action="store_true", help="Print current status")
+    parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
+    parser.add_argument("--history", action="store_true", help="Show history and stats")
+    parser.add_argument("--suggest-bio", action="store_true", help="Generate bio variant draft via LLM")
+    parser.add_argument("--set-bio", action="store_true", help="Manually set bio via stdin")
+    parser.add_argument("--city", default="manhattan-ny", help="City to track search position")
+    parser.add_argument("--llm-provider", default="ollama", help="ollama/groq/openrouter")
+    parser.add_argument("--llm-model", help="Model name, e.g. llama-3.1-8b-instant")
+    parser.add_argument("--manual-captcha", action="store_true", help="Open visible browser for manual captcha solve")
+    args = parser.parse_args()
 
-    cap.mark()
+    init_db()
 
-    # Select Available
-    for by, sel in [
-        (By.XPATH, "//label[contains(text(),'Available')]"),
-        (By.XPATH, "//*[contains(text(),'Available') and not(contains(text(),'Not')) and not(contains(text(),'Status'))]"),
-        (By.CSS_SELECTOR, "input[type='radio']"),
-    ]:
-        try:
-            els = driver.find_elements(by, sel)
-            for el in els:
-                if el.is_displayed():
-                    driver.execute_script("arguments[0].click();", el)
-                    time.sleep(0.5)
-                    break
-        except Exception:
-            pass
+    username = os.environ.get("RM_USER")
+    password = os.environ.get("RM_PASS")
+    if not username or not password:
+        print("ERROR: Set RM_USER and RM_PASS environment variables.")
+        print("Do not hardcode credentials.")
+        sys.exit(1)
 
-    # Duration
-    from selenium.webdriver.support.ui import Select
-    for sel_el in driver.find_elements(By.CSS_SELECTOR, "select"):
-        try:
-            s = Select(sel_el)
+    os.environ.setdefault("LLM_PROVIDER", args.llm_provider)
+    if args.llm_model:
+        os.environ.setdefault("LLM_MODEL", args.llm_model)
+
+    ops = ProfileOps(username, password, city=args.city, manual_captcha=args.manual_captcha)
+
+    if args.status:
+        cmd_status(ops)
+    elif args.once:
+        cmd_once(ops)
+    elif args.history:
+        cmd_history()
+    elif args.suggest_bio:
+        cmd_suggest_bio(ops)
+    elif args.set_bio:
+        cmd_set_bio(ops)
+    elif args.daemon:
+        ops.run_daemon()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+analyze_bios.py:
+```
+import json
+
+bios = [json.loads(l) for l in open("rm_traffic/data/real_bios_with_views.jsonl")]
+bios.sort(key=lambda b: b.get("views_per_day", 0), reverse=True)
+
+print("=" * 80)
+print("TOP 15 BIOS BY VIEWS/DAY")
+print("=" * 80)
+for i, b in enumerate(bios[:15]):
+    r = float(b.get("ratingAverage", 0) or 0)
+    vpd = b.get("views_per_day", 0)
+    print(f"\n#{i+1} {b['username']} | {b['city']} | {vpd:.1f} v/day | {b['visits']} visits | R={r} Rev={b['reviewsCount']}")
+    print(f"  HEADLINE: {b['headline']}")
+    print(f"  SINCE: {b['member_since']} ({b['days_online']} days)")
+    print(f"  SERVICES: {b.get('services', [])}")
+    desc = b["description"].replace("\n", " ")
+    print(f"  DESC: {desc[:500]}")
+
+print("\n" + "=" * 80)
+print("BOTTOM 5")
+print("=" * 80)
+for i, b in enumerate(bios[-5:]):
+    r = float(b.get("ratingAverage", 0) or 0)
+    vpd = b.get("views_per_day", 0)
+    rank = len(bios) - 4 + i
+    print(f"\n#{rank} {b['username']} | {vpd:.1f} v/day | {b['visits']} visits | R={r} Rev={b['reviewsCount']}")
+    print(f"  HEADLINE: {b['headline']}")
+    desc = b["description"].replace("\n", " ")
+    print(f"  DESC: {desc[:300]}")
+
+# Pattern analysis
+print("\n" + "=" * 80)
+print("PATTERN ANALYSIS")
+print("=" * 80)
+
+top10 = bios[:10]
+bot10 = bios[-10:]
+
+def avg(lst):

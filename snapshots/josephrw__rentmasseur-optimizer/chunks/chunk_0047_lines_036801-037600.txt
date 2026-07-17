@@ -1,800 +1,800 @@
-    conn.execute(
-        "INSERT INTO availability_log (ts, action, status, hours, minutes, duration_set, success, detail) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), action, status, hours, minutes,
-         duration_set, int(success), detail)
-    )
-    conn.commit()
-    conn.close()
+            try:
+                api.set_availability(option=1, duration=1)
+                state.available = True
+                self.pulse_start = time.time()
+                state.refreshes_executed += 1
+                _record(state, self.name, "pulse_on", f"hour={hour} after {self.PULSE_OFF}s")
+                return {"algo": self.name, "action": "pulse_on", "hour": hour}
+            except Exception as e:
+                return {"algo": self.name, "action": "error", "error": str(e)}
+        return {"algo": self.name, "action": "noop"}
 
-def log_stats(views, contacts, bookmarks, who_saw, membership, visibility,
-              avail_status, avail_remaining):
-    conn = db()
-    conn.execute(
-        "INSERT INTO stats_log (ts, profile_views, contact_clicks, online_bookmarks, "
-        "who_saw_me, membership_status, visibility, availability_status, availability_remaining) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), views, contacts, bookmarks,
-         who_saw, membership, visibility, avail_status, avail_remaining)
-    )
-    conn.commit()
-    conn.close()
 
-def log_search_position(city, position, total, available_now, username):
-    conn = db()
-    conn.execute(
-        "INSERT INTO search_position (ts, city, position, total_results, available_now, username) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), city, position, total, available_now, username)
-    )
-    conn.commit()
-    conn.close()
+# ═══════════════════════════════════════════════════════════════════
+# Algo 7: GeoRotation — rotate timing for multiple timezone waves
+# ═══════════════════════════════════════════════════════════════════
 
-def log_alert(atype, severity, message):
-    conn = db()
-    conn.execute(
-        "INSERT INTO alerts (ts, type, severity, message) VALUES (?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), atype, severity, message)
-    )
-    conn.commit()
-    conn.close()
-    log.warning("ALERT [%s] %s: %s", severity, atype, message)
+class GeoRotation:
+    """Stagger availability to catch ET, CT, PT traffic waves."""
 
-# ---------------------------------------------------------------------------
-# Browser
-# ---------------------------------------------------------------------------
+    name = "geo_rotation"
+    # ET peak: 8-11, 19-23 | CT peak: 9-12, 20-00 | PT peak: 11-14, 22-02
+    # Combined: ensure availability 8-14 and 19-02
+    GEO_PEAKS = [(8, 14), (19, 24), (0, 2)]
 
-class Browser:
-    """Managed Chrome instance with session persistence."""
+    def should_fire(self, state: AlgoState) -> bool:
+        hour = state.current_hour
+        in_peak = any(start <= hour < end for start, end in self.GEO_PEAKS)
+        return in_peak and not state.available
+
+    def execute(self, api, state: AlgoState) -> Dict:
+        hour = state.current_hour
+        # Calculate duration until peak window ends
+        duration = 2
+        for start, end in self.GEO_PEAKS:
+            if start <= hour < end:
+                duration = min(6, end - hour)
+                break
+        try:
+            api.set_availability(option=1, duration=duration)
+            state.available = True
+            state.refreshes_executed += 1
+            _record(state, self.name, "geo_sync", f"hour={hour} dur={duration}h")
+            return {"algo": self.name, "action": "geo_sync", "hour": hour, "duration": duration}
+        except Exception as e:
+            _record(state, self.name, "error", str(e))
+            return {"algo": self.name, "action": "error", "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Algo 8: EngagementTrigger — refresh after visit/message
+# ═══════════════════════════════════════════════════════════════════
+
+class EngagementTrigger:
+    """Immediately refresh availability after receiving a visit or message."""
+
+    name = "engagement_trigger"
+    COOLDOWN = 300  # 5 min between triggers
 
     def __init__(self):
-        self.driver = None
-        self.logged_in = False
-        self.last_login = 0
+        self.last_trigger = 0
 
-    def start(self):
-        opts = Options()
-        opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument(f"--user-data-dir={CHROME_PROFILE}")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        self.driver = webdriver.Chrome(options=opts)
-        # Remove webdriver flag
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        })
-        log.info("Browser started (profile: %s)", CHROME_PROFILE)
-
-    def stop(self):
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-        self.driver = None
-        self.logged_in = False
-        log.info("Browser stopped")
-
-    def _dismiss_popups(self):
-        time.sleep(1)
-        for xpath in [
-            "//button[contains(text(),'Not now')]",
-            "//button[contains(text(),'Accept all')]",
-            "//button[contains(text(),'Close')]",
-            "//*[contains(@aria-label,'Close')]",
-        ]:
-            try:
-                for el in self.driver.find_elements(By.XPATH, xpath):
-                    if el.is_displayed():
-                        el.click()
-                        time.sleep(0.5)
-            except Exception:
-                pass
-
-    def login(self, force=False):
-        if self.logged_in and not force and (time.time() - self.last_login < 3600):
-            return True
-        if not self.driver:
-            self.start()
-
-        log.info("Logging in as %s...", USERNAME)
-        self.driver.get(f"{BASE_URL}/login")
-        time.sleep(4)
-        self._dismiss_popups()
-
-        # Find login fields
-        email = None
-        pwd = None
-        for inp in self.driver.find_elements(By.CSS_SELECTOR, "input"):
-            itype = (inp.get_attribute("type") or "").lower()
-            iname = (inp.get_attribute("name") or "").lower()
-            if itype == "email" or "email" in iname or "user" in iname:
-                if inp.is_displayed():
-                    email = inp
-            if itype == "password" and inp.is_displayed():
-                pwd = inp
-
-        if not email or not pwd:
-            log.error("Login fields not found")
-            log_availability("login", success=False, detail="fields not found")
-            return False
-
-        email.clear()
-        email.send_keys(USERNAME)
-        pwd.clear()
-        pwd.send_keys(PASSWORD)
-        time.sleep(0.3)
-
-        # Click login button
-        clicked = False
-        for by, sel in [
-            (By.CSS_SELECTOR, "button[type='submit']"),
-            (By.XPATH, "//button[contains(text(),'LOG')]"),
-            (By.XPATH, "//button[contains(text(),'Log')]"),
-            (By.CSS_SELECTOR, "form button"),
-        ]:
-            for el in self.driver.find_elements(by, sel):
-                if el.is_displayed():
-                    el.click()
-                    clicked = True
-                    break
-            if clicked:
-                break
-
-        if not clicked:
-            log.error("Login button not found")
-            return False
-
-        time.sleep(6)
-        self._dismiss_popups()
-
-        # Verify login
-        url = self.driver.current_url
-        if "/login" in url:
-            log.error("Login failed — still on login page")
-            log_availability("login", success=False, detail="redirected back to login")
-            return False
-
-        self.logged_in = True
-        self.last_login = time.time()
-        log.info("Login successful. URL: %s", url)
-        log_availability("login", success=True, detail=url)
-        return True
-
-    def ensure_session(self):
-        """Check if session is still valid, re-login if not."""
-        if not self.driver:
-            return self.login()
-        try:
-            self.driver.get(f"{BASE_URL}/settings")
-            time.sleep(3)
-            if "/login" in self.driver.current_url:
-                log.info("Session expired, re-logging in...")
-                return self.login(force=True)
-            return True
-        except WebDriverException as e:
-            log.warning("Session check failed: %s", e)
-            return self.login(force=True)
-
-    def get_settings_data(self):
-        """Fetch settings page and extract all profile data."""
-        if not self.ensure_session():
-            return None
-        self.driver.get(f"{BASE_URL}/settings")
-        time.sleep(5)
-        self._dismiss_popups()
-        try:
-            body = self.driver.find_element(By.TAG_NAME, "body").text
-        except Exception:
-            return None
-        return body
-
-    def set_available(self, duration=1):
-        """Set availability to 'Available' with given duration (hours)."""
-        if not self.ensure_session():
-            return False
-
-        log.info("Setting availability: Available, %dh", duration)
-        self.driver.get(f"{BASE_URL}/settings?availability=1")
-        time.sleep(5)
-        self._dismiss_popups()
-
-        # Check current status first
-        body = self.driver.find_element(By.TAG_NAME, "body").text
-        match = re.search(r'Status:\s*Available\s*(\d+)h\s*:\s*(\d+)m', body)
-        if match:
-            hours = int(match.group(1))
-            mins = int(match.group(2))
-            total_mins = hours * 60 + mins
-            if total_mins > 10:
-                log.info("Already available (%dh:%dm remaining), skipping", hours, mins)
-                log_availability("skip", status="Available", hours=hours,
-                                 minutes=mins, success=True, detail="sufficient time remaining")
-                return True
-
-        # Click the availability panel to open modal
-        try:
-            avail_panel = self.driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
-            avail_panel.click()
-            time.sleep(2)
-        except (NoSuchElementException, StaleElementReferenceException):
-            log.warning("Could not click availability panel")
-            log_availability("set", success=False, detail="panel not found")
-            return False
-
-        # Wait for modal and find "Available" option
-        time.sleep(1)
-        clicked_available = False
-        for by, sel in [
-            (By.XPATH, "//label[contains(text(),'Available')]"),
-            (By.XPATH, "//*[contains(text(),'Available') and not(contains(text(),'Not')) and not(contains(text(),'Status'))]"),
-            (By.CSS_SELECTOR, "input[type='radio'][value='1']"),
-            (By.CSS_SELECTOR, "input[type='radio']"),
-        ]:
-            try:
-                els = self.driver.find_elements(by, sel)
-                for el in els:
-                    if el.is_displayed():
-                        el.click()
-                        clicked_available = True
-                        log.info("Selected 'Available'")
-                        break
-            except Exception:
-                pass
-            if clicked_available:
-                break
-
-        if not clicked_available:
-            log.warning("Could not select 'Available' option")
-            log_availability("set", success=False, detail="could not select Available")
-            return False
-
-        # Select duration
-        time.sleep(0.5)
-        for sel_el in self.driver.find_elements(By.CSS_SELECTOR, "select"):
-            try:
-                from selenium.webdriver.support.ui import Select
-                sel = Select(sel_el)
-                options = [o.text for o in sel.options]
-                target = f"{duration} Hour" if duration == 1 else f"{duration} Hours"
-                if target in options:
-                    sel.select_by_visible_text(target)
-                    log.info("Selected duration: %s", target)
-                    break
-            except Exception:
-                pass
-
-        # Click SET button
-        time.sleep(0.5)
-        set_clicked = False
-        for by, sel in [
-            (By.XPATH, "//button[contains(text(),'SET')]"),
-            (By.XPATH, "//button[contains(text(),'Set')]"),
-        ]:
-            try:
-                els = self.driver.find_elements(by, sel)
-                for el in els:
-                    if el.is_displayed():
-                        el.click()
-                        set_clicked = True
-                        log.info("Clicked SET")
-                        break
-            except Exception:
-                pass
-            if set_clicked:
-                break
-
-        if not set_clicked:
-            log.warning("SET button not found")
-            log_availability("set", success=False, detail="SET button not found")
-            return False
-
-        time.sleep(3)
-        # Verify
-        body = self.driver.find_element(By.TAG_NAME, "body").text
-        if "Status: Available" in body:
-            match = re.search(r'Status:\s*Available\s*(\d+)h\s*:\s*(\d+)m', body)
-            if match:
-                h, m = int(match.group(1)), int(match.group(2))
-                log.info("Availability confirmed: %dh:%dm", h, m)
-                log_availability("set", status="Available", hours=h, minutes=m,
-                                 duration_set=duration, success=True)
-                return True
-
-        log.warning("Availability set but could not verify")
-        log_availability("set", success=True, detail="could not verify")
-        return True
-
-    def get_stats(self):
-        """Extract profile statistics from settings page."""
-        body = self.get_settings_data()
-        if not body:
-            return None
-
-        stats = {
-            "profile_views": None,
-            "contact_clicks": None,
-            "online_bookmarks": None,
-            "who_saw_me": None,
-            "membership_status": None,
-            "visibility": None,
-            "availability_status": None,
-            "availability_remaining": None,
-        }
-
-        # Profile Views: 77999
-        m = re.search(r'Profile Views:\s*([\d,]+)', body)
-        if m:
-            stats["profile_views"] = int(m.group(1).replace(",", ""))
-
-        # Who Saw Me: 30
-        m = re.search(r'Who Saw Me\s*(\d+)', body)
-        if m:
-            stats["who_saw_me"] = int(m.group(1))
-
-        # Online bookmarks
-        m = re.search(r'(\d+)\s*online', body)
-        if m:
-            stats["online_bookmarks"] = int(m.group(1))
-
-        # Membership
-        m = re.search(r'Profile Status:\s*(\w+)', body)
-        if m:
-            stats["membership_status"] = m.group(1)
-
-        # Visibility
-        if "Profile hidden" in body:
-            stats["visibility"] = "hidden"
-        elif "Profile shown" in body:
-            stats["visibility"] = "shown"
-
-        # Availability
-        m = re.search(r'Status:\s*(Available|Not Available|Not Set)\s*(\d+h\s*:\s*\d+m)?', body)
-        if m:
-            stats["availability_status"] = m.group(1)
-            stats["availability_remaining"] = m.group(2) or ""
-
-        # Contact clicks from ad statistics
-        m = re.search(r'Contact Me\s*clicks\s*([\d,]+)', body)
-        if m:
-            stats["contact_clicks"] = int(m.group(1).replace(",", ""))
-
-        return stats
-
-    def check_search_position(self, city="Manhattan, NY"):
-        """Check profile position in search results for a city."""
-        if not self.ensure_session():
-            return None
-
-        city_slug = city.lower().replace(", ", "-").replace(" ", "-")
-        url = f"{BASE_URL}/gay-massage/{city_slug}/"
-        log.info("Checking search position at %s", url)
-        self.driver.get(url)
-        time.sleep(5)
-        self._dismiss_popups()
-
-        # Find all masseur profile links
-        body = self.driver.find_element(By.TAG_NAME, "body").text
-
-        # Find profile cards/links
-        profile_links = []
-        for el in self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/']"):
-            href = el.get_attribute("href") or ""
-            text = el.text.strip().lower()
-            # Profile links are like /Username
-            if href.startswith(f"{BASE_URL}/") and not any(x in href for x in [
-                "login", "settings", "search", "blog", "reviews", "interviews",
-                "available", "find-massage", "live-cams", "sitemap", "advertise",
-                "mailbox", "static", "_next", "images",
-            ]):
-                parts = href.replace(f"{BASE_URL}/", "").split("/")
-                if parts and parts[0] and len(parts) == 1:
-                    profile_links.append((parts[0].lower(), href))
-
-        # Find our position
-        username_lower = USERNAME.lower()
-        position = None
-        for i, (uname, href) in enumerate(profile_links):
-            if uname == username_lower:
-                position = i + 1
-                break
-
-        # Check available now filter
-        avail_url = f"{url}?available=1"
-        self.driver.get(avail_url)
-        time.sleep(4)
-        self._dismiss_popups()
-
-        avail_links = []
-        for el in self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/']"):
-            href = el.get_attribute("href") or ""
-            if href.startswith(f"{BASE_URL}/") and not any(x in href for x in [
-                "login", "settings", "search", "blog", "reviews", "interviews",
-                "available", "find-massage", "live-cams", "sitemap", "advertise",
-                "mailbox", "static", "_next", "images",
-            ]):
-                parts = href.replace(f"{BASE_URL}/", "").split("/")
-                if parts and parts[0] and len(parts) == 1:
-                    avail_links.append(parts[0].lower())
-
-        avail_position = None
-        for i, uname in enumerate(avail_links):
-            if uname == username_lower:
-                avail_position = i + 1
-                break
-
-        total = len(profile_links)
-        total_avail = len(avail_links)
-
-        result = {
-            "city": city,
-            "position": position,
-            "total": total,
-            "available_position": avail_position,
-            "available_total": total_avail,
-        }
-
-        log.info("Search position: #%d/%d (available: #%s/%d) in %s",
-                 position or -1, total,
-                 avail_position or "N/A", total_avail, city)
-
-        log_search_position(city, position or 0, total, total_avail, USERNAME)
-
-        if position and position > 20:
-            log_alert("ranking_drop", "warning",
-                      f"Position dropped to #{position} in {city}")
-
-        return result
-
-# ---------------------------------------------------------------------------
-# Daemon
-# ---------------------------------------------------------------------------
-
-class TrafficEngine:
-    """Main daemon loop."""
-
-    def __init__(self, watch_city=None):
-        self.browser = Browser()
-        self.watch_city = watch_city
-        self.running = True
-        self.last_refresh = 0
-        self.last_stats = 0
-        self.last_search = 0
-        self.prev_stats = None
-
-    def cycle(self):
-        """One daemon cycle — check what needs doing."""
+    def should_fire(self, state: AlgoState) -> bool:
         now = time.time()
+        if (now - self.last_trigger) < self.COOLDOWN:
+            return False
+        # Fire if recent visit or message within last 2 min
+        recent_visit = (now - state.last_visit) < 120
+        recent_msg = (now - state.last_message) < 120
+        return recent_visit or recent_msg
 
-        # Availability refresh
-        if now - self.last_refresh >= REFRESH_INTERVAL:
+    def execute(self, api, state: AlgoState) -> Dict:
+        try:
+            api.set_availability(option=1, duration=5)
+            state.available = True
+            state.refreshes_executed += 1
+            self.last_trigger = time.time()
+            trigger = "visit" if (time.time() - state.last_visit) < 120 else "message"
+            _record(state, self.name, "engagement_refresh", f"trigger={trigger}")
+            return {"algo": self.name, "action": "engagement_refresh", "trigger": trigger}
+        except Exception as e:
+            _record(state, self.name, "error", str(e))
+            return {"algo": self.name, "action": "error", "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Algo 9: BackoffRecovery — exponential backoff on API failure
+# ═══════════════════════════════════════════════════════════════════
+
+class BackoffRecovery:
+    """Never lose presence: retry with exponential backoff on API failures."""
+
+    name = "backoff_recovery"
+    MAX_RETRIES = 5
+    BASE_DELAY = 2.0
+    MAX_DELAY = 120.0
+
+    def should_fire(self, state: AlgoState) -> bool:
+        return state.api_failures > 0 and not state.available
+
+    def execute(self, api, state: AlgoState) -> Dict:
+        for attempt in range(self.MAX_RETRIES):
+            delay = min(self.MAX_DELAY, self.BASE_DELAY * (2 ** attempt))
             try:
-                self.browser.set_available(duration=1)
-                self.last_refresh = now
+                time.sleep(delay)
+                api.set_availability(option=1, duration=5)
+                state.available = True
+                state.api_failures = 0
+                _record(state, self.name, "recovered", f"attempt={attempt+1} delay={delay:.0f}s")
+                return {"algo": self.name, "action": "recovered", "attempts": attempt + 1, "delay": delay}
             except Exception as e:
-                log.error("Availability refresh failed: %s", e)
-                log_availability("set", success=False, detail=str(e))
-                # Reset browser on error
-                self.browser.stop()
-                time.sleep(5)
+                state.api_failures += 1
+                state.last_api_error = str(e)
+                _record(state, self.name, "retry", f"attempt={attempt+1} delay={delay:.0f}s err={str(e)[:80]}")
+        _record(state, self.name, "exhausted", f"failures={state.api_failures}")
+        return {"algo": self.name, "action": "exhausted", "failures": state.api_failures}
 
-        # Stats collection
-        if now - self.last_stats >= STAT_INTERVAL:
-            try:
-                stats = self.browser.get_stats()
-                if stats:
-                    log_stats(
-                        stats["profile_views"],
-                        stats["contact_clicks"],
-                        stats["online_bookmarks"],
-                        stats["who_saw_me"],
-                        stats["membership_status"],
-                        stats["visibility"],
-                        stats["availability_status"],
-                        stats["availability_remaining"],
-                    )
-                    log.info("Stats: views=%s contacts=%s bookmarks=%s who_saw=%s | %s | vis=%s | avail=%s %s",
-                             stats["profile_views"],
-                             stats["contact_clicks"],
-                             stats["online_bookmarks"],
-                             stats["who_saw_me"],
-                             stats["membership_status"],
-                             stats["visibility"],
-                             stats["availability_status"],
-                             stats["availability_remaining"])
 
-                    # Alert on changes
-                    if self.prev_stats:
-                        if stats["visibility"] == "hidden" and self.prev_stats.get("visibility") != "hidden":
-                            log_alert("visibility_hidden", "critical",
-                                      "Profile is HIDDEN — traffic will drop to zero")
-                        if stats["availability_status"] != "Available":
-                            log_alert("not_available", "warning",
-                                      f"Availability is {stats['availability_status']}")
+# ═══════════════════════════════════════════════════════════════════
+# Orchestrator — runs all 9 algos in priority order
+# ═══════════════════════════════════════════════════════════════════
 
-                    self.prev_stats = stats
-                self.last_stats = now
-            except Exception as e:
-                log.error("Stats collection failed: %s", e)
+ALL_ALGOS = [
+    BackoffRecovery(),    # 9: recover first if broken
+    RefreshCascade(),     # 4: don't let availability lapse
+    EngagementTrigger(),  # 8: capitalize on engagement
+    CompetitorGap(),      # 3: fill competitor gaps
+    PeakHourSync(),       # 2: sync to peaks
+    GeoRotation(),       # 7: timezone coverage
+    DemandPulse(),       # 6: low-traffic pulsing
+    JitterBurst(),       # 1: traffic attraction bursts
+    SearchRankBoost(),   # 5: search rank freshness
+]
 
-        # Search position check
-        if self.watch_city and (now - self.last_search >= SEARCH_CHECK_INTERVAL):
-            try:
-                self.browser.check_search_position(self.watch_city)
-                self.last_search = now
-            except Exception as e:
-                log.error("Search position check failed: %s", e)
+ALGO_NAMES = [a.name for a in ALL_ALGOS]
 
-    def run_once(self):
-        """Single cycle — for --once mode."""
-        log.info("=== Single cycle ===")
-        if not self.browser.login():
-            log.error("Login failed, aborting")
-            return
-        self.last_refresh = 0
-        self.last_stats = 0
-        self.last_search = 0
-        self.cycle()
-        self.browser.stop()
 
-    def run_daemon(self):
-        """Main daemon loop."""
-        log.info("=== Traffic Engine starting (daemon mode) ===")
-        log.info("Refresh interval: %d min | Stats: %d min | Search: %d min",
-                 REFRESH_INTERVAL // 60, STAT_INTERVAL // 60, SEARCH_CHECK_INTERVAL // 60)
-        if self.watch_city:
-            log.info("Watching search position in: %s", self.watch_city)
+def run_algos(api, state: AlgoState) -> List[Dict]:
+    """Run all algos that should fire. Returns list of results."""
+    results = []
+    for algo in ALL_ALGOS:
+        try:
+            if algo.should_fire(state):
+                result = algo.execute(api, state)
+                results.append(result)
+        except Exception as e:
+            log.error(f"algo {algo.name} crashed: {e}")
+            results.append({"algo": algo.name, "action": "crash", "error": str(e)})
+    return results
 
-        if not self.browser.login():
-            log.error("Initial login failed, retrying in 60s...")
-            time.sleep(60)
-            if not self.browser.login():
-                log.error("Login failed twice, exiting")
-                return
 
-        self.last_refresh = time.time() - REFRESH_INTERVAL + 10  # refresh soon
-        self.last_stats = time.time() - STAT_INTERVAL + 10
-        if self.watch_city:
-            self.last_search = time.time() - SEARCH_CHECK_INTERVAL + 10
+def algo_status(state: AlgoState) -> Dict[str, Any]:
+    """Get status of all algos for API response."""
+    return {
+        "available": state.available,
+        "bursts": state.bursts_executed,
+        "refreshes": state.refreshes_executed,
+        "toggles": state.toggles_executed,
+        "api_failures": state.api_failures,
+        "last_error": state.last_api_error,
+        "algos": ALGO_NAMES,
+        "recent": state.algo_history[-10:],
+    }
 
-        while self.running:
-            try:
-                self.cycle()
-            except KeyboardInterrupt:
-                log.info("Shutdown requested")
-                self.running = False
-                break
-            except Exception as e:
-                log.error("Cycle error: %s", e)
-                self.browser.stop()
-                time.sleep(30)
-                self.browser.login()
+```
 
-            time.sleep(30)  # check every 30s
+service.py:
+```
+"""
+RM Traffic Service — unified multi-tenant optimization pipeline.
 
-        self.browser.stop()
-        log.info("Engine stopped")
+Consolidates 5 overlapping systems into one service:
+  - profileops.py  (visibility, availability, stats)
+  - fortress.py    (hardened login, identity rotation, rate limiting)
+  - traffic_loop.py (30-function optimization loop)
+  - money_loop.py   (revenue funnel + LLM optimizer)
+  - engagement_engine.py (Selenium visits + messaging)
+
+Single API client. Single DB for ROI. Per-tenant credentials.
+Orchestrated cycle: collect → prioritize → execute → measure → report.
+
+Usage:
+    python3 -m rm_traffic.service --once --tenant <tenant_id>
+    python3 -m rm_traffic.service --daemon
+    python3 -m rm_traffic.service --register --username <rm_username> --display-name "John Doe"
+    python3 -m rm_traffic.service --report --tenant <tenant_id>
+    python3 -m rm_traffic.service --list-tenants
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+
+# .env loading
+ENV_PATH = Path(__file__).parent.parent / ".env"
+if ENV_PATH.exists():
+    for line in open(ENV_PATH):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+from .api_client import RentMasseurAPI
+from .auth import AuthSession
+from .llm_client import generate_with_fallback
+from . import roi_algorithm as roi
+
+log = logging.getLogger("rm_service")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+SERVICE_DB = Path(__file__).parent / "service.db"
+NY_CITIES = [
+    "manhattan-ny", "brooklyn-ny", "queens-ny",
+    "bronx-ny", "staten-island-ny", "long-island-ny", "westchester-ny",
+]
+
+# Valid actions the orchestrator can execute
+VALID_ACTIONS = {
+    "refresh_availability", "ensure_visible", "send_messages",
+    "visit_profiles", "update_bio", "check_search_rank",
+    "multi_city_rank", "engagement_stats", "sms_alerts",
+    "track_actions", "adjust_rates",
+}
+
+
+def _sdb():
+    conn = sqlite3.connect(str(SERVICE_DB))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_db():
+    conn = _sdb()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS service_cycles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant_id TEXT NOT NULL,
+        ts TEXT NOT NULL,
+        cycle_num INTEGER,
+        actions_executed INTEGER,
+        actions_passed INTEGER,
+        llm_calls INTEGER,
+        views_before INTEGER,
+        views_after INTEGER,
+        contacts_before INTEGER,
+        contacts_after INTEGER,
+        emails_before INTEGER,
+        emails_after INTEGER,
+        search_rank_before INTEGER,
+        search_rank_after INTEGER,
+        receipt_hash TEXT
+    );
+    CREATE TABLE IF NOT EXISTS tenant_credentials (
+        tenant_id TEXT PRIMARY KEY,
+        rm_username TEXT NOT NULL,
+        rm_password_encrypted TEXT NOT NULL,
+        session_json TEXT,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cycles_tenant ON service_cycles(tenant_id, ts);
+    """)
+    conn.commit()
+    conn.close()
+    roi.init_db()
+
 
 # ---------------------------------------------------------------------------
-# Stats Report
+# Credential Storage (simple obfuscation — not plaintext at rest)
 # ---------------------------------------------------------------------------
 
-def print_stats():
-    conn = db()
-    print("\n=== TRAFFIC STATS SUMMARY ===\n")
+_OBF_KEY = os.environ.get("RM_SERVICE_KEY", "rm_traffic_service_v1")
 
-    # Availability history
-    rows = conn.execute(
-        "SELECT * FROM availability_log ORDER BY ts DESC LIMIT 20"
-    ).fetchall()
-    print(f"--- Availability (last {len(rows)} events) ---")
-    for r in rows:
-        print(f"  {r['ts'][:19]} | {r['action']:6s} | status={r['status'] or '-':12s} "
-              f"remaining={r['hours'] or 0}h{r['minutes'] or 0}m | success={bool(r['success'])}")
 
-    # Stats history
-    rows = conn.execute(
-        "SELECT * FROM stats_log ORDER BY ts DESC LIMIT 20"
-    ).fetchall()
-    print(f"\n--- Profile Stats (last {len(rows)} samples) ---")
-    for r in rows:
-        print(f"  {r['ts'][:19]} | views={r['profile_views'] or '-':6} "
-              f"contacts={r['contact_clicks'] or '-':4} "
-              f"bookmarks={r['online_bookmarks'] or '-':3} "
-              f"who_saw={r['who_saw_me'] or '-':3} "
-              f"| {r['availability_status'] or '-':12s} {r['availability_remaining'] or ''} "
-              f"| vis={r['visibility'] or '-'}")
+def _obfuscate(text: str) -> str:
+    return hashlib.sha256((_OBF_KEY + text).encode()).hexdigest()[:8] + "|" + text[::-1]
 
-    # Search positions
-    rows = conn.execute(
-        "SELECT * FROM search_position ORDER BY ts DESC LIMIT 20"
-    ).fetchall()
-    if rows:
-        print(f"\n--- Search Positions (last {len(rows)} checks) ---")
-        for r in rows:
-            print(f"  {r['ts'][:19]} | {r['city']:20s} | "
-                  f"position=#{r['position']}/{r['total_results']} "
-                  f"| available=#{r['available_now'] or 'N/A'}")
 
-    # Alerts
-    rows = conn.execute(
-        "SELECT * FROM alerts WHERE acknowledged=0 ORDER BY ts DESC LIMIT 10"
-    ).fetchall()
-    if rows:
-        print(f"\n--- Active Alerts ({len(rows)}) ---")
-        for r in rows:
-            print(f"  {r['ts'][:19]} | [{r['severity']:8s}] {r['type']:20s} | {r['message']}")
+def _deobfuscate(stored: str) -> str:
+    parts = stored.split("|", 1)
+    if len(parts) != 2:
+        return ""
+    return parts[1][::-1]
 
-    # Trend: views over time
-    rows = conn.execute(
-        "SELECT ts, profile_views FROM stats_log "
-        "WHERE profile_views IS NOT NULL ORDER BY ts ASC LIMIT 50"
-    ).fetchall()
-    if len(rows) >= 2:
-        first = rows[0]
-        last = rows[-1]
-        delta = (last["profile_views"] or 0) - (first["profile_views"] or 0)
-        print(f"\n--- View Trend ---")
-        print(f"  {first['ts'][:19]}: {first['profile_views']} views")
-        print(f"  {last['ts'][:19]}: {last['profile_views']} views")
-        print(f"  Delta: +{delta} views over {len(rows)} samples")
 
+def store_credentials(tenant_id: str, rm_username: str, rm_password: str):
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = _sdb()
+    conn.execute(
+        "INSERT OR REPLACE INTO tenant_credentials (tenant_id, rm_username, rm_password_encrypted, updated_at) VALUES (?, ?, ?, ?)",
+        (tenant_id, rm_username, _obfuscate(rm_password), ts)
+    )
+    conn.commit()
     conn.close()
 
+
+def get_credentials(tenant_id: str) -> Optional[Dict]:
+    conn = _sdb()
+    row = conn.execute("SELECT * FROM tenant_credentials WHERE tenant_id = ?", (tenant_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"username": row["rm_username"], "password": _deobfuscate(row["rm_password_encrypted"])}
+
+
 # ---------------------------------------------------------------------------
-# CLI
+# API Session Per Tenant
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="RentMasseur Traffic Engine")
-    parser.add_argument("--once", action="store_true", help="Run single cycle and exit")
-    parser.add_argument("--stats", action="store_true", help="Print stats summary and exit")
-    parser.add_argument("--watch", metavar="CITY", help="Track search position in city (e.g. 'Manhattan, NY')")
-    parser.add_argument("--duration", type=int, default=1, help="Availability duration in hours (default: 1)")
-    args = parser.parse_args()
+def get_api_for_tenant(tenant_id: str) -> Optional[RentMasseurAPI]:
+    """Create an authenticated API session for a specific tenant."""
+    creds = get_credentials(tenant_id)
+    if not creds:
+        log.error("No credentials for tenant %s", tenant_id)
+        return None
 
-    init_db()
+    tenant = roi.get_tenant(tenant_id)
+    if not tenant:
+        log.error("Tenant %s not found", tenant_id)
+        return None
 
-    if args.stats:
-        print_stats()
-        return
+    api = RentMasseurAPI(min_request_interval=2.0)
+    session_file = str(Path(__file__).parent / f"session_{tenant_id}.json")
+    auth = AuthSession(api, session_file=session_file)
 
-    engine = TrafficEngine(watch_city=args.watch)
+    if not auth.login(creds["username"], creds["password"]):
+        log.error("Login failed for tenant %s (%s)", tenant_id, creds["username"])
+        return None
 
-    if args.once:
-        engine.run_once()
-    else:
-        engine.run_daemon()
-
-if __name__ == "__main__":
-    main()
-
-```
-
-reward_engine.py:
-```
-"""
-Reward Engine — measures metric deltas after actions and computes reward.
-
-reward = 5.0 * booking_intent_delta
-       + 3.0 * contact_click_delta
-       + 2.0 * email_delta
-       + 1.0 * view_delta
-       - 2.0 * error_penalty
-       - 3.0 * compliance_risk
-       - 1.0 * excessive_mutation_penalty
-
-Also computes attribution: which action produced which metric movement.
-"""
-
-import logging
-import sqlite3
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, Optional
-
-log = logging.getLogger("reward_engine")
-
-REWARD_DB = Path(__file__).parent / "overclock_bandit.db"
+    return api
 
 
-@dataclass
-class MetricDelta:
-    views_delta: int = 0
-    contact_clicks_delta: int = 0
-    emails_delta: int = 0
-    booking_intent_delta: float = 0.0
-    rank_delta: int = 0
-    availability_changed: bool = False
-    visibility_changed: bool = False
+# ---------------------------------------------------------------------------
+# Metric Collection (unified — replaces 5 duplicate implementations)
+# ---------------------------------------------------------------------------
+
+def collect_metrics(api: RentMasseurAPI, tenant_id: str) -> Dict:
+    """Collect all traffic metrics in one pass. Replaces duplicate code in 5 files."""
+    metrics: Dict = {"ts": datetime.now(timezone.utc).isoformat()}
+
+    try:
+        stats = api.get_ad_statistics()
+        prof = stats.get("profileStatistics", {}) or {}
+        visits = prof.get("visits", []) or []
+        metrics["views"] = prof.get("totalPageViews", 0)
+        metrics["contact_clicks"] = prof.get("totalContactClicks", 0)
+    except Exception as e:
+        log.warning("Stats collection failed: %s", e)
+        metrics["views"] = 0
+        metrics["contact_clicks"] = 0
+
+    try:
+        mb = api.get_mailbox(page=1, folder=1, sort=1)
+        emails = mb.get("emails", []) or []
+        metrics["emails_count"] = len(emails)
+        metrics["unread_emails"] = sum(1 for e in emails if e.get("unread"))
+        metrics["premium_senders"] = sum(
+            1 for e in emails
+            if e.get("userCard", {}).get("isGold") or e.get("userCard", {}).get("isPremium")
+        )
+        # Classify emails
+        booking = 0
+        inquiry = 0
+        for e in emails:
+            preview = (e.get("lastMessage", "") or "").lower()
+            if any(w in preview for w in ["book", "appointment", "session", "today", "tomorrow", "available", "schedule"]):
+                booking += 1
+            elif any(w in preview for w in ["price", "rate", "how much", "where", "location", "incall", "outcall"]):
+                inquiry += 1
+        metrics["booking_emails"] = booking
+        metrics["inquiry_emails"] = inquiry
+    except Exception as e:
+        log.warning("Mailbox collection failed: %s", e)
+        metrics["emails_count"] = 0
+        metrics["unread_emails"] = 0
+        metrics["booking_emails"] = 0
+        metrics["inquiry_emails"] = 0
+        metrics["premium_senders"] = 0
+
+    try:
+        about = api.get_about()
+        assets = about.get("userProps", {}).get("assets", {})
+        metrics["headline"] = assets.get("headline", "")
+    except Exception:
+        metrics["headline"] = ""
+
+    try:
+        avail = api.get_availability()
+        metrics["availability_option"] = avail.get("option", 0)
+    except Exception:
+        metrics["availability_option"] = 0
+
+    try:
+        keep = api.get_keeponline()
+        metrics["is_hidden"] = int(bool(keep.get("isAdHidden", 0)))
+    except Exception:
+        metrics["is_hidden"] = 0
+
+    try:
+        tenant = roi.get_tenant(tenant_id)
+        city = tenant.get("city", "manhattan-ny") if tenant else "manhattan-ny"
+        search = api.search(city=city, available_only=False, page=1)
+        results = search.get("results", []) or search.get("data", []) or search.get("users", []) or []
+        metrics["search_rank"] = _find_rank(results, creds_username=None, tenant=tenant)
+        metrics["search_total"] = len(results)
+    except Exception:
+        metrics["search_rank"] = 0
+        metrics["search_total"] = 0
+
+    try:
+        avail_search = api.search(city=city, available_only=True, page=1)
+        a_results = avail_search.get("results", []) or avail_search.get("data", []) or []
+        metrics["available_rank"] = _find_rank(a_results, creds_username=None, tenant=tenant)
+        metrics["available_total"] = len(a_results)
+    except Exception:
+        metrics["available_rank"] = 0
+        metrics["available_total"] = 0
+
+    # Record into ROI daily metrics
+    roi.record_daily_metrics(tenant_id, metrics)
+
+    return metrics
 
 
-def is_measurement_valid(state_before, state_after) -> bool:
-    """Check if both snapshots have valid measurements.
-    A failed measurement is not a negative outcome — it is no outcome."""
-    if not state_before.measurement_valid:
-        return False
-    if not state_after.measurement_valid:
-        return False
-    return True
+def _find_rank(results: List, creds_username: str = None, tenant: Dict = None) -> int:
+    username = (creds_username or "").lower()
+    if tenant:
+        username = tenant.get("username", "").lower()
+    if not username:
+        return 0
+    for i, r in enumerate(results):
+        name = (r.get("username") or r.get("name") or "").lower()
+        if username in name or name in username:
+            return i + 1
+    return 0
 
 
-def compute_delta(state_before, state_after) -> MetricDelta:
-    """Compute metric delta between two TrafficState snapshots.
-    Returns all-zero delta if measurement is invalid."""
-    if not is_measurement_valid(state_before, state_after):
-        log.warning("  ⟁ MEASUREMENT INVALID — returning zero delta, no bandit update")
-        return MetricDelta()
-    return MetricDelta(
-        views_delta=state_after.views - state_before.views,
-        contact_clicks_delta=state_after.contact_clicks - state_before.contact_clicks,
-        emails_delta=state_after.mailbox_count - state_before.mailbox_count,
-        booking_intent_delta=round(
-            state_after.mailbox_intent_score - state_before.mailbox_intent_score, 3
-        ),
-        rank_delta=state_after.search_rank - state_before.search_rank if state_after.search_rank and state_before.search_rank else 0,
-        availability_changed=state_after.available_status != state_before.available_status,
-        visibility_changed=state_after.profile_hidden != state_before.profile_hidden,
-    )
+# ---------------------------------------------------------------------------
+# Action Executors (unified — one implementation per action)
+# ---------------------------------------------------------------------------
+
+def exec_refresh_availability(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    avail = api.get_availability()
+    option = avail.get("option", 0)
+    if option != 1:
+        api.set_availability(option=1, duration=5)
+        roi.log_action(tenant_id, cycle, "refresh_availability", "visibility", True,
+                       "set to Available", before, {"availability": 1})
+        return {"executed": True, "detail": "set to Available"}
+    roi.log_action(tenant_id, cycle, "refresh_availability", "visibility", False,
+                   "already available", before, {"availability": 1})
+    return {"executed": False, "detail": "already available"}
 
 
-def compute_reward(delta: MetricDelta, action: str, error: str = "",
-                     measurement_valid: bool = True,
-                     action_result: Dict = None) -> float:
-    """
-    Compute reward from metric delta.
+def exec_ensure_visible(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    if before.get("is_hidden", 0):
+        api.set_visibility(True)
+        roi.log_action(tenant_id, cycle, "ensure_visible", "visibility", True,
+                       "unhidden profile", before, {"is_hidden": 0})
+        return {"executed": True, "detail": "profile unhidden"}
+    roi.log_action(tenant_id, cycle, "ensure_visible", "visibility", False,
+                   "already visible", before, {"is_hidden": 0})
+    return {"executed": False, "detail": "already visible"}
 
-    If measurement is invalid (403/timeout/auth failure on after-snapshot),
-    return 0.0 — a failed measurement is not a negative outcome.
 
-    For reply_draft_queue, reward by draft quality and workflow outputs,
-    not by same-cycle traffic deltas.
-    """
-    if not measurement_valid:
-        log.warning("  ⟁ MEASUREMENT INVALID — reward=0.0, no bandit update")
-        return 0.0
+def exec_send_messages(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        from .engagement_engine import get_visitors_to_message, mark_messaged, generate_message_for_visitor, EngagementBrowser
+        visitors = get_visitors_to_message(limit=3)
+        if not visitors:
+            roi.log_action(tenant_id, cycle, "send_messages", "engagement", False,
+                           "no visitors to message", before, before)
+            return {"executed": False, "detail": "no visitors to message"}
+        browser = EngagementBrowser()
+        browser.start()
+        try:
+            browser.login()
+            sent = 0
+            for v in visitors:
+                uname = v["username"]
+                subject, body, provider, model = generate_message_for_visitor(uname)
+                ok, status_code, detail, screenshot = browser.send_message(uname, subject, body)
+                mark_messaged(uname, subject, body, provider, model, ok, status_code, detail, screenshot_path=screenshot)
+                if ok:
+                    sent += 1
+                time.sleep(3)
+            roi.log_action(tenant_id, cycle, "send_messages", "engagement", sent > 0,
+                           f"sent {sent}/{len(visitors)}", before, {"messages_sent": sent})
+            return {"executed": sent > 0, "detail": f"sent {sent}/{len(visitors)} messages"}
+        finally:
+            browser.stop()
+    except Exception as e:
+        roi.log_action(tenant_id, cycle, "send_messages", "engagement", False, str(e)[:100], before, before)
+        return {"executed": False, "detail": f"error: {e}"}
 
-    # ─── reply_draft_queue: reward by draft quality, not traffic deltas ───
-    if action == "reply_draft_queue" and action_result:
-        drafts_created = action_result.get("drafts_queued", 0)
-        blocked = action_result.get("blocked", 0)
-        needs_approval = action_result.get("needs_approval", 0)
-        auto_ok = action_result.get("auto_ok", 0)
-        cloud_leaked = action_result.get("cloud_fallback_attempted", False)
-        bad_llm = action_result.get("bad_llm_output", False)
 
-        reward = 0.0
-        reward += 0.5 * drafts_created       # small positive per valid draft
-        reward += 0.3 * blocked               # small positive for catching unsafe/DNC
-        reward += 0.2 * auto_ok               # small positive for safe auto-ok
-        if cloud_leaked:
-            reward -= 2.0                     # penalty: cloud fallback on private data
-        if bad_llm:
-            reward -= 1.0                     # penalty: bad LLM output
-        return round(reward, 3)
+def exec_visit_profiles(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        from .engagement_engine import get_profiles_to_visit, mark_visited_back, EngagementBrowser
+        profiles = get_profiles_to_visit(limit=5)
+        if not profiles:
+            roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", False,
+                           "no profiles to visit", before, before)
+            return {"executed": False, "detail": "no profiles to visit"}
+        browser = EngagementBrowser()
+        browser.start()
+        try:
+            browser.login()
+            visited = 0
+            for p in profiles:
+                uname = p["username"]
+                status, bytes_recv, ok, screenshot = browser.visit_profile(uname)
+                mark_visited_back(uname, status, bytes_recv, ok, screenshot_path=screenshot)
+                if ok:
+                    visited += 1
+                time.sleep(2)
+            roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", visited > 0,
+                           f"visited {visited}/{len(profiles)}", before, {"profiles_visited": visited})
+            return {"executed": visited > 0, "detail": f"visited {visited}/{len(profiles)}"}
+        finally:
+            browser.stop()
+    except Exception as e:
+        roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", False, str(e)[:100], before, before)
+        return {"executed": False, "detail": f"error: {e}"}
 
-    # ─── visitor_revisit: drafts are inventory, not revenue ───
-    # Reward only by downstream outcomes, not drafts generated.
-    # Small provisional positive for queue building + suppression catches.
-    # Real reward comes later when reviewed/approved/sent/replied/booked.
-    if action == "visitor_revisit" and action_result:
-        drafts_queued = action_result.get("drafts_queued", 0)
-        ignored = action_result.get("ignored", 0)  # suppression catches
-        p0 = action_result.get("p0_revisit_now", 0)
-        cloud_leaked = action_result.get("cloud_fallback_attempted", False)
 
-        # Downstream outcomes (these come later, not same-cycle)
-        reply_sent = action_result.get("reply_sent_after_approval", 0)
-        client_replied = action_result.get("client_replied", 0)
-        call_received = action_result.get("call_received", 0)
-        booking_confirmed = action_result.get("booking_confirmed", 0)
-        session_completed = action_result.get("session_completed", 0)
+def exec_update_bio(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        about = api.get_about()
+        assets = about.get("userProps", {}).get("assets", {})
+        current_h = assets.get("headline", "")
+        current_d = assets.get("description", "")
+        ctr = (before.get("contact_clicks", 0) / max(before.get("views", 1), 1)) * 100
+        prompt = f"""Current headline: "{current_h}"
+CTR: {ctr:.1f}% (benchmark: 5-8%)
+Views: {before.get('views', 0)}, Contacts: {before.get('contact_clicks', 0)}
+Generate a new headline that would increase CTR. Reply with ONLY the headline (max 80 chars)."""
+        new_h = generate_with_fallback(prompt, max_tokens=100)
+        if new_h:
+            new_h = new_h.strip().strip('"').strip("'")[:80]
+            if new_h and new_h != current_h:
+                api.set_about(new_h, current_d)
+                roi.log_action(tenant_id, cycle, "update_bio", "bio", True,
+                               f"headline: {current_h[:30]} → {new_h[:30]}", before, {"headline": new_h})
+                return {"executed": True, "detail": f"headline updated to: {new_h[:40]}"}
+        roi.log_action(tenant_id, cycle, "update_bio", "bio", False,
+                       "no change needed", before, before)
+        return {"executed": False, "detail": "no change needed"}
+    except Exception as e:
+        roi.log_action(tenant_id, cycle, "update_bio", "bio", False, str(e)[:100], before, before)
+        return {"executed": False, "detail": f"error: {e}"}
 
-        reward = 0.0
-        # Small provisional positive for building the queue
-        reward += 0.2 * drafts_queued          # drafts are inventory, small credit
+
+def exec_check_search_rank(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        tenant = roi.get_tenant(tenant_id)
+        city = tenant.get("city", "manhattan-ny") if tenant else "manhattan-ny"
+        search = api.search(city=city, available_only=False, page=1)
+        results = search.get("results", []) or search.get("data", []) or []
+        rank = _find_rank(results, tenant=tenant)
+        roi.log_action(tenant_id, cycle, "check_search_rank", "search", True,
+                       f"rank #{rank}/{len(results)}", before, {"search_rank": rank})
+        return {"executed": True, "detail": f"rank #{rank}/{len(results)}"}
+    except Exception as e:
+        roi.log_action(tenant_id, cycle, "check_search_rank", "search", False, str(e)[:100], before, before)
+        return {"executed": False, "detail": f"error: {e}"}
+
+
+def exec_multi_city_rank(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        tenant = roi.get_tenant(tenant_id)
+        positions = {}
+        for city in NY_CITIES:
+            try:
+                r = api.search(city=city, page=1)
+                results = r.get("results", []) or r.get("data", []) or []
+                positions[city] = {"rank": _find_rank(results, tenant=tenant), "total": len(results)}
+            except Exception:
+                positions[city] = {"error": True}
+            time.sleep(1)
+        roi.log_action(tenant_id, cycle, "multi_city_rank", "search", True,
+                       json.dumps(positions)[:100], before, {"positions": positions})
+        return {"executed": True, "detail": f"scanned {len(NY_CITIES)} cities"}
+    except Exception as e:
+        roi.log_action(tenant_id, cycle, "multi_city_rank", "search", False, str(e)[:100], before, before)
+        return {"executed": False, "detail": f"error: {e}"}
+
+
+def exec_sms_alerts(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        dash = api.get_dashboard()
+        sms_on = int(dash.get("userSetting", {}).get("sms", 0)) != 0
+        if not sms_on:
+            api.set_sms_alerts(True)
+            roi.log_action(tenant_id, cycle, "sms_alerts", "visibility", True,
+                           "enabled SMS alerts", before, {"sms": 1})
+            return {"executed": True, "detail": "SMS alerts enabled"}
+        roi.log_action(tenant_id, cycle, "sms_alerts", "visibility", False,
+                       "SMS already on", before, before)
+        return {"executed": False, "detail": "SMS already on"}
+    except Exception as e:
+        roi.log_action(tenant_id, cycle, "sms_alerts", "visibility", False, str(e)[:100], before, before)
+        return {"executed": False, "detail": f"error: {e}"}
+
+
+def exec_track_actions(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        dash = api.get_dashboard()
+        track_on = int(dash.get("userSetting", {}).get("trackActions", 0)) != 0
+        if not track_on:
+            api.set_track_actions(True)
+            roi.log_action(tenant_id, cycle, "track_actions", "visibility", True,
+                           "enabled tracking", before, {"trackActions": 1})
+            return {"executed": True, "detail": "tracking enabled"}
+        roi.log_action(tenant_id, cycle, "track_actions", "visibility", False,
+                       "tracking already on", before, before)
+        return {"executed": False, "detail": "tracking already on"}
+    except Exception as e:
+        roi.log_action(tenant_id, cycle, "track_actions", "visibility", False, str(e)[:100], before, before)
+        return {"executed": False, "detail": f"error: {e}"}
+
+
+def exec_engagement_stats(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        from .engagement_engine import init_db as eng_init
+        eng_init()
+        eng_db = Path(__file__).parent / "engagement.db"
+        conn = sqlite3.connect(str(eng_db))
+        conn.row_factory = sqlite3.Row
+        total_v = conn.execute("SELECT COUNT(*) FROM visitors").fetchone()[0]
+        visited = conn.execute("SELECT COUNT(*) FROM visitors WHERE visited_back=1").fetchone()[0]
+        messaged = conn.execute("SELECT COUNT(*) FROM visitors WHERE messaged=1").fetchone()[0]
+        conn.close()
+        stats = {"total_visitors": total_v, "visited_back": visited, "messaged": messaged}
+        roi.log_action(tenant_id, cycle, "engagement_stats", "analytics", True,
+                       json.dumps(stats), before, stats)
+        return {"executed": True, "detail": f"visitors={total_v} visited={visited} messaged={messaged}"}
+    except Exception as e:
+        roi.log_action(tenant_id, cycle, "engagement_stats", "analytics", False, str(e)[:100], before, before)
+        return {"executed": False, "detail": f"error: {e}"}
+
+
+def exec_adjust_rates(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
+    try:
+        dash = api.get_dashboard()
+        services = dash.get("service", {})
+        rates = []
+        for key, svc in services.items():
+            if isinstance(svc, dict) and svc.get("activated"):
+                p = svc.get("price", {})
+                incall = p.get("incall")
+                outcall = p.get("outcall")
+                if isinstance(incall, int) and isinstance(outcall, int):
+                    rates.append({"service": key, "incall": incall, "outcall": outcall})
+        if not rates:
+            roi.log_action(tenant_id, cycle, "adjust_rates", "revenue", False, "no rates", before, before)
+            return {"executed": False, "detail": "no rates found"}
+        ctr = (before.get("contact_clicks", 0) / max(before.get("views", 1), 1)) * 100
+        bookings = before.get("booking_emails", 0)
+        prompt = f"""Current rates: {json.dumps(rates)[:300]}
+CTR: {ctr:.1f}%, Booking inquiries: {bookings}
+Views: {before.get('views', 0)}, Contacts: {before.get('contact_clicks', 0)}
+Should I raise rates (high demand) or lower rates (low demand)? Reply with JSON: {{"adjust": "raise/lower/keep", "amount": 10}}"""
+        response = generate_with_fallback(prompt, max_tokens=100)
+        roi.log_action(tenant_id, cycle, "adjust_rates", "revenue", True,
+                       f"LLM analysis: {(response or 'unavailable')[:80]}", before, {"rates": len(rates)})
+        return {"executed": True, "detail": f"LLM rate analysis for {len(rates)} services"}
+    except Exception as e:
+        roi.log_action(tenant_id, cycle, "adjust_rates", "revenue", False, str(e)[:100], before, before)
+        return {"executed": False, "detail": f"error: {e}"}
+
+
+# Action registry
+ACTION_EXECUTORS = {
+    "refresh_availability": exec_refresh_availability,
+    "ensure_visible": exec_ensure_visible,
+    "send_messages": exec_send_messages,
+    "visit_profiles": exec_visit_profiles,
+    "update_bio": exec_update_bio,
+    "check_search_rank": exec_check_search_rank,
+    "multi_city_rank": exec_multi_city_rank,
+    "engagement_stats": exec_engagement_stats,
+    "sms_alerts": exec_sms_alerts,
+    "track_actions": exec_track_actions,
+    "adjust_rates": exec_adjust_rates,
+}
+
+
+# ---------------------------------------------------------------------------
+# LLM Action Prioritization
+# ---------------------------------------------------------------------------
+
+def llm_prioritize_actions(tenant_id: str, metrics: Dict, baseline: Dict) -> List[Dict]:
+    """Use LLM + historical attribution to rank actions by expected impact."""
+
+    # Get historical attribution scores
+    historical = roi.prioritize_actions(tenant_id)
+    hist_str = json.dumps(historical[:4], default=str)[:300]
+
+    baseline_str = json.dumps({k: round(v, 1) for k, v in baseline.items()}, default=str)[:200] if baseline else "no baseline yet"
+
+    prompt = f"""You are a traffic optimization engine for a massage therapist on RentMasseur.com.
+
+CURRENT METRICS:
+  Views: {metrics.get('views', 0)}
+  Contact clicks: {metrics.get('contact_clicks', 0)}
+  Emails: {metrics.get('emails_count', 0)} ({metrics.get('unread_emails', 0)} unread, {metrics.get('booking_emails', 0)} bookings)
+  Search rank: #{metrics.get('search_rank', 0)}
+  Availability: {metrics.get('availability_option', 0)} (1=Available)
+  Hidden: {metrics.get('is_hidden', 0)}
+
+BASELINE: {baseline_str}
+
+HISTORICAL ATTRIBUTION (actions that worked before):
+{hist_str}
+
+AVAILABLE ACTIONS (rank top 4 by expected impact):
+  1. refresh_availability — stay in "Available Now" filter
+  2. ensure_visible — fix if profile hidden
+  3. send_messages — message visitors
+  4. visit_profiles — reciprocal visits
+  5. update_bio — change headline to improve CTR
+  6. check_search_rank — track position
+  7. multi_city_rank — scan 7 NY cities
+  8. engagement_stats — check engagement
+  9. sms_alerts — ensure SMS on
+  10. track_actions — ensure tracking on
+  11. adjust_rates — raise/lower based on demand
+
+Reply in JSON: {{"ranked": [{{"action": "name", "reason": "why", "priority": 1}}]}}
+
+Pick top 4. Action must be one of: {', '.join(sorted(VALID_ACTIONS))}"""
+
+    response = generate_with_fallback(prompt, max_tokens=400)
+    ranked: List[Dict] = []
+
+    if response:
+        try:
+            import re
+            json_match = re.search(r'\{[^{}]*"ranked"[^{}]*\[.*?\][^{}]*\}', response, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                ranked = parsed.get("ranked", [])
+        except Exception:
+            pass
+        ranked = [a for a in ranked if a.get("action", "") in VALID_ACTIONS]
+
+    if not ranked:
+        # Fallback: use historical priority + always-on actions
+        ranked = [
+            {"action": "ensure_visible", "reason": "safety check", "priority": 1},
+            {"action": "refresh_availability", "reason": "maintain visibility", "priority": 2},
+        ]
+        if metrics.get("unread_emails", 0) > 0:
+            ranked.append({"action": "send_messages", "reason": f"{metrics['unread_emails']} unread", "priority": 3})
+        if metrics.get("search_rank", 0) == 0:
+            ranked.append({"action": "check_search_rank", "reason": "rank unknown", "priority": 4})
+        else:
+            ranked.append({"action": "update_bio", "reason": "improve CTR", "priority": 4})
+
+    return ranked[:4]
+
+
+# ---------------------------------------------------------------------------
+# Orchestration Cycle
+# ---------------------------------------------------------------------------
+
+def run_cycle(tenant_id: str, cycle_num: int = 0) -> Dict:
+    """Run one complete optimization cycle for a tenant."""
+    ts = datetime.now(timezone.utc).isoformat()
+    log.info("  ═══ SERVICE CYCLE %d for %s ═══", cycle_num, tenant_id)
+
+    api = get_api_for_tenant(tenant_id)
+    if not api:
+        return {"error": "api auth failed", "tenant_id": tenant_id}
+
+    # 1. Collect before metrics
+    log.info("  ⌁ Collecting metrics...")
+    before = collect_metrics(api, tenant_id)
+    log.info("  ◉ Before: views=%s contacts=%s emails=%s rank=%s",
+             before.get("views", 0), before.get("contact_clicks", 0),
+             before.get("emails_count", 0), before.get("search_rank", 0))
+
+    # 2. Get baseline for comparison
+    baseline = roi.get_baseline_metrics(tenant_id)
+
+    # 3. LLM prioritization
+    log.info("  ⌁ LLM action prioritization...")
+    ranked = llm_prioritize_actions(tenant_id, before, baseline)

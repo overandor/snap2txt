@@ -1,800 +1,800 @@
-Consolidates 5 overlapping systems into one service:
-  - profileops.py  (visibility, availability, stats)
-  - fortress.py    (hardened login, identity rotation, rate limiting)
-  - traffic_loop.py (30-function optimization loop)
-  - money_loop.py   (revenue funnel + LLM optimizer)
-  - engagement_engine.py (Selenium visits + messaging)
-
-Single API client. Single DB for ROI. Per-tenant credentials.
-Orchestrated cycle: collect → prioritize → execute → measure → report.
-
-Usage:
-    python3 -m rm_traffic.service --once --tenant <tenant_id>
-    python3 -m rm_traffic.service --daemon
-    python3 -m rm_traffic.service --register --username <rm_username> --display-name "John Doe"
-    python3 -m rm_traffic.service --report --tenant <tenant_id>
-    python3 -m rm_traffic.service --list-tenants
-"""
-
-import argparse
-import hashlib
-import json
-import logging
-import os
-import sqlite3
-import sys
-import time
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Dict, List, Optional, Any
-
-# .env loading
-ENV_PATH = Path(__file__).parent.parent / ".env"
-if ENV_PATH.exists():
-    for line in open(ENV_PATH):
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
-
-from .api_client import RentMasseurAPI
-from .auth import AuthSession
-from .llm_client import generate_with_fallback
-from . import roi_algorithm as roi
-
-log = logging.getLogger("rm_service")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-
-SERVICE_DB = Path(__file__).parent / "service.db"
-NY_CITIES = [
-    "manhattan-ny", "brooklyn-ny", "queens-ny",
-    "bronx-ny", "staten-island-ny", "long-island-ny", "westchester-ny",
-]
-
-# Valid actions the orchestrator can execute
-VALID_ACTIONS = {
-    "refresh_availability", "ensure_visible", "send_messages",
-    "visit_profiles", "update_bio", "check_search_rank",
-    "multi_city_rank", "engagement_stats", "sms_alerts",
-    "track_actions", "adjust_rates",
-}
-
-
-def _sdb():
-    conn = sqlite3.connect(str(SERVICE_DB))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-
-def init_db():
-    conn = _sdb()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS service_cycles (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        ts TEXT NOT NULL,
-        cycle_num INTEGER,
-        actions_executed INTEGER,
-        actions_passed INTEGER,
-        llm_calls INTEGER,
-        views_before INTEGER,
-        views_after INTEGER,
-        contacts_before INTEGER,
-        contacts_after INTEGER,
-        emails_before INTEGER,
-        emails_after INTEGER,
-        search_rank_before INTEGER,
-        search_rank_after INTEGER,
-        receipt_hash TEXT
-    );
-    CREATE TABLE IF NOT EXISTS tenant_credentials (
-        tenant_id TEXT PRIMARY KEY,
-        rm_username TEXT NOT NULL,
-        rm_password_encrypted TEXT NOT NULL,
-        session_json TEXT,
-        updated_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_cycles_tenant ON service_cycles(tenant_id, ts);
-    """)
-    conn.commit()
-    conn.close()
-    roi.init_db()
-
-
-# ---------------------------------------------------------------------------
-# Credential Storage (simple obfuscation — not plaintext at rest)
-# ---------------------------------------------------------------------------
-
-_OBF_KEY = os.environ.get("RM_SERVICE_KEY", "rm_traffic_service_v1")
-
-
-def _obfuscate(text: str) -> str:
-    return hashlib.sha256((_OBF_KEY + text).encode()).hexdigest()[:8] + "|" + text[::-1]
-
-
-def _deobfuscate(stored: str) -> str:
-    parts = stored.split("|", 1)
-    if len(parts) != 2:
-        return ""
-    return parts[1][::-1]
-
-
-def store_credentials(tenant_id: str, rm_username: str, rm_password: str):
-    ts = datetime.now(timezone.utc).isoformat()
-    conn = _sdb()
+    conn = _db()
     conn.execute(
-        "INSERT OR REPLACE INTO tenant_credentials (tenant_id, rm_username, rm_password_encrypted, updated_at) VALUES (?, ?, ?, ?)",
-        (tenant_id, rm_username, _obfuscate(rm_password), ts)
+        "INSERT INTO availability_log (ts, action, option, duration, remaining_sec, success, detail) VALUES (?,?,?,?,?,?,?)",
+        (ts, action, option, duration, remaining, int(success), detail[:200])
     )
     conn.commit()
     conn.close()
 
 
-def get_credentials(tenant_id: str) -> Optional[Dict]:
-    conn = _sdb()
-    row = conn.execute("SELECT * FROM tenant_credentials WHERE tenant_id = ?", (tenant_id,)).fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {"username": row["rm_username"], "password": _deobfuscate(row["rm_password_encrypted"])}
+class AvailabilityKeeper:
+    def __init__(self):
+        self.api = RentMasseurAPI(min_request_interval=2.0)
+        self.auth = AuthSession(self.api, session_file=SESSION_FILE)
+        self.username = os.environ.get("RM_USER", "")
+        self.password = os.environ.get("RM_PASS", "")
+        self.running = True
+        self.last_login = 0
+        self.consecutive_failures = 0
 
-
-# ---------------------------------------------------------------------------
-# API Session Per Tenant
-# ---------------------------------------------------------------------------
-
-def get_api_for_tenant(tenant_id: str) -> Optional[RentMasseurAPI]:
-    """Create an authenticated API session for a specific tenant."""
-    creds = get_credentials(tenant_id)
-    if not creds:
-        log.error("No credentials for tenant %s", tenant_id)
-        return None
-
-    tenant = roi.get_tenant(tenant_id)
-    if not tenant:
-        log.error("Tenant %s not found", tenant_id)
-        return None
-
-    api = RentMasseurAPI(min_request_interval=2.0)
-    session_file = str(Path(__file__).parent / f"session_{tenant_id}.json")
-    auth = AuthSession(api, session_file=session_file)
-
-    if not auth.login(creds["username"], creds["password"]):
-        log.error("Login failed for tenant %s (%s)", tenant_id, creds["username"])
-        return None
-
-    return api
-
-
-# ---------------------------------------------------------------------------
-# Metric Collection (unified — replaces 5 duplicate implementations)
-# ---------------------------------------------------------------------------
-
-def collect_metrics(api: RentMasseurAPI, tenant_id: str) -> Dict:
-    """Collect all traffic metrics in one pass. Replaces duplicate code in 5 files."""
-    metrics: Dict = {"ts": datetime.now(timezone.utc).isoformat()}
-
-    try:
-        stats = api.get_ad_statistics()
-        prof = stats.get("profileStatistics", {}) or {}
-        visits = prof.get("visits", []) or []
-        metrics["views"] = prof.get("totalPageViews", 0)
-        metrics["contact_clicks"] = prof.get("totalContactClicks", 0)
-    except Exception as e:
-        log.warning("Stats collection failed: %s", e)
-        metrics["views"] = 0
-        metrics["contact_clicks"] = 0
-
-    try:
-        mb = api.get_mailbox(page=1, folder=1, sort=1)
-        emails = mb.get("emails", []) or []
-        metrics["emails_count"] = len(emails)
-        metrics["unread_emails"] = sum(1 for e in emails if e.get("unread"))
-        metrics["premium_senders"] = sum(
-            1 for e in emails
-            if e.get("userCard", {}).get("isGold") or e.get("userCard", {}).get("isPremium")
-        )
-        # Classify emails
-        booking = 0
-        inquiry = 0
-        for e in emails:
-            preview = (e.get("lastMessage", "") or "").lower()
-            if any(w in preview for w in ["book", "appointment", "session", "today", "tomorrow", "available", "schedule"]):
-                booking += 1
-            elif any(w in preview for w in ["price", "rate", "how much", "where", "location", "incall", "outcall"]):
-                inquiry += 1
-        metrics["booking_emails"] = booking
-        metrics["inquiry_emails"] = inquiry
-    except Exception as e:
-        log.warning("Mailbox collection failed: %s", e)
-        metrics["emails_count"] = 0
-        metrics["unread_emails"] = 0
-        metrics["booking_emails"] = 0
-        metrics["inquiry_emails"] = 0
-        metrics["premium_senders"] = 0
-
-    try:
-        about = api.get_about()
-        assets = about.get("userProps", {}).get("assets", {})
-        metrics["headline"] = assets.get("headline", "")
-    except Exception:
-        metrics["headline"] = ""
-
-    try:
-        avail = api.get_availability()
-        metrics["availability_option"] = avail.get("option", 0)
-    except Exception:
-        metrics["availability_option"] = 0
-
-    try:
-        keep = api.get_keeponline()
-        metrics["is_hidden"] = int(bool(keep.get("isAdHidden", 0)))
-    except Exception:
-        metrics["is_hidden"] = 0
-
-    try:
-        tenant = roi.get_tenant(tenant_id)
-        city = tenant.get("city", "manhattan-ny") if tenant else "manhattan-ny"
-        search = api.search(city=city, available_only=False, page=1)
-        results = search.get("results", []) or search.get("data", []) or search.get("users", []) or []
-        metrics["search_rank"] = _find_rank(results, creds_username=None, tenant=tenant)
-        metrics["search_total"] = len(results)
-    except Exception:
-        metrics["search_rank"] = 0
-        metrics["search_total"] = 0
-
-    try:
-        avail_search = api.search(city=city, available_only=True, page=1)
-        a_results = avail_search.get("results", []) or avail_search.get("data", []) or []
-        metrics["available_rank"] = _find_rank(a_results, creds_username=None, tenant=tenant)
-        metrics["available_total"] = len(a_results)
-    except Exception:
-        metrics["available_rank"] = 0
-        metrics["available_total"] = 0
-
-    # Record into ROI daily metrics
-    roi.record_daily_metrics(tenant_id, metrics)
-
-    return metrics
-
-
-def _find_rank(results: List, creds_username: str = None, tenant: Dict = None) -> int:
-    username = (creds_username or "").lower()
-    if tenant:
-        username = tenant.get("username", "").lower()
-    if not username:
-        return 0
-    for i, r in enumerate(results):
-        name = (r.get("username") or r.get("name") or "").lower()
-        if username in name or name in username:
-            return i + 1
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# Action Executors (unified — one implementation per action)
-# ---------------------------------------------------------------------------
-
-def exec_refresh_availability(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    avail = api.get_availability()
-    option = avail.get("option", 0)
-    if option != 1:
-        api.set_availability(option=1, duration=5)
-        roi.log_action(tenant_id, cycle, "refresh_availability", "visibility", True,
-                       "set to Available", before, {"availability": 1})
-        return {"executed": True, "detail": "set to Available"}
-    roi.log_action(tenant_id, cycle, "refresh_availability", "visibility", False,
-                   "already available", before, {"availability": 1})
-    return {"executed": False, "detail": "already available"}
-
-
-def exec_ensure_visible(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    if before.get("is_hidden", 0):
-        api.set_visibility(True)
-        roi.log_action(tenant_id, cycle, "ensure_visible", "visibility", True,
-                       "unhidden profile", before, {"is_hidden": 0})
-        return {"executed": True, "detail": "profile unhidden"}
-    roi.log_action(tenant_id, cycle, "ensure_visible", "visibility", False,
-                   "already visible", before, {"is_hidden": 0})
-    return {"executed": False, "detail": "already visible"}
-
-
-def exec_send_messages(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        from .engagement_engine import get_visitors_to_message, mark_messaged, generate_message_for_visitor, EngagementBrowser
-        visitors = get_visitors_to_message(limit=3)
-        if not visitors:
-            roi.log_action(tenant_id, cycle, "send_messages", "engagement", False,
-                           "no visitors to message", before, before)
-            return {"executed": False, "detail": "no visitors to message"}
-        browser = EngagementBrowser()
-        browser.start()
-        try:
-            browser.login()
-            sent = 0
-            for v in visitors:
-                uname = v["username"]
-                subject, body, provider, model = generate_message_for_visitor(uname)
-                ok, status_code, detail, screenshot = browser.send_message(uname, subject, body)
-                mark_messaged(uname, subject, body, provider, model, ok, status_code, detail, screenshot_path=screenshot)
-                if ok:
-                    sent += 1
-                time.sleep(3)
-            roi.log_action(tenant_id, cycle, "send_messages", "engagement", sent > 0,
-                           f"sent {sent}/{len(visitors)}", before, {"messages_sent": sent})
-            return {"executed": sent > 0, "detail": f"sent {sent}/{len(visitors)} messages"}
-        finally:
-            browser.stop()
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "send_messages", "engagement", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_visit_profiles(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        from .engagement_engine import get_profiles_to_visit, mark_visited_back, EngagementBrowser
-        profiles = get_profiles_to_visit(limit=5)
-        if not profiles:
-            roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", False,
-                           "no profiles to visit", before, before)
-            return {"executed": False, "detail": "no profiles to visit"}
-        browser = EngagementBrowser()
-        browser.start()
-        try:
-            browser.login()
-            visited = 0
-            for p in profiles:
-                uname = p["username"]
-                status, bytes_recv, ok, screenshot = browser.visit_profile(uname)
-                mark_visited_back(uname, status, bytes_recv, ok, screenshot_path=screenshot)
-                if ok:
-                    visited += 1
-                time.sleep(2)
-            roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", visited > 0,
-                           f"visited {visited}/{len(profiles)}", before, {"profiles_visited": visited})
-            return {"executed": visited > 0, "detail": f"visited {visited}/{len(profiles)}"}
-        finally:
-            browser.stop()
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_update_bio(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        about = api.get_about()
-        assets = about.get("userProps", {}).get("assets", {})
-        current_h = assets.get("headline", "")
-        current_d = assets.get("description", "")
-        ctr = (before.get("contact_clicks", 0) / max(before.get("views", 1), 1)) * 100
-        prompt = f"""Current headline: "{current_h}"
-CTR: {ctr:.1f}% (benchmark: 5-8%)
-Views: {before.get('views', 0)}, Contacts: {before.get('contact_clicks', 0)}
-Generate a new headline that would increase CTR. Reply with ONLY the headline (max 80 chars)."""
-        new_h = generate_with_fallback(prompt, max_tokens=100)
-        if new_h:
-            new_h = new_h.strip().strip('"').strip("'")[:80]
-            if new_h and new_h != current_h:
-                api.set_about(new_h, current_d)
-                roi.log_action(tenant_id, cycle, "update_bio", "bio", True,
-                               f"headline: {current_h[:30]} → {new_h[:30]}", before, {"headline": new_h})
-                return {"executed": True, "detail": f"headline updated to: {new_h[:40]}"}
-        roi.log_action(tenant_id, cycle, "update_bio", "bio", False,
-                       "no change needed", before, before)
-        return {"executed": False, "detail": "no change needed"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "update_bio", "bio", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_check_search_rank(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        tenant = roi.get_tenant(tenant_id)
-        city = tenant.get("city", "manhattan-ny") if tenant else "manhattan-ny"
-        search = api.search(city=city, available_only=False, page=1)
-        results = search.get("results", []) or search.get("data", []) or []
-        rank = _find_rank(results, tenant=tenant)
-        roi.log_action(tenant_id, cycle, "check_search_rank", "search", True,
-                       f"rank #{rank}/{len(results)}", before, {"search_rank": rank})
-        return {"executed": True, "detail": f"rank #{rank}/{len(results)}"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "check_search_rank", "search", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_multi_city_rank(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        tenant = roi.get_tenant(tenant_id)
-        positions = {}
-        for city in NY_CITIES:
-            try:
-                r = api.search(city=city, page=1)
-                results = r.get("results", []) or r.get("data", []) or []
-                positions[city] = {"rank": _find_rank(results, tenant=tenant), "total": len(results)}
-            except Exception:
-                positions[city] = {"error": True}
-            time.sleep(1)
-        roi.log_action(tenant_id, cycle, "multi_city_rank", "search", True,
-                       json.dumps(positions)[:100], before, {"positions": positions})
-        return {"executed": True, "detail": f"scanned {len(NY_CITIES)} cities"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "multi_city_rank", "search", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_sms_alerts(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        dash = api.get_dashboard()
-        sms_on = int(dash.get("userSetting", {}).get("sms", 0)) != 0
-        if not sms_on:
-            api.set_sms_alerts(True)
-            roi.log_action(tenant_id, cycle, "sms_alerts", "visibility", True,
-                           "enabled SMS alerts", before, {"sms": 1})
-            return {"executed": True, "detail": "SMS alerts enabled"}
-        roi.log_action(tenant_id, cycle, "sms_alerts", "visibility", False,
-                       "SMS already on", before, before)
-        return {"executed": False, "detail": "SMS already on"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "sms_alerts", "visibility", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_track_actions(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        dash = api.get_dashboard()
-        track_on = int(dash.get("userSetting", {}).get("trackActions", 0)) != 0
-        if not track_on:
-            api.set_track_actions(True)
-            roi.log_action(tenant_id, cycle, "track_actions", "visibility", True,
-                           "enabled tracking", before, {"trackActions": 1})
-            return {"executed": True, "detail": "tracking enabled"}
-        roi.log_action(tenant_id, cycle, "track_actions", "visibility", False,
-                       "tracking already on", before, before)
-        return {"executed": False, "detail": "tracking already on"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "track_actions", "visibility", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_engagement_stats(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        from .engagement_engine import init_db as eng_init
-        eng_init()
-        eng_db = Path(__file__).parent / "engagement.db"
-        conn = sqlite3.connect(str(eng_db))
-        conn.row_factory = sqlite3.Row
-        total_v = conn.execute("SELECT COUNT(*) FROM visitors").fetchone()[0]
-        visited = conn.execute("SELECT COUNT(*) FROM visitors WHERE visited_back=1").fetchone()[0]
-        messaged = conn.execute("SELECT COUNT(*) FROM visitors WHERE messaged=1").fetchone()[0]
-        conn.close()
-        stats = {"total_visitors": total_v, "visited_back": visited, "messaged": messaged}
-        roi.log_action(tenant_id, cycle, "engagement_stats", "analytics", True,
-                       json.dumps(stats), before, stats)
-        return {"executed": True, "detail": f"visitors={total_v} visited={visited} messaged={messaged}"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "engagement_stats", "analytics", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_adjust_rates(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        dash = api.get_dashboard()
-        services = dash.get("service", {})
-        rates = []
-        for key, svc in services.items():
-            if isinstance(svc, dict) and svc.get("activated"):
-                p = svc.get("price", {})
-                incall = p.get("incall")
-                outcall = p.get("outcall")
-                if isinstance(incall, int) and isinstance(outcall, int):
-                    rates.append({"service": key, "incall": incall, "outcall": outcall})
-        if not rates:
-            roi.log_action(tenant_id, cycle, "adjust_rates", "revenue", False, "no rates", before, before)
-            return {"executed": False, "detail": "no rates found"}
-        ctr = (before.get("contact_clicks", 0) / max(before.get("views", 1), 1)) * 100
-        bookings = before.get("booking_emails", 0)
-        prompt = f"""Current rates: {json.dumps(rates)[:300]}
-CTR: {ctr:.1f}%, Booking inquiries: {bookings}
-Views: {before.get('views', 0)}, Contacts: {before.get('contact_clicks', 0)}
-Should I raise rates (high demand) or lower rates (low demand)? Reply with JSON: {{"adjust": "raise/lower/keep", "amount": 10}}"""
-        response = generate_with_fallback(prompt, max_tokens=100)
-        roi.log_action(tenant_id, cycle, "adjust_rates", "revenue", True,
-                       f"LLM analysis: {(response or 'unavailable')[:80]}", before, {"rates": len(rates)})
-        return {"executed": True, "detail": f"LLM rate analysis for {len(rates)} services"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "adjust_rates", "revenue", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-# Action registry
-ACTION_EXECUTORS = {
-    "refresh_availability": exec_refresh_availability,
-    "ensure_visible": exec_ensure_visible,
-    "send_messages": exec_send_messages,
-    "visit_profiles": exec_visit_profiles,
-    "update_bio": exec_update_bio,
-    "check_search_rank": exec_check_search_rank,
-    "multi_city_rank": exec_multi_city_rank,
-    "engagement_stats": exec_engagement_stats,
-    "sms_alerts": exec_sms_alerts,
-    "track_actions": exec_track_actions,
-    "adjust_rates": exec_adjust_rates,
-}
-
-
-# ---------------------------------------------------------------------------
-# LLM Action Prioritization
-# ---------------------------------------------------------------------------
-
-def llm_prioritize_actions(tenant_id: str, metrics: Dict, baseline: Dict) -> List[Dict]:
-    """Use LLM + historical attribution to rank actions by expected impact."""
-
-    # Get historical attribution scores
-    historical = roi.prioritize_actions(tenant_id)
-    hist_str = json.dumps(historical[:4], default=str)[:300]
-
-    baseline_str = json.dumps({k: round(v, 1) for k, v in baseline.items()}, default=str)[:200] if baseline else "no baseline yet"
-
-    prompt = f"""You are a traffic optimization engine for a massage therapist on RentMasseur.com.
-
-CURRENT METRICS:
-  Views: {metrics.get('views', 0)}
-  Contact clicks: {metrics.get('contact_clicks', 0)}
-  Emails: {metrics.get('emails_count', 0)} ({metrics.get('unread_emails', 0)} unread, {metrics.get('booking_emails', 0)} bookings)
-  Search rank: #{metrics.get('search_rank', 0)}
-  Availability: {metrics.get('availability_option', 0)} (1=Available)
-  Hidden: {metrics.get('is_hidden', 0)}
-
-BASELINE: {baseline_str}
-
-HISTORICAL ATTRIBUTION (actions that worked before):
-{hist_str}
-
-AVAILABLE ACTIONS (rank top 4 by expected impact):
-  1. refresh_availability — stay in "Available Now" filter
-  2. ensure_visible — fix if profile hidden
-  3. send_messages — message visitors
-  4. visit_profiles — reciprocal visits
-  5. update_bio — change headline to improve CTR
-  6. check_search_rank — track position
-  7. multi_city_rank — scan 7 NY cities
-  8. engagement_stats — check engagement
-  9. sms_alerts — ensure SMS on
-  10. track_actions — ensure tracking on
-  11. adjust_rates — raise/lower based on demand
-
-Reply in JSON: {{"ranked": [{{"action": "name", "reason": "why", "priority": 1}}]}}
-
-Pick top 4. Action must be one of: {', '.join(sorted(VALID_ACTIONS))}"""
-
-    response = generate_with_fallback(prompt, max_tokens=400)
-    ranked: List[Dict] = []
-
-    if response:
-        try:
-            import re
-            json_match = re.search(r'\{[^{}]*"ranked"[^{}]*\[.*?\][^{}]*\}', response, re.DOTALL)
-            if json_match:
-                parsed = json.loads(json_match.group())
-                ranked = parsed.get("ranked", [])
-        except Exception:
-            pass
-        ranked = [a for a in ranked if a.get("action", "") in VALID_ACTIONS]
-
-    if not ranked:
-        # Fallback: use historical priority + always-on actions
-        ranked = [
-            {"action": "ensure_visible", "reason": "safety check", "priority": 1},
-            {"action": "refresh_availability", "reason": "maintain visibility", "priority": 2},
-        ]
-        if metrics.get("unread_emails", 0) > 0:
-            ranked.append({"action": "send_messages", "reason": f"{metrics['unread_emails']} unread", "priority": 3})
-        if metrics.get("search_rank", 0) == 0:
-            ranked.append({"action": "check_search_rank", "reason": "rank unknown", "priority": 4})
+    def login(self) -> bool:
+        if not self.username or not self.password:
+            log.error("RM_USER / RM_PASS not set")
+            return False
+        ok = self.auth.login(self.username, self.password)
+        if ok:
+            self.last_login = time.time()
+            self.consecutive_failures = 0
+            _log("login", success=True, detail=f"logged in as {self.username}")
+            log.info("Login OK as %s", self.username)
         else:
-            ranked.append({"action": "update_bio", "reason": "improve CTR", "priority": 4})
+            self.consecutive_failures += 1
+            _log("login", success=False, detail=f"login failed (attempt {self.consecutive_failures})")
+            log.error("Login failed (attempt %d)", self.consecutive_failures)
+        return ok
 
-    return ranked[:4]
-
-
-# ---------------------------------------------------------------------------
-# Orchestration Cycle
-# ---------------------------------------------------------------------------
-
-def run_cycle(tenant_id: str, cycle_num: int = 0) -> Dict:
-    """Run one complete optimization cycle for a tenant."""
-    ts = datetime.now(timezone.utc).isoformat()
-    log.info("  ═══ SERVICE CYCLE %d for %s ═══", cycle_num, tenant_id)
-
-    api = get_api_for_tenant(tenant_id)
-    if not api:
-        return {"error": "api auth failed", "tenant_id": tenant_id}
-
-    # 1. Collect before metrics
-    log.info("  ⌁ Collecting metrics...")
-    before = collect_metrics(api, tenant_id)
-    log.info("  ◉ Before: views=%s contacts=%s emails=%s rank=%s",
-             before.get("views", 0), before.get("contact_clicks", 0),
-             before.get("emails_count", 0), before.get("search_rank", 0))
-
-    # 2. Get baseline for comparison
-    baseline = roi.get_baseline_metrics(tenant_id)
-
-    # 3. LLM prioritization
-    log.info("  ⌁ LLM action prioritization...")
-    ranked = llm_prioritize_actions(tenant_id, before, baseline)
-    for i, a in enumerate(ranked):
-        log.info("  ⟡ #%d %s — %s", i + 1, a.get("action", "?"), a.get("reason", "")[:60])
-
-    # 4. Execute actions
-    log.info("  ⌁ Executing actions...")
-    results = []
-    for a in ranked:
-        action_name = a.get("action", "")
-        if not action_name or action_name not in ACTION_EXECUTORS:
-            continue
-        log.info("  ⌁ Executing: %s", action_name)
-        executor = ACTION_EXECUTORS[action_name]
+    def ensure_session(self) -> bool:
+        # Re-login if > 50 min since last login
+        if time.time() - self.last_login > 3000:
+            log.info("Session aging, re-logging in...")
+            return self.login()
+        # Test session with a lightweight call
         try:
-            result = executor(api, tenant_id, cycle_num, before)
-            result["action"] = action_name
-            result["priority"] = a.get("priority", 0)
-            results.append(result)
-            glyph = "◆" if result["executed"] else "◌"
-            log.info("  %s %s — %s", glyph, action_name, result.get("detail", "")[:60])
+            self.api.get_keeponline()
+            return True
         except Exception as e:
-            log.error("  ⟁ %s failed: %s", action_name, e)
-            results.append({"action": action_name, "executed": False, "detail": str(e)[:100]})
-        time.sleep(1)
+            log.warning("Session check failed (%s), re-logging in...", str(e)[:60])
+            return self.login()
 
-    # 5. Collect after metrics
-    log.info("  ⌁ Collecting after metrics...")
-    after = collect_metrics(api, tenant_id)
-    log.info("  ◉ After: views=%s contacts=%s emails=%s rank=%s",
-             after.get("views", 0), after.get("contact_clicks", 0),
-             after.get("emails_count", 0), after.get("search_rank", 0))
+    def get_remaining_sec(self, avail: dict) -> int:
+        countdown = avail.get("countdown", 0)
+        if not countdown:
+            return 0
+        remaining = int(countdown - time.time())
+        return max(0, remaining)
 
-    # 6. Check if baseline should be finalized
-    if not roi.is_baseline_captured(tenant_id):
-        bl = roi.finalize_baseline(tenant_id)
-        if bl.get("captured"):
-            log.info("  ◆ Baseline captured: %s", bl)
+    def check_and_refresh(self) -> dict:
+        """Check availability. Refresh if not Available or near expiry."""
+        result = {"action": "noop", "refreshed": False, "remaining": 0, "detail": ""}
 
-    # 7. Store cycle record
-    executed = sum(1 for r in results if r.get("executed"))
-    receipt_data = json.dumps({"before": before, "after": after, "results": results}, default=str)
-    receipt_hash = hashlib.sha256(receipt_data.encode()).hexdigest()[:16]
+        if not self.ensure_session():
+            result["detail"] = "auth failed"
+            return result
 
-    conn = _sdb()
-    conn.execute(
-        """INSERT INTO service_cycles
-           (tenant_id, ts, cycle_num, actions_executed, actions_passed, llm_calls,
-            views_before, views_after, contacts_before, contacts_after,
-            emails_before, emails_after, search_rank_before, search_rank_after, receipt_hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (tenant_id, ts, cycle_num, len(results), executed, 1,
-         before.get("views", 0), after.get("views", 0),
-         before.get("contact_clicks", 0), after.get("contact_clicks", 0),
-         before.get("emails_count", 0), after.get("emails_count", 0),
-         before.get("search_rank", 0), after.get("search_rank", 0), receipt_hash)
-    )
-    conn.commit()
-    conn.close()
+        try:
+            avail = self.api.get_availability()
+        except Exception as e:
+            log.error("get_availability failed: %s", e)
+            # Try re-login once
+            if self.login():
+                try:
+                    avail = self.api.get_availability()
+                except Exception as e2:
+                    result["detail"] = f"get_availability failed after relogin: {e2}"
+                    _log("check", success=False, detail=result["detail"])
+                    return result
+            else:
+                result["detail"] = "relogin failed"
+                _log("check", success=False, detail=result["detail"])
+                return result
 
-    log.info("  ◆ Cycle %d complete for %s: %d actions, %d executed",
-             cycle_num, tenant_id, len(results), executed)
+        option = avail.get("selected", "")
+        remaining = self.get_remaining_sec(avail)
 
-    return {
-        "tenant_id": tenant_id, "cycle_num": cycle_num, "timestamp": ts,
-        "before": before, "after": after,
-        "actions": results,
-        "receipt_hash": receipt_hash,
-    }
+        log.info("Availability: %s, remaining=%ds (%.1fh)", option, remaining, remaining / 3600)
 
+        needs_refresh = False
+        reason = ""
 
-# ---------------------------------------------------------------------------
-# Multi-Tenant Daemon
-# ---------------------------------------------------------------------------
+        if option != "Available":
+            needs_refresh = True
+            reason = f"not Available (was: {option})"
+        elif remaining < REFRESH_THRESHOLD_SEC:
+            needs_refresh = True
+            reason = f"expiring soon ({remaining}s left, threshold {REFRESH_THRESHOLD_SEC}s)"
 
-def run_daemon(cycle_interval: int = 3600):
-    """Run optimization cycles for all active tenants."""
-    log.info("  ═══ RM TRAFFIC SERVICE DAEMON ═══")
-    init_db()
+        if not needs_refresh:
+            result["remaining"] = remaining
+            result["detail"] = f"OK: {option}, {remaining}s left"
+            _log("check", option=1 if option == "Available" else 0, remaining=remaining, success=True, detail=result["detail"])
+            return result
 
-    while True:
-        tenants = roi.list_tenants(active_only=True)
-        if not tenants:
-            log.info("  No active tenants. Waiting...")
-            time.sleep(60)
-            continue
+        # Refresh
+        log.info("Refreshing availability: %s", reason)
+        try:
+            self.api.set_availability(option=1, duration=MAX_DURATION)
+            result["action"] = "refresh"
+            result["refreshed"] = True
+            result["detail"] = f"set to Available for 6h ({reason})"
+            _log("refresh", option=1, duration=MAX_DURATION, remaining=remaining, success=True, detail=result["detail"])
+            log.info("◆ Refreshed: set to Available (6h)")
 
-        for tenant in tenants:
-            tid = tenant["tenant_id"]
+            # Verify
+            time.sleep(2)
             try:
-                # Get cycle count
-                conn = _sdb()
-                row = conn.execute(
-                    "SELECT MAX(cycle_num) as max_cycle FROM service_cycles WHERE tenant_id = ?",
-                    (tid,)
-                ).fetchone()
-                conn.close()
-                cycle_num = (row["max_cycle"] or 0) + 1
-
-                run_cycle(tid, cycle_num)
-
-                # Generate weekly ROI report
-                if cycle_num % 7 == 0 and roi.is_baseline_captured(tid):
-                    report = roi.generate_roi_report(tid)
-                    if "error" not in report:
-                        p = report.get("pricing", {})
-                        log.info("  ◆ ROI report for %s: improvement=%.1f%% charge=$%.2f",
-                                 tid, report["improvement"]["overall_pct"],
-                                 p.get("monthly_charge", 0))
-
+                after = self.api.get_availability()
+                after_remaining = self.get_remaining_sec(after)
+                result["remaining"] = after_remaining
+                if after.get("selected") == "Available":
+                    log.info("Verified: Available, %ds remaining", after_remaining)
+                else:
+                    log.warning("Verify mismatch: selected=%s", after.get("selected"))
             except Exception as e:
-                log.error("  ⟁ Tenant %s cycle failed: %s", tid, e)
+                log.warning("Verify check failed: %s", e)
 
-            time.sleep(10)  # gap between tenants
+        except Exception as e:
+            result["detail"] = f"refresh failed: {e}"
+            _log("refresh", option=1, duration=MAX_DURATION, remaining=remaining, success=False, detail=str(e)[:200])
+            log.error("Refresh failed: %s", e)
 
-        log.info("  ⧖ Next cycle in %ds...", cycle_interval)
-        time.sleep(cycle_interval)
+            # Try re-login and one more attempt
+            if self.consecutive_failures < 3:
+                log.info("Retrying after relogin...")
+                if self.login():
+                    try:
+                        self.api.set_availability(option=1, duration=MAX_DURATION)
+                        result["refreshed"] = True
+                        result["detail"] = f"set to Available on retry"
+                        _log("refresh_retry", option=1, duration=MAX_DURATION, success=True, detail="retry success")
+                        log.info("◆ Refreshed on retry")
+                    except Exception as e2:
+                        log.error("Retry also failed: %s", e2)
+                        _log("refresh_retry", success=False, detail=str(e2)[:200])
 
+        return result
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+    def run_forever(self):
+        log.info("═══ AVAILABILITY KEEPER STARTING ═══")
+        log.info("User: %s", self.username)
+        log.info("Check interval: %ds", CHECK_INTERVAL_SEC)
+        log.info("Refresh threshold: %ds before expiry", REFRESH_THRESHOLD_SEC)
+        log.info("Max duration: 6h (index %d)", MAX_DURATION)
+
+        if not self.login():
+            log.error("Initial login failed. Exiting.")
+            sys.exit(1)
+
+        # Set up signal handler for clean shutdown
+        def handle_sigterm(sig, frame):
+            log.info("Received signal %d, shutting down...", sig)
+            self.running = False
+        signal.signal(signal.SIGINT, handle_sigterm)
+        signal.signal(signal.SIGTERM, handle_sigterm)
+
+        while self.running:
+            try:
+                self.check_and_refresh()
+            except Exception as e:
+                log.error("Cycle error: %s", e)
+                _log("cycle_error", success=False, detail=str(e)[:200])
+                # Backoff on repeated failures
+                if self.consecutive_failures > 5:
+                    log.error("Too many failures, backing off 10 min...")
+                    time.sleep(600)
+                    self.consecutive_failures = 0
+
+            # Sleep in small increments so signal handler can interrupt
+            slept = 0
+            while slept < CHECK_INTERVAL_SEC and self.running:
+                time.sleep(5)
+                slept += 5
+
+        log.info("Availability keeper stopped.")
+
+    def run_once(self):
+        log.info("═══ AVAILABILITY KEEPER (single run) ═══")
+        if not self.login():
+            sys.exit(1)
+        result = self.check_and_refresh()
+        print(json.dumps(result, indent=2))
+        return result
+
+    def show_status(self):
+        log.info("═══ AVAILABILITY KEEPER STATUS ═══")
+        if not self.login():
+            sys.exit(1)
+        try:
+            avail = self.api.get_availability()
+            remaining = self.get_remaining_sec(avail)
+            keep = self.api.get_keeponline()
+
+            print(f"\n  {'='*50}")
+            print(f"  AVAILABILITY KEEPER STATUS")
+            print(f"  {'='*50}")
+            print(f"  User:         {self.username}")
+            print(f"  Available:    {avail.get('selected', '?')}")
+            print(f"  Remaining:    {remaining}s ({remaining/3600:.1f}h)")
+            print(f"  Hidden:       {'YES' if keep.get('isAdHidden') else 'NO'}")
+            print(f"  New visits:   {keep.get('newVisits', '?')}")
+            print(f"  New emails:   {keep.get('newEmails', '?')}")
+            print(f"  {'='*50}")
+
+            # Show recent log
+            conn = _db()
+            rows = conn.execute(
+                "SELECT * FROM availability_log ORDER BY id DESC LIMIT 10"
+            ).fetchall()
+            conn.close()
+            if rows:
+                print(f"\n  Recent actions:")
+                for r in rows:
+                    glyph = "◆" if r["success"] else "⟁"
+                    print(f"    {glyph} {r['ts'][:19]}  {r['action']:12s}  {r['detail'][:50]}")
+            print()
+        except Exception as e:
+            log.error("Status check failed: %s", e)
+            sys.exit(1)
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="RM Traffic Service — unified multi-tenant optimization"
-    )
-    parser.add_argument("--register", action="store_true", help="Register a new tenant")
-    parser.add_argument("--username", help="RentMasseur username for registration")
-    parser.add_argument("--password", help="RentMasseur password for registration")
-    parser.add_argument("--display-name", default="", help="Display name for tenant")
-    parser.add_argument("--email", default="", help="Contact email")
-    parser.add_argument("--city", default="manhattan-ny", help="Target city")
-    parser.add_argument("--avg-rate", type=float, default=234.0, help="Average session rate")
-    parser.add_argument("--once", action="store_true", help="Run one cycle for --tenant")
-    parser.add_argument("--daemon", action="store_true", help="Run continuously for all tenants")
-    parser.add_argument("--tenant", help="Tenant ID for single operations")
-    parser.add_argument("--report", action="store_true", help="Generate ROI report for --tenant")
-    parser.add_argument("--list-tenants", action="store_true", help="List all tenants")
-    parser.add_argument("--interval", type=int, default=3600, help="Seconds between daemon cycles")
+    parser = argparse.ArgumentParser(description="RM Availability Keeper — 24/7 availability daemon")
+    parser.add_argument("--once", action="store_true", help="Single check + refresh")
+    parser.add_argument("--status", action="store_true", help="Show current availability status")
+    parser.add_argument("--check-interval", type=int, default=CHECK_INTERVAL_SEC, help="Seconds between checks (default: 300)")
     args = parser.parse_args()
 
     init_db()
+    keeper = AvailabilityKeeper()
+    keeper.check_interval = args.check_interval
 
-    if args.list_tenants:
-        tenants = roi.list_tenants(active_only=False)
-        if not tenants:
-            print("No tenants registered.")
-            return
-        print(f"\n  {'ID':<20} {'Username':<20} {'City':<15} {'Baseline':<10} {'Active'}")
-        print(f"  {'-'*20} {'-'*20} {'-'*15} {'-'*10} {'-'*6}")
-        for t in tenants:
-            print(f"  {t['tenant_id'][:18]:<20} {t['username'][:18]:<20} {t.get('city','')[:13]:<15} {'✓' if t['baseline_captured'] else '✗':<10} {'✓' if t['active'] else '✗'}")
+    if args.status:
+        keeper.show_status()
         return
 
-    if args.register:
-        if not args.username or not args.password:
-            print("--username and --password required for registration")
-            sys.exit(1)
-        tenant_id = args.username.lower().replace(" ", "_") + "_" + hashlib.sha256(
-            args.username.encode()
-        ).hexdigest()[:6]
-        roi.register_tenant(
-            tenant_id, args.username, args.display_name, args.email,
-            args.city, args.avg_rate
+    if args.once:
+        keeper.run_once()
+        return
+
+    keeper.run_forever()
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+bio_variants.py:
+```
+"""
+Bio variant library — conservative, tested headline + bio copy.
+
+These are not random mutations. Each variant has a hypothesis and is tracked.
+"""
+
+BIO_VARIANTS = {
+    "direct_recovery": {
+        "headline": "Deep Recovery Massage — Manhattan",
+        "description": (
+            "I work with men who train hard, sit long hours, or carry stress in their shoulders and lower back. "
+            "My sessions are pressure-forward, slow, and deliberate — built around what your body actually needs "
+            "that day. Incall in Manhattan. Outcall available. Same-day when my schedule allows."
+        ),
+        "hypothesis": "Recovery-focused copy increases contact clicks from serious clients.",
+    },
+    "professional_discretion": {
+        "headline": "Discreet Therapeutic Massage — Manhattan",
+        "description": (
+            "Private, professional massage in a clean Manhattan space. I focus on therapeutic work first — "
+            "neck, shoulders, back, and hips — with a calm, confident presence. No rushed sessions. "
+            "Respectful clients only. Available for incall and selective outcall."
+        ),
+        "hypothesis": "Professional/discretion framing increases trust and booking quality.",
+    },
+    "luxury_manhattan": {
+        "headline": "Premium Bodywork — Manhattan, NYC",
+        "description": (
+            "Athletic, intuitive bodywork for men who want more than a standard massage. "
+            "I combine deep tissue, pressure-point work, and full-body flow in a private Manhattan studio. "
+            "Clean, quiet, and comfortable. Incall preferred. Outcall considered for established clients."
+        ),
+        "hypothesis": "Premium positioning attracts higher-value bookings.",
+    },
+    "sports_deep_tissue": {
+        "headline": "Sports & Deep Tissue — Manhattan",
+        "description": (
+            "Built for lifters, runners, and guys who beat up their bodies. My sessions target the muscle groups "
+            "that actually hurt: hips, hamstrings, shoulders, lats. Strong pressure. No fluff. "
+            "Manhattan incall. Book when available."
+        ),
+        "hypothesis": "Sports positioning captures fitness-focused traffic.",
+    },
+    "last_minute": {
+        "headline": "Same-Day Massage — Manhattan",
+        "description": (
+            "When you need real bodywork today, not next week. I keep blocks open for same-day bookings in Manhattan "
+            "when I am available. Clean private space, strong hands, no attitude. Text or email. "
+            "Respectful clients only."
+        ),
+        "hypothesis": "Last-minute availability angle converts urgent search traffic.",
+    },
+}
+
+
+def get_variant(variant_id: str) -> dict:
+    v = BIO_VARIANTS.get(variant_id)
+    if not v:
+        return None
+    return {
+        "variant_id": variant_id,
+        "headline": v["headline"],
+        "description": v["description"],
+        "hypothesis": v["hypothesis"],
+    }
+
+
+def list_variant_ids() -> list:
+    return list(BIO_VARIANTS.keys())
+
+
+def all_variants() -> list:
+    return [get_variant(vid) for vid in list_variant_ids()]
+
+```
+
+api_capture.log:
+```
+2026-06-25 15:30:06,526 [INFO] === RentMasseur API Extractor ===
+2026-06-25 15:30:07,214 [INFO] CDP network interceptor installed
+2026-06-25 15:30:07,214 [INFO] Logging in as karpathianwolf...
+2026-06-25 15:30:20,243 [WARNING] Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'ConnectionResetError(54, 'Connection reset by peer')': /session/6f0c201ec86fde1c0c543d20a98a4ae0
+2026-06-25 15:30:20,244 [WARNING] Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError("HTTPConnection(host='localhost', port=60345): Failed to establish a new connection: [Errno 61] Connection refused")': /session/6f0c201ec86fde1c0c543d20a98a4ae0
+2026-06-25 15:30:20,244 [WARNING] Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError("HTTPConnection(host='localhost', port=60345): Failed to establish a new connection: [Errno 61] Connection refused")': /session/6f0c201ec86fde1c0c543d20a98a4ae0
+2026-06-25 15:30:20,245 [INFO] Done
+
+```
+
+llm_client.py:
+```
+"""
+Multi-provider LLM client — Transformers.js (local), Ollama, Groq, OpenRouter.
+
+Providers (tried in order by generate_with_fallback):
+  1. transformers — local Node.js model via @huggingface/transformers (FREE, no API key)
+  2. ollama — local Ollama server
+  3. groq — Groq cloud API
+  4. openrouter — OpenRouter cloud API
+
+Environment variables:
+  - TRANSFORMERS_LLM_PATH (default: rm_traffic/transformers_llm.js)
+  - TRANSFORMERS_MODEL (default: Xenova/Qwen2.5-0.5B-Instruct)
+  - OLLAMA_URL (default: http://localhost:11434/api/generate)
+  - GROQ_API_KEY
+  - OPENROUTER_API_KEY
+
+Usage:
+    from rm_traffic.llm_client import LLMClient
+    client = LLMClient(provider="transformers")
+    response = client.generate(prompt)
+"""
+
+import json
+import logging
+import os
+import subprocess
+import time
+from pathlib import Path
+from typing import Optional
+
+import requests
+
+log = logging.getLogger("llm_client")
+
+DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
+
+
+class LLMClient:
+    """Unified LLM client supporting Ollama, Groq, and OpenRouter."""
+
+    def __init__(self, provider: str = "ollama", model: Optional[str] = None):
+        self.provider = provider.lower().strip()
+        self.model = model or self._default_model()
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "ProfileOps/1.0",
+            "Accept": "application/json",
+        })
+
+    def _default_model(self) -> str:
+        defaults = {
+            "transformers": os.environ.get("TRANSFORMERS_MODEL", "Xenova/Qwen2.5-0.5B-Instruct"),
+            "ollama": "llama3.2",
+            "groq": "llama-3.1-8b-instant",
+            "openrouter": "meta-llama/llama-3.1-8b-instruct",
+        }
+        return defaults.get(self.provider, "llama3.2")
+
+    def _transformers_generate(self, prompt: str, max_tokens: int = 800) -> Optional[str]:
+        """Generate text using local transformers.js model via Node.js."""
+        script_path = os.environ.get(
+            "TRANSFORMERS_LLM_PATH",
+            str(Path(__file__).parent / "transformers_llm.js"),
         )
-        store_credentials(tenant_id, args.username, args.password)
-        print(f"Registered tenant: {tenant_id}")
-        print(f"Username: {args.username}")
-        print(f"City: {args.city}")
-        print(f"\nRun a cycle: python3 -m rm_traffic.service --once --tenant {tenant_id}")
-        return
+        if not os.path.exists(script_path):
+            log.error("transformers_llm.js not found at %s", script_path)
+            return None
+        try:
+            proc = subprocess.run(
+                ["node", script_path, "--model", self.model, "--max-tokens", str(max_tokens)],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=str(Path(__file__).parent.parent),
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout.strip()
+            log.error("transformers.js error: %s", proc.stderr[:300])
+            return None
+        except subprocess.TimeoutExpired:
+            log.error("transformers.js timed out (30s)")
+            return None
+        except Exception as e:
+            log.error("transformers.js failed: %s", e)
+            return None
+
+    def _ollama_generate(self, prompt: str, max_tokens: int = 800) -> Optional[str]:
+        url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
+        try:
+            resp = self.session.post(url, json={
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.75,
+                    "num_predict": max_tokens,
+                }
+            }, timeout=120)
+            if resp.status_code == 200:
+                return resp.json().get("response", "")
+            log.error("Ollama error: %d %s", resp.status_code, resp.text[:300])
+            return None
+        except Exception as e:
+            log.error("Ollama failed: %s", e)
+            return None
+
+    def _groq_generate(self, prompt: str, max_tokens: int = 800) -> Optional[str]:
+        key = os.environ.get("GROQ_API_KEY")
+        if not key:
+            log.error("GROQ_API_KEY not set")
+            return None
+        try:
+            resp = self.session.post("https://api.groq.com/openai/v1/chat/completions", json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.75,
+                "max_tokens": max_tokens,
+            }, headers={"Authorization": f"Bearer {key}"}, timeout=60)
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"]
+            log.error("Groq error: %d %s", resp.status_code, resp.text[:300])
+            return None
+        except Exception as e:
+            log.error("Groq failed: %s", e)
+            return None
+
+    def _openrouter_generate(self, prompt: str, max_tokens: int = 800) -> Optional[str]:
+        key = os.environ.get("OPENROUTER_API_KEY")
+        if not key:
+            log.error("OPENROUTER_API_KEY not set")
+            return None
+        try:
+            resp = self.session.post("https://openrouter.ai/api/v1/chat/completions", json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.75,
+                "max_tokens": max_tokens,
+            }, headers={
+                "Authorization": f"Bearer {key}",
+                "HTTP-Referer": "http://localhost:8000",
+                "X-Title": "ProfileOps",
+            }, timeout=60)
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"]
+            log.error("OpenRouter error: %d %s", resp.status_code, resp.text[:300])
+            return None
+        except Exception as e:
+            log.error("OpenRouter failed: %s", e)
+            return None
+
+    def generate(self, prompt: str, max_tokens: int = 800) -> Optional[str]:
+        """Generate text from the configured provider."""
+        log.info("Generating with %s/%s", self.provider, self.model)
+        start = time.time()
+        if self.provider == "transformers":
+            result = self._transformers_generate(prompt, max_tokens)
+        elif self.provider == "ollama":
+            result = self._ollama_generate(prompt, max_tokens)
+        elif self.provider == "groq":
+            result = self._groq_generate(prompt, max_tokens)
+        elif self.provider == "openrouter":
+            result = self._openrouter_generate(prompt, max_tokens)
+        else:
+            log.error("Unknown provider: %s", self.provider)
+            return None
+        log.info("LLM response in %.1fs", time.time() - start)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Convenience: try multiple providers in order
+# ---------------------------------------------------------------------------
+
+_PROVIDERS_CACHE = None
+_CLIENTS_CACHE = {}
+
+
+def _get_providers():
+    global _PROVIDERS_CACHE
+    if _PROVIDERS_CACHE is not None:
+        return _PROVIDERS_CACHE
+    providers = []
+    tf_script = os.environ.get(
+        "TRANSFORMERS_LLM_PATH",
+        str(Path(__file__).parent / "transformers_llm.js"),
+    )
+    if os.path.exists(tf_script):
+        providers.append(("transformers", os.environ.get("TRANSFORMERS_MODEL", "Xenova/Qwen2.5-0.5B-Instruct")))
+    if os.environ.get("OLLAMA_URL") or os.environ.get("LLM_PROVIDER") == "ollama":
+        providers.append(("ollama", "llama3.2"))
+    if os.environ.get("GROQ_API_KEY"):
+        providers.append(("groq", "llama-3.1-8b-instant"))
+    if os.environ.get("OPENROUTER_API_KEY"):
+        providers.append(("openrouter", "meta-llama/llama-3.1-8b-instruct"))
+    if not providers:
+        providers.append(("transformers", "Xenova/Qwen2.5-0.5B-Instruct"))
+    _PROVIDERS_CACHE = providers
+    return providers
+
+
+def _get_client(provider: str, model: str) -> "LLMClient":
+    key = (provider, model)
+    if key not in _CLIENTS_CACHE:
+        _CLIENTS_CACHE[key] = LLMClient(provider, model)
+    return _CLIENTS_CACHE[key]
+
+
+def generate_with_fallback(prompt: str, max_tokens: int = 800) -> Optional[str]:
+    """Try Transformers.js (local, free), then Ollama, then Groq, then OpenRouter."""
+    for provider, model in _get_providers():
+        client = _get_client(provider, model)
+        result = client.generate(prompt, max_tokens)
+        if result:
+            return result
+    log.error("All LLM providers failed")
+    return None
+
+```
+
+api_client.py:
+```
+"""
+RentMasseur API Client — bounded, production-ready HTTP client.
+
+Confirmed endpoints only. No guesswork. No spam.
+"""
+
+import json
+import logging
+import os
+import re
+import time
+from typing import Optional, Dict, Any
+
+import requests
+
+log = logging.getLogger("rm_api")
+
+BASE = "https://rentmasseur.com"
+API = f"{BASE}/api/v1"
+
+_PROXY_URL = os.environ.get("PROXY_URL", "")
+_PROXY_SECRET = os.environ.get("PROXY_SECRET", "")
+
+if _PROXY_URL:
+    _PROXY_URL = _PROXY_URL.rstrip("/")
+    API = f"{_PROXY_URL}/api/v1"
+    BASE = _PROXY_URL
+    log.info("Using proxy: %s", _PROXY_URL)
+
+
+class RentMasseurAPI:
+    """Direct API client for rentmasseur.com using confirmed endpoints."""
+
+    def __init__(self, min_request_interval: float = 2.0):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"{BASE}/settings",
+            "Origin": BASE,
+        })
+        if _PROXY_SECRET:
+            self.session.headers["X-Proxy-Secret"] = _PROXY_SECRET
+        self.csrf = None
+        self.logged_in = False
+        self.username = None
+        self.last_request = 0.0
+        self.min_request_interval = min_request_interval
+        self._read_cache = {}
+        self._cache_ttl = 15.0
+
+    def _wait(self):
+        """Respectful rate limiting between requests."""
+        elapsed = time.time() - self.last_request
+        if elapsed < self.min_request_interval:
+            time.sleep(self.min_request_interval - elapsed)
+        self.last_request = time.time()
+
+    def _get(self, path: str, params: Optional[Dict] = None) -> requests.Response:
+        self._wait()
+        return self.session.get(f"{API}{path}", params=params, timeout=15)
+
+    def _cached_get(self, path: str, cache_key: str = None) -> Dict:
+        """GET with in-memory TTL cache for read endpoints."""
+        key = cache_key or path
+        now = time.time()
+        cached = self._read_cache.get(key)
+        if cached and (now - cached[0]) < self._cache_ttl:
+            return cached[1]
+        resp = self._get(path)
+        resp.raise_for_status()
+        data = resp.json()
+        self._read_cache[key] = (now, data)
+        return data
+
+    def invalidate_cache(self, *keys: str):
+        """Invalidate specific cache keys after a mutation."""
+        for k in keys:
+            self._read_cache.pop(k, None)
+
+    def invalidate_all(self):
+        self._read_cache.clear()
+
+    def _post(self, path: str, json_data: Dict) -> requests.Response:
+        self._wait()
+        return self.session.post(f"{API}{path}", json=json_data, timeout=15)
+
+    def _put(self, path: str, json_data: Dict) -> requests.Response:
+        self._wait()
+        return self.session.put(f"{API}{path}", json=json_data, timeout=15)
+
+    def _get_csrf(self) -> str:
+        resp = self.session.get(f"{BASE}/login")
+        m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', resp.text)
+        if m:
+            self.csrf = m.group(1)
+            return self.csrf
+        for cookie in self.session.cookies:
+            if "csrf" in cookie.name.lower() or "token" in cookie.name.lower():
+                self.csrf = cookie.value
+                return self.csrf
+        return ""
+
+    def login(self, username: str, password: str) -> bool:
+        """Login via API and store bearer token."""
+        self.username = username
+        csrf = self._get_csrf()
+        self._wait()
+        resp = self.session.post(f"{API}/login", json={
+            "email": username,
+            "password": password,
+            "csrf": csrf,
+            "remember": True,
+        })
+        if resp.status_code != 200:
+            log.error("Login failed: %d %s", resp.status_code, resp.text[:200])
+            return False
+        try:
+            data = resp.json()
+        except Exception:
+            log.error("Login response not JSON (captcha/block?): %s", resp.text[:300])
+            return False
+        token = data.get("accessToken")
+        if token:
+            self.session.headers["Authorization"] = f"Bearer {token}"
+        self.logged_in = True
+        log.info("Login OK as %s", username)
+        return True
+
+    def load_cookies(self, cookies: list):
+        """Load cookies from a saved session (e.g. from Selenium)."""
+        for c in cookies:
+            self.session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
+        self.logged_in = True
+
+    # ------------------------------------------------------------------
+    # Confirmed read endpoints
+    # ------------------------------------------------------------------
+
+    def get_dashboard(self) -> Dict:
+        return self._cached_get("/account/dashboard", "dashboard")
+
+    def get_availability(self) -> Dict:
+        return self._cached_get("/account/dashboard/availability", "availability")
+
+    def set_availability(self, option: int = 1, duration: int = 5) -> Dict:
+        """
+        Set availability.
+        option: 0=Not Set, 1=Available, 2=Not Available
+        duration: index from timePeriods (0=1h, 1=2h, ..., 5=6h)
+        """
+        resp = self._put("/account/dashboard/availability", {"option": option, "duration": duration})
+        resp.raise_for_status()
+        self.invalidate_cache("availability")
+        return resp.json()
+
+    def get_ad_statistics(self) -> Dict:
+        return self._cached_get("/account/dashboard/ad-statistics", "ad_statistics")
+
+    def get_keeponline(self) -> Dict:
+        return self._cached_get("/account/keeponline", "keeponline")
+
+    def get_about(self) -> Dict:
+        return self._cached_get("/settings/about", "about")
+
+    def get_mailbox(self, page: int = 1, folder: int = 1, sort: int = 1) -> Dict:
+        resp = self._get("/mailbox", params={"page": page, "folder": folder, "sort": sort})
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_blogs(self, page: int = 1) -> Dict:
+        resp = self._get("/blogs", params={"page": page})
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Confirmed write endpoints
+    # ------------------------------------------------------------------
+
+    def set_visibility(self, visible: bool) -> Dict:
+        resp = self._put("/settings/visibility", {"isAdHidden": not visible})
+        resp.raise_for_status()
+        self.invalidate_cache("keeponline", "dashboard")
+        return resp.json()
+
+    def set_sms_alerts(self, enabled: bool) -> Dict:
+        resp = self._put("/settings/sms", {"sms": enabled})
+        resp.raise_for_status()
+        self.invalidate_cache("dashboard")
+        return resp.json()
+
+    def set_track_actions(self, enabled: bool) -> Dict:
+        resp = self._put("/settings/track-actions", {"trackActions": enabled})
+        resp.raise_for_status()
+        self.invalidate_cache("dashboard")
+        return resp.json()
+
+    def set_about(self, headline: str, description: str) -> Dict:
+        resp = self._put("/settings/about", {"headline": headline, "description": description})
+        resp.raise_for_status()
+        self.invalidate_cache("about")
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": "ok", "raw": resp.text[:500]}
+
+    # ------------------------------------------------------------------
+    # Blog endpoints
+    # ------------------------------------------------------------------
+
+    def get_blog(self, blog_id: str) -> Dict:
+        resp = self._get(f"/blogs/{blog_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    def create_blog(self, title: str, body: str, tags: list = None) -> Dict:
+        payload = {"title": title, "body": body}
+        if tags:
+            payload["tags"] = tags
+        resp = self._post("/blogs", payload)
+        resp.raise_for_status()
+        self.invalidate_cache("blogs")
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": "ok", "raw": resp.text[:500]}
+
+    def update_blog(self, blog_id: str, title: str = None, body: str = None) -> Dict:

@@ -1,3 +1,583 @@
+        inferred.append({"name": "financial_density", "value": f"{len(fin_kpis)} refs", "method": "kpi_cross_ref", "confidence": 0.8})
+    if len(kpis) > 20:
+        inferred.append({"name": "high_signal_density", "value": f"{len(kpis)} KPIs", "method": "kpi_count", "confidence": 0.7})
+
+    result["inferred_kpis"] = inferred
+
+    # ── LLM extrapolation (if OpenAI configured) ──
+    llm_extrapolation = _jorki_llm_extrapolate(text, kpis, dna, result)
+    if llm_extrapolation:
+        result["llm_extrapolation"] = llm_extrapolation
+
+    return result
+
+
+def _jorki_llm_30_facts(text, kpis, dna, ml_result, meta):
+    """Use Groq LLM to generate 30 facts about a file, served as KPIs."""
+    if not GROQ_API_KEY and not OPENAI_API_KEY:
+        return None
+
+    filename = meta.get("filename", "unknown")
+    species = dna.get("species", "?") if isinstance(dna, dict) else "?"
+    complexity = float(dna.get("complexity_score", 0)) if isinstance(dna, dict) else 0
+    total_lines = int(meta.get("total_lines", 0))
+    total_words = int(meta.get("total_words", 0))
+    total_chunks = int(meta.get("total_chunks", 0))
+
+    kpi_summary = "; ".join(f"{k['name']}={k['value']}" for k in kpis[:15])
+    topics = ", ".join(t["keywords"][:3] for t in ml_result.get("topics", [])[:3]) if ml_result.get("topics") else "none"
+    text_sample = text[:2000]
+
+    prompt = f"""You are a forensic file analyst. Generate exactly 30 distinct, factual KPI-style insights about this file.
+
+FILE: {filename}
+SPECIES: {species}
+LINES: {total_lines} | WORDS: {total_words} | CHUNKS: {total_chunks} | COMPLEXITY: {complexity:.1f}
+EXTRACTED KPIs: {kpi_summary}
+ML TOPICS: {topics}
+
+FILE SAMPLE (first 2000 chars):
+{text_sample}
+
+Return a JSON array of exactly 30 objects, each with:
+{{
+  "id": 1-30,
+  "label": "short KPI name (2-4 words)",
+  "value": "the fact value (string or number)",
+  "category": "one of: structural|financial|technical|operational|risk|legal|ml|value|quality|security",
+  "confidence": 0.0-1.0,
+  "source": "llm"
+}}
+
+Cover diverse categories: structure, complexity, vocabulary, patterns, risk, value, quality, security, legal, financial, ML insights, recommendations.
+Be specific and grounded in the actual file content. No generic statements."""
+
+    # ── Fallback chain: try every active provider until one works ──
+    import urllib.request as _urllib, time as _time
+    _chain_path = _Path(__file__).resolve().parent / "data" / "llm_fallback_chain.json"
+    _cat_path = _Path(__file__).resolve().parent / "data" / "api_catalog.json"
+    providers_to_try = []
+    # 1) Build from fallback chain (ranked)
+    if _chain_path.exists():
+        try:
+            for c in json.load(open(_chain_path)):
+                if c.get("score", 0) > 0: providers_to_try.append(c)
+        except: pass
+    # 2) Fallback to hardcoded Groq/OpenAI if chain empty
+    if not providers_to_try:
+        if GROQ_API_KEY: providers_to_try.append({"provider":"groq","env_var":"GROQ_API_KEY","model":"llama-3.3-70b-versatile"})
+        if OPENAI_API_KEY: providers_to_try.append({"provider":"openai","env_var":"OPENAI_API_KEY","model":"gpt-4o-mini"})
+    # 2.5) Always add LLM7 anonymous as ultimate fallback
+    providers_to_try.append({"provider":"llm7","env_var":"LLM7_API_KEY","model":"fast","endpoint":"https://api.llm7.io/v1/chat/completions"})
+    # 3) Load catalog for endpoints
+    _endpoints = {}
+    if _cat_path.exists():
+        try:
+            for s in json.load(open(_cat_path)).get("services", []): _endpoints[s["p"]] = s["e"]
+        except: pass
+    if "groq" not in _endpoints: _endpoints["groq"] = GROQ_URL
+    if "openai" not in _endpoints: _endpoints["openai"] = "https://api.openai.com/v1/chat/completions"
+    # 4) Try each provider
+    for entry in providers_to_try:
+        prov = entry.get("provider",""); env_var = entry.get("env_var",""); model = entry.get("model","")
+        key = os.environ.get(env_var, "unused" if prov == "llm7" else "")
+        if not key: continue
+        endpoint = entry.get("endpoint", "") or _endpoints.get(prov, "")
+        if not endpoint: continue
+        try:
+            body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 2000}).encode()
+            req = _urllib.Request(endpoint, data=body, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", f"Bearer {key}")
+            with _urllib.urlopen(req, timeout=30) as resp:
+                content = json.loads(resp.read())["choices"][0]["message"]["content"]
+            return _parse_facts(content)
+        except Exception: continue
+    return None
+
+
+def _parse_facts(content):
+    """Parse LLM response into 30 facts."""
+    try:
+        facts = json.loads(content)
+        if isinstance(facts, list):
+            return facts[:30]
+        if isinstance(facts, dict) and "facts" in facts:
+            return facts["facts"][:30]
+    except:
+        import re as _re
+        m = _re.search(r'\[.*\]', content, _re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group())[:30]
+            except:
+                pass
+    return [{"id": 1, "label": "llm_parse_error", "value": content[:200], "category": "technical", "confidence": 0.1, "source": "llm"}]
+
+
+def _jorki_llm_extrapolate(text, kpis, dna, ml_result):
+    """Use LLM to extrapolate hidden features, risks, and opportunities."""
+    if not OPENAI_API_KEY:
+        return None
+
+    # Build a compact prompt from extracted features
+    kpi_summary = "; ".join(f"{k['name']}={k['value']}" for k in kpis[:15])
+    dna_summary = f"species={dna.get('species','?')}, complexity={dna.get('complexity_score',0)}"
+    topics = ", ".join(t["keywords"][:3] for t in ml_result.get("topics", [])[:2])
+    text_sample = text[:1500]
+
+    prompt = f"""Analyze this file's extracted features and extrapolate hidden value, risks, and opportunities.
+
+FILE SAMPLE (first 1500 chars):
+{text_sample}
+
+EXTRACTED KPIs: {kpi_summary}
+DNA: {dna_summary}
+ML TOPICS: {topics}
+
+Return JSON with:
+{{
+  "inferred_purpose": "what this file is likely used for",
+  "hidden_value": "economic or strategic value not obvious from content",
+  "counterparty_risk": "any risk from sharing this with external parties",
+  "monetization_vector": "how this file's data could be monetized",
+  "compliance_flags": ["any regulatory concerns"],
+  "comparable_assets": "what kind of financial or intellectual asset this resembles",
+  "confidence": 0.0-1.0
+}}"""
+
+    try:
+        import requests as _req
+        resp = _req.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 500,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            content = resp.json()["choices"][0]["message"]["content"]
+            try:
+                return json.loads(content)
+            except:
+                return {"raw_response": content}
+    except:
+        pass
+    return None
+
+
+@app.get("/ml/{file_id}")
+async def jorki_ml_profile(file_id: str):
+    """Unsupervised ML features: topics, clusters, anomalies, latent features, LLM extrapolation."""
+    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Index not found for {file_id}"}
+    conn = sqlite3.connect(str(idx_path))
+    meta_rows = conn.execute("SELECT key, value FROM file_meta").fetchall()
+    kpi_rows = conn.execute("SELECT id, name, value, line, category, confidence FROM kpis").fetchall()
+    dna_rows = conn.execute("SELECT key, value FROM dna").fetchall()
+    word_rows = conn.execute("SELECT word, count FROM word_freq").fetchall()
+    chunk_rows = conn.execute("SELECT idx, line_start, line_end, boundary_type, preview, line_count FROM chunks").fetchall()
+    conn.close()
+    _jorki_track_query(file_id, "ml")
+
+    meta = {r[0]: r[1] for r in meta_rows}
+    kpis = [{"id": r[0], "name": r[1], "value": r[2], "line": r[3], "category": r[4], "confidence": r[5]} for r in kpi_rows]
+    dna = {r[0]: r[1] for r in dna_rows}
+    word_freq = {r[0]: int(r[1]) for r in word_rows}
+    chunks = [{"idx": r[0], "line_start": r[1], "line_end": r[2], "boundary_type": r[3], "preview": r[4], "line_count": r[5]} for r in chunk_rows]
+
+    # Reconstruct text from chunks (limit to first 200 chunks for performance)
+    text = "\n".join(c["preview"] for c in chunks[:200])
+    lines = text.split("\n")
+
+    try:
+        dna_obj = json.loads(dna.get("genes", "{}")) if isinstance(dna.get("genes"), str) else {}
+        dna_dict = {"genes": dna_obj, "complexity_score": float(dna.get("complexity_score", 0)),
+                    "dna_sequence": dna.get("dna_sequence", ""), "species": dna.get("species", "")}
+    except:
+        dna_dict = {}
+
+    try:
+        ml_result = _jorki_ml_extract(text, lines, chunks, word_freq, kpis, dna_dict)
+    except Exception as e:
+        ml_result = {"available": False, "error": str(e), "engine": "error"}
+    return {"file_id": file_id, "filename": meta.get("filename", "unknown"), "ml": ml_result}
+
+# ─── Pipeline API: Clipboard → Repo → Artifact → Deploy → App → DMG → AppStore ─
+
+import subprocess as _subproc
+import re as _re
+import uuid as _uuid
+
+PIPELINE_DIR = _Path(os.environ.get("JORKI_PIPELINE_DIR", "/tmp/jorki_pipeline"))
+PIPELINE_RUNS = {}
+PIPELINE_LOGS = {}
+
+PIPELINE_STAGES = ["clipboard", "repo", "artifact", "deploy"]
+
+GLYPH_MAP = {"idle": "◌", "active": "◉", "complete": "✓", "error": "⟁", "skipped": "◍"}
+
+def _pipe_log(run_id: str, stage: str, msg: str, level: str = "info"):
+    if run_id not in PIPELINE_LOGS:
+        PIPELINE_LOGS[run_id] = []
+    glyph = GLYPH_MAP.get("active" if level == "info" else
+                           "complete" if level == "done" else
+                           "error" if level == "error" else "active", "◉")
+    PIPELINE_LOGS[run_id].append({
+        "ts": datetime.now().strftime("%H:%M:%S"),
+        "stage": stage, "msg": msg, "level": level, "glyph": glyph,
+    })
+
+def _pipe_receipt(chain: list, stage: str, artifacts: dict) -> dict:
+    prev = chain[-1]["hash"] if chain else "0" * 64
+    entry = json.dumps({"stage": stage, "artifacts": artifacts, "ts": time.time()}, sort_keys=True, default=str)
+    h = hashlib.sha256((prev + entry).encode()).hexdigest()
+    r = {"stage": stage, "artifacts": artifacts, "hash": h, "prev_hash": prev, "ts": time.time()}
+    chain.append(r)
+    return r
+
+def _detect_content_type(content: str) -> str:
+    s = content.strip()
+    if not s: return "empty"
+    if s.startswith("{") or s.startswith("["):
+        try: json.loads(s); return "json"
+        except: pass
+    if s.startswith("#!"): return "script"
+    if "import " in s and ("def " in s or "class " in s): return "python"
+    if "function " in s or "const " in s or "=>" in s: return "javascript"
+    if s.startswith("<"): return "markup"
+    if "# " in s[:10] or "## " in s[:20]: return "markdown"
+    if _re.match(r'^(FROM|RUN|COPY|CMD|WORKDIR)', s, _re.MULTILINE): return "dockerfile"
+    return "text"
+
+def _derive_name(content: str, ctype: str) -> str:
+    if ctype == "python":
+        for line in content.split("\n"):
+            if "class " in line and ":" in line:
+                n = line.split("class ")[1].split("(")[0].split(":")[0].strip()
+                if n and n[0].isupper(): return _re.sub(r'[^A-Za-z0-9]', '', n)
+    if ctype == "json":
+        try:
+            d = json.loads(content.strip())
+            if isinstance(d, dict):
+                for k in ("name", "title", "app"):
+                    if k in d and isinstance(d[k], str): return _re.sub(r'[^A-Za-z0-9]', '', d[k])
+        except: pass
+    words = _re.findall(r'\b[A-Za-z][a-z]+\b', content[:500])
+    if words: return _re.sub(r'[^A-Za-z0-9]', '', "".join(w.capitalize() for w in words[:3])) or "ClipboardApp"
+    return "ClipboardApp"
+
+def _run_pipeline(run_id: str, content: str):
+    state = PIPELINE_RUNS[run_id]
+    chain = state["receipt_chain"]
+    try:
+        # Stage 1: Clipboard
+        _pipe_log(run_id, "clipboard", f"Read {len(content)} chars")
+        ctype = _detect_content_type(content)
+        chash = hashlib.sha256(content.encode()).hexdigest()
+        pname = _derive_name(content, ctype)
+        state["content_type"] = ctype
+        state["content_hash"] = chash
+        state["project_name"] = pname
+        state["content_preview"] = content[:500]
+
+        # Index clipboard content via Jorki indexer for dossier/intel
+        try:
+            clip_path = JORKI_DATA_DIR / "pipeline_uploads" / f"{pname}.txt"
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            clip_path.write_text(content)
+            idx_result = _jorki_index_file(str(clip_path))
+            state["file_id"] = idx_result.get("file_id", "")
+            reg = _jorki_load_registry()
+            reg[state["file_id"]] = {
+                "filename": idx_result.get("filename", pname),
+                "size_bytes": idx_result.get("size_bytes", 0),
+                "size_human": idx_result.get("size_human", ""),
+                "format": ctype, "status": "active", "indexed_at": time.time(),
+            }
+            _jorki_save_registry(reg)
+            _pipe_log(run_id, "clipboard", f"Indexed as file_id: {state['file_id']}", "ok")
+        except Exception as e:
+            _pipe_log(run_id, "clipboard", f"Index warning: {str(e)[:80]}", "info")
+
+        _pipe_receipt(chain, "clipboard", {"type": ctype, "hash": chash, "name": pname, "file_id": state.get("file_id", "")})
+        state["completed_stages"].append("clipboard")
+        _pipe_log(run_id, "clipboard", f"Type: {ctype} │ Name: {pname}", "ok")
+
+        # Stage 2: Repo
+        state["current_stage"] = "repo"
+        _pipe_log(run_id, "repo", f"Creating project: {pname}")
+        proj_dir = PIPELINE_DIR / "projects" / pname
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        main_file = "main.py" if ctype in ("python", "script") else \
+                    "index.js" if ctype == "javascript" else \
+                    "index.html" if ctype == "markup" else \
+                    "content.md" if ctype == "markdown" else \
+                    "data.json" if ctype == "json" else "content.txt"
+        (proj_dir / main_file).write_text(content)
+        (proj_dir / "README.md").write_text(f"# {pname}\n\nAuto-generated from clipboard via Jorki pipeline.\n\n- Type: {ctype}\n- Hash: `{chash}`\n")
+        (proj_dir / ".gitignore").write_text(".venv/\n__pycache__/\nnode_modules/\ndist/\nbuild/\n.env\n*.dmg\n")
+
+        _subproc.run(["git", "init"], cwd=str(proj_dir), capture_output=True, check=False)
+        _subproc.run(["git", "add", "-A"], cwd=str(proj_dir), capture_output=True, check=False)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "Jorki", "GIT_AUTHOR_EMAIL": "pipeline@jorki.local",
+               "GIT_COMMITTER_NAME": "Jorki", "GIT_COMMITTER_EMAIL": "pipeline@jorki.local"}
+        _subproc.run(["git", "commit", "-m", f"Initial commit from clipboard\n\nType: {ctype}\nHash: {chash}"],
+                     cwd=str(proj_dir), capture_output=True, check=False, env=env)
+
+        repo_name = pname.lower().replace("_", "-")
+        gh_url = ""
+        try:
+            r = _subproc.run(["gh", "repo", "create", repo_name, "--public", "--source=.", "--push",
+                              "--description", f"Auto-generated from clipboard ({ctype})"],
+                             cwd=str(proj_dir), capture_output=True, text=True, check=False, env=env)
+            if r.returncode == 0:
+                for line in (r.stderr + r.stdout).split("\n"):
+                    if "github.com" in line:
+                        gh_url = line.strip().split()[-1]; break
+                if not gh_url:
+                    r2 = _subproc.run(["gh", "repo", "view", repo_name, "--json", "url"],
+                                      capture_output=True, text=True, check=False)
+                    if r2.returncode == 0:
+                        try: gh_url = json.loads(r2.stdout).get("url", "")
+                        except: pass
+                state["github_repo"] = repo_name
+                state["github_url"] = gh_url
+                _pipe_log(run_id, "repo", f"GitHub: {gh_url}", "ok")
+            else:
+                _pipe_log(run_id, "repo", f"gh failed: {r.stderr.strip()[:100]}", "info")
+                state["github_repo"] = repo_name
+                state["github_url"] = ""
+                _pipe_receipt(chain, "repo", {"repo": repo_name, "url": "local", "dir": str(proj_dir), "skipped": "gh_error"})
+        except FileNotFoundError:
+            _pipe_log(run_id, "repo", f"gh not installed — local repo only: {str(proj_dir)}", "info")
+            state["github_repo"] = repo_name
+            state["github_url"] = ""
+            _pipe_receipt(chain, "repo", {"repo": repo_name, "url": "local", "dir": str(proj_dir), "skipped": "gh_not_found"})
+        _pipe_receipt(chain, "repo", {"repo": repo_name, "url": gh_url or "local", "dir": str(proj_dir)})
+        state["completed_stages"].append("repo")
+
+        # Stage 3: Artifact (HuggingFace Space)
+        state["current_stage"] = "artifact"
+        hf_token = os.environ.get("HF_TOKEN", "")
+        if hf_token:
+            _pipe_log(run_id, "artifact", "Creating HuggingFace Space…")
+            try:
+                from huggingface_hub import HfApi, create_repo
+                space_id = f"{os.environ.get('HF_USERNAME', 'user')}/{repo_name}-space"
+                create_repo(repo_id=space_id, repo_type="space", space_sdk="static", exist_ok=True)
+                api = HfApi()
+                api.upload_folder(folder_path=str(proj_dir), repo_id=space_id, repo_type="space")
+                hf_url = f"https://huggingface.co/spaces/{space_id}"
+                state["hf_space_id"] = space_id
+                state["hf_space_url"] = hf_url
+                _pipe_log(run_id, "artifact", f"HF Space: {hf_url}", "ok")
+                _pipe_receipt(chain, "artifact", {"space_id": space_id, "url": hf_url})
+            except Exception as e:
+                _pipe_log(run_id, "artifact", f"HF failed: {str(e)[:100]}", "error")
+                state["error_stage"] = "artifact"
+                state["status"] = "error"
+                return
+        else:
+            _pipe_log(run_id, "artifact", "HF_TOKEN not set — skipping", "info")
+            _pipe_receipt(chain, "artifact", {"skipped": True, "reason": "no HF_TOKEN"})
+        state["completed_stages"].append("artifact")
+
+        # Stage 4: Deploy (Vercel)
+        state["current_stage"] = "deploy"
+        _pipe_log(run_id, "deploy", "Deploying to Vercel…")
+        try:
+            r = _subproc.run(["vercel", "--prod", "--yes"], cwd=str(proj_dir),
+                             capture_output=True, text=True, check=False, timeout=120)
+            if r.returncode == 0:
+                vercel_url = r.stdout.strip().split("\n")[-1].strip()
+                if not vercel_url.startswith("http"):
+                    for line in r.stdout.split("\n"):
+                        if "https://" in line:
+                            vercel_url = line.strip(); break
+                state["vercel_url"] = vercel_url
+                _pipe_log(run_id, "deploy", f"Vercel: {vercel_url}", "ok")
+                _pipe_receipt(chain, "deploy", {"url": vercel_url})
+            else:
+                _pipe_log(run_id, "deploy", f"Vercel failed: {r.stderr.strip()[:100]}", "error")
+                _pipe_receipt(chain, "deploy", {"failed": True, "error": r.stderr.strip()[:200]})
+        except Exception as e:
+            _pipe_log(run_id, "deploy", f"Vercel error: {str(e)[:100]}", "error")
+            _pipe_receipt(chain, "deploy", {"error": str(e)[:200]})
+        state["completed_stages"].append("deploy")
+
+        state["status"] = "complete"
+        state["current_stage"] = ""
+        _pipe_log(run_id, "pipeline", "Pipeline complete", "done")
+
+    except Exception as e:
+        _pipe_log(run_id, state.get("current_stage", "pipeline"), f"Error: {str(e)[:200]}", "error")
+        state["status"] = "error"
+        state["error_stage"] = state.get("current_stage", "unknown")
+
+@app.post("/pipeline/trigger")
+async def pipeline_trigger(body: dict = Body(...)):
+    content = body.get("content", "")
+    if not content:
+        try:
+            r = _subproc.run(["pbpaste"], capture_output=True, text=True, check=False, timeout=5)
+            content = r.stdout
+        except Exception:
+            content = ""
+    if not content.strip():
+        return {"error": "Clipboard is empty and no content provided"}
+    run_id = str(_uuid.uuid4())[:12]
+    PIPELINE_RUNS[run_id] = {
+        "run_id": run_id, "status": "running", "current_stage": "clipboard",
+        "completed_stages": [], "error_stage": "",
+        "content_type": "", "content_hash": "", "project_name": "",
+        "content_preview": "", "github_repo": "", "github_url": "",
+        "hf_space_id": "", "hf_space_url": "", "vercel_url": "",
+        "app_bundle_path": "", "dmg_path": "", "notarization_id": "",
+        "file_id": "", "receipt_chain": [],
+    }
+    PIPELINE_LOGS[run_id] = []
+    thread = threading.Thread(target=lambda: _run_pipeline(run_id, content), daemon=True)
+    thread.start()
+    return {"run_id": run_id, "status": "started", "message": "Pipeline started. Poll GET /pipeline/status/{run_id}"}
+
+@app.get("/pipeline/status/{run_id}")
+async def pipeline_status(run_id: str):
+    state = PIPELINE_RUNS.get(run_id)
+    if not state:
+        return {"error": f"Run {run_id} not found"}
+    result = dict(state)
+    result["logs"] = PIPELINE_LOGS.get(run_id, [])
+    return result
+
+@app.get("/pipeline/latest")
+async def pipeline_latest():
+    if not PIPELINE_RUNS:
+        return {"run_id": None}
+    latest = max(PIPELINE_RUNS.values(), key=lambda s: s.get("started_at", 0) if "started_at" in s else 0)
+    return {"run_id": latest["run_id"], "status": latest["status"]}
+
+@app.get("/pipeline/receipts/{run_id}")
+async def pipeline_receipts(run_id: str):
+    state = PIPELINE_RUNS.get(run_id)
+    if not state:
+        return {"error": f"Run {run_id} not found"}
+    return {"run_id": run_id, "receipts": state.get("receipt_chain", []),
+            "chain_valid": all(
+                r["prev_hash"] == (state["receipt_chain"][i-1]["hash"] if i > 0 else "0"*64)
+                for i, r in enumerate(state.get("receipt_chain", []))
+            )}
+
+# Mount React UI static assets if dist exists
+_ui_dist = _Path("/app/jorki_ui_dist")
+if _ui_dist.exists():
+    _assets_dist = _ui_dist / "assets"
+    if _assets_dist.exists():
+        app.mount("/assets", StaticFiles(directory=str(_assets_dist)), name="jorki_assets")
+
+    @app.get("/ui")
+    async def jorki_ui():
+        return FileResponse(str(_ui_dist / "index.html"))
+
+# ─── LLM API Key Agent Endpoints ────────────────────────────────────────
+_LLM_DATA_DIR = _Path(__file__).resolve().parent / "data"
+_LLM_CATALOG_PATH = _LLM_DATA_DIR / "api_catalog_raw.json"
+if not _LLM_CATALOG_PATH.exists():
+    _LLM_CATALOG_PATH = _LLM_DATA_DIR / "api_catalog.json"
+_LLM_REGISTRY_PATH = _LLM_DATA_DIR / "api_key_registry.json"
+_LLM_CHAIN_PATH = _LLM_DATA_DIR / "llm_fallback_chain.json"
+_LLM_USAGE = {"total_requests": 0, "per_provider": {}, "fallbacks_triggered": 0}
+
+def _llm_load_json(path):
+    if path.exists():
+        with open(path) as f: return json.load(f)
+    return {}
+
+def _llm_save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f: json.dump(data, f, indent=2)
+
+@app.get("/llm/keys")
+async def llm_keys():
+    """Return all validated keys with status, provider, model, score."""
+    registry = _llm_load_json(_LLM_REGISTRY_PATH)
+    return {"keys": registry, "total": len(registry) if isinstance(registry, list) else 0,
+            "active": sum(1 for r in registry if r.get("status") == "active") if isinstance(registry, list) else 0}
+
+@app.get("/llm/catalog")
+async def llm_catalog():
+    """Return full 300+ service catalog."""
+    return _llm_load_json(_LLM_CATALOG_PATH)
+
+@app.get("/llm/models")
+async def llm_models():
+    """Return all available models across all providers."""
+    catalog = _llm_load_json(_LLM_CATALOG_PATH)
+    models = []
+    for svc in catalog.get("services", []):
+        for m in svc.get("m", []):
+            models.append({"model": m, "provider": svc["p"], "category": svc["c"], "endpoint": svc["e"]})
+    return {"models": models, "total": len(models)}
+
+@app.get("/llm/health")
+async def llm_health():
+    """Ping all providers, return live status board."""
+    import urllib.request, urllib.error, time as _time
+    registry = _llm_load_json(_LLM_REGISTRY_PATH)
+    if not isinstance(registry, list): registry = []
+    statuses = []
+    for r in registry:
+        p = r.get("provider", ""); st = r.get("status", "unknown")
+        glyph = {"active": "◉", "expired": "⟁", "rate_limited": "⧖", "invalid": "✕", "untested": "◌"}.get(st, "◌")
+        statuses.append({"provider": p, "status": st, "glyph": glyph, "latency_ms": r.get("latency_ms", 0), "score": r.get("score", 0)})
+    return {"providers": statuses, "timestamp": _time.time(),
+            "summary": {"active": sum(1 for s in statuses if s["status"] == "active"),
+                        "total": len(statuses)}}
+
+@app.get("/llm/chain")
+async def llm_chain():
+    """Return the ranked fallback chain."""
+    return {"chain": _llm_load_json(_LLM_CHAIN_PATH)}
+
+@app.post("/llm/chat")
+async def llm_chat(body: dict = Body(...)):
+    """Auto-route to best available provider, fall back on failure."""
+    import urllib.request, urllib.error, time as _time
+    chain = _llm_load_json(_LLM_CHAIN_PATH)
+    if not isinstance(chain, list): chain = []
+    active = [c for c in chain if c.get("score", 0) > 0]
+    if not active: active = chain
+    # Always include LLM7 anonymous as ultimate fallback
+    active.append({"provider": "llm7", "env_var": "LLM7_API_KEY", "model": "fast", "endpoint": "https://api.llm7.io/v1/chat/completions"})
+    messages = body.get("messages", [{"role": "user", "content": "Hello"}])
+    model = body.get("model", "")
+    prompt = body.get("prompt", "")
+    if prompt and not messages: messages = [{"role": "user", "content": prompt}]
+    errors = []
+    for entry in active:
+        provider = entry.get("provider", ""); env_var = entry.get("env_var", "")
+        key = os.environ.get(env_var, "unused"); endpoint = entry.get("endpoint", "")
+        if not endpoint:
+            for svc in _llm_load_json(_LLM_CATALOG_PATH).get("services", []):
+                if svc["p"] == provider: endpoint = svc["e"]; break
+        if not endpoint: continue
+        use_model = model or entry.get("model", "")
+        req_body = json.dumps({"model": use_model, "messages": messages, "max_tokens": body.get("max_tokens", 500), "temperature": body.get("temperature", 0.3)}).encode()
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        try:
+            req = urllib.request.Request(endpoint, data=req_body, headers=headers, method="POST")
+            resp = urllib.request.urlopen(req, timeout=15)
+            data = json.loads(resp.read())
+            _LLM_USAGE["total_requests"] += 1
+            _LLM_USAGE["per_provider"][provider] = _LLM_USAGE["per_provider"].get(provider, 0) + 1
+            return {"response": data.get("choices", [{}])[0].get("message", {}).get("content", ""),
+                    "provider": provider, "model": use_model, "usage": _LLM_USAGE}
+        except Exception as e:
             errors.append({"provider": provider, "error": str(e)[:200]}); continue
     _LLM_USAGE["fallbacks_triggered"] += 1
     return {"error": "All providers failed", "errors": errors, "usage": _LLM_USAGE}
@@ -218,583 +798,3 @@ async def oa_decision_gate(body: dict = Body(...)):
 @app.get("/api/decision-gate")
 async def oa_decision_list():
     """List all decisions in the ledger."""
-    conn = _oa_db()
-    rows = conn.execute("SELECT ts, action, rationale, evidence, approved, operator FROM decisions ORDER BY ts DESC LIMIT 50").fetchall()
-    conn.close()
-    return {"decisions": [{"ts": r[0], "action": r[1], "rationale": r[2], "evidence": r[3], "approved": bool(r[4]), "operator": r[5]} for r in rows], "count": len(rows)}
-
-@app.get("/api/receipts")
-async def oa_receipts(limit: int = 50):
-    """Receipt ledger — tamper-evident chain of all important actions."""
-    conn = _oa_db()
-    rows = conn.execute("SELECT ts, action, actor, detail, hash, prev_hash FROM receipts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-    conn.close()
-    return {
-        "receipts": [{"ts": r[0], "action": r[1], "actor": r[2], "detail": r[3], "hash": r[4], "prev_hash": r[5]} for r in rows],
-        "count": len(rows),
-        "chain_verified": len(rows) > 0,
-    }
-
-@app.post("/api/experiments")
-async def oa_experiment_create(body: dict = Body(...)):
-    """Track experiment state: hypothesis, metric delta, verdict."""
-    name = body.get("name", "")
-    hypothesis = body.get("hypothesis", "")
-    if not name:
-        return {"error": "name is required"}
-    conn = _oa_db()
-    conn.execute("INSERT INTO experiments (ts, name, hypothesis, state, metric_delta, verdict) VALUES (?,?,?,?,?,?)",
-                 (time.time(), name, hypothesis[:300], "running", "", ""))
-    conn.commit(); conn.close()
-    rhash = _oa_receipt("experiment_start", "system", f"Experiment: {name} — {hypothesis}")
-    return {"experiment": name, "state": "running", "receipt": rhash[:16]}
-
-@app.post("/api/experiments/{name}/verdict")
-async def oa_experiment_verdict(name: str, body: dict = Body(...)):
-    """Record experiment verdict: keep, rollback, or iterate."""
-    verdict = body.get("verdict", "inconclusive")
-    metric_delta = body.get("metric_delta", "")
-    conn = _oa_db()
-    conn.execute("UPDATE experiments SET state=?, metric_delta=?, verdict=? WHERE name=? AND state='running'",
-                 ("complete", str(metric_delta)[:200], verdict, name))
-    conn.commit(); conn.close()
-    rhash = _oa_receipt("experiment_verdict", "system", f"{name}: {verdict} — delta={metric_delta}")
-    return {"experiment": name, "verdict": verdict, "receipt": rhash[:16]}
-
-@app.get("/api/experiments")
-async def oa_experiment_list():
-    """List all experiments and their states."""
-    conn = _oa_db()
-    rows = conn.execute("SELECT ts, name, hypothesis, state, metric_delta, verdict FROM experiments ORDER BY ts DESC").fetchall()
-    conn.close()
-    return {"experiments": [{"ts": r[0], "name": r[1], "hypothesis": r[2], "state": r[3], "metric_delta": r[4], "verdict": r[5]} for r in rows], "count": len(rows)}
-
-@app.get("/api/dashboard")
-async def oa_dashboard():
-    """Production control surface: alive? attention? buyer intent? keep/rollback/wait/test?"""
-    kpis = _oa_compute_kpis()
-    conn = _oa_db()
-    # Recent metrics
-    recent_metrics = conn.execute("SELECT ts, source, metric, value FROM metrics ORDER BY ts DESC LIMIT 20").fetchall()
-    # Decision count
-    decisions = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
-    approved = conn.execute("SELECT COUNT(*) FROM decisions WHERE approved=1").fetchone()[0]
-    # Experiment count
-    experiments = conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
-    active_exp = conn.execute("SELECT COUNT(*) FROM experiments WHERE state='running'").fetchone()[0]
-    # Receipt chain
-    receipt_count = conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0]
-    last_receipt = conn.execute("SELECT ts, action FROM receipts ORDER BY id DESC LIMIT 1").fetchone()
-    conn.close()
-    # System alive check
-    alive = kpis["raw"]["health_checks_1h"] > 0 or receipt_count > 0
-    attention_increasing = kpis["raw"]["view_acceleration_pct"] > 0
-    buyer_intent = kpis["raw"]["contacts_1h"] > 0
-    if kpis["composite"] > 50:
-        recommendation = "keep"
-    elif kpis["composite"] < 25:
-        recommendation = "rollback"
-    else:
-        recommendation = "wait"
-    return {
-        "alive": alive,
-        "attention_increasing": attention_increasing,
-        "buyer_intent": buyer_intent,
-        "recommendation": recommendation,
-        "kpis": kpis,
-        "counts": {
-            "decisions": decisions,
-            "approved": approved,
-            "experiments": experiments,
-            "active_experiments": active_exp,
-            "receipts": receipt_count,
-        },
-        "last_receipt": {"ts": last_receipt[0], "action": last_receipt[1]} if last_receipt else None,
-        "recent_metrics": [{"ts": r[0], "source": r[1], "metric": r[2], "value": r[3]} for r in recent_metrics],
-        "operator_questions": {
-            "is_system_alive": alive,
-            "is_attention_increasing": attention_increasing,
-            "did_latest_change_improve_buyer_intent": buyer_intent,
-            "should_we": recommendation,
-        },
-    }
-
-@app.get("/api/operator-report")
-async def oa_operator_report():
-    """Short operator report: what changed, what proven, what unproven, what next."""
-    kpis = _oa_compute_kpis()
-    conn = _oa_db()
-    # What changed (recent receipts)
-    changes = conn.execute("SELECT action, actor, ts FROM receipts ORDER BY id DESC LIMIT 10").fetchall()
-    # What proven (backed by receipts + metrics)
-    proven = []
-    if kpis["raw"]["total_receipts"] > 0:
-        proven.append(f"Receipt chain intact: {kpis['raw']['total_receipts']} receipts")
-    if kpis["raw"]["health_checks_1h"] > 0:
-        proven.append(f"System alive: {kpis['raw']['health_checks_1h']} health checks in last hour")
-    if kpis["raw"]["views_1h"] > 0:
-        proven.append(f"Attention measurable: {kpis['raw']['views_1h']} profile views in last hour")
-    if kpis["raw"]["contacts_1h"] > 0:
-        proven.append(f"Buyer intent detected: {kpis['raw']['contacts_1h']} contact clicks in last hour")
-    # What unproven
-    unproven = []
-    if kpis["raw"]["health_checks_1h"] == 0:
-        unproven.append("No health checks in last hour — system liveness unproven")
-    if kpis["raw"]["views_1h"] == 0:
-        unproven.append("No profile views recorded — attention unproven")
-    if kpis["raw"]["contacts_1h"] == 0:
-        unproven.append("No contact clicks recorded — conversion unproven")
-    if kpis["proof"] < 50:
-        unproven.append(f"Proof density low ({kpis['proof']}/100) — need more receipts + metrics")
-    # What next
-    next_moves = []
-    if kpis["raw"]["health_checks_1h"] == 0:
-        next_moves.append("Start health check loop: POST /api/metrics/ingest with metric=health_check")
-    if kpis["raw"]["views_1h"] == 0:
-        next_moves.append("Ingest profile view metrics from first-party source")
-    if kpis["raw"]["contacts_1h"] == 0 and kpis["raw"]["views_1h"] > 0:
-        next_moves.append("A/B test contact button placement to improve conversion")
-    if kpis["composite"] < 50:
-        next_moves.append("Run experiment: POST /api/experiments with hypothesis for improvement")
-    if not next_moves:
-        next_moves.append("System stable. Monitor KPI trends and plan next experiment.")
-    conn.close()
-    return {
-        "report_ts": time.time(),
-        "kpi_snapshot": kpis,
-        "what_changed": [{"action": r[0], "actor": r[1], "ts": r[2]} for r in changes],
-        "what_proven": proven,
-        "what_unproven": unproven,
-        "what_next": next_moves,
-        "STATUS": "alive" if kpis["raw"]["total_receipts"] > 0 else "cold_start",
-        "PROOF": f"{kpis['proof']}/100 — {kpis['raw']['total_receipts']} receipts, {kpis['raw']['distinct_metrics_1h']} distinct metrics",
-        "RISK": "low" if kpis["composite"] > 50 else "medium" if kpis["composite"] > 25 else "high",
-        "NEXT_MOVE": next_moves[0] if next_moves else "monitor",
-    }
-
-# ─── SonicGlyph: Audio Glyph System for JORKI ───────────────────────────
-# Audio becomes a GlyphLang target: non-playable proof receipts for audio.
-# Fidelity ladder: L0 exists → L1 metadata → L2 signal → L3 fingerprint →
-# L4 speaker topology → L5 transcript shadow → L6 semantic claims →
-# L7 degraded preview → L8 encrypted full → L9 playable transport
-
-SONIC_DATA_DIR = JORKI_DATA_DIR / "audio"
-SONIC_DATA_DIR.mkdir(parents=True, exist_ok=True)
-SONIC_REGISTRY_PATH = SONIC_DATA_DIR / "sonic_registry.json"
-_sonic_claims = {}
-
-def _sonic_load_registry():
-    if SONIC_REGISTRY_PATH.exists():
-        return json.loads(SONIC_REGISTRY_PATH.read_text())
-    return {}
-
-def _sonic_save_registry(reg):
-    SONIC_REGISTRY_PATH.write_text(json.dumps(reg, indent=2))
-
-def _sonic_extract_metadata(content: bytes, filename: str) -> dict:
-    """Extract L0-L2 metadata from audio bytes without playing."""
-    import struct
-    size = len(content)
-    sha256 = hashlib.sha256(content).hexdigest()
-    # Format detection by magic bytes
-    fmt = "unknown"
-    sample_rate = 0
-    channels = 0
-    bitrate = 0
-    duration_s = 0.0
-    codec = "unknown"
-    if content[:4] == b'RIFF' and content[8:12] == b'WAVE':
-        fmt = "wav"
-        codec = "pcm"
-        if len(content) > 44:
-            channels = struct.unpack('<H', content[22:24])[0]
-            sample_rate = struct.unpack('<I', content[24:28])[0]
-            bits_per_sample = struct.unpack('<H', content[34:36])[0]
-            bitrate = sample_rate * channels * bits_per_sample
-            data_size = struct.unpack('<I', content[40:44])[0]
-            if sample_rate > 0 and channels > 0 and bits_per_sample > 0:
-                duration_s = data_size / (sample_rate * channels * (bits_per_sample // 8))
-    elif content[:3] == b'ID3' or (len(content) > 2 and content[0] == 0xFF and (content[1] & 0xE0) == 0xE0):
-        fmt = "mp3"
-        codec = "mp3"
-        # Rough bitrate detection from header
-        if len(content) > 4:
-            br_idx = (content[2] >> 4) & 0x0F
-            br_table = [0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0]
-            bitrate = br_table[br_idx] * 1000 if br_idx < 16 else 0
-            sr_idx = (content[2] >> 2) & 0x03
-            sr_table = [44100, 48000, 32000, 0]
-            sample_rate = sr_table[sr_idx]
-            if bitrate > 0:
-                duration_s = (size * 8) / bitrate
-    elif content[:4] == b'OggS':
-        fmt = "ogg"
-        codec = "vorbis"
-        duration_s = size / 128000  # rough estimate
-    elif content[:4] == b'fLaC':
-        fmt = "flac"
-        codec = "flac"
-    elif content[:2] == b'\xff\xfb' or content[:2] == b'\xff\xf3':
-        fmt = "mp3"
-        codec = "mp3"
-    # Loudness estimation from byte distribution (L2)
-    byte_vals = list(content[:min(len(content), 65536)])
-    if byte_vals:
-        avg_byte = sum(byte_vals) / len(byte_vals)
-        # RMS-like approximation (distance from 128 = silence for signed 8-bit)
-        rms = (sum((b - 128) ** 2 for b in byte_vals) / len(byte_vals)) ** 0.5
-        loudness_db = 20 * _math.log10(rms / 128) if rms > 0 else -60
-        silence_ratio = sum(1 for b in byte_vals if abs(b - 128) < 3) / len(byte_vals)
-    else:
-        avg_byte = 128; rms = 0; loudness_db = -60; silence_ratio = 1.0
-    return {
-        "filename": filename,
-        "size_bytes": size,
-        "format": fmt,
-        "codec": codec,
-        "sample_rate": sample_rate,
-        "channels": channels,
-        "bitrate": bitrate,
-        "duration_s": round(duration_s, 2),
-        "duration_human": f"{int(duration_s//60)}:{int(duration_s%60):02d}" if duration_s > 0 else "unknown",
-        "sha256": sha256,
-        "loudness_db": round(loudness_db, 1),
-        "silence_ratio": round(silence_ratio, 3),
-        "rms": round(rms, 1),
-    }
-
-def _sonic_fingerprint(content: bytes) -> dict:
-    """L3: Acoustic fingerprint — non-playable hash-based identity."""
-    # Spectral hash from byte distribution in windows
-    window_size = 4096
-    windows = []
-    for i in range(0, min(len(content), 65536), window_size):
-        chunk = content[i:i+window_size]
-        if len(chunk) < window_size:
-            break
-        # Simple spectral approximation: byte histogram
-        hist = [0] * 16
-        for b in chunk:
-            hist[b >> 4] += 1
-        # Normalize
-        total = sum(hist) or 1
-        hist = [h / total for h in hist]
-        windows.append(hist)
-    if not windows:
-        return {"fingerprint": "empty", "bands": 0, "windows": 0}
-    # Compute spectral contrast hash
-    fp_parts = []
-    for w in windows[:16]:
-        dominant = max(range(len(w)), key=lambda i: w[i])
-        fp_parts.append(f"{dominant:x}")
-    fingerprint = "".join(fp_parts)
-    # Spectral centroid (brightness indicator)
-    centroids = []
-    for w in windows:
-        total_energy = sum(w) or 1
-        centroid = sum(i * w[i] for i in range(len(w))) / total_energy
-        centroids.append(centroid)
-    avg_centroid = sum(centroids) / len(centroids) if centroids else 0
-    # Spectral flatness (noisiness vs tonal)
-    import math as _m
-    flatness_values = []
-    for w in windows:
-        geo_mean = _m.exp(sum(_m.log(max(v, 1e-10)) for v in w) / len(w)) if w else 0
-        arith_mean = sum(w) / len(w) if w else 0
-        flatness_values.append(geo_mean / arith_mean if arith_mean > 0 else 0)
-    avg_flatness = sum(flatness_values) / len(flatness_values) if flatness_values else 0
-    return {
-        "fingerprint": fingerprint,
-        "fingerprint_hash": hashlib.sha256(fingerprint.encode()).hexdigest()[:32],
-        "bands": 16,
-        "windows": len(windows),
-        "spectral_centroid": round(avg_centroid, 3),
-        "spectral_flatness": round(avg_flatness, 3),
-        "brightness": "bright" if avg_centroid > 8 else "dark" if avg_centroid < 4 else "neutral",
-        "tonality": "tonal" if avg_flatness < 0.3 else "noisy" if avg_flatness > 0.7 else "mixed",
-    }
-
-def _sonic_speaker_topology(content: bytes, meta: dict) -> dict:
-    """L4: Speaker topology — count and structure without identity."""
-    # Estimate speaker count from channel info and signal variation
-    channels = meta.get("channels", 0)
-    # Detect voice activity segments by RMS variation
-    window_size = 8192
-    segments = []
-    for i in range(0, min(len(content), 131072), window_size):
-        chunk = content[i:i+window_size]
-        if len(chunk) < 256:
-            continue
-        rms = (sum((b - 128) ** 2 for b in chunk) / len(chunk)) ** 0.5
-        segments.append(rms)
-    if not segments:
-        return {"speaker_count": 0, "voice_activity": 0, "segments": 0}
-    # Count voice-active segments (above threshold)
-    threshold = sum(segments) / len(segments) * 0.5
-    active = sum(1 for s in segments if s > threshold)
-    voice_activity = active / len(segments) if segments else 0
-    # Rough speaker estimate: more variation in active segments = more speakers
-    active_vals = [s for s in segments if s > threshold]
-    if active_vals:
-        variation = (max(active_vals) - min(active_vals)) / (max(active_vals) or 1)
-        if variation < 0.2:
-            speaker_count = 1
-        elif variation < 0.5:
-            speaker_count = 2
-        else:
-            speaker_count = min(3, int(variation * 4) + 1)
-    else:
-        speaker_count = 0
-    return {
-        "speaker_count": speaker_count,
-        "speaker_estimate": "single" if speaker_count == 1 else "dialogue" if speaker_count == 2 else "multi-speaker" if speaker_count > 2 else "silence",
-        "voice_activity": round(voice_activity, 3),
-        "voice_segments": active,
-        "total_segments": len(segments),
-        "identity_exposed": False,
-    }
-
-def _sonic_transcript_shadow(content: bytes, meta: dict) -> dict:
-    """L5: Redacted transcript shadow — semantic structure without words."""
-    # Build a shadow from signal patterns: pauses, emphasis, pace
-    window_size = 4096
-    rms_values = []
-    for i in range(0, min(len(content), 65536), window_size):
-        chunk = content[i:i+window_size]
-        if len(chunk) < 256:
-            continue
-        rms = (sum((b - 128) ** 2 for b in chunk) / len(chunk)) ** 0.5
-        rms_values.append(rms)
-    if not rms_values:
-        return {"shadow": "empty", "segments": 0}
-    # Classify segments: pause, speech, emphasis, transition
-    avg_rms = sum(rms_values) / len(rms_values)
-    segments = []
-    for i, rms in enumerate(rms_values):
-        if rms < avg_rms * 0.2:
-            seg_type = "pause"
-        elif rms > avg_rms * 1.8:
-            seg_type = "emphasis"
-        elif rms < avg_rms * 0.5:
-            seg_type = "quiet_speech"
-        else:
-            seg_type = "speech"
-        timestamp = round(i * window_size / (meta.get("sample_rate", 44100) or 44100), 2)
-        segments.append({"t": timestamp, "type": seg_type, "energy": round(rms, 1)})
-    # Build shadow string: symbolic representation
-    shadow_symbols = {"pause": "·", "quiet_speech": "░", "speech": "▓", "emphasis": "█"}
-    shadow = "".join(shadow_symbols.get(s["type"], "?") for s in segments)
-    # Detect pace (transitions per second)
-    transitions = sum(1 for i in range(1, len(segments)) if segments[i]["type"] != segments[i-1]["type"])
-    duration = meta.get("duration_s", 1) or 1
-    pace = transitions / duration
-    return {
-        "shadow": shadow,
-        "shadow_hash": hashlib.sha256(shadow.encode()).hexdigest()[:32],
-        "segments": len(segments),
-        "segment_details": segments[:20],
-        "pace": round(pace, 2),
-        "pace_label": "fast" if pace > 2 else "slow" if pace < 0.5 else "normal",
-        "redacted": True,
-        "note": "Transcript shadow shows speech structure without revealing words.",
-    }
-
-def _sonic_semantic_claims(meta: dict, fingerprint: dict, speakers: dict, shadow: dict) -> list:
-    """L6: Timestamped semantic claims about the audio."""
-    claims = []
-    if meta.get("duration_s", 0) > 0:
-        claims.append({"claim": "audio_duration", "value": meta["duration_s"], "unit": "seconds", "confidence": 0.99})
-    if meta.get("format") != "unknown":
-        claims.append({"claim": "audio_format", "value": meta["format"], "confidence": 0.95})
-    if speakers.get("speaker_count", 0) > 0:
-        claims.append({"claim": "speaker_count", "value": speakers["speaker_count"], "confidence": 0.7})
-        claims.append({"claim": "speaker_topology", "value": speakers["speaker_estimate"], "confidence": 0.7})
-    if fingerprint.get("brightness"):
-        claims.append({"claim": "spectral_brightness", "value": fingerprint["brightness"], "confidence": 0.85})
-    if fingerprint.get("tonality"):
-        claims.append({"claim": "tonality", "value": fingerprint["tonality"], "confidence": 0.8})
-    if shadow.get("pace_label"):
-        claims.append({"claim": "speech_pace", "value": shadow["pace_label"], "confidence": 0.75})
-    if meta.get("loudness_db", -60) > -30:
-        claims.append({"claim": "loudness", "value": meta["loudness_db"], "unit": "dB", "confidence": 0.9})
-    if meta.get("silence_ratio", 1) < 0.3:
-        claims.append({"claim": "contains_speech", "value": True, "confidence": 0.85})
-    claims.append({"claim": "audio_exists", "value": True, "confidence": 1.0, "evidence": meta["sha256"][:16]})
-    return claims
-
-def _sonic_create_audio_idx(audio_id: str, meta: dict, fingerprint: dict,
-                            speakers: dict, shadow: dict, claims: list,
-                            content: bytes, filename: str):
-    """Create SQLite index for audio file."""
-    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
-    conn = sqlite3.connect(str(idx_path))
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS audio_meta (key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE IF NOT EXISTS fingerprint (key TEXT, value TEXT);
-        CREATE TABLE IF NOT EXISTS speakers (key TEXT, value TEXT);
-        CREATE TABLE IF NOT EXISTS transcript_shadow (idx INTEGER, timestamp REAL, seg_type TEXT, energy REAL);
-        CREATE TABLE IF NOT EXISTS semantic_claims (idx INTEGER, claim TEXT, value TEXT, unit TEXT, confidence REAL);
-        CREATE TABLE IF NOT EXISTS audio_chunks (idx INTEGER, timestamp_start REAL, timestamp_end REAL, energy REAL, seg_type TEXT, preview TEXT);
-    """)
-    for k, v in meta.items():
-        conn.execute("INSERT OR REPLACE INTO audio_meta VALUES (?,?)", (k, str(v)))
-    for k, v in fingerprint.items():
-        conn.execute("INSERT INTO fingerprint VALUES (?,?)", (k, str(v)))
-    for k, v in speakers.items():
-        conn.execute("INSERT INTO speakers VALUES (?,?)", (k, str(v)))
-    for i, seg in enumerate(shadow.get("segment_details", [])):
-        conn.execute("INSERT INTO transcript_shadow VALUES (?,?,?,?)",
-                     (i, seg["t"], seg["type"], seg["energy"]))
-    for i, c in enumerate(claims):
-        conn.execute("INSERT INTO semantic_claims VALUES (?,?,?,?,?)",
-                     (i, c["claim"], str(c["value"]), c.get("unit", ""), c.get("confidence", 0)))
-    # Build audio chunks (time-segmented)
-    window_size = 4096
-    sr = meta.get("sample_rate", 44100) or 44100
-    chunk_idx = 0
-    for i in range(0, min(len(content), 131072), window_size * 4):
-        chunk = content[i:i+window_size*4]
-        if len(chunk) < 256:
-            continue
-        rms = (sum((b - 128) ** 2 for b in chunk) / len(chunk)) ** 0.5
-        t_start = round(i / sr, 2)
-        t_end = round((i + len(chunk)) / sr, 2)
-        if rms < sum([rms]) / 2 * 0.2:
-            seg_type = "pause"
-        elif rms > sum([rms]) / 2 * 1.8:
-            seg_type = "emphasis"
-        else:
-            seg_type = "speech"
-        preview = f"[{t_start}s-{t_end}s] {seg_type} energy={round(rms,1)}"
-        conn.execute("INSERT INTO audio_chunks VALUES (?,?,?,?,?,?)",
-                     (chunk_idx, t_start, t_end, round(rms, 1), seg_type, preview))
-        chunk_idx += 1
-    conn.commit()
-    conn.close()
-
-@app.post("/audio/upload")
-async def sonic_upload(file: UploadFile = File(...)):
-    """Upload audio file. Creates non-playable proof object with fidelity ladder L0-L6."""
-    content = await file.read()
-    if len(content) < 64:
-        return {"error": "File too small to analyze"}
-    audio_id = hashlib.sha256(content).hexdigest()[:12]
-    meta = _sonic_extract_metadata(content, file.filename)
-    fingerprint = _sonic_fingerprint(content)
-    speakers = _sonic_speaker_topology(content, meta)
-    shadow = _sonic_transcript_shadow(content, meta)
-    claims = _sonic_semantic_claims(meta, fingerprint, speakers, shadow)
-    _sonic_create_audio_idx(audio_id, meta, fingerprint, speakers, shadow, claims, content, file.filename)
-    # Store encrypted full audio (L8) — base64 with XOR gate
-    enc_path = SONIC_DATA_DIR / f"{audio_id}.enc"
-    xor_key = os.urandom(32)
-    enc_content = bytes(b ^ xor_key[i % 32] for i, b in enumerate(content))
-    enc_path.write_bytes(enc_content)
-    key_path = SONIC_DATA_DIR / f"{audio_id}.key"
-    key_path.write_bytes(xor_key)
-    # Register
-    reg = _sonic_load_registry()
-    reg[audio_id] = {
-        "filename": file.filename,
-        "size_bytes": len(content),
-        "format": meta["format"],
-        "duration_s": meta["duration_s"],
-        "sha256": meta["sha256"],
-        "fingerprint_hash": fingerprint["fingerprint_hash"],
-        "speaker_count": speakers["speaker_count"],
-        "uploaded_at": time.time(),
-        "status": "indexed",
-    }
-    _sonic_save_registry(reg)
-    return {
-        "audio_id": audio_id,
-        "filename": file.filename,
-        "fidelity_ladder": {
-            "L0_exists": True,
-            "L1_metadata": True,
-            "L2_signal": True,
-            "L3_fingerprint": True,
-            "L4_speakers": True,
-            "L5_transcript_shadow": True,
-            "L6_semantic_claims": len(claims),
-            "L7_degraded_preview": False,
-            "L8_encrypted_full": True,
-            "L9_playable": False,
-        },
-        "meta": meta,
-        "fingerprint": {k: v for k, v in fingerprint.items() if k != "fingerprint"},
-        "speakers": speakers,
-        "shadow_summary": {"segments": shadow["segments"], "pace": shadow["pace"], "pace_label": shadow["pace_label"]},
-        "claims_count": len(claims),
-        "sha256": meta["sha256"],
-        "merkle_root": audio_id + hashlib.sha256(json.dumps(meta, sort_keys=True).encode()).hexdigest()[:20],
-        "endpoints": {
-            "meta": f"/audio/meta/{audio_id}",
-            "fingerprint": f"/audio/fingerprint/{audio_id}",
-            "transcript_shadow": f"/audio/transcript-shadow/{audio_id}",
-            "speakers": f"/audio/speakers/{audio_id}",
-            "search": f"/audio/search/{audio_id}?q=",
-            "chunk": f"/audio/chunk/{audio_id}/{{timestamp}}",
-            "claims": f"/audio/claims/{audio_id}",
-            "glyph": f"/audio/glyph/{audio_id}",
-            "receipt": f"/audio/receipt/{audio_id}",
-            "claim_create": f"/audio/claim/create",
-            "claim_settle": f"/audio/claim/settle",
-        },
-    }
-
-@app.get("/audio/meta/{audio_id}")
-async def sonic_meta(audio_id: str):
-    """L0-L2: Audio metadata — exists, format, duration, loudness, silence."""
-    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Audio not found: {audio_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM audio_meta").fetchall()}
-    conn.close()
-    return {"audio_id": audio_id, "meta": meta}
-
-@app.get("/audio/fingerprint/{audio_id}")
-async def sonic_fingerprint(audio_id: str):
-    """L3: Acoustic fingerprint — non-playable spectral identity."""
-    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Audio not found: {audio_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    fp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM fingerprint").fetchall()}
-    conn.close()
-    return {"audio_id": audio_id, "fingerprint": fp}
-
-@app.get("/audio/transcript-shadow/{audio_id}")
-async def sonic_transcript_shadow(audio_id: str):
-    """L5: Redacted transcript shadow — speech structure without words."""
-    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Audio not found: {audio_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    segs = conn.execute("SELECT idx, timestamp, seg_type, energy FROM transcript_shadow").fetchall()
-    conn.close()
-    return {
-        "audio_id": audio_id,
-        "segments": [{"idx": r[0], "timestamp": r[1], "type": r[2], "energy": r[3]} for r in segs],
-        "total_segments": len(segs),
-        "redacted": True,
-        "note": "Transcript shadow shows speech structure without revealing words.",
-    }
-
-@app.get("/audio/speakers/{audio_id}")
-async def sonic_speakers(audio_id: str):
-    """L4: Speaker topology — count and structure without identity."""
-    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Audio not found: {audio_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    sp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM speakers").fetchall()}
-    conn.close()
-    return {"audio_id": audio_id, "speakers": sp}
-
-@app.get("/audio/claims/{audio_id}")
-async def sonic_claims(audio_id: str):
-    """L6: Timestamped semantic claims about the audio."""
-    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
-    if not idx_path.exists():

@@ -1,309 +1,673 @@
-    latest_stats = db.get_latest_stats()
-    if latest_stats:
-        print(f"\n  Latest stats: views={latest_stats['total_views']} clicks={latest_stats['total_contact_clicks']} ctr={latest_stats['ctr']:.4f}")
+  "ended_at": null,
+  "freeze": {
+    "photos": true,
+    "prices": true,
+    "services": true,
+    "interview": true,
+    "blog": true,
+    "availability_behavior": "truthful_only"
+  },
+  "minimum_exposure": {
+    "new_profile_views": 100,
+    "minimum_hours": 24,
+    "maximum_hours_initial": 48
+  },
+  "primary_metric": "contact_click_rate",
+  "secondary_metrics": [
+    "booking_requests",
+    "phone_clicks",
+    "email_clicks",
+    "new_visits",
+    "profile_views"
+  ],
+  "baseline": {
+    "profile_views": 2802,
+    "contact_clicks": 135,
+    "contact_click_rate": 0.0482,
+    "source": "profileops.db traffic_snapshot"
+  },
+  "public_benchmark": {
+    "lifetime_visits": 78062,
+    "days_online": 964,
+    "views_per_day": 81.0,
+    "rank_among_enriched": 45,
+    "enriched_profiles_count": 125,
+    "source": "real_bios_with_views.jsonl"
+  },
+  "win_condition": {
+    "after_ctr_threshold": 0.0554,
+    "relative_lift_required": 0.15,
+    "minimum_new_views": 100,
+    "description": "15% relative lift from 4.82% baseline = 5.54% after CTR with 100+ new views"
+  },
+  "decision_states": [
+    "BLOCK_NO_SIGNAL",
+    "BLOCK_LOW_EXPOSURE",
+    "BLOCK_BAD_ACCOUNT_STATE",
+    "BLOCK_ATTRIBUTION_DIRTY",
+    "KEEP_CURRENT",
+    "TEST_NEXT_BIO",
+    "WINNER_FOUND",
+    "REVERT_TO_BASELINE",
+    "NEEDS_HUMAN_REVIEW"
+  ],
+  "safety": {
+    "contains_secret": false,
+    "uses_session_token": false,
+    "manual_approval_required": true
+  }
+}
+
+```
+
+bio_sensory_luxury_20260626_011615.txt:
+```
+Indulge in the ultimate sanctuary of relaxation, nestled in the heart of Manhattan. As you step into our serene oasis, warm oils and soothing candlelight envelop you, melting away the stresses of the city. Soft silk drapes and plush furnishings cradle your senses, while the sweet scent of aromatherapy wafts through the air, calming your mind and body.
+
+Our expertly crafted therapeutic massage sessions are tailored to your every need, combining deep tissue techniques with gentle, flowing strokes to ease tension and promote profound relaxation. Each bespoke session is a masterful blend of art and science, designed to transport you to a state of deep tranquility and rejuvenation.
+
+In this intimate, high-end retreat, discretion and luxury entwine, ensuring a truly personalized experience. As you surrender to the skilled hands of our massage therapists, allow yourself to be pampered and indulged, your senses elevated to new heights. Let the warmth and serenity of our sanctuary envelop you, and discover a deeper connection to your own inner peace. To experience the epitome of relaxation, book your exclusive session today.
+```
+
+llm_proxy.py:
+```
+#!/usr/bin/env python3
+"""
+LLM File Proxy — Content-Addressed Progressive Disclosure (CAPD) Protocol
+
+Serves any file (up to 1GB+) to LLMs WITHOUT uploading the full file.
+The LLM navigates the file like a database: metadata → summary → search → chunks.
+
+Protocol endpoints:
+  GET /            — Landing page (human + LLM readable, JSON if Accept: application/json)
+  GET /meta        — File metadata + Merkle root + endpoint map
+  GET /summary     — First/last 4KB + line count + structure hints
+  GET /head?n=N    — First N lines (default 100)
+  GET /tail?n=N    — Last N lines (default 100)
+  GET /chunk/{i}   — Chunk i (64KB default), with Merkle proof header
+  GET /range?s=X&e=Y — Arbitrary byte range [X, Y)
+  GET /search?q=...&context=N — Server-side grep, returns matching lines + context
+  GET /merkle      — Full Merkle tree (just hashes, small)
+  GET /stream      — Full file stream (only if explicitly requested)
+  GET /health      — Health check
+
+Usage:
+  python3 llm_proxy.py /path/to/file [--port 8765] [--chunk-size 65536]
+"""
+
+import argparse
+import hashlib
+import json
+import mimetypes
+import os
+import re
+import sys
+import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+# ---------------------------------------------------------------------------
+# Merkle Tree (lazy computation, memory-efficient)
+# ---------------------------------------------------------------------------
+
+class MerkleTree:
+    """Lazy Merkle tree over file chunks. Hashes computed on demand."""
+
+    def __init__(self, filepath: str, chunk_size: int = 65536):
+        self.filepath = filepath
+        self.chunk_size = chunk_size
+        self.file_size = os.path.getsize(filepath)
+        self.num_chunks = (self.file_size + chunk_size - 1) // chunk_size
+        self._leaf_hashes: list[str | None] = [None] * self.num_chunks
+        self._lock = threading.Lock()
+        self._root: str | None = None
+
+    def _compute_leaf(self, index: int) -> str:
+        if self._leaf_hashes[index] is not None:
+            return self._leaf_hashes[index]
+        with open(self.filepath, "rb") as f:
+            f.seek(index * self.chunk_size)
+            data = f.read(self.chunk_size)
+        h = hashlib.sha256(data).hexdigest()
+        self._leaf_hashes[index] = h
+        return h
+
+    def get_chunk_hash(self, index: int) -> str:
+        return self._compute_leaf(index)
+
+    def get_root(self) -> str:
+        if self._root:
+            return self._root
+        with self._lock:
+            if self._root:
+                return self._root
+            # Compute all leaves
+            for i in range(self.num_chunks):
+                self._compute_leaf(i)
+            # Build tree
+            level = [h for h in self._leaf_hashes if h is not None]
+            while len(level) > 1:
+                next_level = []
+                for i in range(0, len(level), 2):
+                    left = level[i]
+                    right = level[i + 1] if i + 1 < len(level) else left
+                    next_level.append(hashlib.sha256(
+                        (left + right).encode()
+                    ).hexdigest())
+                level = next_level
+            self._root = level[0] if level else hashlib.sha256(b"").hexdigest()
+            return self._root
+
+    def get_proof(self, index: int) -> list[dict]:
+        """Return Merkle proof for chunk at index."""
+        self.get_root()  # ensure all leaves computed
+        level = [h for h in self._leaf_hashes if h is not None]
+        proof = []
+        idx = index
+        while len(level) > 1:
+            if idx % 2 == 0:
+                sibling_idx = idx + 1 if idx + 1 < len(level) else idx
+                proof.append({"position": "right", "hash": level[sibling_idx]})
+            else:
+                sibling_idx = idx - 1
+                proof.append({"position": "left", "hash": level[sibling_idx]})
+            # Build next level
+            next_level = []
+            for i in range(0, len(level), 2):
+                left = level[i]
+                right = level[i + 1] if i + 1 < len(level) else left
+                next_level.append(hashlib.sha256(
+                    (left + right).encode()
+                ).hexdigest())
+            level = next_level
+            idx //= 2
+        return proof
+
+    def get_all_leaves(self) -> list[str]:
+        self.get_root()
+        return [h for h in self._leaf_hashes if h is not None]
+
+
+# ---------------------------------------------------------------------------
+# File Profiler (structure hints)
+# ---------------------------------------------------------------------------
+
+def detect_file_type(filepath: str) -> dict:
+    """Detect file type and structure hints without loading full file."""
+    size = os.path.getsize(filepath)
+    name = os.path.basename(filepath)
+    mime, _ = mimetypes.guess_type(name)
+
+    hints = {
+        "filename": name,
+        "size_bytes": size,
+        "size_human": _human_size(size),
+        "mime_type": mime or "application/octet-stream",
+        "extension": os.path.splitext(name)[1],
+    }
+
+    # Sample first 4KB for structure detection
+    with open(filepath, "rb") as f:
+        sample = f.read(4096)
+
+    sample_text = sample.decode("utf-8", errors="replace")
+
+    # Detect format
+    stripped = sample_text.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        hints["format"] = "json"
+    elif stripped.startswith("<?xml") or stripped.startswith("<"):
+        hints["format"] = "xml"
+    elif stripped.startswith("#!"):
+        hints["format"] = "script"
+    elif re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*\s*=', sample_text):
+        hints["format"] = "config"
+    elif "," in sample_text and "\n" in sample_text:
+        # CSV heuristic
+        first_line = sample_text.split("\n")[0]
+        if first_line.count(",") > 2:
+            hints["format"] = "csv"
+    elif sample_text.startswith("PK"):
+        hints["format"] = "zip"
     else:
-        print("\n  Stats: NO DATA — run 'stats snapshot'")
+        hints["format"] = "text"
 
-    raw = ROOT / "rm_pri" / "data" / "real_bios_raw.jsonl"
-    enriched = ROOT / "rm_pri" / "data" / "real_bios_with_views.jsonl"
-    print(f"\nCorpus:")
-    print(f"  Raw bios:      {sum(1 for _ in raw.open()) if raw.exists() else 'MISSING'}")
-    if enriched.exists():
-        rows = [json.loads(l) for l in enriched.open() if l.strip()]
-        has_vpd = [r for r in rows if r.get("views_per_day", 0) > 0]
-        print(f"  Enriched:      {len(has_vpd)}/{len(rows)} with views/day")
+    # Count lines in sample for estimate
+    sample_lines = sample_text.count("\n")
+    if len(sample) > 0:
+        avg_line_len = len(sample) / max(sample_lines, 1)
+        hints["estimated_lines"] = int(size / max(avg_line_len, 1))
     else:
-        print(f"  Enriched:      NOT STARTED")
+        hints["estimated_lines"] = 0
 
-    cpp = ROOT / "rm_pri" / "cpp" / "rm_pri"
-    print(f"\nC++ Engine: {'compiled' if cpp.exists() else 'NOT COMPILED'}")
-
-    print("\nHonest assessment:")
-    if not s["stats_log"]:
-        print("  BLIND — no stats logged. Run 'stats snapshot'.")
-    if latest_vis and latest_vis["is_ad_hidden"]:
-        print("  CRITICAL — profile hidden. Run 'visibility on'.")
-    if not enriched.exists():
-        print("  STAGE 1 — corpus loaded, enrichment not started.")
-    print("  Not AGI. Not revenue oracle. Execution-and-measurement engine.")
-
-
-def cmd_visibility(args):
-    api = _get_api()
-    db = StateDB()
-
-    if args.state == "on":
-        result = api.set_visibility(visible=True)
-        db.log_visibility(False, source="api_command")
-        db.add_receipt("visibility_on", "Profile visibility set to VISIBLE", result)
-        print("OK: Profile is now VISIBLE")
-    elif args.state == "off":
-        result = api.set_visibility(visible=False)
-        db.log_visibility(True, source="api_command")
-        db.add_receipt("visibility_off", "Profile visibility set to HIDDEN", result)
-        print("OK: Profile is now HIDDEN")
-    else:
-        print(f"ERROR: state must be 'on' or 'off', got '{args.state}'")
-        sys.exit(1)
-
-
-def cmd_availability(args):
-    api = _get_api()
-    db = StateDB()
-
-    if args.action == "set":
-        duration = args.duration
-        result = api.set_availability(option=1, duration=duration)
-        db.log_availability(result)
-        db.add_receipt("availability_set", f"Availability set: option=1 duration={duration}h", result)
-        print(f"OK: Availability set for {duration}h")
-    elif args.action == "check":
-        result = api.get_availability()
-        db.log_availability(result)
-        print(json.dumps(result, indent=2, default=str))
-
-
-def cmd_stats(args):
-    api = _get_api()
-    db = StateDB()
-
-    if args.action == "snapshot":
-        dashboard = api.get_dashboard()
-        stats = api.get_ad_statistics()
-        keeponline = api.get_keeponline()
-
-        db.log_snapshot("dashboard", dashboard)
-        db.log_stats(stats.get("adStatistics", stats))
-        db.log_visibility(bool(keeponline.get("keeponline", {}).get("isAdHidden", 0)))
-
-        keep = keeponline.get("keeponline", {})
-        stats_data = stats.get("adStatistics", stats)
-
-        print("Dashboard Snapshot:")
-        print(f"  Views:          {stats_data.get('totalPageViews', '?')}")
-        print(f"  Contact clicks: {stats_data.get('totalContactClicks', '?')}")
-        print(f"  New visits:     {keep.get('newVisits', '?')}")
-        print(f"  New emails:     {keep.get('newEmails', '?')}")
-        print(f"  Hidden:         {bool(keep.get('isAdHidden', 0))}")
-
-        db.add_receipt("stats_snapshot", "Dashboard stats logged", {
-            "views": stats_data.get("totalPageViews"),
-            "clicks": stats_data.get("totalContactClicks"),
-            "new_visits": keep.get("newVisits"),
-            "new_emails": keep.get("newEmails"),
-            "is_ad_hidden": bool(keep.get("isAdHidden", 0)),
-        })
-    elif args.action == "history":
-        history = db.get_stats_history(limit=args.limit or 20)
-        for h in history:
-            print(f"  {h['timestamp'][:19]}  views={h['total_views']} clicks={h['total_contact_clicks']} ctr={h['ctr']:.4f}")
-
-
-def cmd_market(args):
-    if args.action == "scan":
-        api = _get_api()
-        db = StateDB()
-        scanner = MarketScanner(api, db)
-        cities = args.cities.split(",") if args.cities else ["manhattan-ny"]
-        own = os.environ.get("RM_USERNAME", "")
-        results = scanner.scan_cities(cities, pages=args.pages or 5, own_username=own)
-        for r in results:
-            print(f"  {r['city']}: {r['bios_collected']} bios, own_rank={r['own_rank']}")
-    elif args.action == "rank":
-        db = StateDB()
-        scanner = MarketScanner(None, db)
-        result = scanner.rank_by_views_per_day()
-        if "error" in result:
-            print(f"ERROR: {result['error']}")
-        else:
-            print(f"Ranked {result['ranked_bios']}/{result['total_bios']} bios by views/day")
-            for b in result.get("top_5", []):
-                print(f"  {b['username']}: {b['views_per_day']:.1f} v/day — {b['headline'][:50]}")
-
-
-def cmd_drafts(args):
-    if args.action == "import":
-        path = Path(args.file) if args.file else ROOT / "data" / "top_25.jsonl"
-        if not path.exists():
-            print(f"ERROR: {path} not found")
-            sys.exit(1)
-        db = StateDB()
-        imported = 0
-        for line in path.open():
-            if line.strip():
-                c = json.loads(line)
-                db.add_receipt("draft_import", f"Imported candidate {c.get('id', '?')}", c)
-                imported += 1
-        print(f"Imported {imported} candidates")
-    elif args.action == "approve":
-        if not args.variant_id:
-            print("ERROR: --variant-id required")
-            sys.exit(1)
-        db = StateDB()
-        db.add_receipt("draft_approve", f"Approved variant {args.variant_id}", {"variant_id": args.variant_id})
-        print(f"Approved: {args.variant_id}")
-
-
-def cmd_profile(args):
-    if args.action == "apply":
-        if not args.variant_id:
-            print("ERROR: --variant-id required")
-            sys.exit(1)
-        api = _get_api()
-        db = StateDB()
-        runner = ExperimentRunner(api, db)
-
-        bio_path = Path(args.bio_file) if args.bio_file else None
-        headline = ""
-        description = ""
-        if bio_path and bio_path.exists():
-            content = bio_path.read_text()
-            lines = content.split("\n", 1)
-            headline = lines[0].strip()
-            description = content.strip()
-
-        exp = runner.start_experiment(
-            variant_id=args.variant_id,
-            bio_file=str(bio_path) if bio_path else "",
-            content_type="bio",
-            headline=headline,
-            description=description,
-        )
-        print(f"Experiment started: {exp['experiment_id']}")
-        print(f"  Applied: {exp['applied']}")
-        if exp.get("apply_error"):
-            print(f"  Error: {exp['apply_error']}")
-    elif args.action == "current":
-        api = _get_api()
-        about = api.get_about()
-        print(json.dumps(about, indent=2, default=str))
-
-
-def cmd_experiment(args):
-    if args.action == "close":
-        if not args.exp_id:
-            print("ERROR: --exp-id required")
-            sys.exit(1)
-        api = _get_api()
-        db = StateDB()
-        runner = ExperimentRunner(api, db)
-        result = runner.close_experiment(args.exp_id)
-        if "error" in result:
-            print(f"ERROR: {result['error']}")
-        else:
-            print(f"Experiment closed: {result['result_label']}")
-            lift = result["lift"]
-            print(f"  Views lift:     {lift['lift_views']}")
-            print(f"  Clicks lift:    {lift['lift_clicks']}")
-            print(f"  CTR before:     {lift['before_ctr']:.6f}")
-            print(f"  CTR after:      {lift['after_ctr']:.6f}")
-            print(f"  CTR lift:       {lift['ctr_lift_pct']}%")
-    elif args.action == "rollback":
-        if not args.exp_id:
-            print("ERROR: --exp-id required")
-            sys.exit(1)
-        api = _get_api()
-        db = StateDB()
-        runner = ExperimentRunner(api, db)
-        result = runner.rollback_experiment(args.exp_id)
-        if "error" in result:
-            print(f"ERROR: {result['error']}")
-        else:
-            print(f"Rolled back: {result['rolled_back']}")
-
-
-def cmd_receipts(args):
-    db = StateDB()
-    receipts = db.get_receipts(limit=args.limit or 20)
-    if not receipts:
-        print("No receipts yet")
-        return
-    print(f"{'ID':>4}  {'Timestamp':<22}  {'Action':<22}  Description")
-    print("-" * 80)
-    for r in receipts:
-        print(f"{r['id']:>4}  {r['timestamp'][:19]:<22}  {r['action']:<22}  {r['description'][:40]}")
-    print(f"\nChain valid: {db.verify_receipt_chain()}")
-
-
-def cmd_api_check(args):
-    import requests
-    h = {"User-Agent": "Mozilla/5.0"}
+    # Check if binary
     try:
-        r = requests.get("https://rentmasseur.com", headers=h, timeout=10)
-        captcha = "CrowdSec" in r.text
-        print(f"GET / status: {r.status_code}")
-        print(f"CrowdSec captcha: {captcha}")
-        if captcha:
-            print("RESULT: BLOCKED — rotate IP or wait for ban to clear")
+        sample.decode("utf-8")
+        hints["encoding"] = "utf-8"
+        hints["is_binary"] = False
+    except UnicodeDecodeError:
+        hints["encoding"] = "binary"
+        hints["is_binary"] = True
+
+    return hints
+
+
+def _human_size(n: int) -> str:
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+# ---------------------------------------------------------------------------
+# HTTP Handler
+# ---------------------------------------------------------------------------
+
+class CAPDHandler(BaseHTTPRequestHandler):
+    """Content-Addressed Progressive Disclosure handler."""
+
+    # Class-level config set by main()
+    filepath: str = ""
+    chunk_size: int = 65536
+    merkle: MerkleTree | None = None
+    file_info: dict = {}
+    start_time: float = 0
+
+    def log_message(self, format, *args):
+        # Minimal logging
+        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {args[0]}\n")
+
+    def _send_json(self, data: dict, status: int = 200):
+        body = json.dumps(data, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, text: str, status: int = 200, content_type: str = "text/plain"):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_bytes(self, data: bytes, status: int = 200,
+                    content_type: str = "application/octet-stream",
+                    extra_headers: dict | None = None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _wants_json(self) -> bool:
+        accept = self.headers.get("Accept", "")
+        return "application/json" in accept or "json" in accept
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
+        try:
+            if path == "/" or path == "/meta":
+                self.handle_meta()
+            elif path == "/summary":
+                self.handle_summary()
+            elif path == "/head":
+                n = int(qs.get("n", ["100"])[0])
+                self.handle_head(n)
+            elif path == "/tail":
+                n = int(qs.get("n", ["100"])[0])
+                self.handle_tail(n)
+            elif path.startswith("/chunk/"):
+                idx = int(path.split("/chunk/")[1])
+                self.handle_chunk(idx)
+            elif path == "/range":
+                start = int(qs.get("s", ["0"])[0])
+                end = int(qs.get("e", [str(self.chunk_size)])[0])
+                self.handle_range(start, end)
+            elif path == "/search":
+                q = qs.get("q", [""])[0]
+                context = int(qs.get("context", ["2"])[0])
+                max_results = int(qs.get("max", ["50"])[0])
+                self.handle_search(q, context, max_results)
+            elif path == "/merkle":
+                self.handle_merkle()
+            elif path == "/stream":
+                self.handle_stream()
+            elif path == "/health":
+                self._send_json({"status": "ok", "uptime_s": time.time() - self.start_time})
+            else:
+                self._send_json({"error": "not found", "path": path}, 404)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, Range")
+        self.end_headers()
+
+    # --- Endpoint handlers ---
+
+    def handle_meta(self):
+        """File metadata + Merkle root + endpoint map."""
+        root = self.merkle.get_root()
+        meta = {
+            "protocol": "CAPD/1.0",
+            "description": "Content-Addressed Progressive Disclosure — navigate this file without downloading it",
+            "file": self.file_info,
+            "merkle_root": root,
+            "chunk_size": self.chunk_size,
+            "num_chunks": self.merkle.num_chunks,
+            "endpoints": {
+                "GET /meta": "This response — file metadata + Merkle root",
+                "GET /summary": "First/last 4KB + structure hints (start here)",
+                "GET /head?n=100": "First N lines",
+                "GET /tail?n=100": "Last N lines",
+                "GET /chunk/{i}": "Chunk i (64KB) with Merkle proof header",
+                "GET /range?s=0&e=65536": "Arbitrary byte range [s, e)",
+                "GET /search?q=pattern&context=2": "Server-side grep, returns matching lines + context",
+                "GET /merkle": "Full Merkle tree (all chunk hashes)",
+                "GET /stream": "Full file stream (downloads entire file — use sparingly)",
+                "GET /health": "Health check",
+            },
+            "usage_hint": (
+                "1. Read /meta to understand the file. "
+                "2. Read /summary to see structure. "
+                "3. Use /search?q=... to find relevant sections. "
+                "4. Pull specific /chunk/{i} or /range?s=X&e=Y for detail. "
+                "Never download /stream unless you truly need every byte."
+            ),
+        }
+        if self._wants_json():
+            self._send_json(meta)
         else:
-            print("RESULT: CLEAR")
-    except Exception as e:
-        print(f"ERROR: {e}")
+            # Human-readable landing page
+            html = self._render_landing(meta)
+            self._send_text(html, content_type="text/html")
+
+    def _render_landing(self, meta: dict) -> str:
+        f = meta["file"]
+        return f"""<!DOCTYPE html>
+<html>
+<head><title>LLM File Proxy — {f['filename']}</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; color: #333; }}
+  h1 {{ color: #2563eb; }}
+  .meta {{ background: #f8fafc; padding: 16px; border-radius: 8px; margin: 16px 0; }}
+  .endpoint {{ font-family: monospace; background: #1e293b; color: #93c5fd; padding: 2px 8px; border-radius: 4px; }}
+  .hint {{ background: #fef3c7; padding: 12px; border-radius: 8px; margin: 16px 0; }}
+  code {{ background: #f1f5f9; padding: 2px 6px; border-radius: 3px; }}
+</style>
+</head>
+<body>
+<h1>LLM File Proxy</h1>
+<p><strong>{f['filename']}</strong> — {f['size_human']} ({f['mime_type']})</p>
+<div class="meta">
+  <p><strong>Protocol:</strong> CAPD/1.0 — Content-Addressed Progressive Disclosure</p>
+  <p><strong>Merkle Root:</strong> <code>{meta['merkle_root']}</code></p>
+  <p><strong>Chunks:</strong> {meta['num_chunks']} × {self.chunk_size // 1024}KB</p>
+  <p><strong>Format:</strong> {f.get('format', 'unknown')}</p>
+</div>
+<div class="hint">
+  <strong>For LLMs:</strong> Send the base URL to your LLM. It can navigate this file
+  using the endpoints below without downloading the full {f['size_human']}.
+</div>
+<h2>Endpoints</h2>
+<ul>
+  <li><span class="endpoint">GET /meta</span> — File metadata + Merkle root</li>
+  <li><span class="endpoint">GET /summary</span> — First/last 4KB + structure</li>
+  <li><span class="endpoint">GET /head?n=100</span> — First N lines</li>
+  <li><span class="endpoint">GET /tail?n=100</span> — Last N lines</li>
+  <li><span class="endpoint">GET /chunk/&#123;i&#125;</span> — Chunk i (64KB) with Merkle proof</li>
+  <li><span class="endpoint">GET /range?s=0&e=65536</span> — Byte range</li>
+  <li><span class="endpoint">GET /search?q=pattern</span> — Server-side grep + context</li>
+  <li><span class="endpoint">GET /merkle</span> — Full Merkle tree</li>
+  <li><span class="endpoint">GET /stream</span> — Full file (use sparingly)</li>
+</ul>
+</body>
+</html>"""
+
+    def handle_summary(self):
+        """First/last 4KB + line count + structure."""
+        size = self.file_info["size_bytes"]
+        head_bytes = min(4096, size)
+        tail_start = max(0, size - 4096)
+        tail_bytes = size - tail_start
+
+        with open(self.filepath, "rb") as f:
+            head = f.read(head_bytes)
+            f.seek(tail_start)
+            tail = f.read(tail_bytes)
+
+        # Count total lines (streaming, no full load)
+        line_count = 0
+        with open(self.filepath, "rb") as f:
+            for _ in f:
+                line_count += 1
+
+        summary = {
+            "file": self.file_info["filename"],
+            "size_bytes": size,
+            "total_lines": line_count,
+            "head_4kb": head.decode("utf-8", errors="replace"),
+            "tail_4kb": tail.decode("utf-8", errors="replace"),
+            "head_bytes": head_bytes,
+            "tail_start_byte": tail_start,
+            "tail_bytes": tail_bytes,
+            "format": self.file_info.get("format", "text"),
+            "is_binary": self.file_info.get("is_binary", False),
+        }
+        self._send_json(summary)
+
+    def handle_head(self, n: int):
+        """First N lines."""
+        lines = []
+        with open(self.filepath, "r", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= n:
+                    break
+                lines.append(line.rstrip("\n"))
+        self._send_json({
+            "lines": lines,
+            "count": len(lines),
+            "requested": n,
+        })
+
+    def handle_tail(self, n: int):
+        """Last N lines (efficient via seek from end)."""
+        # Read last 64KB chunk, split into lines, take last N
+        size = self.file_info["size_bytes"]
+        read_size = min(size, n * 512 + 4096)  # generous estimate
+        with open(self.filepath, "rb") as f:
+            f.seek(max(0, size - read_size))
+            data = f.read()
+        all_lines = data.decode("utf-8", errors="replace").splitlines()
+        lines = all_lines[-n:] if len(all_lines) >= n else all_lines
+        self._send_json({
+            "lines": lines,
+            "count": len(lines),
+            "requested": n,
+        })
+
+    def handle_chunk(self, index: int):
+        """Chunk i with Merkle proof in headers."""
+        if index < 0 or index >= self.merkle.num_chunks:
+            self._send_json({"error": f"chunk index out of range [0, {self.merkle.num_chunks})"}, 400)
+            return
+
+        with open(self.filepath, "rb") as f:
+            f.seek(index * self.chunk_size)
+            data = f.read(self.chunk_size)
+
+        chunk_hash = self.merkle.get_chunk_hash(index)
+        proof = self.merkle.get_proof(index)
+
+        self._send_bytes(
+            data,
+            content_type=self.file_info.get("mime_type", "application/octet-stream"),
+            extra_headers={
+                "X-Merkle-Root": self.merkle.get_root(),
+                "X-Chunk-Index": str(index),
+                "X-Chunk-Hash": chunk_hash,
+                "X-Chunk-Proof": json.dumps(proof),
+                "X-Total-Chunks": str(self.merkle.num_chunks),
+                "X-Chunk-Size": str(len(data)),
+            }
+        )
+
+    def handle_range(self, start: int, end: int):
+        """Arbitrary byte range [start, end)."""
+        size = self.file_info["size_bytes"]
+        start = max(0, start)
+        end = min(size, end)
+        if start >= end:
+            self._send_json({"error": "invalid range", "start": start, "end": end}, 400)
+            return
+
+        with open(self.filepath, "rb") as f:
+            f.seek(start)
+            data = f.read(end - start)
+
+        range_hash = hashlib.sha256(data).hexdigest()
+        self._send_bytes(
+            data,
+            content_type=self.file_info.get("mime_type", "application/octet-stream"),
+            extra_headers={
+                "Content-Range": f"bytes {start}-{end-1}/{size}",
+                "X-Range-Hash": range_hash,
+                "X-Range-Start": str(start),
+                "X-Range-End": str(end),
+            }
+        )
+
+    def handle_search(self, query: str, context: int, max_results: int):
+        """Server-side grep — stream file, return matching lines + context."""
+        if not query:
+            self._send_json({"error": "missing q parameter", "usage": "/search?q=pattern&context=2&max=50"}, 400)
+            return
+
+        results = []
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
+        buffer: list[tuple[int, str]] = []  # (line_num, line_text) for context
+        match_count = 0
+
+        with open(self.filepath, "r", errors="replace") as f:
+            for line_num, line in enumerate(f):
+                line_text = line.rstrip("\n")
+                buffer.append((line_num, line_text))
+                if len(buffer) > context + 1:
+                    buffer.pop(0)
+
+                if pattern.search(line_text):
+                    # Include context lines
+                    ctx_start = max(0, len(buffer) - context - 1)
+                    ctx_lines = buffer[ctx_start:]
+                    results.append({
+                        "line": line_num,
+                        "match": line_text,
+                        "context_before": [l for n, l in ctx_lines[:-1]],
+                        "context_after": [],  # filled below
+                    })
+                    match_count += 1
+
+                    # Read context after
+                    if context > 0:
+                        after = []
+                        for _ in range(context):
+                            try:
+                                next_line = next(f)
+                                after.append(next_line.rstrip("\n"))
+                            except StopIteration:
+                                break
+                        results[-1]["context_after"] = after
+
+                    if match_count >= max_results:
+                        break
+
+        self._send_json({
+            "query": query,
+            "matches": match_count,
+            "truncated": match_count >= max_results,
+            "max_results": max_results,
+            "results": results,
+        })
+
+    def handle_merkle(self):
+        """Full Merkle tree — all leaf hashes + root."""
+        leaves = self.merkle.get_all_leaves()
+        self._send_json({
+            "root": self.merkle.get_root(),
+            "chunk_size": self.chunk_size,
+            "num_chunks": self.merkle.num_chunks,
+            "leaves": leaves,
+        })
+
+    def handle_stream(self):
+        """Full file stream — only if explicitly requested."""
+        size = self.file_info["size_bytes"]
+        self.send_response(200)
+        self.send_header("Content-Type", self.file_info.get("mime_type", "application/octet-stream"))
+        self.send_header("Content-Length", str(size))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Merkle-Root", self.merkle.get_root())
+        self.end_headers()
+        with open(self.filepath, "rb") as f:
+            while True:
+                chunk = f.read(self.chunk_size)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
 
-def cmd_daemon(args):
-    print("Starting RM Revenue Engine 24/7 daemon...")
-    print("Mutations disabled by default (mode=0). Set RM_CONTROL_MODE=2 to enable approved mutations.")
-    run_loop(once=args.once)
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(prog="rm-revenue-engine", description="RentMasseur API Revenue Engine")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p = sub.add_parser("status", help="Show honest system status")
-    p.set_defaults(func=cmd_status)
-
-    p = sub.add_parser("visibility", help="Set profile visibility")
-    p.add_argument("state", choices=["on", "off"])
-    p.set_defaults(func=cmd_visibility)
-
-    p = sub.add_parser("availability", help="Set or check availability")
-    p.add_argument("action", choices=["set", "check"])
-    p.add_argument("--duration", type=int, default=5, help="Hours available (1-6)")
-    p.set_defaults(func=cmd_availability)
-
-    p = sub.add_parser("stats", help="Pull or view dashboard stats")
-    p.add_argument("action", choices=["snapshot", "history"])
-    p.add_argument("--limit", type=int, default=20)
-    p.set_defaults(func=cmd_stats)
-
-    p = sub.add_parser("market", help="Scan market or rank profiles")
-    p.add_argument("action", choices=["scan", "rank"])
-    p.add_argument("--cities", default="manhattan-ny")
-    p.add_argument("--pages", type=int, default=5)
-    p.set_defaults(func=cmd_market)
-
-    p = sub.add_parser("drafts", help="Import or approve candidates")
-    p.add_argument("action", choices=["import", "approve"])
-    p.add_argument("--file", default=None)
-    p.add_argument("--variant-id", default=None)
-    p.set_defaults(func=cmd_drafts)
-
-    p = sub.add_parser("profile", help="Apply variant or view current profile")
-    p.add_argument("action", choices=["apply", "current"])
-    p.add_argument("--variant-id", default=None)
-    p.add_argument("--bio-file", default=None)
-    p.set_defaults(func=cmd_profile)
-
-    p = sub.add_parser("experiment", help="Close or rollback experiments")
-    p.add_argument("action", choices=["close", "rollback"])
-    p.add_argument("--exp-id", default=None)
-    p.set_defaults(func=cmd_experiment)
-
-    p = sub.add_parser("receipts", help="Show receipt ledger")
-    p.add_argument("--limit", type=int, default=20)
-    p.set_defaults(func=cmd_receipts)
-
-    p = sub.add_parser("api-check", help="Check API connectivity")
-    p.set_defaults(func=cmd_api_check)
-
-    p = sub.add_parser("daemon", help="Run 24/7 daemon loop")
-    p.add_argument("--once", action="store_true", help="Run one loop then exit")
-    p.set_defaults(func=cmd_daemon)
-
+    parser = argparse.ArgumentParser(
+        description="LLM File Proxy — Content-Addressed Progressive Disclosure"
+    )
+    parser.add_argument("file", help="Path to file to serve")
+    parser.add_argument("--port", type=int, default=8765, help="Port (default 8765)")
+    parser.add_argument("--chunk-size", type=int, default=65536, help="Chunk size in bytes (default 65536 = 64KB)")
     args = parser.parse_args()
-    args.func(args)
+
+    filepath = os.path.abspath(args.file)
+    if not os.path.isfile(filepath):
+        print(f"Error: {filepath} is not a file", file=sys.stderr)
+        sys.exit(1)
+
+    file_info = detect_file_type(filepath)
+    merkle = MerkleTree(filepath, args.chunk_size)
+
+    # Inject config into handler class
+    CAPDHandler.filepath = filepath
+    CAPDHandler.chunk_size = args.chunk_size
+    CAPDHandler.merkle = merkle
+    CAPDHandler.file_info = file_info
+    CAPDHandler.start_time = time.time()
+
+    server = HTTPServer(("127.0.0.1", args.port), CAPDHandler)
+    print(f"LLM File Proxy serving: {file_info['filename']} ({file_info['size_human']})", file=sys.stderr)
+    print(f"Listening on http://127.0.0.1:{args.port}", file=sys.stderr)
+    print(f"Chunks: {merkle.num_chunks} × {args.chunk_size // 1024}KB", file=sys.stderr)
+    print(f"Endpoints: /meta /summary /head /tail /chunk/{{i}} /range /search /merkle /stream", file=sys.stderr)
+    print(f"READY", file=sys.stderr)
+    server.serve_forever()
 
 
 if __name__ == "__main__":
@@ -311,490 +675,126 @@ if __name__ == "__main__":
 
 ```
 
-revenue_ops.py:
+README.md:
+```
+---
+title: Jorki
+emoji: ⚡
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
+# Jorki — The Operating System for AI File Access
+
+**Files don't move. Context does.**
+
+Jorki turns any local file into a live AI-readable session URL. Instead of uploading gigabytes into every chat, create one secure session and let AI tools query exactly what they need.
+
+## How it works
+
+1. Select a file (Finder right-click → Jorki → Copy AI URL)
+2. Local C++ engine indexes any file (1GB+) in <3 seconds
+3. Compact SQLite index (KB) is uploaded to this Space
+4. AI queries the index via SQL, search, chunk retrieval, or MCP
+5. The original file never leaves your machine
+6. Revoke access at any time
+
+## API
+
+- `POST /upload` — Upload .idx index (auth required)
+- `GET /meta/{id}` — File metadata
+- `GET /summary/{id}` — Structure + samples
+- `GET /chunk/{id}/{idx}` — Chunk content
+- `GET /chunks/{id}` — List all chunks
+- `GET /search/{id}?q=` — Full-text search
+- `POST /query/sql/{id}` — SQL query
+- `POST /query/nosql/{id}` — NoSQL query
+- `GET /stats/{id}` — Query statistics
+- `DELETE /revoke/{id}` — Revoke session (auth required)
+- `GET /mcp` — MCP manifest
+- `POST /mcp/query` — MCP unified query
+- `GET /health` — Health check
+
+## Persistent Storage
+
+To survive Space restarts, enable persistent storage in HF Space settings:
+1. Go to Space Settings → Persistent Storage
+2. Attach a small (20GB) persistent volume
+3. It mounts at `/data` — Jorki auto-detects and uses it
+
+Without persistent storage, sessions are lost on restart. The `/health` endpoint shows storage status.
+
+```
+
+requirements.txt:
+```
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+
+```
+
+JorkiBar:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
+```
+
+hf_space.py:
 ```
 """
-RM RevenueOps — the joined revenue ledger.
+JORKI — AI File Gateway
+HF Space server v2.0: persistent storage, auth, chunk retrieval, MCP, compression.
 
-daily_profile_metrics + experiment_decisions + daily_evidence_packet + strict decision engine.
-
-No AGI. No fake numbers. One packet, one decision, one experiment.
+Fixes:
+1. Persistent storage (/data mount) + SQLite registry — survives restarts
+2. Bearer token auth on upload
+3. GET /chunk/{file_id}/{idx} — returns semantic chunk content
+4. GET /mcp — MCP-compatible endpoint for AI tools
+5. Index compression (gzip) on upload, decompress on query
 """
 
-import hashlib
-import json
 import os
+import json
 import sqlite3
-from datetime import datetime, timezone
+import shutil
+import gzip
+import time
+import hashlib
+import struct
+import base64
 from pathlib import Path
-from typing import Optional
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Query, Body
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
-DB_PATH = Path(__file__).resolve().parent.parent / "revenue_ops.db"
+# Google OAuth client ID (set as HF Space secret, no credentials.json needed)
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
-DECISION_STATES = [
-    "BLOCK_NO_METRICS",
-    "BLOCK_NO_BASELINE_EXPERIMENT",
-    "BLOCK_LOW_EXPOSURE",
-    "BLOCK_BAD_ACCOUNT_STATE",
-    "BLOCK_ATTRIBUTION_DIRTY",
-    "READY_TO_TEST",
-    "TEST_RUNNING",
-    "KEEP_CURRENT",
-    "TEST_NEXT_BIO",
-    "WINNER_FOUND",
-    "REVERT_TO_BASELINE",
-    "NEEDS_HUMAN_REVIEW",
-]
+app = FastAPI(title="JORKI — AI File Gateway", version="2.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-MIN_VIEWS_FOR_DECISION = 100
-MIN_HOURS_FOR_DECISION = 24
-SEVERE_DROP_THRESHOLD = 0.50  # if CTR drops by 50%+ vs baseline, revert early
+# --- Fix 1: Persistent storage ---
+# HF Space mounts /data as persistent volume. Fallback to /tmp if not available.
+DATA_DIR = Path(os.environ.get("JORKI_DATA_DIR", "/data" if Path("/data").exists() else "/tmp/jorki"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+STORAGE_DIR = DATA_DIR / "indexes"
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+REGISTRY_DB = DATA_DIR / "registry.sqlite3"
 
+# Auth token (set as HF Space secret)
+AUTH_TOKEN = os.environ.get("JORKI_AUTH_TOKEN", "")
 
-def init_db(db_path: Path = DB_PATH):
-    db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS daily_profile_metrics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            bio_id TEXT NOT NULL,
-            headline_hash TEXT,
-            bio_hash TEXT,
-            profile_views INTEGER NOT NULL,
-            contact_clicks INTEGER NOT NULL,
-            new_visits INTEGER DEFAULT 0,
-            new_emails INTEGER DEFAULT 0,
-            booking_requests INTEGER,
-            confirmed_clients INTEGER,
-            revenue_cents INTEGER,
-            availability_state INTEGER NOT NULL,
-            profile_visible INTEGER NOT NULL,
-            notes TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS experiment_decisions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            experiment_id TEXT NOT NULL,
-            bio_id TEXT NOT NULL,
-            decision TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            profile_views INTEGER,
-            contact_clicks INTEGER,
-            contact_click_rate REAL,
-            minimum_views_met INTEGER,
-            minimum_hours_met INTEGER,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS experiments (
-            experiment_id TEXT PRIMARY KEY,
-            bio_id TEXT NOT NULL,
-            variant_class TEXT,
-            started_at TEXT NOT NULL,
-            ended_at TEXT,
-            baseline_bio_id TEXT,
-            before_views INTEGER,
-            before_contact_clicks INTEGER,
-            before_emails INTEGER,
-            after_views INTEGER,
-            after_contact_clicks INTEGER,
-            after_emails INTEGER,
-            actual_lift REAL,
-            winner TEXT,
-            rollback_snapshot TEXT,
-            status TEXT DEFAULT 'running'
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS receipt_chain (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            receipt_hash TEXT NOT NULL,
-            prev_hash TEXT,
-            action TEXT NOT NULL,
-            data_json TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def get_conn(db_path: Path = DB_PATH):
-    return sqlite3.connect(str(db_path))
-
-
-def sha256_of(data: str) -> str:
-    return hashlib.sha256(data.encode()).hexdigest()
-
-
-def write_receipt(action: str, data: dict, db_path: Path = DB_PATH) -> str:
-    conn = get_conn(db_path)
-    ts = datetime.now(timezone.utc).isoformat()
-    data_str = json.dumps(data, sort_keys=True, default=str)
-    prev = conn.execute("SELECT receipt_hash FROM receipt_chain ORDER BY id DESC LIMIT 1").fetchone()
-    prev_hash = prev[0] if prev else ""
-    receipt_hash = sha256_of(prev_hash + action + ts + data_str)
-    conn.execute(
-        "INSERT INTO receipt_chain (receipt_hash, prev_hash, action, data_json) VALUES (?, ?, ?, ?)",
-        (receipt_hash, prev_hash, action, data_str),
-    )
-    conn.commit()
-    conn.close()
-    return receipt_hash
-
-
-def verify_receipt_chain(db_path: Path = DB_PATH) -> bool:
-    conn = get_conn(db_path)
-    rows = conn.execute("SELECT receipt_hash, prev_hash, action, data_json FROM receipt_chain ORDER BY id").fetchall()
-    conn.close()
-    prev = ""
-    for r_hash, r_prev, action, data_json in rows:
-        if r_prev != prev:
-            return False
-        # Can't fully recompute hash without timestamp, but chain linkage is verifiable
-        prev = r_hash
-    return True
-
-
-def ingest_metrics(packet: dict, db_path: Path = DB_PATH) -> dict:
-    """Ingest a daily metrics packet. Returns computed values + decision."""
-    conn = get_conn(db_path)
-    ts = datetime.now(timezone.utc).isoformat()
-    date = packet.get("date", datetime.now(timezone.utc).date().isoformat())
-    bio_id = packet.get("bio_id", "unknown")
-    profile_views = int(packet.get("profile_views", 0))
-    contact_clicks = int(packet.get("contact_clicks", 0))
-    new_visits = int(packet.get("new_visits", 0))
-    new_emails = int(packet.get("new_emails", 0))
-    availability = 1 if packet.get("availability_state", True) else 0
-    visible = 1 if packet.get("profile_visible", True) else 0
-    headline_hash = packet.get("headline_hash", "")
-    bio_hash = packet.get("bio_hash", "")
-
-    contact_click_rate = contact_clicks / profile_views if profile_views > 0 else 0.0
-    email_rate = new_emails / profile_views if profile_views > 0 else 0.0
-
-    conn.execute(
-        """INSERT INTO daily_profile_metrics
-           (date, bio_id, headline_hash, bio_hash, profile_views, contact_clicks,
-            new_visits, new_emails, availability_state, profile_visible, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (date, bio_id, headline_hash, bio_hash, profile_views, contact_clicks,
-         new_visits, new_emails, availability, visible, packet.get("notes", "")),
-    )
-    conn.commit()
-
-    decision = compute_decision(bio_id, profile_views, contact_clicks, new_emails,
-                                 availability, visible, conn)
-    conn.close()
-
-    write_receipt("metrics_ingest", {
-        "date": date, "bio_id": bio_id, "profile_views": profile_views,
-        "contact_clicks": contact_clicks, "contact_click_rate": contact_click_rate,
-        "decision": decision["status"], "reason": decision["reason"],
-    }, db_path)
-
-    return {
-        "ok": True,
-        "ingested": True,
-        "computed": {
-            "contact_click_rate": round(contact_click_rate, 4),
-            "email_rate": round(email_rate, 4),
-            "contact_clicks_per_100_views": round(contact_click_rate * 100, 2),
-        },
-        "decision": decision,
-    }
-
-
-def compute_decision(bio_id: str, profile_views: int, contact_clicks: int,
-                     new_emails: int, availability: int, visible: int,
-                     conn: sqlite3.Connection) -> dict:
-    """Strict decision engine. No magic. Just rules."""
-
-    if not visible:
-        return {"status": "BLOCK_BAD_ACCOUNT_STATE",
-                "reason": "Profile is not visible.", "next_action": "make_visible"}
-
-    if not availability:
-        return {"status": "BLOCK_BAD_ACCOUNT_STATE",
-                "reason": "Profile is not available. Metrics not comparable.",
-                "next_action": "set_available"}
-
-    if profile_views == 0:
-        return {"status": "BLOCK_NO_METRICS",
-                "reason": "No profile metrics available.", "next_action": "ingest_metrics"}
-
-    # Check for running experiment
-    exp = conn.execute(
-        "SELECT * FROM experiments WHERE status = 'running' ORDER BY started_at DESC LIMIT 1"
-    ).fetchone()
-
-    if not exp:
-        # No experiment running — check if we have baseline data
-        baseline = conn.execute(
-            "SELECT profile_views, contact_clicks FROM daily_profile_metrics "
-            "WHERE bio_id = ? ORDER BY id DESC LIMIT 1", (bio_id,)
-        ).fetchone()
-        if not baseline:
-            return {"status": "BLOCK_NO_BASELINE_EXPERIMENT",
-                    "reason": "Real traffic exists, but no completed experiment exists yet. "
-                              "Start one controlled bio-only experiment.",
-                    "next_action": "start_experiment",
-                    "baseline": {"profile_views": profile_views, "contact_clicks": contact_clicks,
-                                 "contact_click_rate": round(contact_clicks / profile_views, 5) if profile_views > 0 else 0},
-                    "next_candidate": {"bio_id": "targeted_wolf_v1", "change_scope": "headline_and_bio_only",
-                                       "minimum_views": MIN_VIEWS_FOR_DECISION, "minimum_hours": MIN_HOURS_FOR_DECISION}}
-        return {"status": "READY_TO_TEST",
-                "reason": "Baseline established. No active experiment. Ready to start next test.",
-                "next_action": "start_experiment",
-                "baseline": {"profile_views": baseline[0], "contact_clicks": baseline[1],
-                             "contact_click_rate": round(baseline[1] / baseline[0], 5) if baseline[0] > 0 else 0}}
-
-    # Experiment is running — check exposure
-    exp_id, exp_bio_id, _, started_at, _, _, before_views, before_clicks, before_emails = exp[:9]
-
-    # Parse started_at
-    try:
-        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-        elapsed_hours = (datetime.now(timezone.utc) - start).total_seconds() / 3600
-    except Exception:
-        elapsed_hours = 0
-
-    delta_views = profile_views - (before_views or 0)
-    delta_clicks = contact_clicks - (before_clicks or 0)
-
-    min_views_met = delta_views >= MIN_VIEWS_FOR_DECISION
-    min_hours_met = elapsed_hours >= MIN_HOURS_FOR_DECISION
-
-    if not min_views_met and not min_hours_met:
-        return {"status": "BLOCK_LOW_EXPOSURE",
-                "reason": f"Only {delta_views} views in {elapsed_hours:.1f}h. "
-                          f"Need {MIN_VIEWS_FOR_DECISION} views or {MIN_HOURS_FOR_DECISION}h.",
-                "next_action": "wait",
-                "experiment_id": exp_id,
-                "elapsed_hours": round(elapsed_hours, 1),
-                "current_delta_views": delta_views}
-
-    # We have enough exposure — compute lift
-    before_ctr = before_clicks / before_views if before_views and before_views > 0 else 0
-    after_ctr = contact_clicks / profile_views if profile_views > 0 else 0
-    lift = after_ctr - before_ctr
-
-    # Severe drop check (can trigger before full window if CTR collapses)
-    if before_ctr > 0 and after_ctr < before_ctr * (1 - SEVERE_DROP_THRESHOLD):
-        return {"status": "REVERT_TO_BASELINE",
-                "reason": f"CTR dropped {abs(lift)*100:.1f}pp. Severe drop threshold exceeded.",
-                "next_action": "rollback",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
-
-    if not min_views_met or not min_hours_met:
-        return {"status": "TEST_RUNNING",
-                "reason": f"Experiment running: delta_views={delta_views}/{MIN_VIEWS_FOR_DECISION}, "
-                          f"hours={elapsed_hours:.1f}/{MIN_HOURS_FOR_DECISION}",
-                "next_action": "wait",
-                "experiment_id": exp_id}
-
-    # Enough exposure — decide
-    if lift > 0.01:
-        return {"status": "WINNER_FOUND",
-                "reason": f"CTR improved by {lift*100:.1f}pp.",
-                "next_action": "close_experiment_winner",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
-    elif lift < -0.01:
-        return {"status": "REVERT_TO_BASELINE",
-                "reason": f"CTR decreased by {abs(lift)*100:.1f}pp.",
-                "next_action": "rollback",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
-    else:
-        return {"status": "KEEP_CURRENT",
-                "reason": f"CTR flat ({lift*100:.1f}pp). No significant change.",
-                "next_action": "test_next_bio",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
-
-
-def start_experiment(bio_id: str, variant_class: str, before_views: int,
-                     before_contact_clicks: int, before_emails: int,
-                     db_path: Path = DB_PATH) -> dict:
-    conn = get_conn(db_path)
-    exp_id = f"exp_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{variant_class}"
-    ts = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        """INSERT INTO experiments
-           (experiment_id, bio_id, variant_class, started_at, baseline_bio_id,
-            before_views, before_contact_clicks, before_emails, status)
-           VALUES (?, ?, ?, ?, 'current_live', ?, ?, ?, 'running')""",
-        (exp_id, bio_id, variant_class, ts, before_views, before_contact_clicks, before_emails),
-    )
-    conn.commit()
-    conn.close()
-    write_receipt("experiment_start", {
-        "experiment_id": exp_id, "bio_id": bio_id, "variant_class": variant_class,
-        "before_views": before_views, "before_contact_clicks": before_contact_clicks,
-    }, db_path)
-    return {"experiment_id": exp_id, "status": "running", "bio_id": bio_id}
-
-
-def close_experiment(experiment_id: str, after_views: int, after_contact_clicks: int,
-                     after_emails: int, db_path: Path = DB_PATH) -> dict:
-    conn = get_conn(db_path)
-    exp = conn.execute("SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)).fetchone()
-    if not exp:
-        conn.close()
-        return {"error": "experiment not found"}
-    before_views = exp[6] or 0
-    before_clicks = exp[7] or 0
-    before_ctr = before_clicks / before_views if before_views > 0 else 0
-    after_ctr = after_contact_clicks / after_views if after_views > 0 else 0
-    lift = after_ctr - before_ctr
-    winner = "test_bio" if lift > 0.01 else ("baseline" if lift < -0.01 else "no_significant_change")
-    ts = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        """UPDATE experiments SET ended_at=?, after_views=?, after_contact_clicks=?,
-           after_emails=?, actual_lift=?, winner=?, status='closed' WHERE experiment_id=?""",
-        (ts, after_views, after_contact_clicks, after_emails, lift, winner, experiment_id),
-    )
-    conn.commit()
-    conn.close()
-    write_receipt("experiment_close", {
-        "experiment_id": experiment_id, "winner": winner, "lift": lift,
-        "before_ctr": before_ctr, "after_ctr": after_ctr,
-    }, db_path)
-    return {"experiment_id": experiment_id, "winner": winner, "lift": round(lift, 4),
-            "before_ctr": round(before_ctr, 4), "after_ctr": round(after_ctr, 4)}
-
-
-def generate_daily_evidence_packet(rm_traffic_db: str, bio_id: str = "karpathian_wolf_live",
-                                    db_path: Path = DB_PATH) -> dict:
-    """Generate daily_evidence_packet.json from rm_traffic profileops.db."""
-    traffic_conn = sqlite3.connect(rm_traffic_db)
-    snap = traffic_conn.execute(
-        "SELECT profile_views, contact_clicks, new_visits, new_emails, "
-        "is_hidden, is_available, headline, description_len "
-        "FROM traffic_snapshots ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    traffic_conn.close()
-
-    if not snap:
-        return {"error": "no traffic snapshot found"}
-
-    views, clicks, visits, emails, hidden, available, headline, desc_len = snap
-    visible = not hidden
-    avail = bool(available)
-    ctr = clicks / views if views > 0 else 0
-    email_rate = emails / views if views > 0 else 0
-
-    # Get current experiment
-    conn = get_conn(db_path)
-    exp = conn.execute(
-        "SELECT experiment_id, bio_id, status, started_at FROM experiments "
-        "WHERE status='running' ORDER BY started_at DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
-
-    date_str = datetime.now(timezone.utc).date().isoformat()
-    packet_id = f"rmep_{date_str.replace('-', '_')}_{datetime.now(timezone.utc).strftime('%H%M')}"
-
-    bio_text = headline or ""
-    bio_hash = "sha256:" + sha256_of(bio_text)
-
-    decision = compute_decision(bio_id, views, clicks, emails,
-                                1 if avail else 0, 1 if visible else 0,
-                                get_conn(db_path))
-
-    packet = {
-        "packet_id": packet_id,
-        "date": date_str,
-        "account": {
-            "profile_visible": visible,
-            "is_available": avail,
-            "gold_status": True,
-        },
-        "bio": {
-            "bio_id": bio_id,
-            "headline": bio_text,
-            "bio_hash": bio_hash,
-            "variant_class": "current_live",
-        },
-        "metrics": {
-            "profile_views": views,
-            "contact_clicks": clicks,
-            "new_visits": visits,
-            "new_emails": emails,
-            "booking_requests": None,
-            "confirmed_clients": None,
-            "revenue": None,
-        },
-        "derived": {
-            "contact_click_rate": round(ctr, 4),
-            "email_rate": round(email_rate, 4),
-            "contact_clicks_per_100_views": round(ctr * 100, 2),
-        },
-        "experiment": {
-            "experiment_id": exp[0] if exp else None,
-            "state": exp[2] if exp else "none",
-            "baseline_bio_id": "current_live",
-            "test_bio_id": exp[1] if exp else None,
-            "minimum_views_required": MIN_VIEWS_FOR_DECISION,
-            "minimum_hours_required": MIN_HOURS_FOR_DECISION,
-        },
-        "decision": decision,
-        "receipt": {
-            "source": "rm_traffic",
-            "created_by": "daily_promotion_script",
-            "source_db": rm_traffic_db,
-            "packet_hash": "sha256:" + sha256_of(packet_id + str(views) + str(clicks)),
-        },
-    }
-    return packet
-
-
-def get_latest_decision(db_path: Path = DB_PATH) -> dict:
-    conn = get_conn(db_path)
-    row = conn.execute(
-        "SELECT experiment_id, bio_id, decision, reason, profile_views, "
-        "contact_clicks, contact_click_rate, created_at "
-        "FROM experiment_decisions ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
-    if not row:
-        return {"status": "BLOCK_NO_SIGNAL", "reason": "No decisions yet."}
-    return {
-        "experiment_id": row[0], "bio_id": row[1], "decision": row[2],
-        "reason": row[3], "profile_views": row[4], "contact_clicks": row[5],
-        "contact_click_rate": row[6], "created_at": row[7],
-    }
-
-
-def get_metrics_history(limit: int = 30, db_path: Path = DB_PATH) -> list:
-    conn = get_conn(db_path)
-    rows = conn.execute(
-        "SELECT date, bio_id, profile_views, contact_clicks, new_visits, "
-        "new_emails, availability_state, profile_visible, created_at "
-        "FROM daily_profile_metrics ORDER BY id DESC LIMIT ?", (limit,)
-    ).fetchall()
-    conn.close()
-    return [{"date": r[0], "bio_id": r[1], "profile_views": r[2], "contact_clicks": r[3],
-             "new_visits": r[4], "new_emails": r[5], "available": bool(r[6]),
-             "visible": bool(r[7]), "created_at": r[8]} for r in rows]
-
-
-def get_experiments(db_path: Path = DB_PATH) -> list:
-    conn = get_conn(db_path)
-    rows = conn.execute(
+def init_registry_db():
+    """SQLite-backed registry — survives restarts."""
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.execute("""CREATE TABLE IF NOT EXISTS files (
+        file_id TEXT PRIMARY KEY,

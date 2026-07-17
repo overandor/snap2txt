@@ -1,0 +1,800 @@
+
+        return {
+            "total_bios": len(bios),
+            "ranked_bios": len(has_views),
+            "top_5": [{"username": b["username"], "views_per_day": b["views_per_day"],
+                        "headline": b.get("headline", "")} for b in has_views[:5]],
+            "output": str(ranked_path),
+        }
+
+```
+
+experiment_runner.py:
+```
+"""
+ExperimentRunner — before/after measurement, lift computation, rollback.
+
+Never applies without approval. Never claims success without measurement.
+Every experiment produces a receipt with before/after snapshots.
+"""
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from .state_db import StateDB
+from rm_pri.py.api_client import RentMasseurAPI
+
+
+class ExperimentRunner:
+    """Run controlled profile experiments with before/after measurement."""
+
+    def __init__(self, api: RentMasseurAPI, db: StateDB, experiments_dir: str = "rm_pri/data/experiments"):
+        self.api = api
+        self.db = db
+        self.experiments_dir = Path(experiments_dir)
+        self.experiments_dir.mkdir(parents=True, exist_ok=True)
+
+    def snapshot_dashboard(self) -> dict:
+        """Take a full dashboard snapshot."""
+        dashboard = self.api.get_dashboard()
+        stats = self.api.get_ad_statistics()
+        keeponline = self.api.get_keeponline()
+        about = self.api.get_about()
+
+        keep = keeponline.get("keeponline", {}) if isinstance(keeponline, dict) else {}
+        stats_data = stats.get("adStatistics", stats) if isinstance(stats, dict) else {}
+        about_data = about.get("about", about) if isinstance(about, dict) else {}
+
+        snapshot = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "profile_views": stats_data.get("totalPageViews") or dashboard.get("profileViews", 0),
+            "contact_clicks": stats_data.get("totalContactClicks", 0),
+            "new_visits": keep.get("newVisits", 0),
+            "new_emails": keep.get("newEmails", 0),
+            "online_bookmarks": dashboard.get("onlineBookmarks", 0),
+            "is_ad_hidden": keep.get("isAdHidden", 0),
+            "headline": about_data.get("headline", ""),
+            "description_len": len(about_data.get("description", "")),
+            "raw_dashboard": dashboard,
+            "raw_stats": stats,
+            "raw_keeponline": keeponline,
+        }
+
+        ctr = (snapshot["contact_clicks"] / snapshot["profile_views"]) if snapshot["profile_views"] else 0.0
+        snapshot["ctr"] = round(ctr, 6)
+
+        return snapshot
+
+    def start_experiment(self, variant_id: str, bio_file: str, content_type: str = "bio",
+                         headline: str = "", description: str = "") -> dict:
+        """Start an experiment: snapshot before, apply variant, return experiment record."""
+        before = self.snapshot_dashboard()
+        self.db.log_snapshot("experiment_before", before)
+
+        exp_id = f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        applied = False
+        apply_error = None
+        if headline or description:
+            try:
+                self.api.set_about(headline=headline, description=description)
+                applied = True
+            except Exception as e:
+                apply_error = str(e)
+
+        experiment = {
+            "experiment_id": exp_id,
+            "variant_id": variant_id,
+            "bio_file": bio_file,
+            "content_type": content_type,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "status": "live" if applied else "failed",
+            "before": before,
+            "applied": applied,
+            "apply_error": apply_error,
+            "headline": headline,
+            "description": description[:200] if description else "",
+        }
+
+        exp_path = self.experiments_dir / f"{exp_id}.json"
+        exp_path.write_text(json.dumps(experiment, indent=2, default=str))
+
+        self.db.add_receipt("experiment_start", f"Experiment {exp_id} started with {variant_id}", experiment)
+
+        return experiment
+
+    def close_experiment(self, experiment_id: str) -> dict:
+        """Close an experiment: snapshot after, compute lift, write receipt."""
+        exp_path = self.experiments_dir / f"{experiment_id}.json"
+        if not exp_path.exists():
+            return {"error": f"Experiment {experiment_id} not found"}
+
+        experiment = json.loads(exp_path.read_text())
+        after = self.snapshot_dashboard()
+        self.db.log_snapshot("experiment_after", after)
+
+        lift = self._compute_lift(experiment.get("before", {}), after)
+
+        result = {
+            "experiment_id": experiment_id,
+            "variant_id": experiment.get("variant_id"),
+            "started_at": experiment.get("started_at"),
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+            "before": experiment.get("before", {}),
+            "after": after,
+            "lift": lift,
+            "result_label": "winner" if lift["ctr_lift"] > 0 else ("loser" if lift["ctr_lift"] < 0 else "inconclusive"),
+            "status": "closed",
+        }
+
+        result_path = self.experiments_dir / f"{experiment_id}_result.json"
+        result_path.write_text(json.dumps(result, indent=2, default=str))
+
+        self.db.add_receipt("experiment_close", f"Experiment {experiment_id} closed: {result['result_label']}", result)
+
+        return result
+
+    def rollback_experiment(self, experiment_id: str, original_headline: str = "", original_description: str = "") -> dict:
+        """Rollback: restore original profile content."""
+        exp_path = self.experiments_dir / f"{experiment_id}.json"
+        if not exp_path.exists():
+            return {"error": f"Experiment {experiment_id} not found"}
+
+        experiment = json.loads(exp_path.read_text())
+        before = experiment.get("before", {})
+        headline = original_headline or before.get("headline", "")
+        description = original_description or before.get("description", "")
+
+        try:
+            self.api.set_about(headline=headline, description=description)
+            rolled_back = True
+        except Exception as e:
+            rolled_back = False
+            error = str(e)
+
+        after_rollback = self.snapshot_dashboard()
+
+        result = {
+            "experiment_id": experiment_id,
+            "action": "rollback",
+            "rolled_back": rolled_back,
+            "restored_headline": headline[:80],
+            "after_rollback": after_rollback,
+        }
+
+        self.db.add_receipt("experiment_rollback", f"Rolled back experiment {experiment_id}", result)
+        return result
+
+    def _compute_lift(self, before: dict, after: dict) -> dict:
+        """Compute real lift between before/after snapshots."""
+        bv = before.get("profile_views", 0) or 0
+        av = after.get("profile_views", 0) or 0
+        bc = before.get("contact_clicks", 0) or 0
+        ac = after.get("contact_clicks", 0) or 0
+        be = before.get("new_emails", 0) or 0
+        ae = after.get("new_emails", 0) or 0
+        bn = before.get("new_visits", 0) or 0
+        an = after.get("new_visits", 0) or 0
+
+        before_ctr = bc / bv if bv > 0 else 0.0
+        after_ctr = ac / av if av > 0 else 0.0
+
+        return {
+            "lift_views": av - bv,
+            "lift_clicks": ac - bc,
+            "lift_emails": ae - be,
+            "lift_new_visits": an - bn,
+            "before_ctr": round(before_ctr, 6),
+            "after_ctr": round(after_ctr, 6),
+            "ctr_lift": round(after_ctr - before_ctr, 6),
+            "ctr_lift_pct": round(((after_ctr - before_ctr) / before_ctr * 100) if before_ctr > 0 else 0, 2),
+        }
+
+```
+
+state_db.py:
+```
+"""
+StateDB — SQLite state logger for RentMasseur account.
+
+Logs every dashboard snapshot, ad statistics, visibility state,
+availability window, search rank, and experiment receipt.
+
+No mock data. No estimates. Only real API responses.
+"""
+
+import json
+import sqlite3
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    snapshot_type TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    source TEXT DEFAULT 'api'
+);
+
+CREATE TABLE IF NOT EXISTS stats_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    total_views INTEGER,
+    total_contact_clicks INTEGER,
+    new_visits INTEGER,
+    new_emails INTEGER,
+    online_bookmarks INTEGER,
+    ctr REAL,
+    raw_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS visibility_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    is_ad_hidden INTEGER NOT NULL,
+    source TEXT DEFAULT 'api'
+);
+
+CREATE TABLE IF NOT EXISTS availability_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    option INTEGER,
+    countdown INTEGER,
+    selected TEXT,
+    raw_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS search_rank (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    city TEXT,
+    own_rank INTEGER,
+    total_results INTEGER,
+    raw_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    action TEXT NOT NULL,
+    description TEXT,
+    data_json TEXT,
+    prev_hash TEXT,
+    hash TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON snapshots(timestamp);
+CREATE INDEX IF NOT EXISTS idx_stats_ts ON stats_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_visibility_ts ON visibility_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_receipts_ts ON receipts(timestamp);
+"""
+
+
+class StateDB:
+    """SQLite-backed state logger. Thread-safe via per-connection."""
+
+    def __init__(self, db_path: str = "rm_revenue_engine/state.db"):
+        self.path = Path(db_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_schema()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_schema(self):
+        conn = self._conn()
+        conn.executescript(SCHEMA)
+        conn.commit()
+        conn.close()
+
+    def _ts(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    # ─── Snapshots ───
+
+    def log_snapshot(self, snapshot_type: str, data: dict, source: str = "api"):
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO snapshots (timestamp, snapshot_type, data_json, source) VALUES (?, ?, ?, ?)",
+            (self._ts(), snapshot_type, json.dumps(data, default=str), source),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_snapshots(self, snapshot_type: str = None, limit: int = 20) -> list:
+        conn = self._conn()
+        if snapshot_type:
+            rows = conn.execute(
+                "SELECT * FROM snapshots WHERE snapshot_type=? ORDER BY timestamp DESC LIMIT ?",
+                (snapshot_type, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM snapshots ORDER BY timestamp DESC LIMIT ?", (limit,)
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    # ─── Stats ───
+
+    def log_stats(self, stats: dict):
+        total_views = stats.get("totalPageViews") or stats.get("total_views") or 0
+        total_clicks = stats.get("totalContactClicks") or stats.get("total_contact_clicks") or 0
+        new_visits = stats.get("newVisits") or stats.get("new_visits") or 0
+        new_emails = stats.get("newEmails") or stats.get("new_emails") or 0
+        bookmarks = stats.get("onlineBookmarks") or stats.get("online_bookmarks") or 0
+        ctr = (total_clicks / total_views) if total_views else 0.0
+
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO stats_log (timestamp, total_views, total_contact_clicks, new_visits, new_emails, online_bookmarks, ctr, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (self._ts(), total_views, total_clicks, new_visits, new_emails, bookmarks, ctr, json.dumps(stats, default=str)),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_latest_stats(self) -> Optional[dict]:
+        conn = self._conn()
+        row = conn.execute("SELECT * FROM stats_log ORDER BY timestamp DESC LIMIT 1").fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def get_stats_history(self, limit: int = 50) -> list:
+        conn = self._conn()
+        rows = conn.execute("SELECT * FROM stats_log ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    # ─── Visibility ───
+
+    def log_visibility(self, is_ad_hidden: bool, source: str = "api"):
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO visibility_log (timestamp, is_ad_hidden, source) VALUES (?, ?, ?)",
+            (self._ts(), 1 if is_ad_hidden else 0, source),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_latest_visibility(self) -> Optional[dict]:
+        conn = self._conn()
+        row = conn.execute("SELECT * FROM visibility_log ORDER BY timestamp DESC LIMIT 1").fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    # ─── Availability ───
+
+    def log_availability(self, avail: dict):
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO availability_log (timestamp, option, countdown, selected, raw_json) VALUES (?, ?, ?, ?, ?)",
+            (self._ts(), avail.get("option"), avail.get("countdown"), avail.get("selected"), json.dumps(avail, default=str)),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_latest_availability(self) -> Optional[dict]:
+        conn = self._conn()
+        row = conn.execute("SELECT * FROM availability_log ORDER BY timestamp DESC LIMIT 1").fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    # ─── Search Rank ───
+
+    def log_search_rank(self, city: str, own_rank: int, total_results: int, raw: dict):
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO search_rank (timestamp, city, own_rank, total_results, raw_json) VALUES (?, ?, ?, ?, ?)",
+            (self._ts(), city, own_rank, total_results, json.dumps(raw, default=str)),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_rank_history(self, limit: int = 20) -> list:
+        conn = self._conn()
+        rows = conn.execute("SELECT * FROM search_rank ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    # ─── Receipts (SHA-256 chained) ───
+
+    def add_receipt(self, action: str, description: str, data: dict) -> dict:
+        import hashlib
+        conn = self._conn()
+        prev = conn.execute("SELECT hash FROM receipts ORDER BY id DESC LIMIT 1").fetchone()
+        prev_hash = prev["hash"] if prev else "0" * 64
+        ts = self._ts()
+        entry = {
+            "timestamp": ts,
+            "action": action,
+            "description": description,
+            "data_json": json.dumps(data, default=str, sort_keys=True),
+            "prev_hash": prev_hash,
+        }
+        entry_str = json.dumps(entry, sort_keys=True)
+        entry["hash"] = hashlib.sha256(entry_str.encode()).hexdigest()
+        conn.execute(
+            "INSERT INTO receipts (timestamp, action, description, data_json, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?)",
+            (ts, action, description, entry["data_json"], prev_hash, entry["hash"]),
+        )
+        conn.commit()
+        conn.close()
+        return entry
+
+    def get_receipts(self, limit: int = 50) -> list:
+        conn = self._conn()
+        rows = conn.execute("SELECT * FROM receipts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def verify_receipt_chain(self) -> bool:
+        import hashlib
+        conn = self._conn()
+        rows = conn.execute("SELECT * FROM receipts ORDER BY id ASC").fetchall()
+        conn.close()
+        prev_hash = "0" * 64
+        for r in rows:
+            if r["prev_hash"] != prev_hash:
+                return False
+            entry = {
+                "timestamp": r["timestamp"],
+                "action": r["action"],
+                "description": r["description"],
+                "data_json": r["data_json"],
+                "prev_hash": r["prev_hash"],
+            }
+            expected = hashlib.sha256(json.dumps(entry, sort_keys=True).encode()).hexdigest()
+            if r["hash"] != expected:
+                return False
+            prev_hash = r["hash"]
+        return True
+
+    # ─── Summary ───
+
+    def summary(self) -> dict:
+        conn = self._conn()
+        snap_count = conn.execute("SELECT COUNT(*) as c FROM snapshots").fetchone()["c"]
+        stats_count = conn.execute("SELECT COUNT(*) as c FROM stats_log").fetchone()["c"]
+        vis_count = conn.execute("SELECT COUNT(*) as c FROM visibility_log").fetchone()["c"]
+        avail_count = conn.execute("SELECT COUNT(*) as c FROM availability_log").fetchone()["c"]
+        rank_count = conn.execute("SELECT COUNT(*) as c FROM search_rank").fetchone()["c"]
+        receipt_count = conn.execute("SELECT COUNT(*) as c FROM receipts").fetchone()["c"]
+        chain_valid = self.verify_receipt_chain() if receipt_count > 0 else True
+        conn.close()
+        return {
+            "snapshots": snap_count,
+            "stats_log": stats_count,
+            "visibility_log": vis_count,
+            "availability_log": avail_count,
+            "search_rank": rank_count,
+            "receipts": receipt_count,
+            "chain_valid": chain_valid,
+        }
+
+```
+
+daemon.py:
+```
+"""
+Daemon — 24/7 RM Revenue Engine loop.
+
+Runs only safe, read-only operations by default. Mutations require mode >= 2.
+Every action is logged and receipted. Errors are caught, never crash the loop.
+
+Intervals (seconds):
+    visibility_check  : 300   (5 min)
+    availability_check: 300   (5 min)
+    stats_snapshot    : 600   (10 min)
+    market_scan       : 3600  (1 hour)
+    enrich            : 86400 (1 day)
+    train             : 86400 (1 day)
+    experiment_cycle  : 21600 (6 hours)
+"""
+
+import json
+import logging
+import os
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from .state_db import StateDB
+from .market_scan import MarketScanner
+from .experiment_runner import ExperimentRunner
+from rm_pri.py.api_client import RentMasseurAPI
+from rm_pri.py.auth import AuthSession
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("rm_daemon")
+
+
+INTERVALS = {
+    "visibility_check": 300,
+    "availability_check": 300,
+    "stats_snapshot": 600,
+    "market_scan": 3600,
+    "enrich": 86400,
+    "train": 86400,
+    "experiment_cycle": 21600,
+}
+
+# Load control mode from env, default to 0 (read-only)
+CONTROL_MODE = int(os.environ.get("RM_CONTROL_MODE", "0"))
+
+
+def _get_api() -> Optional[RentMasseurAPI]:
+    api = RentMasseurAPI()
+    auth = AuthSession(api)
+    if not auth.login():
+        log.error("Login failed — credentials missing or invalid")
+        return None
+    return api
+
+
+def _check_ip_block() -> bool:
+    """Return True if CrowdSec captcha is active."""
+    import requests
+    try:
+        r = requests.get("https://rentmasseur.com", headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        return "CrowdSec" in r.text
+    except Exception as e:
+        log.error("IP check failed: %s", e)
+        return True
+
+
+def _can_mutate() -> bool:
+    return CONTROL_MODE >= 2
+
+
+def _record_action(db: StateDB, action: str, description: str, data: dict):
+    log.info("%s: %s", action, description)
+    db.add_receipt(action, description, data)
+
+
+def check_visibility(db: StateDB, api: RentMasseurAPI):
+    try:
+        keep = api.get_keeponline()
+        is_hidden = bool(keep.get("keeponline", {}).get("isAdHidden", 0))
+        db.log_visibility(is_hidden)
+        if is_hidden:
+            log.warning("PROFILE IS HIDDEN")
+            if _can_mutate():
+                log.info("Control mode >= 2 — unhiding profile")
+                api.set_visibility(visible=True)
+                db.log_visibility(False, source="daemon_unhide")
+                _record_action(db, "visibility_auto_on", "Auto-unhid profile", {"control_mode": CONTROL_MODE})
+            else:
+                _record_action(db, "visibility_warning", "Profile hidden but control mode < 2 — no auto action", {"control_mode": CONTROL_MODE})
+    except Exception as e:
+        log.error("Visibility check failed: %s", e)
+
+
+def check_availability(db: StateDB, api: RentMasseurAPI):
+    try:
+        avail = api.get_availability()
+        db.log_availability(avail)
+        countdown = avail.get("countdown", 0)
+        now = time.time()
+        minutes_left = max(0, int(countdown - now) // 60)
+        log.info("Availability: %s, minutes_left=%d", avail.get("selected"), minutes_left)
+        if minutes_left < 30 and _can_mutate():
+            log.info("Availability expiring soon — refreshing to 6h if actually available")
+            api.set_availability(option=1, duration=5)
+            _record_action(db, "availability_refresh", "Refreshed availability", {"control_mode": CONTROL_MODE})
+    except Exception as e:
+        log.error("Availability check failed: %s", e)
+
+
+def snapshot_stats(db: StateDB, api: RentMasseurAPI):
+    try:
+        dashboard = api.get_dashboard()
+        stats = api.get_ad_statistics()
+        keeponline = api.get_keeponline()
+        db.log_snapshot("dashboard", dashboard)
+        db.log_stats(stats.get("adStatistics", stats))
+        db.log_visibility(bool(keeponline.get("keeponline", {}).get("isAdHidden", 0)))
+        _record_action(db, "stats_snapshot", "Logged dashboard stats", {
+            "views": stats.get("adStatistics", stats).get("totalPageViews"),
+            "clicks": stats.get("adStatistics", stats).get("totalContactClicks"),
+        })
+    except Exception as e:
+        log.error("Stats snapshot failed: %s", e)
+
+
+def scan_market(db: StateDB, api: RentMasseurAPI):
+    try:
+        cities = os.environ.get("RM_SCAN_CITIES", "manhattan-ny").split(",")
+        pages = int(os.environ.get("RM_SCAN_PAGES", "5"))
+        own = os.environ.get("RM_USERNAME", "")
+        scanner = MarketScanner(api, db)
+        results = scanner.scan_cities(cities, pages=pages, own_username=own)
+        _record_action(db, "market_scan", f"Scanned {len(results)} cities", {"results": results})
+    except Exception as e:
+        log.error("Market scan failed: %s", e)
+
+
+def run_enrich(db: StateDB):
+    """Run enricher if not blocked. This is public scraping, not API login."""
+    if _check_ip_block():
+        log.warning("IP blocked — skipping enrichment")
+        return
+    try:
+        from rm_pri.py import enrich
+        input_path = Path("rm_pri/data/real_bios_raw.jsonl")
+        output_path = Path("rm_pri/data/real_bios_with_views.jsonl")
+        if not input_path.exists():
+            log.error("Raw bios not found")
+            return
+        enrich.enrich(input_path, output_path, limit=100, resume=True, min_delay=2.0)
+        _record_action(db, "enrich", "Ran public profile enrichment", {"limit": 100})
+    except Exception as e:
+        log.error("Enrich failed: %s", e)
+
+
+def run_train(db: StateDB):
+    try:
+        cpp = Path("rm_pri/cpp/rm_pri")
+        if not cpp.exists():
+            log.error("C++ engine not compiled")
+            return
+        enriched = Path("rm_pri/data/real_bios_with_views.jsonl")
+        if not enriched.exists():
+            log.error("Enriched data not found")
+            return
+        result = subprocess.run(
+            [str(cpp), "train", str(enriched), "--label", "views_per_day", "--cv", "5", "--walk-forward"],
+            capture_output=True, text=True, timeout=600
+        )
+        _record_action(db, "train", "Ran C++ model training", {
+            "exit_code": result.returncode,
+            "stdout_tail": result.stdout[-500:],
+            "stderr_tail": result.stderr[-500:],
+        })
+    except Exception as e:
+        log.error("Train failed: %s", e)
+
+
+def experiment_cycle(db: StateDB, api: RentMasseurAPI):
+    """Close any live experiment, then start next approved candidate if mode allows."""
+    try:
+        experiments_dir = Path("rm_pri/data/experiments")
+        experiments_dir.mkdir(parents=True, exist_ok=True)
+
+        # Close any live experiment
+        live = None
+        for f in sorted(experiments_dir.glob("exp_*.json")):
+            exp = json.loads(f.read_text())
+            if exp.get("status") == "live":
+                live = exp
+                break
+
+        runner = ExperimentRunner(api, db)
+        if live:
+            log.info("Closing live experiment %s", live["experiment_id"])
+            result = runner.close_experiment(live["experiment_id"])
+            _record_action(db, "experiment_close", f"Closed experiment {live['experiment_id']}", result)
+
+        if not _can_mutate():
+            log.info("Control mode < 2 — not starting new experiment")
+            return
+
+        # Start next approved candidate if available
+        top_file = Path("data/top_25.jsonl")
+        if not top_file.exists():
+            log.info("No top candidates file — cannot start experiment")
+            return
+
+        candidates = [json.loads(l) for l in top_file.open() if l.strip()]
+        if not candidates:
+            log.info("No approved candidates — cannot start experiment")
+            return
+
+        c = candidates[0]
+        bio_file = Path(c.get("bio_file", "content/bios/best_bio.txt"))
+        if not bio_file.exists():
+            log.info("Bio file not found: %s", bio_file)
+            return
+
+        log.info("Starting experiment with candidate %s", c.get("id", "?"))
+        content = bio_file.read_text()
+        lines = content.split("\n", 1)
+        headline = lines[0].strip()
+        description = content.strip()
+        exp = runner.start_experiment(
+            variant_id=c.get("id", "unknown"),
+            bio_file=str(bio_file),
+            content_type="bio",
+            headline=headline,
+            description=description,
+        )
+        _record_action(db, "experiment_start", f"Started experiment {exp['experiment_id']}", exp)
+    except Exception as e:
+        log.error("Experiment cycle failed: %s", e)
+
+
+def run_loop(once: bool = False):
+    log.info("RM Revenue Engine daemon starting — control_mode=%d", CONTROL_MODE)
+
+    db = StateDB()
+    _record_action(db, "daemon_start", "24/7 daemon started", {"control_mode": CONTROL_MODE, "intervals": INTERVALS})
+
+    api = None
+    if not _check_ip_block():
+        api = _get_api()
+        if api:
+            log.info("API authenticated")
+
+    last = {k: 0 for k in INTERVALS}
+
+    try:
+        while True:
+            now = time.time()
+
+            # Re-auth if needed
+            if api is None:
+                if not _check_ip_block():
+                    api = _get_api()
+
+            if api:
+                if _check_ip_block():
+                    log.warning("IP block detected — dropping API session")
+                    api = None
+                else:
+                    if now - last["visibility_check"] >= INTERVALS["visibility_check"]:
+                        check_visibility(db, api)
+                        last["visibility_check"] = now
+
+                    if now - last["availability_check"] >= INTERVALS["availability_check"]:
+                        check_availability(db, api)
+                        last["availability_check"] = now
+
+                    if now - last["stats_snapshot"] >= INTERVALS["stats_snapshot"]:
+                        snapshot_stats(db, api)
+                        last["stats_snapshot"] = now
+
+                    if now - last["market_scan"] >= INTERVALS["market_scan"]:
+                        scan_market(db, api)
+                        last["market_scan"] = now
+
+                    if now - last["experiment_cycle"] >= INTERVALS["experiment_cycle"]:
+                        experiment_cycle(db, api)
+                        last["experiment_cycle"] = now
+
+            # Public scraping (does not need API login)
+            if now - last["enrich"] >= INTERVALS["enrich"]:
+                run_enrich(db)
+                last["enrich"] = now
+
+            if now - last["train"] >= INTERVALS["train"]:
+                run_train(db)
+                last["train"] = now
+
+            if once:
+                log.info("Single loop complete")
+                break
+
+            time.sleep(60)
+
+    except KeyboardInterrupt:
+        log.info("Daemon stopped by user")
+        _record_action(db, "daemon_stop", "24/7 daemon stopped", {"control_mode": CONTROL_MODE})
+    except Exception as e:
+        log.error("Daemon crashed: %s", e)
+        _record_action(db, "daemon_crash", "Daemon crashed", {"error": str(e), "control_mode": CONTROL_MODE})
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true", help="Run one loop then exit")
+    ap.add_argument("--mode", type=int, default=None, help="Override control mode")

@@ -1,0 +1,800 @@
+            "char_freq": {"char", "count"},
+            "line_length_dist": {"length", "count"},
+            "extracted_entities": {"type", "value", "line"},
+            "section_headers": {"line", "header"},
+            "code_symbols": {"line", "type", "symbol"},
+            "capabilities": {"id", "name", "enabled"},
+            "index_stats": {"key", "value"},
+            "semantic_chunks": {"idx", "offset", "size", "hash", "preview", "boundary_type", "line_start", "line_end"},
+            "bloom_filter": {"key", "value"},
+            "content_graph": {"source", "target", "relation"},
+            "function_index": {"line", "symbol", "args"},
+        }
+        if filter_key and filter_value:
+            if filter_key not in allowed_columns.get(table, set()):
+                raise HTTPException(400, f"Column '{filter_key}' not allowed for table '{table}'")
+            cur = conn.execute(f"SELECT * FROM {table} WHERE {filter_key} = ? LIMIT ?", [filter_value, limit])
+        else:
+            cur = conn.execute(f"SELECT * FROM {table} LIMIT ?", [limit])
+        columns = [desc[0] for desc in cur.description]
+        docs = [dict(zip(columns, [r[c] for c in columns])) for r in cur.fetchall()]
+        log_query(file_id, "nosql", f"table={table}")
+        return {"table": table, "documents": docs, "count": len(docs)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Query error: {e}")
+    finally:
+        close_index(conn)
+
+
+@app.get("/search/{file_id}")
+async def search(file_id: str, q: str = "", limit: int = 50):
+    if not q:
+        raise HTTPException(400, "Missing query parameter 'q'")
+    conn = open_index(file_id)
+    try:
+        results = {}
+        searches = {
+            "lines": ("line_index", "preview"),
+            "words": ("word_freq", "word"),
+            "entities": ("extracted_entities", "value"),
+            "symbols": ("code_symbols", "symbol"),
+            "headers": ("section_headers", "header"),
+            "functions": ("function_index", "symbol"),
+            "chunks": ("semantic_chunks", "preview"),
+        }
+        for key, (table, col) in searches.items():
+            try:
+                rows = conn.execute(
+                    f"SELECT * FROM {table} WHERE {col} LIKE ? LIMIT ?",
+                    [f"%{q}%", limit]
+                ).fetchall()
+                results[key] = [dict(r) for r in rows]
+            except:
+                results[key] = []
+        log_query(file_id, "search", q)
+        total = sum(len(v) for v in results.values())
+        return {"query": q, "total_matches": total, "results": results}
+    finally:
+        close_index(conn)
+
+
+# --- Fix 4: MCP endpoint ---
+@app.get("/mcp")
+async def mcp_manifest():
+    """MCP-compatible manifest for AI tools."""
+    reg = load_registry()
+    return {
+        "protocol": "mcp/1.0",
+        "server": "JORKI",
+        "version": "2.0",
+        "description": "AI File Gateway — query local files via compact indexes",
+        "tools": [
+            {
+                "name": "search",
+                "description": "Search across a file's index",
+                "endpoint": "/search/{file_id}?q={query}",
+                "method": "GET",
+            },
+            {
+                "name": "sql_query",
+                "description": "Run SQL on a file's index",
+                "endpoint": "/query/sql/{file_id}",
+                "method": "POST",
+                "body": {"sql": "SELECT ..."},
+            },
+            {
+                "name": "get_chunk",
+                "description": "Retrieve a specific chunk's content",
+                "endpoint": "/chunk/{file_id}/{chunk_idx}",
+                "method": "GET",
+            },
+            {
+                "name": "get_summary",
+                "description": "Get file structure and samples",
+                "endpoint": "/summary/{file_id}",
+                "method": "GET",
+            },
+            {
+                "name": "get_meta",
+                "description": "Get file metadata",
+                "endpoint": "/meta/{file_id}",
+                "method": "GET",
+            },
+            {
+                "name": "list_chunks",
+                "description": "List semantic chunks",
+                "endpoint": "/chunks/{file_id}",
+                "method": "GET",
+            },
+        ],
+        "available_files": [
+            {"file_id": fid, "filename": info["filename"], "size": info["meta"].get("size_human", "?")}
+            for fid, info in reg.items()
+        ],
+    }
+
+
+@app.post("/mcp/query")
+async def mcp_query(body: dict = None):
+    """MCP query endpoint — unified query interface for AI tools."""
+    params = body or {}
+    action = params.get("action", "search")
+    file_id = params.get("file_id", "")
+    query = params.get("query", "")
+
+    if action == "list_files" or not file_id:
+        reg = load_registry()
+        files = [{"file_id": fid, "filename": info["filename"]} for fid, info in reg.items()]
+        if not file_id and action != "list_files":
+            if not files:
+                return {"files": [], "message": "No files indexed yet. Upload a .idx file first."}
+            # Auto-select first file for console convenience
+            file_id = files[0]["file_id"]
+        else:
+            return {"files": files}
+
+    if action == "search":
+        return await search(file_id, q=query)
+    elif action == "summary":
+        return await get_summary(file_id)
+    elif action == "meta":
+        return await get_meta(file_id)
+    elif action == "chunk":
+        idx = params.get("chunk_idx", 0)
+        return await get_chunk(file_id, idx)
+    elif action == "sql":
+        return await query_sql(file_id, {"sql": query})
+    elif action == "capabilities":
+        return await get_capabilities(file_id)
+    elif action == "list_chunks":
+        return await list_chunks(file_id)
+    else:
+        raise HTTPException(400, f"Unknown action: {action}. Use: search, summary, meta, chunk, sql, capabilities, list_chunks, list_files")
+
+
+@app.get("/stats/{file_id}")
+async def get_stats(file_id: str):
+    """Query statistics for a file."""
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT query_type, COUNT(*) as count, MAX(timestamp) as last_query FROM query_log WHERE file_id = ? GROUP BY query_type",
+        [file_id]
+    ).fetchall()
+    conn.close()
+    return {"file_id": file_id, "stats": [dict(r) for r in rows]}
+
+
+@app.delete("/revoke/{file_id}")
+async def revoke_access(file_id: str, authorization: str = Header(None)):
+    """Revoke AI access to a file by deleting its index."""
+    check_auth(authorization)
+    reg = load_registry()
+    if file_id not in reg:
+        raise HTTPException(404, {
+            "status": "session_not_found",
+            "file_id": file_id,
+            "message": "This Jorki session is expired, revoked, or unavailable.",
+            "next": "Create a new Jorki session."
+        })
+    path = reg[file_id]["path"]
+    try:
+        Path(path).unlink(missing_ok=True)
+    except:
+        pass
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.execute("DELETE FROM files WHERE file_id = ?", [file_id])
+    conn.execute("DELETE FROM query_log WHERE file_id = ?", [file_id])
+    conn.commit()
+    conn.close()
+    return {"status": "revoked", "file_id": file_id}
+
+
+# --- GraphQL endpoint ---
+@app.post("/graphql")
+async def graphql(body: dict = None):
+    """Minimal GraphQL-like query endpoint."""
+    params = body or {}
+    query = params.get("query", "")
+    # Parse simple GraphQL: { file(id: "xxx") { filename size format } }
+    import re
+    file_match = re.search(r'file\s*\(\s*id:\s*"([^"]+)"\s*\)', query)
+    if file_match:
+        fid = file_match.group(1)
+        reg = load_registry()
+        if fid not in reg:
+            return {"errors": [{"message": f"file_id '{fid}' not found"}]}
+        info = reg[fid]
+        meta = info["meta"]
+        fields = re.findall(r'(\w+)', query.split("}", 1)[0])
+        result = {}
+        for f in fields:
+            if f in ("filename",): result["filename"] = meta.get("filename", "unknown")
+            elif f in ("size", "size_human"): result["size"] = meta.get("size_human", "?")
+            elif f in ("format",): result["format"] = meta.get("format", "?")
+            elif f in ("merkle", "merkle_root"): result["merkle_root"] = meta.get("merkle_root", "?")
+            elif f in ("lines", "total_lines"): result["total_lines"] = meta.get("total_lines", "?")
+            elif f in ("entropy",): result["entropy"] = meta.get("entropy", "?")
+            elif f in ("engine", "engine_version"): result["engine_version"] = meta.get("engine_version", "1.0")
+        return {"data": {"file": result}}
+    # List all files
+    if "files" in query:
+        reg = load_registry()
+        return {"data": {"files": [{"file_id": fid, "filename": info["filename"]} for fid, info in reg.items()]}}
+    return {"errors": [{"message": "Unsupported query. Use: { file(id: \"xxx\") { filename size format } } or { files { filename } }"}]}
+
+
+# --- Clipboard Superposition ---
+# Multiple Jorki sessions encoded into a single base64 blob for clipboard.
+# Format: JORKI:v1:<base64(json({sessions: [{file_id, filename, url, added_at}]}))>
+
+SUPERPOSE_PREFIX = "JORKI:v1:"
+
+def encode_superposition(file_ids: list) -> str:
+    """Pack multiple file_ids into a single base64 clipboard string."""
+    reg = load_registry()
+    sessions = []
+    for fid in file_ids:
+        if fid in reg:
+            info = reg[fid]
+            sessions.append({
+                "file_id": fid,
+                "filename": info["meta"].get("filename", "unknown"),
+                "size": info["meta"].get("size_human", "?"),
+                "url": f"/meta/{fid}",
+                "added_at": time.time(),
+            })
+    payload = json.dumps({"sessions": sessions, "created_at": time.time()}).encode()
+    return SUPERPOSE_PREFIX + base64.b64encode(payload).decode()
+
+def decode_superposition(blob: str) -> dict:
+    """Unpack a superposition blob into session list."""
+    blob = blob.strip()
+    if not blob.startswith(SUPERPOSE_PREFIX):
+        raise HTTPException(400, {"status": "invalid_blob", "message": "Not a Jorki superposition blob."})
+    try:
+        payload = base64.b64decode(blob[len(SUPERPOSE_PREFIX):])
+        return json.loads(payload)
+    except Exception:
+        raise HTTPException(400, {"status": "invalid_blob", "message": "Corrupted superposition blob."})
+
+@app.post("/superpose/encode")
+async def superpose_encode(file_ids: list = Body(...)):
+    """Encode multiple file_ids into a single clipboard-ready base64 blob.
+    Paste the blob into any LLM — it can decode and query all files at once."""
+    if not file_ids:
+        raise HTTPException(400, {"status": "error", "message": "Provide a list of file_ids."})
+    blob = encode_superposition(file_ids)
+    reg = load_registry()
+    valid = [fid for fid in file_ids if fid in reg]
+    return {
+        "blob": blob,
+        "sessions": len(valid),
+        "file_ids": valid,
+        "format": "JORKI:v1:base64",
+        "usage": "Copy the blob field. Paste into any LLM. The LLM can POST it to /superpose/query to query all files at once.",
+    }
+
+@app.post("/superpose/decode")
+async def superpose_decode(blob: str = Body(..., embed=True)):
+    """Decode a superposition blob back into session list with live status."""
+    data = decode_superposition(blob)
+    reg = load_registry()
+    for s in data["sessions"]:
+        s["live"] = s["file_id"] in reg
+        s["status"] = "live" if s["live"] else "expired"
+    data["active_sessions"] = sum(1 for s in data["sessions"] if s["live"])
+    data["expired_sessions"] = sum(1 for s in data["sessions"] if not s["live"])
+    return data
+
+@app.post("/superpose/query")
+async def superpose_query(body: dict = Body(...)):
+    """Query across ALL files in a superposition blob simultaneously.
+    The LLM posts the blob + a query, gets aggregated results from every file."""
+    blob = body.get("blob", "")
+    query = body.get("query", "")
+    action = body.get("action", "search")
+
+    if not blob:
+        raise HTTPException(400, {"status": "error", "message": "Provide a superposition blob."})
+
+    data = decode_superposition(blob)
+    reg = load_registry()
+    results = []
+    total_matches = 0
+
+    for s in data["sessions"]:
+        fid = s["file_id"]
+        if fid not in reg:
+            results.append({
+                "file_id": fid,
+                "filename": s.get("filename", "?"),
+                "status": "expired",
+                "matches": 0,
+            })
+            continue
+
+        try:
+            if action == "search" and query:
+                conn = open_index(fid)
+                try:
+                    file_results = {}
+                    searches = {
+                        "lines": ("line_index", "preview"),
+                        "words": ("word_freq", "word"),
+                        "symbols": ("code_symbols", "symbol"),
+                        "headers": ("section_headers", "header"),
+                        "functions": ("function_index", "symbol"),
+                        "chunks": ("semantic_chunks", "preview"),
+                    }
+                    for key, (table, col) in searches.items():
+                        try:
+                            rows = conn.execute(
+                                f"SELECT * FROM {table} WHERE {col} LIKE ? LIMIT 10",
+                                [f"%{query}%"]
+                            ).fetchall()
+                            if rows:
+                                file_results[key] = [dict(r) for r in rows]
+                        except:
+                            pass
+                    matches = sum(len(v) for v in file_results.values())
+                    total_matches += matches
+                    results.append({
+                        "file_id": fid,
+                        "filename": s.get("filename", reg[fid]["meta"].get("filename", "?")),
+                        "status": "live",
+                        "matches": matches,
+                        "results": file_results,
+                    })
+                finally:
+                    close_index(conn)
+            elif action == "meta":
+                results.append({
+                    "file_id": fid,
+                    "filename": reg[fid]["meta"].get("filename", "?"),
+                    "status": "live",
+                    "meta": reg[fid]["meta"],
+                })
+                total_matches += 1
+            elif action == "summary":
+                conn = open_index(fid)
+                try:
+                    meta = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM file_meta")}
+                    chunks_count = conn.execute("SELECT COUNT(*) FROM semantic_chunks").fetchone()[0]
+                    results.append({
+                        "file_id": fid,
+                        "filename": reg[fid]["meta"].get("filename", "?"),
+                        "status": "live",
+                        "total_lines": meta.get("total_lines"),
+                        "chunks": chunks_count,
+                        "format": meta.get("format"),
+                    })
+                    total_matches += 1
+                except:
+                    results.append({"file_id": fid, "status": "live", "error": "summary failed"})
+                finally:
+                    close_index(conn)
+            elif action == "state":
+                stats_conn = sqlite3.connect(str(REGISTRY_DB))
+                stats_conn.row_factory = sqlite3.Row
+                stats = stats_conn.execute(
+                    "SELECT query_type, COUNT(*) as count FROM query_log WHERE file_id = ? GROUP BY query_type",
+                    [fid]
+                ).fetchall()
+                stats_conn.close()
+                results.append({
+                    "file_id": fid,
+                    "filename": reg[fid]["meta"].get("filename", "?"),
+                    "status": "live",
+                    "queries": [dict(r) for r in stats],
+                    "total_queries": sum(r["count"] for r in stats),
+                })
+                total_matches += 1
+        except Exception as e:
+            results.append({
+                "file_id": fid,
+                "filename": s.get("filename", "?"),
+                "status": "error",
+                "error": str(e),
+            })
+
+    return {
+        "blob_sessions": len(data["sessions"]),
+        "active": sum(1 for r in results if r.get("status") == "live"),
+        "expired": sum(1 for r in results if r.get("status") == "expired"),
+        "total_matches": total_matches,
+        "query": query,
+        "action": action,
+        "results": results,
+    }
+
+@app.get("/superpose/state/{file_id}")
+async def superpose_state(file_id: str):
+    """Get the live state of a single file in the superposition —
+    query count, last access, session status, data returned."""
+    reg = load_registry()
+    if file_id not in reg:
+        raise HTTPException(404, {
+            "status": "session_not_found",
+            "file_id": file_id,
+            "message": "This Jorki session is expired, revoked, or unavailable.",
+            "next": "Create a new Jorki session."
+        })
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.row_factory = sqlite3.Row
+    stats = conn.execute(
+        "SELECT query_type, COUNT(*) as count, MAX(timestamp) as last_query FROM query_log WHERE file_id = ? GROUP BY query_type",
+        [file_id]
+    ).fetchall()
+    total_queries = sum(r["count"] for r in stats)
+    last_access = max((r["last_query"] for r in stats), default=None)
+    conn.close()
+
+    info = reg[file_id]
+    path = info["path"]
+    file_exists = Path(path).exists()
+
+    return {
+        "file_id": file_id,
+        "filename": info["meta"].get("filename", "?"),
+        "session_status": "live" if file_exists else "index_gone",
+        "uploaded_at": info.get("uploaded_at"),
+        "last_access": last_access,
+        "total_queries": total_queries,
+        "query_breakdown": [dict(r) for r in stats],
+        "index_size_bytes": Path(path).stat().st_size if file_exists else 0,
+        "original_size": info["meta"].get("size_human", "?"),
+        "compression_ratio": f"{Path(path).stat().st_size / 1024:.1f}KB index" if file_exists else "gone",
+        "endpoints": {
+            "meta": f"/meta/{file_id}",
+            "summary": f"/summary/{file_id}",
+            "search": f"/search/{file_id}?q=",
+            "chunk": f"/chunk/{file_id}/{{idx}}",
+            "sql": f"/query/sql/{file_id}",
+            "stats": f"/stats/{file_id}",
+        },
+    }
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+```
+
+LLMFileProxyBar:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY hf_space.py .
+
+# Persistent storage mount point
+RUN mkdir -p /data/indexes
+
+ENV PORT=7860
+EXPOSE 7860
+
+CMD ["python", "hf_space.py"]
+
+```
+
+engine:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
+```
+
+launch.sh:
+```
+#!/bin/bash
+# launch.sh — Start LLM File Proxy + Cloudflare Quick Tunnel, copy URL to clipboard
+# Usage: launch.sh /path/to/file
+# Outputs the public URL and copies it to clipboard
+
+set -euo pipefail
+
+FILE_PATH="$1"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PORT="${2:-8765}"
+
+if [ -z "$FILE_PATH" ] || [ ! -f "$FILE_PATH" ]; then
+    echo "ERROR: Provide a valid file path" >&2
+    echo "Usage: $0 /path/to/file [port]" >&2
+    exit 1
+fi
+
+# Start the proxy server in background
+echo "Starting LLM File Proxy for: $(basename "$FILE_PATH")" >&2
+python3 "$SCRIPT_DIR/llm_proxy.py" "$FILE_PATH" --port "$PORT" &
+PROXY_PID=$!
+
+# Wait for server to be ready
+for i in $(seq 1 10); do
+    if curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+done
+
+if ! curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    echo "ERROR: Proxy server failed to start" >&2
+    kill $PROXY_PID 2>/dev/null || true
+    exit 1
+fi
+
+echo "Proxy server running on http://127.0.0.1:$PORT" >&2
+
+# Start Cloudflare Quick Tunnel (no account needed, free, instant)
+echo "Starting Cloudflare Quick Tunnel..." >&2
+cloudflared tunnel --url "http://127.0.0.1:$PORT" 2>&1 | while IFS= read -r line; do
+    # Cloudflare prints the tunnel URL in a line like:
+    # "Your quick Tunnel has been created! Visit it at: https://xxx.trycloudflare.com"
+    if echo "$line" | grep -q "trycloudflare.com"; then
+        TUNNEL_URL=$(echo "$line" | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com')
+        if [ -n "$TUNNEL_URL" ]; then
+            echo "$TUNNEL_URL" | pbcopy
+            echo ""
+            echo "========================================" >&2
+            echo "  LLM URL copied to clipboard!" >&2
+            echo "  URL: $TUNNEL_URL" >&2
+            echo "========================================" >&2
+            echo ""
+            echo "$TUNNEL_URL"
+            # Show macOS notification
+            osascript -e "display notification \"URL copied to clipboard: $TUNNEL_URL\" with title \"LLM File Proxy\" sound name \"Glass\"" 2>/dev/null || true
+        fi
+    fi
+    # Keep tunnel running
+done
+
+# Cleanup if tunnel exits
+kill $PROXY_PID 2>/dev/null || true
+
+```
+
+deploy_controlled_wolf_v1_2026-06-26T09-35-19.536791+00-00.json:
+```
+{
+  "action": "bio_deploy",
+  "bio_id": "controlled_wolf_v1",
+  "experiment_id": "exp_001_targeted_wolf",
+  "success": false,
+  "timestamp": "2026-06-26T09:35:19.536791+00:00",
+  "notes": "dry_run_only"
+}
+```
+
+deploy_controlled_wolf_v1_2026-06-26T09-36-49.641204+00-00.json:
+```
+{
+  "action": "bio_deploy",
+  "bio_id": "controlled_wolf_v1",
+  "experiment_id": "exp_001_targeted_wolf",
+  "success": false,
+  "timestamp": "2026-06-26T09:36:49.641204+00:00",
+  "notes": "deploy_failed"
+}
+```
+
+daemon.log:
+```
+2026-07-16 13:36:11,708 [INFO] rm_daemon: RentMasseur Optimizer Daemon starting
+2026-07-16 13:36:11,782 [INFO] rm_daemon: Health: {'timestamp': '2026-07-16T17:36:11.708546+00:00', 'space': 'rentmasseur-optimizer', 'subsystems': {'rm_traffic.engine': False, 'rm_revenue_engine.revenue_ops': True, 'server': True}, 'credentials_set': False}
+2026-07-16 13:36:11,810 [INFO] rm_daemon: Starting FastAPI server on 0.0.0.0:7860
+2026-07-16 13:36:13,787 [INFO] rm_daemon: Running one daemon cycle
+2026-07-16 13:36:13,788 [INFO] rm_daemon: Running bio merge
+2026-07-16 13:36:13,788 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/merge_bios.py
+2026-07-16 13:36:13,866 [INFO] rm_daemon: Running view backfill
+2026-07-16 13:36:13,866 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/backfill_views.py
+2026-07-16 13:37:44,603 [INFO] rm_daemon: RentMasseur Optimizer Daemon starting
+2026-07-16 13:37:44,650 [INFO] rm_daemon: Health: {'timestamp': '2026-07-16T17:37:44.603261+00:00', 'space': 'rentmasseur-optimizer', 'subsystems': {'rm_traffic.engine': False, 'rm_revenue_engine.revenue_ops': True, 'server': True}, 'credentials_set': True}
+2026-07-16 13:37:44,678 [INFO] rm_daemon: Starting FastAPI server on 0.0.0.0:7860
+2026-07-16 13:37:46,651 [INFO] rm_daemon: Running one daemon cycle
+2026-07-16 13:37:46,651 [INFO] rm_daemon: Running bio merge
+2026-07-16 13:37:46,651 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/merge_bios.py
+2026-07-16 13:37:46,725 [INFO] rm_daemon: Running view backfill
+2026-07-16 13:37:46,726 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/backfill_views.py
+2026-07-16 13:38:17,454 [INFO] rm_daemon: Running traffic cycle
+2026-07-16 13:38:17,455 [INFO] rm_daemon: Running daily promotion
+2026-07-16 13:38:17,455 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/daily_promotion.py
+2026-07-16 13:46:27,976 [INFO] rm_daemon: RentMasseur Optimizer Daemon starting
+2026-07-16 13:46:28,024 [INFO] rm_daemon: Health: {'timestamp': '2026-07-16T17:46:27.976473+00:00', 'space': 'rentmasseur-optimizer', 'subsystems': {'rm_traffic.engine': False, 'rm_revenue_engine.revenue_ops': True, 'server': True}, 'credentials_set': True}
+2026-07-16 13:46:28,049 [INFO] rm_daemon: Starting FastAPI server on 0.0.0.0:7860
+2026-07-16 13:46:30,030 [INFO] rm_daemon: Running one daemon cycle
+2026-07-16 13:46:30,030 [INFO] rm_daemon: Running bio merge
+2026-07-16 13:46:30,031 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/merge_bios.py
+2026-07-16 13:46:30,113 [INFO] rm_daemon: Running view backfill
+2026-07-16 13:46:30,113 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/backfill_views.py
+2026-07-16 13:48:28,892 [INFO] rm_daemon: Running traffic cycle
+2026-07-16 13:48:28,892 [INFO] rm_daemon: Running daily promotion
+2026-07-16 13:48:28,892 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/daily_promotion.py
+
+```
+
+debug_login_no_password_20260626_053649.html:
+```
+<html lang="en"><head>
+    <title>CrowdSec Captcha</title>
+    <meta content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>/*! tailwindcss v3.2.7 | MIT License | https://tailwindcss.com*/*,:after,:before{border:0 solid #e5e7eb;box-sizing:border-box}:after,:before{--tw-content:""}html{-webkit-text-size-adjust:100%;font-feature-settings:normal;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,Noto Sans,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;line-height:1.5;-moz-tab-size:4;-o-tab-size:4;tab-size:4}body{line-height:inherit;margin:0}hr{border-top-width:1px;color:inherit;height:0}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:initial}sub{bottom:-.25em}sup{top:-.5em}table{border-collapse:collapse;border-color:inherit;text-indent:0}button,input,optgroup,select,textarea{color:inherit;font-family:inherit;font-size:100%;font-weight:inherit;line-height:inherit;margin:0;padding:0}button,select{text-transform:none}[type=button],[type=reset],[type=submit],button{-webkit-appearance:button;background-color:initial;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:initial}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{color:#9ca3af;opacity:1}input::placeholder,textarea::placeholder{color:#9ca3af;opacity:1}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{height:auto;max-width:100%}[hidden]{display:none}*,::backdrop,:after,:before{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:#3b82f680;--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: }.fixed{position:fixed}.right-0{right:0}.top-0{top:0}.flex{display:flex}.h-24{height:6rem}.h-3\/5{height:60%}.h-6{height:1.5rem}.h-full{height:100%}.h-screen{height:100vh}.w-24{width:6rem}.w-6{width:1.5rem}.w-full{width:100%}.w-screen{width:100vw}.flex-col{flex-direction:column}.items-center{align-items:center}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-bottom:calc(.25rem*var(--tw-space-y-reverse));margin-top:calc(.25rem*(1 - var(--tw-space-y-reverse)))}.space-y-4>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-bottom:calc(1rem*var(--tw-space-y-reverse));margin-top:calc(1rem*(1 - var(--tw-space-y-reverse)))}.rounded-xl{border-radius:.75rem}.border-2{border-width:2px}.border-black{--tw-border-opacity:1;border-color:rgb(0 0 0/var(--tw-border-opacity))}.p-4{padding:1rem}.text-2xl{font-size:1.5rem;line-height:2rem}.text-sm{font-size:.875rem;line-height:1.25rem}.text-xl{font-size:1.25rem;line-height:1.75rem}.dark .dark\:border-white{--tw-border-opacity:1;border-color:rgb(255 255 255/var(--tw-border-opacity))}.dark .dark\:bg-slate-900{--tw-bg-opacity:1;background-color:rgb(15 23 42/var(--tw-bg-opacity))}.dark .dark\:text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity))}@media (min-width:640px){.sm\:w-2\/3{width:66.666667%}}@media (min-width:768px){.md\:h-2\/5{height:40%}.md\:flex-row{flex-direction:row}.md\:text-2xl{font-size:1.5rem;line-height:2rem}.md\:text-lg{font-size:1.125rem;line-height:1.75rem}}@media (min-width:1024px){.lg\:w-1\/2{width:50%}.lg\:text-3xl{font-size:1.875rem;line-height:2.25rem}.lg\:text-xl{font-size:1.25rem;line-height:1.75rem}}@media (min-width:1280px){.xl\:text-4xl{font-size:2.25rem;line-height:2.5rem}}</style>
+    <script type="text/javascript" async="" charset="utf-8" src="https://www.gstatic.com/recaptcha/releases/MerVUtRoajKEbP7pLiGXkL28/recaptcha__en.js" crossorigin="anonymous" integrity="sha384-m1PC1ygjfLmGwsDY9jhFKKTk4uAMPEO34ag12kE5Ljsj7EXMzvB24pLZaON7S8Ds"></script><script src="https://www.recaptcha.net/recaptcha/api.js" async="" defer=""></script>
+</head>
+<body class="h-screen w-screen dark">
+  <div class="h-full w-full flex flex-col justify-center items-center dark:bg-slate-900 dark:text-white">
+    <div class="flex flex-col justify-between items-center border-2 border-black dark:border-white rounded-xl p-4 h-3/5 md:h-2/5 w-full sm:w-2/3 lg:w-1/2">
+      <div class="fixed p-4 top-0 right-0 dark-mode-toggle"><svg class="h-6 w-6" viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="M3 12H5M5.00006 19L7.00006 17M12 19V21M17 17L19 19M5 5L7 7M19 12H21M16.9999 7L18.9999 5M12 3V5M15 12C15 13.6569 13.6569 15 12 15C10.3431 15 9 13.6569 9 12C9 10.3431 10.3431 9 12 9C13.6569 9 15 10.3431 15 12Z" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
+      <div class="flex flex-col items-center space-y-4">
+        <svg fill="white" class="h-24 w-24" aria-hidden="true" focusable="false" data-prefix="fas" data-icon="exclamation-triangle" role="img" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512">
+          <path d="M569.517 440.013C587.975 472.007 564.806 512 527.94 512H48.054c-36.937 0-59.999-40.055-41.577-71.987L246.423 23.985c18.467-32.009 64.72-31.951 83.154 0l239.94 416.028zM288 354c-25.405 0-46 20.595-46 46s20.595 46 46 46 46-20.595 46-46-20.595-46-46-46zm-43.673-165.346l7.418 136c.347 6.364 5.609 11.346 11.982 11.346h48.546c6.373 0 11.635-4.982 11.982-11.346l7.418-136c.375-6.874-5.098-12.654-11.982-12.654h-63.383c-6.884 0-12.356 5.78-11.981 12.654z"></path>
+        </svg>
+        <h1 class="text-2xl lg:text-3xl xl:text-4xl">CrowdSec Captcha</h1>
+        <form action="" method="POST" class="flex flex-col space-y-1" id="captcha-form">
+          <div id="captcha" class="g-recaptcha" data-sitekey="6Le2q64qAAAAAJEgw2HU_tXf5dhJtlfKfTUhimF8" data-callback="captchaCallback"><div style="width: 304px; height: 78px;"><div><iframe title="reCAPTCHA" width="304" height="78" role="presentation" name="a-w5byruq7m84p" frameborder="0" scrolling="no" sandbox="allow-forms allow-popups allow-same-origin allow-scripts allow-top-navigation allow-modals allow-popups-to-escape-sandbox allow-storage-access-by-user-activation" src="https://www.recaptcha.net/recaptcha/api2/anchor?ar=1&amp;k=6Le2q64qAAAAAJEgw2HU_tXf5dhJtlfKfTUhimF8&amp;co=aHR0cHM6Ly9yZW50bWFzc2V1ci5jb206NDQz&amp;hl=en&amp;v=MerVUtRoajKEbP7pLiGXkL28&amp;size=normal&amp;anchor-ms=20000&amp;execute-ms=30000&amp;cb=9ksd5ijab2s1"></iframe></div><textarea id="g-recaptcha-response" name="g-recaptcha-response" class="g-recaptcha-response" style="width: 250px; height: 40px; border: 1px solid rgb(193, 193, 193); margin: 10px 25px; padding: 0px; resize: none; display: none;"></textarea></div><iframe style="display: none;"></iframe></div>
+        </form>
+      </div>
+      <div class="flex-col md:flex-row text-sm flex items-center">
+        <p>
+          This security check has been powered by
+        </p>
+        <a href="https://crowdsec.net/" target="_blank" rel="noopener" class="flex flex-col items-center">
+          <svg fill="white" width="33.92" height="33.76" viewBox="0 0 254.4 253.2">
+          <defs>
+            <clipPath id="a">
+              <path d="M0 52h84v201.2H0zm0 0"></path>
+            </clipPath>
+            <clipPath id="b">
+              <path d="M170 52h84.4v201.2H170zm0 0"></path>
+            </clipPath>
+          </defs>
+          <path d="M59.3 128.4c1.4 2.3 2.5 4.6 3.4 7-1-4.1-2.3-8.1-4.3-12-3.1-6-7.8-5.8-10.7 0-2 4-3.2 8-4.3 12.1 1-2.4 2-4.8 3.4-7.1 3.4-5.8 8.8-6 12.5 0M207.8 128.4a42.9 42.9 0 013.4 7c-1-4.1-2.3-8.1-4.3-12-3.2-6-7.8-5.8-10.7 0-2 4-3.3 8-4.3 12.1.9-2.4 2-4.8 3.4-7.1 3.4-5.8 8.8-6 12.5 0M134.6 92.9c2 3.5 3.6 7 4.8 10.7-1.3-5.4-3-10.6-5.6-15.7-4-7.5-9.7-7.2-13.3 0a75.4 75.4 0 00-5.6 16c1.2-3.8 2.7-7.4 4.7-11 4.1-7.2 10.6-7.5 15 0M43.8 136.8c.9 4.6 3.7 8.3 7.3 9.2 0 2.7 0 5.5.2 8.2.3 3.3.4 6.6 1 9.6.3 2.3 1 2.2 1.3 0 .5-3 .6-6.3 1-9.6l.2-8.2c3.5-1 6.4-4.6 7.2-9.2a17.8 17.8 0 01-9 2.4c-3.5 0-6.6-1-9.2-2.4M192.4 136.8c.8 4.6 3.7 8.3 7.2 9.2 0 2.7 0 5.5.3 8.2.3 3.3.4 6.6 1 9.6.3 2.3.9 2.2 1.2 0 .6-3 .7-6.3 1-9.6.2-2.7.3-5.5.2-8.2 3.6-1 6.4-4.6 7.3-9.2a17.8 17.8 0 01-9.1 2.4c-3.4 0-6.6-1-9.1-2.4M138.3 104.6c-3.1 1.9-7 3-11.3 3-4.3 0-8.2-1.1-11.3-3 1 5.8 4.5 10.3 9 11.5 0 3.4 0 6.8.3 10.2.4 4.1.5 8.2 1.2 12 .4 2.9 1.2 2.7 1.6 0 .7-3.8.8-7.9 1.2-12 .3-3.4.3-6.8.3-10.2 4.5-1.2 8-5.7 9-11.5"></path>
+          <path d="M51 146c0 2.7.1 5.5.3 8.2.3 3.3.4 6.6 1 9.6.3 2.3 1 2.2 1.3 0 .5-3 .6-6.3 1-9.6l.2-8.2c3.5-1 6.4-4.6 7.2-9.2a17.8 17.8 0 01-9 2.4c-3.5 0-6.6-1-9.2-2.4.9 4.6 3.7 8.3 7.3 9.2M143.9 105c-1.9-.4-3.5-1.2-4.9-2.3 1.4 5.6 2.5 11.3 4 17 1.2 5 2 10 2.4 15 .6 7.8-4.5 14.5-10.9 14.5h-15c-6.4 0-11.5-6.7-11-14.5.5-5 1.3-10 2.6-15 1.3-5.3 2.3-10.5 3.6-15.7-2.2 1.2-4.8 1.9-7.7 2-4.7.1-9.4-.3-14-1-4-.4-6.7-3-8-6.7-1.3-3.4-2-7-3.3-10.4-.5-1.5-1.6-2.8-2.4-4.2-.4-.6-.8-1.2-.9-1.8v-7.8a77 77 0 0124.5-3c6.1 0 12 1 17.8 3.2 4.7 1.7 9.7 1.8 14.4 0 9-3.4 18.2-3.8 27.5-3 4.9.5 9.8 1.6 14.8 2.4v8.2c0 .6-.3 1.5-.7 1.7-2 .9-2.2 2.7-2.7 4.5-.9 3.2-1.8 6.4-2.9 9.5a11 11 0 01-8.8 7.7 40.6 40.6 0 01-18.4-.2m29.4 80.6c-3.2-26.8-6.4-50-8.9-60.7a14.3 14.3 0 0014.1-14h.4a9 9 0 005.6-16.5 14.3 14.3 0 00-3.7-27.2 9 9 0 00-6.9-14.6c2.4-1.1 4.5-3 5.8-5 3.4-5.3 4-29-8-44.4-5-6.3-9.8-2.5-10 1.8-1 13.2-1.1 23-4.5 34.3a9 9 0 00-16-4.1 14.3 14.3 0 00-28.4 0 9 9 0 00-16 4.1c-3.4-11.2-3.5-21.1-4.4-34.3-.3-4.3-5.2-8-10-1.8-12 15.3-11.5 39-8.1 44.4 1.3 2 3.4 3.9 5.8 5a9 9 0 00-7 14.6 14.3 14.3 0 00-3.6 27.2A9 9 0 0075 111h.5a14.5 14.5 0 0014.3 14c-4 17.2-10 66.3-15 111.3l-1.3 13.4a1656.4 1656.4 0 01106.6 0l-1.4-12.7-5.4-51.3"></path>
+          <g clip-path="url(#a)">
+            <path d="M83.5 136.6l-2.3.7c-5 1-9.8 1-14.8-.2-1.4-.3-2.7-1-3.8-1.9l3.1 13.7c1 4 1.7 8 2 12 .5 6.3-3.6 11.6-8.7 11.6H46.9c-5.1 0-9.2-5.3-8.7-11.6.3-4 1-8 2-12 1-4.2 1.8-8.5 2.9-12.6-1.8 1-3.9 1.5-6.3 1.6a71 71 0 01-11.1-.7 7.7 7.7 0 01-6.5-5.5c-1-2.7-1.6-5.6-2.6-8.3-.4-1.2-1.3-2.3-2-3.4-.2-.4-.6-1-.6-1.4v-6.3c6.4-2 13-2.6 19.6-2.5 4.9.1 9.6 1 14.2 2.6 3.9 1.4 7.9 1.5 11.7 0 1.8-.7 3.6-1.2 5.5-1.6a13 13 0 01-1.6-15.5A18.3 18.3 0 0159 73.1a11.5 11.5 0 00-17.4 8.1 7.2 7.2 0 00-12.9 3.3c-2.7-9-2.8-17-3.6-27.5-.2-3.4-4-6.5-8-1.4C7.5 67.8 7.9 86.9 10.6 91c1.1 1.7 2.8 3.1 4.7 4a7.2 7.2 0 00-5.6 11.7 11.5 11.5 0 00-2.9 21.9 7.2 7.2 0 004.5 13.2h.3c0 .6 0 1.1.2 1.7.9 5.4 5.6 9.5 11.3 9.5A1177.2 1177.2 0 0010 253.2c18.1-1.5 38.1-2.6 59.5-3.4.4-4.6.8-9.3 1.4-14 1.2-11.6 3.3-30.5 5.7-49.7 2.2-18 4.7-36.3 7-49.5"></path>
+          </g>
+          <g clip-path="url(#b)">
+            <path d="M254.4 118.2c0-5.8-4.2-10.5-9.7-11.4a7.2 7.2 0 00-5.6-11.7c2-.9 3.6-2.3 4.7-4 2.7-4.2 3.1-23.3-6.5-35.5-4-5.1-7.8-2-8 1.4-.8 10.5-.9 18.5-3.6 27.5a7.2 7.2 0 00-12.8-3.3 11.5 11.5 0 00-17.8-7.9 18.4 18.4 0 01-4.5 22 13 13 0 01-1.3 15.2c2.4.5 4.8 1 7.1 2 3.8 1.3 7.8 1.4 11.6 0 7.2-2.8 14.6-3 22-2.4 4 .4 7.9 1.2 12 1.9l-.1 6.6c0 .5-.2 1.2-.5 1.3-1.7.7-1.8 2.2-2.2 3.7l-2.3 7.6a8.8 8.8 0 01-7 6.1c-5 1-10 1-14.9-.2-1.5-.3-2.8-1-3.9-1.9 1.2 4.5 2 9.1 3.2 13.7 1 4 1.6 8 2 12 .4 6.3-3.6 11.6-8.8 11.6h-12c-5.2 0-9.3-5.3-8.8-11.6.4-4 1-8 2-12 1-4.2 1.9-8.5 3-12.6-1.8 1-4 1.5-6.3 1.6-3.7 0-7.5-.3-11.2-.7a7.7 7.7 0 01-3.7-1.5c3.1 18.4 7.1 51.2 12.5 100.9l.6 5.3.8 7.9c21.4.7 41.5 1.9 59.7 3.4L243 243l-4.4-41.2a606 606 0 00-7-48.7 11.5 11.5 0 0011.2-11.2h.4a7.2 7.2 0 004.4-13.2c4-1.8 6.8-5.8 6.8-10.5"></path>
+          </g>
+          <path d="M180 249.6h.4a6946 6946 0 00-7.1-63.9l5.4 51.3 1.4 12.6M164.4 125c2.5 10.7 5.7 33.9 8.9 60.7a570.9 570.9 0 00-8.9-60.7M74.8 236.3l-1.4 13.4 1.4-13.4"></path>
+        </svg>
+        <span>
+          CrowdSec
+        </span>
+      </a>
+    </div>
+    </div>
+  </div>
+  <script>
+    const moonSvgString = '<svg fill="black" class="h-6 w-6" viewBox="0 0 35 35" data-name="Layer 2" id="Layer_2" xmlns="http://www.w3.org/2000/svg"><path d="M18.44,34.68a18.22,18.22,0,0,1-2.94-.24,18.18,18.18,0,0,1-15-20.86A18.06,18.06,0,0,1,9.59.63,2.42,2.42,0,0,1,12.2.79a2.39,2.39,0,0,1,1,2.41L11.9,3.1l1.23.22A15.66,15.66,0,0,0,23.34,21h0a15.82,15.82,0,0,0,8.47.53A2.44,2.44,0,0,1,34.47,25,18.18,18.18,0,0,1,18.44,34.68ZM10.67,2.89a15.67,15.67,0,0,0-5,22.77A15.66,15.66,0,0,0,32.18,24a18.49,18.49,0,0,1-9.65-.64A18.18,18.18,0,0,1,10.67,2.89Z"/></svg>'
+    const sunSvgString = '<svg class="h-6 w-6" viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="M3 12H5M5.00006 19L7.00006 17M12 19V21M17 17L19 19M5 5L7 7M19 12H21M16.9999 7L18.9999 5M12 3V5M15 12C15 13.6569 13.6569 15 12 15C10.3431 15 9 13.6569 9 12C9 10.3431 10.3431 9 12 9C13.6569 9 15 10.3431 15 12Z" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    const svg = Array.from(document.querySelectorAll('svg'));
+    const button = document.querySelector('.dark-mode-toggle');
+    window.onload = () => {
+      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        document.body.classList.add('dark');
+        svg.forEach(element => {
+          element.setAttribute('fill', 'white');
+        });
+        button.innerHTML = sunSvgString;
+      } else {
+        button.innerHTML = moonSvgString;
+      }
+      button.addEventListener('click', function() {
+        document.body.classList.toggle('dark');
+        svg.forEach(element => {
+          element.getAttribute('fill') === 'black' ? element.setAttribute('fill', 'white') : element.setAttribute('fill', 'black');
+        });
+        if (document.body.classList.contains('dark')) {
+            button.innerHTML = sunSvgString;
+          } else {
+            button.innerHTML = moonSvgString;
+          }
+      });
+    };
+    function captchaCallback () {
+      setTimeout(() => {
+        document.querySelector('#captcha-form').submit();
+      }, 500);
+    }
+  </script>
+
+
+<div style="background-color: rgb(255, 255, 255); border: 1px solid rgb(204, 204, 204); box-shadow: rgba(0, 0, 0, 0.2) 2px 2px 3px; position: absolute; transition: visibility linear 0.3s, opacity 0.3s linear; opacity: 0; visibility: hidden; z-index: 2000000000; left: 0px; top: -10000px;"><div style="width: 100%; height: 100%; position: fixed; top: 0px; left: 0px; z-index: 2000000000; background-color: rgb(255, 255, 255); opacity: 0.05;"></div><div class="g-recaptcha-bubble-arrow" style="border: 11px solid transparent; width: 0px; height: 0px; position: absolute; pointer-events: none; margin-top: -11px; z-index: 2000000000;"></div><div class="g-recaptcha-bubble-arrow" style="border: 10px solid transparent; width: 0px; height: 0px; position: absolute; pointer-events: none; margin-top: -10px; z-index: 2000000000;"></div><div style="z-index: 2000000000; position: relative;"><iframe title="recaptcha challenge expires in two minutes" name="c-w5byruq7m84p" frameborder="0" scrolling="no" sandbox="allow-forms allow-popups allow-same-origin allow-scripts allow-top-navigation allow-modals allow-popups-to-escape-sandbox allow-storage-access-by-user-activation" src="https://www.recaptcha.net/recaptcha/api2/bframe?hl=en&amp;v=MerVUtRoajKEbP7pLiGXkL28&amp;k=6Le2q64qAAAAAJEgw2HU_tXf5dhJtlfKfTUhimF8&amp;bft=0dAFcWeA5z5gYqUQyOtKjt9BlQduknDFftMdHQlP1goq_FBDo6XT8yWhKp_QHEtUH98SyNHgiAIJiArrVLn38GhXa9W90xOg5N7g" style="width: 100%; height: 100%;"></iframe></div></div></body></html>
+```
+
+debug_login_no_password_20260626_053649.png:
+```
+Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
+```
+
+pipeline_summary.json:
+```
+{
+  "pipeline_run": "2026-06-26T06:09:23.502412+00:00",
+  "stages": {
+    "live_scrape": {
+      "providers": 4,
+      "mode": "live"
+    },
+    "agi_train": {
+      "exit_code": 0,
+      "model": true
+    },
+    "agi_pipeline": {
+      "generate": 0,
+      "score": 0,
+      "evolve": 0,
+      "select": 0,
+      "selected_count": 3
+    },
+    "groq_bios": {
+      "strategies": [
+        "sensory_luxury",
+        "therapeutic_expert",
+        "mystery_desire",
+        "local_hustle",
+        "transformation_story"
+      ],
+      "bios_generated": 0
+    },
+    "merge": {
+      "total": 3,
+      "best_source": "agi_cpp"
+    },
+    "selenium": {
+      "login": true,
+      "availability": true,
+      "bio_applied": true
+    }
+  },
+  "receipts": {
+    "total_receipts": 11,
+    "chain_valid": true,
+    "last_action": "selenium"
+  }
+}
+```
+
+pipeline_receipts.jsonl:
+```
+{"index": 0, "timestamp": "2026-06-26T05:15:14.880062+00:00", "action": "live_scrape", "description": "Scraped real competitor availability from rentmasseur.com", "data": {"stage": "live_scrape", "exit_code": 0, "timestamp": "2026-06-26T05:15:14.879545+00:00", "mode": "live", "providers_scraped": 4, "errors": 0, "providers": [{"slug": "Preston_Banks", "status": "available", "location": "Los Angeles, CA", "rate": ""}, {"slug": "Tonyxxxx", "status": "available", "location": "Orlando, FL", "rate": ""}, {"slug": "MickeyCuteBoy", "status": "available", "location": "Newark, NJ", "rate": ""}, {"slug": "ExoticYoungGuy", "status": "available", "location": "Atlanta, GA", "rate": ""}]}, "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000", "hash": "aaf14e389a23597b3df75937167606cb67d0fccd7374d91411cf796421db871e"}
+{"index": 1, "timestamp": "2026-06-26T05:15:20.908568+00:00", "action": "agi_train", "description": "Trained MLP on real bio corpus", "data": {"stage": "agi_train", "exit_code": 0, "label": "reviews", "corpus": "/Users/alep/Downloads/windsurf-smoke/rm_traffic/data/real_bios.jsonl", "cv": 5, "walk_forward": true, "timestamp": "2026-06-26T05:15:20.908324+00:00", "output": "Loaded 2723 bios from /Users/alep/Downloads/windsurf-smoke/rm_traffic/data/real_bios.jsonl\nLabel: reviews\n\n\u2500\u2500\u2500 5-Fold Cross-Validation \u2500\u2500\u2500\nFold 0 \u2014 MAE=0.177464 RMSE=0.223644 R2=-0.576835\nFold 1 \u2014 MAE=0.188472 RMSE=0.231563 R2=-0.469099\nFold 2 \u2014 MAE=0.188416 RMSE=0.238457 R2=-0.536625\nFold 3 \u2014 MAE=0.195392 RMSE=0.240308 R2=-0.624000\nFold 4 \u2014 MAE=0.193508 RMSE=0.240466 R2=-0.620767\nCV mean \u2014 MAE=0.188650 RMSE=0.234888 R2=-0.565465\n\n\u2500\u2500\u2500 Walk-Forward Validation \u2500\u2500\u2500\nEpoch 0 train_loss=0.268701\nWalk-forward \u2014 MAE=0.204926 RMSE=0.258753 R2=-0.895010\n\n\u2500\u2500\u2500 Training Final Model \u2500\u2500\u2500\nEpoch 0 \u2014 avg_loss=0.150180\nEpoch 20 \u2014 avg_loss=0.137241\nEpoch 40 \u2014 avg_loss=0.122583\nEpoch 60 \u2014 avg_loss=0.112021\nEpoch 80 \u2014 avg_loss=0.106836\nModel saved to rm_agi/data/models/bio_model.bin\n", "model_path": "/Users/alep/Downloads/windsurf-smoke/rm_agi/data/models/bio_model.bin", "model_exists": true, "model_size_bytes": 33820}, "prev_hash": "aaf14e389a23597b3df75937167606cb67d0fccd7374d91411cf796421db871e", "hash": "86a9a48ffc7a2fb250a869056b67a968fda40345ef851465bde6c79669561390"}
+{"index": 2, "timestamp": "2026-06-26T05:16:13.944206+00:00", "action": "agi_pipeline", "description": "AGI generate\u2192score\u2192evolve\u2192select on real corpus", "data": {"stage": "agi_pipeline", "generate": {"exit_code": 0, "count": 100000, "file_size": 51735320}, "score": {"exit_code": 0, "file_size": 54435320}, "evolve": {"exit_code": 0, "generations": 100, "output": "Loaded 100000 candidates\nGen 0 \u2014 top score=0.2959 (risk=0.0000): Deep Tissue Recovery with the Wolf\nGen 50 \u2014 top score=0.2959 (risk=0.0000): Wolf Hands, Deep Pressure, Real Recovery\nGA done. Saved 100 elites to rm_agi/data/candidates/ga_elites.jsonl\n"}, "select": {"exit_code": 0, "top": 25, "error": "Cannot open /Users/alep/Downloads/windsurf-smoke/rm_agi/data/candidates/pipeline_evolved.jsonl\n"}, "agi_bios": [], "timestamp": "2026-06-26T05:16:13.944195+00:00"}, "prev_hash": "86a9a48ffc7a2fb250a869056b67a968fda40345ef851465bde6c79669561390", "hash": "116e8391e6ac7df06a2596607d9fd257c7d182cefe424b936caff0cdf2a4098c"}
+{"index": 3, "timestamp": "2026-06-26T05:16:20.640574+00:00", "action": "groq_bios", "description": "Groq LLM generated bios for top strategies", "data": {"stage": "groq_bios", "top_strategies": ["sensory_luxury", "therapeutic_expert", "mystery_desire", "local_hustle", "transformation_story"], "bios_generated": 1, "groq_bios": [{"strategy": "sensory_luxury", "bio": "Indulge in the ultimate sanctuary of relaxation, nestled in the heart of Manhattan. As you step into our serene oasis, warm oils and soothing candlelight envelop you, melting away the stresses of the city. Soft silk drapes and plush furnishings cradle your senses, while the sweet scent of aromatherapy wafts through the air, calming your mind and body.\n\nOur expertly crafted therapeutic massage sessions are tailored to your every need, combining deep tissue techniques with gentle, flowing strokes to ease tension and promote profound relaxation. Each bespoke session is a masterful blend of art and science, designed to transport you to a state of deep tranquility and rejuvenation.\n\nIn this intimate, high-end retreat, discretion and luxury entwine, ensuring a truly personalized experience. As you surrender to the skilled hands of our massage therapists, allow yourself to be pampered and indulged, your senses elevated to new heights. Let the warmth and serenity of our sanctuary envelop you, and discover a deeper connection to your own inner peace. To experience the epitome of relaxation, book your exclusive session today.", "chars": 1133, "source": "groq_llm"}], "timestamp": "2026-06-26T05:16:20.640531+00:00"}, "prev_hash": "116e8391e6ac7df06a2596607d9fd257c7d182cefe424b936caff0cdf2a4098c", "hash": "a26322ec47cfb73f8862189c8e21de426eb8ce35fdf3df9bc858c064c55cd5e4"}
+{"index": 4, "timestamp": "2026-06-26T05:16:20.641037+00:00", "action": "merge_rank", "description": "Merged and ranked AGI + Groq candidate pools", "data": {"stage": "merge_rank", "total_candidates": 1, "agi_count": 0, "groq_count": 1, "best_source": "groq_llm", "best_strategy": "sensory_luxury", "best_score": 0, "best_bio_preview": "Indulge in the ultimate sanctuary of relaxation, nestled in the heart of Manhattan. As you step into our serene oasis, warm oils and soothing candlelight envelop you, melting away the stresses of the ", "all_candidates": [{"source": "groq_llm", "bio": "Indulge in the ultimate sanctuary of relaxation, nestled in the heart of Manhattan. As you step into our serene oasis, warm oils and soothing candlelight envelop you, melting away the stresses of the city. Soft silk drapes and plush furnishings cradle your senses, while the sweet scent of aromatherapy wafts through the air, calming your mind and body.\n\nOur expertly crafted therapeutic massage sessions are tailored to your every need, combining deep tissue techniques with gentle, flowing strokes to ease tension and promote profound relaxation. Each bespoke session is a masterful blend of art and science, designed to transport you to a state of deep tranquility and rejuvenation.\n\nIn this intimate, high-end retreat, discretion and luxury entwine, ensuring a truly personalized experience. As you surrender to the skilled hands of our massage therapists, allow yourself to be pampered and indulged, your senses elevated to new heights. Let the warmth and serenity of our sanctuary envelop you, and discover a deeper connection to your own inner peace. To experience the epitome of relaxation, book your exclusive session today.", "headline": "", "score": 0, "risk": 0, "rank": 0, "strategy": "sensory_luxury", "chars": 1133}], "timestamp": "2026-06-26T05:16:20.641024+00:00"}, "prev_hash": "a26322ec47cfb73f8862189c8e21de426eb8ce35fdf3df9bc858c064c55cd5e4", "hash": "8960ac67e21a3a2f2e08c9cfdbfa70e39d165afed63a557e0f9767f9500d581b"}
+
+```
+
+all_candidates.json:
+```
+[
+  {
+    "source": "agi_cpp",
+    "bio": "I do not do generic relaxation. I do targeted recovery.\n\nTrained hands, specific pressure, real results.\n\nDeep tissue, sports recovery, Swedish flow, stretching, and pressure-forward bodywork.\n\nIf your shoulders live near your ears, you are my kind of client.\n\nPrivate space in NYC. Same-day appointments when available.\n\nMessage me: your focus areas, preferred time, and pressure preference.",
+    "headline": "The Wolf Fixes What Your Desk Did",
+    "score": 0.295888,
+    "risk": 0,
+    "rank": 1,
+    "strategy": "agi_evolved"
+  },
+  {
+    "source": "agi_cpp",
+    "bio": "Most people wait until they cannot turn their head. You are smarter than that.\n\nPrivate studio, fresh linens, shower available, clear communication.\n\nPressure-forward deep tissue and sports recovery. Tell me what hurts.\n\nGuys who lift, guys who sit, guys who fly \u2014 your body needs this.\n\nIf your posture had a Yelp review, it would not be flattering.\n\nBronx-Manhattan area. Private setup. Easy to reach.\n\nReach out with your preferred time and what needs work.",
+    "headline": "Wolf Recovery: Deep Tissue for Real Bodies",
+    "score": 0.295888,
+    "risk": 0,
+    "rank": 2,
+    "strategy": "agi_evolved"

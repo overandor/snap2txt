@@ -1,800 +1,800 @@
-  GET  /account/dashboard/ad-statistics
-  GET  /account/keeponline
-  GET  /settings/about
-  GET  /mailbox
-  POST /search
-"""
-
-import hashlib
-import json
-import logging
-import sqlite3
-import time
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, Optional
-
-log = logging.getLogger("feature_store")
-
-FS_DB = Path(__file__).parent / "ai_revenue.db"
-
-
-@dataclass
-class MetricSnapshot:
-    tenant_id: str = ""
-    ts: str = ""
-    views: int = 0
-    contact_clicks: int = 0
-    emails_count: int = 0
-    new_emails: int = 0
-    new_visits: int = 0
-    search_rank: int = 0
-    available_rank: int = 0
-    is_available: bool = False
-    is_hidden: bool = False
-    headline_hash: str = ""
-    bio_hash: str = ""
-    mailbox_intent_score: float = 0.0
-    booking_proxy_count: int = 0
-    repeat_sender_count: int = 0
-    response_latency: float = 0.0
-    available_minutes: float = 0.0
-    snapshot_hash: str = ""
-
-
-def _db():
-    conn = sqlite3.connect(str(FS_DB))
-    conn.row_factory = sqlite3.Row
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS metric_snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        ts TEXT NOT NULL,
-        views INTEGER DEFAULT 0,
-        contact_clicks INTEGER DEFAULT 0,
-        emails_count INTEGER DEFAULT 0,
-        new_emails INTEGER DEFAULT 0,
-        new_visits INTEGER DEFAULT 0,
-        search_rank INTEGER DEFAULT 0,
-        available_rank INTEGER DEFAULT 0,
-        is_available INTEGER DEFAULT 0,
-        is_hidden INTEGER DEFAULT 0,
-        headline_hash TEXT,
-        bio_hash TEXT,
-        mailbox_intent_score REAL DEFAULT 0,
-        booking_proxy_count INTEGER DEFAULT 0,
-        repeat_sender_count INTEGER DEFAULT 0,
-        response_latency REAL DEFAULT 0,
-        available_minutes REAL DEFAULT 0,
-        snapshot_hash TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_snap_tenant ON metric_snapshots(tenant_id);
-    CREATE INDEX IF NOT EXISTS idx_snap_ts ON metric_snapshots(ts);
-
-    CREATE TABLE IF NOT EXISTS actions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        ts TEXT NOT NULL,
-        action_type TEXT NOT NULL,
-        payload_hash TEXT,
-        endpoint_used TEXT,
-        executed INTEGER DEFAULT 0,
-        error TEXT,
-        receipt_hash TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_act_tenant ON actions(tenant_id);
-    CREATE INDEX IF NOT EXISTS idx_act_type ON actions(action_type);
-    """)
-    conn.commit()
-    return conn
-
-
-def collect_snapshot(api, tenant_id: str = "") -> MetricSnapshot:
-    """Collect a metric snapshot from all verified endpoints."""
-    snap = MetricSnapshot(
-        tenant_id=tenant_id,
-        ts=datetime.now(timezone.utc).isoformat(),
-    )
-
-    # Dashboard
-    try:
-        dash = api.get_dashboard()
-        ps = dash.get("profileStatistics") or {}
-        snap.views = int(ps.get("totalPageViews", 0))
-        snap.contact_clicks = int(ps.get("totalContactClicks", 0))
-        snap.is_hidden = bool(dash.get("isAdHidden", False))
-    except Exception as e:
-        log.warning(f"dashboard error: {e}")
-
-    # Ad statistics
-    try:
-        stats = api.get_ad_statistics()
-        ps = stats.get("profileStatistics") or {}
-        if not snap.views:
-            snap.views = int(ps.get("totalPageViews", 0))
-        if not snap.contact_clicks:
-            snap.contact_clicks = int(ps.get("totalContactClicks", 0))
-    except Exception as e:
-        log.warning(f"ad_statistics error: {e}")
-
-    # KeepOnline
-    try:
-        keep = api.get_keeponline()
-        snap.new_emails = int(keep.get("newEmails", 0))
-        snap.new_visits = int(keep.get("newVisits", 0))
-        snap.is_hidden = snap.is_hidden or bool(keep.get("isAdHidden", False))
-    except Exception as e:
-        log.warning(f"keeponline error: {e}")
-
-    # Availability
-    try:
-        avail = api.get_availability()
-        selected = avail.get("selected", "")
-        snap.is_available = (selected == "Available")
-        countdown = int(avail.get("countdown", 0) or 0)
-        if countdown:
-            snap.available_minutes = max(0, (countdown - time.time()) / 60.0)
-    except Exception as e:
-        log.warning(f"availability error: {e}")
-
-    # About
-    try:
-        about = api.get_about()
-        props = about.get("userProps", {})
-        assets = props.get("assets", {})
-        headline = assets.get("headline", "")
-        info = props.get("information", {})
-        bio_text = info.get("description", "") or ""
-        snap.headline_hash = hashlib.sha256(headline.encode()).hexdigest()[:8] if headline else ""
-        snap.bio_hash = hashlib.sha256(bio_text.encode()).hexdigest()[:8] if bio_text else ""
-    except Exception as e:
-        log.warning(f"about error: {e}")
-
-    # Mailbox
-    try:
-        mailbox = api.get_mailbox(page=1, folder=1, sort=1)
-        emails = mailbox.get("emails", [])
-        snap.emails_count = len(emails)
-
-        booking_kw = ["book", "today", "tonight", "tomorrow", "session", "schedule", "available"]
-        repeat_kw = ["again", "last time", "saw you", "been a while", "regular", "missed you"]
-
-        for email in emails:
-            msg = (email.get("lastMessage", "") or "").lower()
-            if any(kw in msg for kw in booking_kw):
-                snap.booking_proxy_count += 1
-            if any(kw in msg for kw in repeat_kw):
-                snap.repeat_sender_count += 1
-
-        if emails:
-            scores = []
-            for email in emails:
-                msg = (email.get("lastMessage", "") or "").lower()
-                score = 0.0
-                if any(kw in msg for kw in booking_kw):
-                    score += 0.5
-                if msg.strip():
-                    score += 0.2
-                scores.append(min(1.0, score))
-            snap.mailbox_intent_score = round(sum(scores) / len(scores), 3)
-    except Exception as e:
-        log.warning(f"mailbox error: {e}")
-
-    # Search rank
-    try:
-        results = api.search_masseurs(city="manhattan-ny", page=1)
-        users = results.get("users", [])
-        snap.available_rank = len(users)
-        # Find our position (if username available)
-        for i, user in enumerate(users):
-            if hasattr(api, 'username') and user.get("username") == api.username:
-                snap.search_rank = i + 1
-                break
-    except Exception as e:
-        log.warning(f"search error: {e}")
-
-    # Compute snapshot hash
-    d = {k: v for k, v in asdict(snap).items() if k != "snapshot_hash"}
-    snap.snapshot_hash = hashlib.sha256(
-        json.dumps(d, sort_keys=True, default=str).encode()
-    ).hexdigest()[:16]
-
-    return snap
-
-
-def save_snapshot(conn: sqlite3.Connection, snap: MetricSnapshot):
-    """Save a metric snapshot to the database."""
-    conn.execute("""
-        INSERT INTO metric_snapshots
-        (tenant_id, ts, views, contact_clicks, emails_count, new_emails, new_visits,
-         search_rank, available_rank, is_available, is_hidden, headline_hash, bio_hash,
-         mailbox_intent_score, booking_proxy_count, repeat_sender_count,
-         response_latency, available_minutes, snapshot_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (snap.tenant_id, snap.ts, snap.views, snap.contact_clicks,
-          snap.emails_count, snap.new_emails, snap.new_visits,
-          snap.search_rank, snap.available_rank, int(snap.is_available),
-          int(snap.is_hidden), snap.headline_hash, snap.bio_hash,
-          snap.mailbox_intent_score, snap.booking_proxy_count,
-          snap.repeat_sender_count, snap.response_latency,
-          snap.available_minutes, snap.snapshot_hash))
-    conn.commit()
-
-
-def get_baseline(conn: sqlite3.Connection, tenant_id: str, hours: int = 24) -> Optional[Dict]:
-    """Get baseline metrics from the last N hours."""
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT AVG(views) as avg_views, AVG(contact_clicks) as avg_contacts,
-               AVG(emails_count) as avg_emails, AVG(new_emails) as avg_new_emails,
-               AVG(mailbox_intent_score) as avg_intent,
-               AVG(booking_proxy_count) as avg_booking_proxy,
-               AVG(repeat_sender_count) as avg_repeat,
-               AVG(available_minutes) as avg_avail_min,
-               COUNT(*) as n
-        FROM metric_snapshots
-        WHERE tenant_id = ? AND ts >= datetime('now', ?)
-    """, (tenant_id, f'-{hours} hours'))
-    row = cur.fetchone()
-    if not row or row["n"] == 0:
-        return None
-    return dict(row)
-
-
-def log_action(conn: sqlite3.Connection, tenant_id: str, action_type: str,
-               endpoint: str = "", payload: str = "", error: str = "",
-               receipt_hash: str = "") -> int:
-    """Log an action to the database."""
-    payload_hash = hashlib.sha256(payload.encode()).hexdigest()[:8] if payload else ""
-    cur = conn.execute("""
-        INSERT INTO actions (tenant_id, ts, action_type, payload_hash, endpoint_used, executed, error, receipt_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (tenant_id, datetime.now(timezone.utc).isoformat(), action_type,
-          payload_hash, endpoint, 1 if not error else 0, error, receipt_hash))
-    conn.commit()
-    return cur.lastrowid
-
-
-def get_latest_snapshot(conn: sqlite3.Connection, tenant_id: str) -> Optional[Dict]:
-    """Get the most recent snapshot for a tenant."""
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM metric_snapshots WHERE tenant_id = ? ORDER BY id DESC LIMIT 1
-    """, (tenant_id,))
-    row = cur.fetchone()
-    return dict(row) if row else None
-
-```
-
-discover_blog_interview.py:
-```
-"""
-Discover Blog + Interview API endpoints via Selenium CDP.
-
-Uses the existing logged-in Chrome profile to avoid login/captcha.
-Opens the blog and interview editor pages and captures the exact network
-requests when saving/publishing.
-
-Usage:
-    python3 rm_traffic/discover_blog_interview.py
-
-Output:
-    rm_traffic/blog_interview_endpoints.json
-"""
-
-import json
-import time
-from pathlib import Path
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-
-BASE = "https://rentmasseur.com"
-PROFILE = "/tmp/rm_action_api"
-
-
-def get_driver():
-    opts = Options()
-    opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument(f"--user-data-dir={PROFILE}")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    return webdriver.Chrome(options=opts)
-
-
-def dismiss_popups(driver):
-    time.sleep(1)
-    try:
-        driver.execute_script("document.querySelectorAll('.DialogOverlay,[class*=\"overlay\"]').forEach(e=>e.remove())")
-    except Exception:
-        pass
-
-
-def get_api_calls(driver):
-    logs = driver.get_log("performance")
-    reqs = {}
-    for entry in logs:
-        try:
-            msg = json.loads(entry["message"])["message"]
-            if msg["method"] == "Network.requestWillBeSent":
-                p = msg["params"]
-                r = p["request"]
-                rid = p["requestId"]
-                reqs[rid] = {
-                    "url": r["url"],
-                    "method": r["method"],
-                    "postData": r.get("postData", "")[:2000],
-                }
-            elif msg["method"] == "Network.responseReceived":
-                p = msg["params"]
-                rid = p["requestId"]
-                if rid in reqs:
-                    reqs[rid]["status"] = p["response"]["status"]
-                    try:
-                        body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": rid})
-                        reqs[rid]["response"] = body.get("body", "")[:2000]
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    return [v for v in reqs.values() if "/api/" in v["url"]]
-
-
-def find_clickable(driver, texts):
-    for text in texts:
-        for el in driver.find_elements(By.XPATH, f"//*[contains(text(),'{text}')]"):
-            if el.is_displayed():
-                return el
-    return None
-
-
-def discover_blog(driver):
-    print("\n=== BLOG DISCOVERY ===")
-    driver.get(f"{BASE}/settings?blog=1")
-    time.sleep(5)
-    dismiss_popups(driver)
-    print(f"URL: {driver.current_url}")
-
-    # List possible buttons
-    buttons = driver.find_elements(By.TAG_NAME, "button")
-    print(f"Buttons found: {len(buttons)}")
-    for b in buttons:
-        txt = (b.text or "").strip()
-        if txt:
-            print(f"  Button: {txt[:50]}")
-
-    # Try to click "Create" or "New"
-    for action_text in ["Create", "New", "Add", "Write", "Post"]:
-        el = find_clickable(driver, [action_text])
-        if el:
-            print(f"Clicking '{action_text}'...")
-            driver.execute_script("arguments[0].click()", el)
+    # Look for edit buttons or text areas
+    for el in d.find_elements(By.CSS_SELECTOR, "textarea"):
+        print(f"  textarea: id={el.get_attribute('id')} name={el.get_attribute('name')}")
+    for el in d.find_elements(By.XPATH, "//button[contains(text(),'Save')]"):
+        if el.is_displayed():
+            print(f"  Save button found, clicking...")
+            d.execute_script("arguments[0].click()", el)
             time.sleep(3)
-            break
+            calls = get_api_calls()
+            for c in calls:
+                if c not in calls[:len(calls)]:
+                    print(f"  NEW: {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
+                    if c.get("postData"): print(f"        body: {c['postData'][:200]}")
+except Exception as e:
+    print(f"  Error: {e}")
 
-    # Clear logs and try to find form
-    driver.get_log("performance")
-    textareas = driver.find_elements(By.TAG_NAME, "textarea")
-    inputs = driver.find_elements(By.TAG_NAME, "input")
-    print(f"Textareas: {len(textareas)}, Inputs: {len(inputs)}")
-    for i, ta in enumerate(textareas):
-        print(f"  textarea[{i}]: placeholder={ta.get_attribute('placeholder') or 'N/A'}")
-    for i, inp in enumerate(inputs):
-        t = inp.get_attribute("type") or "text"
-        if t in ("text", "email", "search"):
-            print(f"  input[{i}]: type={t} placeholder={inp.get_attribute('placeholder') or 'N/A'}")
+# Visit blog page
+print("\n--- BLOG PAGE ---")
+d.get(f"{BASE}/settings?blog=1")
+time.sleep(5)
+dismiss()
+calls = get_api_calls()
+for c in calls:
+    print(f"  {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
+    if c.get("postData"): print(f"        body: {c['postData'][:200]}")
+    if c.get("response"): print(f"        resp: {c['response'][:200]}")
 
-    # Save action
-    save_btn = find_clickable(driver, ["Save", "Submit", "Publish", "Create", "Post"])
-    if save_btn:
-        print("Clicking save...")
-        driver.execute_script("arguments[0].click()", save_btn)
-        time.sleep(3)
-        calls = get_api_calls(driver)
-        print(f"Captured {len(calls)} API calls")
-        for c in calls:
-            print(f"  {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
-        return calls
+# Try to find blog create/edit
+print("\n--- BLOG INTERACTION ---")
+try:
+    for el in d.find_elements(By.CSS_SELECTOR, "textarea"):
+        print(f"  textarea: id={el.get_attribute('id')} name={el.get_attribute('name')}")
+    for el in d.find_elements(By.XPATH, "//button[contains(text(),'Create')]"):
+        if el.is_displayed():
+            print(f"  Create button found")
+            d.execute_script("arguments[0].click()", el)
+            time.sleep(3)
+            calls = get_api_calls()
+            for c in calls[-5:]:
+                print(f"  {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
+                if c.get("postData"): print(f"        body: {c['postData'][:200]}")
+    for el in d.find_elements(By.XPATH, "//button[contains(text(),'New')]"):
+        if el.is_displayed():
+            print(f"  New button found")
+            d.execute_script("arguments[0].click()", el)
+            time.sleep(3)
+            calls = get_api_calls()
+            for c in calls[-5:]:
+                print(f"  {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
+                if c.get("postData"): print(f"        body: {c['postData'][:200]}")
+except Exception as e:
+    print(f"  Error: {e}")
+
+# Also check settings page for all available sections
+print("\n--- SETTINGS SECTIONS ---")
+d.get(f"{BASE}/settings")
+time.sleep(4)
+dismiss()
+for el in d.find_elements(By.CSS_SELECTOR, "a[href*='settings']"):
+    href = el.get_attribute("href") or ""
+    text = el.text.strip()
+    if text and "?" in href:
+        print(f"  {text}: {href}")
+
+d.quit()
+print("\nDone")
+
+```
+
+fortress.log:
+```
+
+```
+
+bio_features.py:
+```
+"""
+Bio feature extraction for ML/GA optimization.
+"""
+
+import re
+from typing import Dict, List
+
+from .bio_tokenizer import speech_features
+
+LOCAL_AREAS = [
+    "manhattan", "chelsea", "midtown", "hell's kitchen", "upper west side",
+    "upper east side", "tribeca", "soho", "west village", "east village",
+    "financial district", "flatiron", "gramercy", "murray hill", "nomad",
+    "nyc", "new york"
+]
+
+SERVICE_WORDS = [
+    "deep tissue", "sports", "recovery", "massage", "bodywork", "relief",
+    "therapy", "knots", "tension", "pressure", "shoulder", "back", "hip",
+    "neck", "glute", "stress", "desk", "travel", "athlete", "professional"
+]
+
+CTA_WORDS = [
+    "message", "text", "email", "book", "call", "contact", "dm", "schedule",
+    "reach out", "get in touch"
+]
+
+PROOF_WORDS = [
+    "clients", "professional", "clean", "private", "experienced", "trained",
+    "results", "years", "certified", "licensed"
+]
+
+TRUST_WORDS = [
+    "professional", "clean", "private", "respect", "discreet", "boundaries",
+    "communication", "confidential"
+]
+
+HUMOR_WORDS = [
+    "wolf", "robot", "concrete", "phone cord", "group chat", "screaming",
+    "dramatic", "hostile", "no fluff", "feather", "magic", "gps"
+]
+
+
+def extract_features(headline: str, description: str) -> Dict[str, float]:
+    text = (headline + " " + description).lower()
+    words = re.findall(r'\b[a-z]+\b', text)
+    sentences = re.split(r'[.!?]+', description)
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    headline_len = len(headline)
+    desc_len = len(description)
+    word_count = len(words)
+    avg_sentence_len = sum(len(s.split()) for s in sentences) / max(1, len(sentences))
+    question_count = text.count("?")
+    exclamation_count = text.count("!")
+    paragraph_count = len([p for p in description.split("\n") if p.strip()])
+
+    local_score = sum(1 for w in LOCAL_AREAS if w in text) / len(LOCAL_AREAS)
+    service_score = sum(1 for w in SERVICE_WORDS if w in text) / len(SERVICE_WORDS)
+    cta_score = sum(1 for w in CTA_WORDS if w in text) / len(CTA_WORDS)
+    proof_score = sum(1 for w in PROOF_WORDS if w in text) / len(PROOF_WORDS)
+    trust_score = sum(1 for w in TRUST_WORDS if w in text) / len(TRUST_WORDS)
+    humor_score = min(1.0, sum(1 for w in HUMOR_WORDS if w in text) / 3.0)
+
+    # Readability
+    if 50 <= desc_len <= 300:
+        readability = 1.0
+    elif desc_len < 50:
+        readability = 0.5
     else:
-        print("No save button found")
-        return []
+        readability = max(0.3, 1.0 - (desc_len - 300) / 500)
+
+    speech = speech_features(text)
+    return {
+        "headline_len": headline_len / 100,
+        "desc_len": desc_len / 500,
+        "word_count": word_count / 100,
+        "avg_sentence_len": min(avg_sentence_len / 30, 1.0),
+        "paragraph_count": min(paragraph_count / 5, 1.0),
+        "question_count": question_count / 2,
+        "exclamation_count": exclamation_count / 2,
+        "local_score": local_score,
+        "service_score": service_score,
+        "cta_score": cta_score,
+        "proof_score": proof_score,
+        "trust_score": trust_score,
+        "humor_score": humor_score,
+        "readability": readability,
+        "speech_score": speech["speech_score"],
+    }
 
 
-def discover_interview(driver):
-    print("\n=== INTERVIEW DISCOVERY ===")
-    driver.get(f"{BASE}/settings?interview=1")
-    time.sleep(5)
-    dismiss_popups(driver)
-    print(f"URL: {driver.current_url}")
-
-    # List inputs and buttons
-    textareas = driver.find_elements(By.TAG_NAME, "textarea")
-    inputs = driver.find_elements(By.TAG_NAME, "input")
-    buttons = driver.find_elements(By.TAG_NAME, "button")
-    print(f"Textareas: {len(textareas)}, Inputs: {len(inputs)}, Buttons: {len(buttons)}")
-    for i, ta in enumerate(textareas):
-        print(f"  textarea[{i}]: placeholder={ta.get_attribute('placeholder') or 'N/A'}")
-    for b in buttons:
-        txt = (b.text or "").strip()
-        if txt:
-            print(f"  Button: {txt[:50]}")
-
-    # Clear logs and try to save
-    driver.get_log("performance")
-    save_btn = find_clickable(driver, ["Save", "Submit", "Update", "Confirm"])
-    if save_btn:
-        print("Clicking save...")
-        driver.execute_script("arguments[0].click()", save_btn)
-        time.sleep(3)
-        calls = get_api_calls(driver)
-        print(f"Captured {len(calls)} API calls")
-        for c in calls:
-            print(f"  {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
-        return calls
-    else:
-        print("No save button found")
-        return []
+def feature_vector(headline: str, description: str) -> List[float]:
+    f = extract_features(headline, description)
+    return [
+        f["headline_len"],
+        f["desc_len"],
+        f["word_count"],
+        f["avg_sentence_len"],
+        f["paragraph_count"],
+        f["question_count"],
+        f["exclamation_count"],
+        f["local_score"],
+        f["service_score"],
+        f["cta_score"],
+        f["proof_score"],
+        f["trust_score"],
+        f["humor_score"],
+        f["readability"],
+        f["speech_score"],
+    ]
 
 
-def main():
-    driver = get_driver()
+FEATURE_NAMES = [
+    "headline_len", "desc_len", "word_count", "avg_sentence_len", "paragraph_count",
+    "question_count", "exclamation_count", "local_score", "service_score", "cta_score",
+    "proof_score", "trust_score", "humor_score", "readability", "speech_score",
+]
+
+```
+
+config.example.json:
+```
+{
+  "city": "manhattan-ny",
+  "mode": "guard",
+  "session_file": "rm_traffic/session.json",
+  "min_request_interval_seconds": 2.0,
+  "visibility_check_interval_minutes": 10,
+  "availability_check_interval_minutes": 30,
+  "traffic_snapshot_interval_minutes": 15,
+  "daily_draft_hour": 9,
+  "bio_change_cooldown_hours": 24,
+  "availability_refresh_threshold_minutes": 45,
+  "llm_provider": "ollama",
+  "llm_model": "llama3.2",
+  "allowed_auto_actions": ["visibility_repair", "stats_logging", "availability_refresh"],
+  "require_approval_for": ["bio_publish", "blog_publish", "interview_edit", "message_send", "payment"]
+}
+
+```
+
+probe.py:
+```
+import requests, re, json
+
+s = requests.Session()
+s.headers.update({
+    'User-Agent': 'Mozilla/5.0',
+    'Accept': 'application/json,text/plain,*/*',
+    'Referer': 'https://rentmasseur.com/settings',
+    'Origin': 'https://rentmasseur.com',
+})
+
+r = s.get('https://rentmasseur.com/login')
+m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', r.text)
+csrf = m.group(1) if m else ''
+r = s.post('https://rentmasseur.com/api/v1/login', json={
+    'email': 'karpathianwolf', 'password': 'os.environ.get("RM_PASSWORD", "")', 'csrf': csrf, 'remember': True
+})
+token = r.json().get('accessToken', '')
+s.headers['Authorization'] = f'Bearer {token}'
+print('Login OK')
+
+# UNHIDE
+r = s.put('https://rentmasseur.com/api/v1/settings/visibility', json={'isAdHidden': False})
+print('UNHIDE:', r.status_code, r.text[:200])
+
+# Probe endpoints
+endpoints = [
+    ('GET', '/api/v1/account/interview'),
+    ('GET', '/api/v1/account/blog'),
+    ('GET', '/api/v1/account/profile'),
+    ('GET', '/api/v1/account/bio'),
+    ('GET', '/api/v1/account/about'),
+    ('GET', '/api/v1/account/travels'),
+    ('GET', '/api/v1/account/photos'),
+    ('GET', '/api/v1/account/reviews'),
+    ('GET', '/api/v1/account/membership'),
+    ('GET', '/api/v1/account/sponsor'),
+    ('GET', '/api/v1/settings/profile'),
+    ('GET', '/api/v1/settings/bio'),
+    ('GET', '/api/v1/settings/about'),
+    ('GET', '/api/v1/settings/interview'),
+    ('GET', '/api/v1/settings/blog'),
+    ('GET', '/api/v1/account/dashboard/interview'),
+    ('GET', '/api/v1/account/dashboard/blog'),
+    ('GET', '/api/v1/account/dashboard/profile'),
+    ('GET', '/api/v1/account/dashboard/bio'),
+    ('GET', '/api/v1/account/dashboard/about'),
+    ('GET', '/api/v1/blog'),
+    ('GET', '/api/v1/interview'),
+    ('GET', '/api/v1/profile'),
+    ('PUT', '/api/v1/settings/profile'),
+    ('PUT', '/api/v1/settings/bio'),
+    ('PUT', '/api/v1/settings/about'),
+    ('PUT', '/api/v1/settings/interview'),
+    ('PUT', '/api/v1/settings/blog'),
+    ('PUT', '/api/v1/account/profile'),
+    ('PUT', '/api/v1/account/interview'),
+    ('PUT', '/api/v1/account/blog'),
+    ('POST', '/api/v1/account/blog'),
+    ('POST', '/api/v1/account/interview'),
+    ('POST', '/api/v1/account/profile'),
+    ('POST', '/api/v1/blog'),
+    ('POST', '/api/v1/interview'),
+    ('GET', '/api/v1/account/dashboard/membership'),
+    ('GET', '/api/v1/account/dashboard/sponsor'),
+    ('GET', '/api/v1/account/dashboard/advertise'),
+    ('GET', '/api/v1/account/dashboard/travels'),
+    ('GET', '/api/v1/account/dashboard/photos'),
+    ('GET', '/api/v1/account/dashboard/reviews'),
+    ('GET', '/api/v1/account/dashboard/blog'),
+    ('GET', '/api/v1/account/dashboard/interview'),
+    ('GET', '/api/v1/account/dashboard/certificates'),
+    ('GET', '/api/v1/account/dashboard/massages'),
+    ('GET', '/api/v1/account/certificates'),
+    ('GET', '/api/v1/account/massages'),
+    ('GET', '/api/v1/settings/certificates'),
+    ('GET', '/api/v1/settings/massages'),
+    ('GET', '/api/v1/settings/travels'),
+    ('GET', '/api/v1/settings/reviews'),
+    ('GET', '/api/v1/settings/membership'),
+    ('GET', '/api/v1/settings/sponsor'),
+    ('GET', '/api/v1/settings/advertise'),
+]
+
+for method, path in endpoints:
+    url = f'https://rentmasseur.com{path}'
     try:
-        blog_calls = discover_blog(driver)
-        interview_calls = discover_interview(driver)
-        out = {
-            "blog": blog_calls,
-            "interview": interview_calls,
-            "timestamp": time.time(),
-        }
-        Path("rm_traffic/blog_interview_endpoints.json").write_text(
-            json.dumps(out, indent=2, default=str)
-        )
-        print("\nSaved to rm_traffic/blog_interview_endpoints.json")
-    finally:
-        driver.quit()
-
-
-if __name__ == "__main__":
-    main()
+        if method == 'GET':
+            r = s.get(url, timeout=5)
+        elif method == 'POST':
+            r = s.post(url, json={}, timeout=5)
+        elif method == 'PUT':
+            r = s.put(url, json={}, timeout=5)
+        if r.status_code != 404:
+            body = r.text[:150].replace('\n', ' ')
+            print(f'{method:4s} {r.status_code} {path:55s} {body}')
+    except Exception as e:
+        print(f'{method:4s} ERR {path:55s} {str(e)[:80]}')
 
 ```
 
-endpoint_registry.py:
+transformers_llm.js:
+```
+#!/usr/bin/env node
+/**
+ * Transformers.js local LLM — runs entirely in Node.js, no API keys needed.
+ *
+ * Usage:
+ *   echo "Your prompt here" | node rm_traffic/transformers_llm.js
+ *   echo "Your prompt here" | node rm_traffic/transformers_llm.js --model Xenova/Phi-3.5-mini-instruct
+ *   echo "Your prompt here" | node rm_traffic/transformers_llm.js --max-tokens 500
+ *
+ * Reads prompt from stdin, writes generated text to stdout.
+ * First run downloads model (~2GB cached in ~/.cache/huggingface).
+ */
+
+const { pipeline, env } = require("@huggingface/transformers");
+
+// Allow local models, disable remote loading errors on first run
+env.allowLocalModels = false;
+
+async function main() {
+  const args = process.argv.slice(2);
+  let modelName = "Xenova/Qwen2.5-0.5B-Instruct";
+  let maxTokens = 800;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--model" && args[i + 1]) {
+      modelName = args[i + 1];
+      i++;
+    } else if (args[i] === "--max-tokens" && args[i + 1]) {
+      maxTokens = parseInt(args[i + 1], 10);
+      i++;
+    }
+  }
+
+  // Read prompt from stdin
+  const chunks = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(chunk);
+  }
+  const prompt = Buffer.concat(chunks).toString("utf-8").trim();
+
+  if (!prompt) {
+    console.error("ERROR: No prompt provided on stdin");
+    process.exit(1);
+  }
+
+  try {
+    process.stderr.write(`[transformers.js] Loading model: ${modelName}\n`);
+    const t0 = Date.now();
+
+    const pipe = await pipeline("text-generation", modelName, {
+      device: "cpu",
+    });
+
+    process.stderr.write(`[transformers.js] Model loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s\n`);
+
+    const messages = [
+      { role: "system", content: "You are a helpful assistant for a massage therapist optimization system. Be concise and direct." },
+      { role: "user", content: prompt },
+    ];
+
+    const t1 = Date.now();
+    const output = await pipe(messages, {
+      max_new_tokens: maxTokens,
+      temperature: 0.75,
+      do_sample: true,
+    });
+
+    const elapsed = ((Date.now() - t1) / 1000).toFixed(1);
+    process.stderr.write(`[transformers.js] Generated in ${elapsed}s\n`);
+
+    // Extract text from output
+    let text = "";
+    if (Array.isArray(output) && output.length > 0) {
+      const msg = output[0].generated_text;
+      if (Array.isArray(msg)) {
+        // Chat format: [{role, content}, ...]
+        const last = msg[msg.length - 1];
+        text = last?.content || "";
+      } else if (typeof msg === "string") {
+        text = msg;
+      } else {
+        text = JSON.stringify(msg);
+      }
+    } else if (typeof output === "string") {
+      text = output;
+    } else {
+      text = JSON.stringify(output);
+    }
+
+    // Write only the generated text to stdout (clean for Python to consume)
+    process.stdout.write(text.trim());
+  } catch (err) {
+    process.stderr.write(`[transformers.js] ERROR: ${err.message}\n`);
+    process.exit(1);
+  }
+}
+
+main();
+
+```
+
+blog_interview_endpoints.json:
+```
+{
+  "blog": [],
+  "interview": [],
+  "timestamp": 1782419231.202249
+}
+```
+
+probe3.py:
+```
+import requests, re, json
+
+s = requests.Session()
+s.headers.update({
+    'User-Agent': 'Mozilla/5.0',
+    'Accept': 'application/json',
+    'Referer': 'https://rentmasseur.com/settings',
+    'Origin': 'https://rentmasseur.com',
+})
+
+r = s.get('https://rentmasseur.com/login')
+m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', r.text)
+csrf = m.group(1) if m else ''
+r = s.post('https://rentmasseur.com/api/v1/login', json={
+    'email': 'karpathianwolf', 'password': 'os.environ.get("RM_PASSWORD", "")', 'csrf': csrf, 'remember': True
+})
+s.headers['Authorization'] = 'Bearer ' + r.json()['accessToken']
+print('Login OK')
+
+# Probe interview endpoints
+print('\n--- INTERVIEW ---')
+for path in ['/api/v1/settings/interview', '/api/v1/account/dashboard/interview', '/api/v1/account/interview']:
+    r = s.get(f'https://rentmasseur.com{path}', timeout=5)
+    if r.status_code != 404:
+        print(f'GET {r.status_code} {path}: {r.text[:500]}')
+
+# Probe blog endpoints
+print('\n--- BLOG ---')
+for path in ['/api/v1/settings/blog', '/api/v1/account/dashboard/blog', '/api/v1/account/blog', '/api/v1/blog']:
+    r = s.get(f'https://rentmasseur.com{path}', timeout=5)
+    if r.status_code != 404:
+        print(f'GET {r.status_code} {path}: {r.text[:500]}')
+
+# Try PUT interview with sample data
+print('\n--- PUT INTERVIEW ---')
+r = s.put('https://rentmasseur.com/api/v1/settings/interview', json={
+    'interview': 'test answer'
+})
+print(f'PUT interview: {r.status_code} {r.text[:300]}')
+
+# Try PUT blog
+print('\n--- PUT/POST BLOG ---')
+r = s.post('https://rentmasseur.com/api/v1/settings/blog', json={
+    'title': 'test', 'content': 'test'
+})
+print(f'POST blog: {r.status_code} {r.text[:300]}')
+r = s.put('https://rentmasseur.com/api/v1/settings/blog', json={
+    'title': 'test', 'content': 'test'
+})
+print(f'PUT blog: {r.status_code} {r.text[:300]}')
+
+```
+
+bio_evolver.py:
 ```
 """
-Endpoint Registry — store verified API endpoints discovered via CDP or manual testing.
+Genetic Algorithm for bio optimization.
 
-Levels:
-  unverified  = discovered but not replay-tested
-  verified    = replay-tested and confirmed working
-  blocked     = unsafe, do not use
+Evolution target: maximize CTR + email + phone-call predictions.
+Genetic operators: crossover, mutation, tournament selection.
+Population: generated bios or from library.
+Result: top elite individuals for A/B testing.
 """
 
-import json
 import logging
-from typing import Optional, Dict, Any, List
-
-from .db import upsert_endpoint, get_endpoints
-
-log = logging.getLogger("profileops.registry")
-
-
-class EndpointRegistry:
-    """Registry of discovered API endpoints."""
-
-    def register(self, action_id: str, method: str, path: str,
-                 request_schema: Optional[Dict] = None,
-                 response_schema: Optional[Dict] = None,
-                 safety_level: str = "unverified"):
-        upsert_endpoint(method, path, action_id,
-                        request_schema=json.dumps(request_schema or {}, sort_keys=True, default=str),
-                        response_schema=json.dumps(response_schema or {}, sort_keys=True, default=str))
-        log.info("Registered endpoint: %s %s -> %s (level=%s)", method, path, action_id, safety_level)
-
-    def list(self, level: Optional[str] = None) -> List[Dict]:
-        rows = get_endpoints()
-        if level:
-            # safety_level not stored in current schema; filter would need extension
-            pass
-        return rows
-
-    def get(self, action_id: str) -> Optional[Dict]:
-        rows = self.list()
-        for r in rows:
-            if r.get("action_name") == action_id:
-                return r
-        return None
-
-    def mark_verified(self, action_id: str):
-        log.info("Endpoint verified: %s", action_id)
-
-    def mark_blocked(self, action_id: str):
-        log.warning("Endpoint blocked: %s", action_id)
-
-
-# Pre-register known, verified endpoints from captured work
-KNOWN = [
-    ("login", "POST", "/api/v1/login"),
-    ("get_dashboard", "GET", "/api/v1/account/dashboard"),
-    ("get_availability", "GET", "/api/v1/account/dashboard/availability"),
-    ("set_availability", "PUT", "/api/v1/account/dashboard/availability"),
-    ("get_ad_statistics", "GET", "/api/v1/account/dashboard/ad-statistics"),
-    ("get_keeponline", "GET", "/api/v1/account/keeponline"),
-    ("get_about", "GET", "/api/v1/settings/about"),
-    ("set_about", "PUT", "/api/v1/settings/about"),
-    ("set_visibility", "PUT", "/api/v1/settings/visibility"),
-    ("set_sms", "PUT", "/api/v1/settings/sms"),
-    ("set_track_actions", "PUT", "/api/v1/settings/track-actions"),
-    ("search", "POST", "/api/v1/search"),
-    ("get_mailbox", "GET", "/api/v1/mailbox"),
-    ("get_blogs", "GET", "/api/v1/blogs"),
-    ("get_rates", "GET", "/api/v1/settings/rates"),
-]
-
-
-def seed_registry():
-    """Seed the registry with known verified endpoints."""
-    reg = EndpointRegistry()
-    for action_id, method, path in KNOWN:
-        reg.register(action_id, method, path, safety_level="verified")
-
-```
-
-approval_queue.py:
-```
-"""
-Approval Queue — formal interface for content drafts awaiting approval.
-"""
-
-from .db import (
-    get_conn,
-    upsert_content_variant,
-    set_variant_status,
-    get_variant_history,
-    get_active_variant,
-    now_iso,
-)
-
-
-def submit_draft(variant_id: str, kind: str, headline: str, description: str,
-                 title: str = "", body: str = "", hypothesis: str = "") -> str:
-    """Submit a draft to the approval queue."""
-    upsert_content_variant(variant_id, kind, headline, description, title, body,
-                         status="pending_approval", hypothesis=hypothesis)
-    return variant_id
-
-
-def approve_draft(variant_id: str) -> bool:
-    """Mark a draft as approved."""
-    set_variant_status(variant_id, "approved")
-    return True
-
-
-def reject_draft(variant_id: str) -> bool:
-    """Reject a draft."""
-    set_variant_status(variant_id, "rejected")
-    return True
-
-
-def list_pending(kind: str = None) -> list:
-    """List pending drafts."""
-    conn = get_conn()
-    if kind:
-        rows = conn.execute(
-            "SELECT * FROM content_variants WHERE kind=? AND status='pending_approval' ORDER BY created_at DESC",
-            (kind,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM content_variants WHERE status='pending_approval' ORDER BY created_at DESC"
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def list_approved(kind: str = None) -> list:
-    """List approved drafts."""
-    conn = get_conn()
-    if kind:
-        rows = conn.execute(
-            "SELECT * FROM content_variants WHERE kind=? AND status='approved' ORDER BY created_at DESC",
-            (kind,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM content_variants WHERE status='approved' ORDER BY created_at DESC"
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-```
-
-action_bandit.py:
-```
-"""
-Action Bandit — contextual bandit for action selection.
-
-Each action is an arm. The bandit chooses based on measured outcomes,
-not LLM freestyle. The LLM can explain, but the bandit chooses.
-
-ROA = Revenue Overclock Advantage
-ROA_t = expected_revenue_lift(action | state) × confidence × attribution_weight × repeatability_score
-        − compliance_risk − mutation_cost − platform_error_risk
-
-best_action = argmax_a ROA(a, current_state)
-
-Reward only counts when real metrics move:
-  reward = 5.0 * booking_intent_delta
-         + 3.0 * contact_click_delta
-         + 2.0 * email_delta
-         + 1.0 * view_delta
-         - 2.0 * error_penalty
-         - 3.0 * compliance_risk
-         - 1.0 * excessive_mutation_penalty
-"""
-
-import json
-import logging
-import math
-import os
-import sqlite3
+import random
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-log = logging.getLogger("action_bandit")
+from .bio_generator import (
+    _generate_headline, _generate_description, _score_variant, _sentiment_score,
+    HEADLINE_TEMPLATES, HOOKS, SPECIALTIES, CLIENTS, STYLES, PROOFS, CTAS,
+)
+from .bio_features import feature_vector
+from .bio_predictor import predict_performance, train_predictor, MLP
+from .db import upsert_content_variant, write_receipt
 
-BANDIT_DB = Path(__file__).parent / "overclock_bandit.db"
+log = logging.getLogger("profileops.evolver")
 
-# All action arms
-ACTIONS = [
-    "refresh_availability",
-    "ensure_visible",
-    "check_search_rank",
-    "mailbox_intent_scan",
-    "reply_draft_queue",
-    "visitor_revisit",
-    "headline_variant_test",
-    "bio_variant_test",
-    "photo_order_test",
-    "rate_position_test",
-    "city_rank_scan",
-    "traffic_report",
-    "do_nothing",
+
+def _crossover(parent1: Dict, parent2: Dict) -> Dict:
+    """Create child by combining headline from one parent and desc from another."""
+    return {
+        "headline": parent1["headline"],
+        "description": parent2["description"],
+    }
+
+
+def _mutate_headline(headline: str) -> str:
+    """Mutate a headline."""
+    return _generate_headline()
+
+
+def _mutate_description(description: str) -> str:
+    """Mutate a description by swapping a random paragraph."""
+    parts = {
+        "hook": random.choice(HOOKS),
+        "specialty": random.choice(SPECIALTIES),
+        "client": random.choice(CLIENTS),
+        "style": random.choice(STYLES),
+        "proof": random.choice(PROOFS),
+        "cta": random.choice(CTAS),
+    }
+    return random.choice([
+        f"{parts['hook']}\n\n{parts['specialty']}\n\n{parts['client']}\n\n{parts['style']}\n\n{parts['cta']}",
+        f"{parts['hook']}\n\n{parts['style']}\n\n{parts['specialty']}\n\n{parts['proof']}\n\n{parts['cta']}",
+    ])
+
+
+def _mutate(bio: Dict, mutation_rate: float = 0.3) -> Dict:
+    headline = bio["headline"]
+    description = bio["description"]
+    if random.random() < mutation_rate:
+        headline = _mutate_headline(headline)
+    if random.random() < mutation_rate:
+        description = _mutate_description(description)
+    return {"headline": headline, "description": description}
+
+
+def _fitness(bio: Dict, model: MLP = None, speech_weight: float = 0.5) -> float:
+    """Fitness = weighted sum of predicted CTR, email, phone, sentiment, speech, minus risk."""
+    from .bio_features import extract_features
+    scores = _score_variant(bio["headline"], bio["description"])
+    pred = predict_performance(bio["headline"], bio["description"], model)
+    features = extract_features(bio["headline"], bio["description"])
+    risk_penalty = max(0, scores["headline_risk"], scores["bio_risk"]) * 0.5
+    # Weighted: CTR, email, phone, sentiment, speech-friendliness
+    fitness = (
+        pred["ctr"] * 3.0
+        + pred["email"] * 2.0
+        + pred["phone"] * 1.5
+        + scores["sentiment"]["score"] * 0.5
+        + features["speech_score"] * speech_weight
+        - risk_penalty
+    )
+    return fitness
+
+
+def _tournament_select(population: List[Dict], fitnesses: List[float], k: int = 3) -> Dict:
+    selected = random.sample(list(zip(population, fitnesses)), min(k, len(population)))
+    selected.sort(key=lambda x: x[1], reverse=True)
+    return selected[0][0]
+
+
+def evolve(population: List[Dict], generations: int = 50, population_size: int = 100,
+           elite_size: int = 10, mutation_rate: float = 0.3,
+           model: MLP = None) -> List[Dict]:
+    """Run genetic algorithm to optimize bios."""
+    log.info("Starting GA: %d generations, pop=%d", generations, population_size)
+
+    # If population is too small, seed with more random
+    while len(population) < population_size:
+        population.append({"headline": _generate_headline(), "description": _generate_description()})
+
+    for gen in range(generations):
+        # Evaluate fitness
+        fitnesses = [_fitness(bio, model) for bio in population]
+
+        # Sort by fitness
+        ranked = sorted(zip(population, fitnesses), key=lambda x: x[1], reverse=True)
+        log.info("Gen %d: best fitness=%.4f", gen, ranked[0][1])
+
+        # Elites
+        elites = [bio for bio, _ in ranked[:elite_size]]
+
+        # Create next generation
+        next_pop = elites[:]
+        while len(next_pop) < population_size:
+            parent1 = _tournament_select(population, fitnesses)
+            parent2 = _tournament_select(population, fitnesses)
+            child = _crossover(parent1, parent2)
+            child = _mutate(child, mutation_rate)
+            next_pop.append(child)
+
+        population = next_pop
+
+    # Final evaluation
+    fitnesses = [_fitness(bio, model) for bio in population]
+    ranked = sorted(zip(population, fitnesses), key=lambda x: x[1], reverse=True)
+    return [bio for bio, _ in ranked[:elite_size]]
+
+
+def run_evolution(initial_bios: List[Dict] = None, generations: int = 50,
+                  population_size: int = 100, elite_size: int = 10,
+                  top_n: int = 10) -> List[Dict]:
+    """Full GA pipeline: train predictor, evolve, save top elites."""
+    if initial_bios is None:
+        from .bio_generator import generate_bios
+        initial_bios = generate_bios(count=population_size, top_n=population_size)
+
+    # Train predictor on initial population
+    model = train_predictor(initial_bios, epochs=300)
+
+    # Run GA
+    elites = evolve(initial_bios, generations=generations, population_size=population_size,
+                    elite_size=elite_size, model=model)
+
+    # Save elites
+    batch_id = f"ga_{int(time.time())}"
+    saved_ids = []
+    for i, bio in enumerate(elites):
+        variant_id = f"{batch_id}_{i:03d}"
+        pred = predict_performance(bio["headline"], bio["description"], model)
+        scores = _score_variant(bio["headline"], bio["description"])
+        upsert_content_variant(
+            variant_id, "bio",
+            headline=bio["headline"],
+            description=bio["description"],
+            hypothesis=f"GA elite. CTR={pred['ctr']}, email={pred['email']}, phone={pred['phone']}, fitness={_fitness(bio, model):.4f}",
+            status="draft"
+        )
+        saved_ids.append(variant_id)
+
+    write_receipt(
+        "ga_evolution_v1",
+        "run_evolution",
+        {"generations": generations, "population_size": population_size},
+        {"elites_saved": len(saved_ids), "top_fitness": _fitness(elites[0], model) if elites else 0},
+        verified=True,
+    )
+    log.info("GA evolution complete. Saved %d elites.", len(saved_ids))
+    return saved_ids
+
+```
+
+bio_generator.py:
+```
+"""
+Large-scale bio generator — combinatorial + hilarious + sentiment prediction.
+
+Generates many variants, scores them for sentiment, risk, and conversion,
+stores only the best ones.
+
+Never auto-publishes. All drafts are approval-gated.
+"""
+
+import logging
+import random
+import time
+from typing import Dict, List
+
+from .db import upsert_content_variant, write_receipt
+from .content_policy import check_bio_risk, check_headline_risk
+from .bio_variants_library import list_all as list_all_library_variants
+
+log = logging.getLogger("profileops.bio_generator")
+
+# Headline templates
+HEADLINE_TEMPLATES = [
+    "Deep Tissue & {thing} — Manhattan",
+    "{adjective} Bodywork in Manhattan",
+    "{name} Does {thing} — Manhattan",
+    "The Wolf's {thing} — Manhattan",
+    "{thing} for {person} — Manhattan",
+    "Manhattan's {adjective} {thing}",
+    "Not Your Average {thing} — Manhattan",
+    "Real {thing} for {person}",
+    "{thing}: No Fluff, Just Pressure",
+    "Bring the {body_part}, Bring the Wolf — Manhattan",
+    "{adjective} {thing} in Manhattan, NYC",
+    "The {person}'s {thing} — Manhattan",
+    "Wolf-Level {thing} — Manhattan",
+    "{body_part} Rescue in Manhattan",
+    "From {city} Stress to {thing}",
 ]
 
-# Actions that mutate the profile (need mutation cost)
-MUTATION_ACTIONS = {
-    "headline_variant_test",
-    "bio_variant_test",
-    "photo_order_test",
-    "rate_position_test",
-}
+# Bio paragraph templates
+BIO_TEMPLATES = [
+    "{hook}\n\n{specialty}\n\n{client}\n\n{style}\n\n{cta}",
+    "{hook}\n\n{style}\n\n{specialty}\n\n{proof}\n\n{cta}",
+    "{specialty}\n\n{client}\n\n{hook}\n\n{style}\n\n{cta}",
+    "{hook}\n\n{proof}\n\n{specialty}\n\n{cta}",
+]
 
-# Actions that are always safe (no platform risk)
-SAFE_ACTIONS = {
-    "refresh_availability",
-    "ensure_visible",
-    "check_search_rank",
-    "mailbox_intent_scan",
-    "reply_draft_queue",
-    "visitor_revisit",
-    "city_rank_scan",
-    "traffic_report",
-    "do_nothing",
-}
+# Component banks
+HOOKS = [
+    "Your shoulders called. They want out of this meeting.",
+    "I don't do feathers. I do fixes.",
+    "You bring the stress, I bring the Wolf.",
+    "If your body were a group chat, your hips would be the one screaming.",
+    "Some people meditate. I prefer pressure.",
+    "Desk life: 1. Your posture: 0. I can fix that.",
+    "Your back is not a storage unit for stress.",
+    "I work on humans, not mannequins.",
+    "The gym builds muscle. I build recovery.",
+    "Tight neck? Tight shoulders? Tight everything? Same.",
+    "Wolf knows where the knots hide.",
+    "You can't out-train bad recovery, but you can out-massage it.",
+    "Manhattan is stressful. Your body doesn't have to be.",
+    "My hands are GPS for tension.",
+    "If your muscles wrote a Yelp review, it would not be five stars.",
+    "I find the thing that hurts and make it stop hurting.",
+    "Your body is a resume. Let's edit it.",
+    "Squats gave you glutes. I give them back their range of motion.",
+    "The only thing I ghost is tension.",
+    "I've got strong hands and zero patience for bad posture.",
+]
+
+SPECIALTIES = [
+    "I specialize in deep tissue, sports recovery, and targeted relief for shoulders, neck, back, and hips.",
+    "My focus is pressure-forward work: slow, deliberate, and built around the muscle groups that actually need it.",
+    "I do deep tissue, recovery bodywork, and the kind of pressure that actually changes how you move.",
+    "Sports recovery, deep tissue, and hip/glute work are my main zones.",
+    "I work on the tension that builds from training, travel, and ten-hour desk days.",
+]
+
+CLIENTS = [
+    "Best for lifters, runners, desk workers, and anyone who treats their body like a rental.",
+    "Great if you sit all day, train hard, or fly too much.",
+    "If your neck feels like a phone cord from 1997, you're my people.",
+    "For clients who want real pressure, clear communication, and a clean space.",
+    "You don't need to be an athlete. You need to be tight.",
+]
+
+STYLES = [
+    "My style is direct. I find the tension, apply pressure, and stay there until it releases.",
+    "No spa music required. No fluffy rituals. Just focused work.",
+    "I adjust pressure to your body, not a script.",
+    "Strong hands, calm presence, zero attitude.",
+    "I work with intention. Every minute has a target.",
+]
+
+PROOFS = [
+    "Clients usually leave looser, taller, and less hostile toward their desk.",
+    "The feedback I get most: 'I should have done this months ago.'",
+    "One session won't fix ten years of bad posture, but it's a solid opening argument.",
+    "I don't promise magic. I promise real pressure in the right places.",
+]
+
+CTAS = [
+    "Message me with your focus areas and we'll get you sorted.",
+    "Manhattan incall. Text or email to book.",
+    "Clean private space in Manhattan. DM me to set something up.",
+    "If your body is ready, so am I. Message for availability.",
+    "Book a session and let's make your muscles less dramatic.",
+]
+
+THINGS = [
+    "Sports Recovery", "Deep Tissue", "Bodywork", "Knot Removal", "Recovery",
+    "Shoulder Rescue", "Hip Relief", "Back Therapy", "Desk Detox", "Stress Reset",
+]
+
+ADJECTIVES = [
+    "Serious", "Pressure-Forward", "Wolf-Approved", "No-Nonsense", "Focused",
+    "Real", "Direct", "Professional", "High-Octane", "Tension-Finding",
+]
+
+PERSONS = [
+    "Desk Workers", "Athletes", "Gym Rats", "Frequent Flyers", "Tired Humans",
+    "Shoulders", "Hips", "Runners", "Lifters", "Stressed New Yorkers",
+]
+
+BODY_PARTS = [
+    "Shoulders", "Back", "Hips", "Neck", "Glutes",
+]
+
+CITIES = [
+    "Manhattan", "Midtown", "Chelsea", "Hell's Kitchen", "NYC",
+]
+
+NAMES = [
+    "The Wolf", "Karpathian Wolf", "Wolf", "This Guy",
+]
 
 
-@dataclass
-class ActionOutcome:
-    action: str
-    reward: float
-    metric_delta: Dict[str, float] = field(default_factory=dict)
-    timestamp: str = ""
-    state_before_hash: str = ""
-    state_after_hash: str = ""
-    error: str = ""
-
-
-def _db():
-    conn = sqlite3.connect(str(BANDIT_DB))
-    conn.row_factory = sqlite3.Row
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS action_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT,
-        action TEXT,
-        reward REAL,
-        metric_delta TEXT,
-        state_before_hash TEXT,
-        state_after_hash TEXT,
-        error TEXT,
-        timestamp TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_action ON action_history(action);
-    CREATE INDEX IF NOT EXISTS idx_tenant ON action_history(tenant_id);
-    """)
-    conn.commit()
-    return conn
-
-
-def get_action_stats(conn: sqlite3.Connection, tenant_id: str = "") -> Dict[str, Dict]:
-    """Get per-action stats: count, avg_reward, confidence."""
-    cur = conn.cursor()
-    stats = {}
-    for action in ACTIONS:
-        cur.execute(
-            "SELECT COUNT(*) as n, AVG(reward) as avg_r, "
-            "SUM(CASE WHEN reward > 0 THEN 1 ELSE 0 END) as wins "
-            f"FROM action_history WHERE action = ? AND tenant_id = ?",
-            (action, tenant_id)
-        )
-        row = cur.fetchone()
-        n = row["n"] or 0
-        avg_r = row["avg_r"] or 0.0
-        wins = row["wins"] or 0
-        # Wilson score interval lower bound as confidence
-        if n > 0:
-            z = 1.96
-            p = wins / n
-            denominator = 1 + z * z / n
-            center = (p + z * z / (2 * n)) / denominator
-            margin = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n) / denominator
-            confidence = max(0, center - margin)
-        else:
-            confidence = 0.0
-        stats[action] = {
-            "n": n,
-            "avg_reward": round(avg_r, 3),
-            "win_rate": round(wins / n, 3) if n > 0 else 0.0,
-            "confidence": round(confidence, 3),
-        }
-    return stats
-
-
-def compute_roa(action: str, state, stats: Dict) -> float:
-    """
-    ROA = Revenue Overclock Advantage
-
-    ROA = expected_revenue_lift × confidence × attribution_weight × repeatability
-          − compliance_risk − mutation_cost − platform_error_risk
-    """
-    s = stats.get(action, {"avg_reward": 0, "confidence": 0, "n": 0})
-
-    # Expected revenue lift: use avg reward as base, adjust for current state
-    expected_lift = s["avg_reward"]
-
-    # State-based adjustments
-    pressure = state.revenue_pressure
-
-    if action == "refresh_availability":
-        if state.available_status != "Available":
-            expected_lift = 2.0  # high value when not available
-        elif state.availability_seconds_left < 3600:
-            expected_lift = 1.0  # medium value when expiring
-        else:
-            expected_lift = 0.1  # low value when already available
-
-    elif action == "ensure_visible":
-        expected_lift = 2.0 if state.profile_hidden else 0.1
-
-    elif action == "mailbox_intent_scan":
-        expected_lift = 0.5 + (state.mailbox_intent_score * 2.0)
-
-    elif action == "reply_draft_queue":
-        expected_lift = 1.0 + (state.mailbox_intent_score * 3.0)
-
-    elif action == "check_search_rank":
-        expected_lift = 0.3
-
-    elif action == "city_rank_scan":
-        expected_lift = 0.3
-
+def _generate_headline() -> str:

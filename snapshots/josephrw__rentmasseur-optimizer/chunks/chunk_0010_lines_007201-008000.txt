@@ -1,3 +1,187 @@
+        print(f"Rotator stderr: {result.stderr.strip()}")
+
+    if result.returncode != 0:
+        print("Rotator failed to pick a bio")
+        sys.exit(1)
+
+    # Parse output: "Next bio: bio_D_funny_direct_cta (strategy: funny_direct_cta, uses: 0, reward: 0)"
+    output = result.stdout.strip()
+    for variant in BIO_VARIANTS:
+        if variant["id"] in output:
+            print(f"Selected bio: {variant['id']} (strategy: {variant['strategy']})")
+            return variant
+
+    print(f"Could not parse selected bio from: {output}")
+    sys.exit(1)
+
+
+def push_bio_to_profile(variant: dict):
+    """Login to RentMasseur and push the selected bio."""
+    bio_content = load_bio_content(variant["file"])
+
+    # Verify rebrandly link
+    if REBRANDLY_LINK not in bio_content:
+        print(f"ERROR: Bio does not contain rebrandly link: {REBRANDLY_LINK}")
+        sys.exit(1)
+
+    print(f"\nBio to push ({variant['id']}):")
+    print(f"  Headline: {variant['headline']}")
+    print(f"  Length: {len(bio_content)} chars")
+    print(f"  Rebrandly link: PRESENT")
+    print(f"  Content preview: {bio_content[:200]}...")
+
+    # Load credentials from .env
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent / ".env"
+    load_dotenv(env_path)
+
+    username = os.environ.get("RENTMASSEUR_USERNAME")
+    password = os.environ.get("RENTMASSEUR_PASSWORD")
+
+    if not username or not password or username == "REDACTED_ROTATE_ME":
+        print("ERROR: No valid credentials in .env")
+        sys.exit(1)
+
+    print(f"\nLogging in as {username}...")
+    api = RentMasseurAPI(min_request_interval=2.0)
+
+    if not api.login(username, password):
+        print("ERROR: Login failed")
+        sys.exit(1)
+
+    print("Login successful")
+
+    # Check current bio first
+    print("\nFetching current bio...")
+    try:
+        current = api.get_about()
+        print(f"Current headline: {current.get('headline', 'unknown')}")
+        current_desc = current.get("description", "")
+        if REBRANDLY_LINK in current_desc:
+            print("Current bio already has rebrandly link")
+    except Exception as e:
+        print(f"Warning: Could not fetch current bio: {e}")
+
+    # Push new bio
+    print(f"\nPushing bio: {variant['id']}")
+    print(f"  Headline: {variant['headline']}")
+    print(f"  Description: {bio_content[:100]}...")
+
+    try:
+        result = api.set_about(headline=variant["headline"], description=bio_content)
+        print(f"API response: {json.dumps(result, indent=2)}")
+        print("BIO UPDATED SUCCESSFULLY")
+    except Exception as e:
+        print(f"ERROR: Failed to update bio: {e}")
+        sys.exit(1)
+
+    # Write receipt
+    write_receipt(variant, bio_content, result)
+
+    # Verify
+    print("\nVerifying update...")
+    try:
+        verify = api.get_about()
+        print(f"Verified headline: {verify.get('headline', 'unknown')}")
+        verified_desc = verify.get("description", "")
+        if REBRANDLY_LINK in verified_desc:
+            print("VERIFIED: Rebrandly link is live in profile bio")
+        else:
+            print("WARNING: Rebrandly link not found in verified bio")
+        print(f"Verified bio length: {len(verified_desc)} chars")
+    except Exception as e:
+        print(f"Warning: Could not verify: {e}")
+
+
+def write_receipt(variant: dict, bio_content: str, api_result: dict):
+    """Write a receipt for the bio update."""
+    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc)
+    receipt = {
+        "action": "bio_rotation_push",
+        "timestamp": ts.isoformat(),
+        "variant_id": variant["id"],
+        "strategy": variant["strategy"],
+        "headline": variant["headline"],
+        "bio_length": len(bio_content),
+        "rebrandly_link": REBRANDLY_LINK,
+        "rebrandly_present": REBRANDLY_LINK in bio_content,
+        "api_result": api_result,
+        "status": "pushed",
+    }
+    receipt_path = RECEIPTS_DIR / f"bio_push_{ts.strftime('%Y%m%d_%H%M%S')}.json"
+    receipt_path.write_text(json.dumps(receipt, indent=2))
+    print(f"\nReceipt written: {receipt_path}")
+
+
+def main():
+    print("=" * 60)
+    print("RM-PRI BIO ROTATION PIPELINE")
+    print("=" * 60)
+
+    # Step 1: Seed rotator
+    print("\n--- Step 1: Seed rotator ---")
+    seed_rotator()
+
+    # Step 2: Pick best bio via C++ rotator
+    print("\n--- Step 2: Rotator picks next bio ---")
+    selected = run_rotator_pick()
+
+    # Step 3: Push to live profile
+    print("\n--- Step 3: Push bio to live profile ---")
+    push_bio_to_profile(selected)
+
+    # Step 4: Show rotator report
+    print("\n--- Step 4: Rotator report ---")
+    rotator = Path(__file__).parent / "rotator_engine"
+    report = subprocess.run(
+        ["./rotator_engine", "--report", "--dir", str(CONTENT_DIR)],
+        cwd=Path(__file__).parent, capture_output=True, text=True
+    )
+    print(report.stdout)
+
+    print("\n" + "=" * 60)
+    print("PIPELINE COMPLETE")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+settings_avail.png:
+```
+Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
+```
+
+requirements.txt:
+```
+fastapi>=0.104.0
+uvicorn>=0.24.0
+requests>=2.31.0
+selenium>=4.15.0
+python-crontab>=3.0.0
+
+```
+
+daily_promotion.py:
+```
+#!/usr/bin/env python3
+"""
+Daily Promotion Script — the bridge between rm_traffic and the runtime.
+
+rm_traffic/profileops.db → sanitize → hash → compact → daily_evidence_packet.json
+
+Usage:
+    python3 daily_promotion.py [--traffic-db PATH] [--out PATH] [--ingest-url URL]
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -310,491 +494,307 @@ print("\nDone.")
 
 ```
 
-test_py.py:
-```
-import sys
-print(f"python {sys.version}")
-with open("/Users/alep/Downloads/02_AI_Agents/rentmasseur-extension/testfile.txt", "w") as f:
-    f.write("hello")
-
-```
-
-ga_rl_optimizer.cpp:
-```
-/*
- * GA + RL Revenue Optimizer — C++ Native
- * High-performance genetic algorithm + reinforcement learning for
- * RentMasseur revenue maximization ($300/day target).
- *
- * Build: g++ -O3 -std=c++17 -o ga_rl_optimizer ga_rl_optimizer.cpp
- * Run:   ./ga_rl_optimizer
- *        ./ga_rl_optimizer --population 20 --generations 10 --target 300
- *        ./ga_rl_optimizer --report
- */
-
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <map>
-#include <algorithm>
-#include <random>
-#include <chrono>
-#include <ctime>
-#include <cmath>
-#include <cstdlib>
-
-struct AccountConfig {
-    std::string id;
-    std::string bio;
-    int price;
-    std::string photo_style;
-    std::string cta;
-    std::string headline;
-    double fitness;
-    double revenue_estimate;
-    double reward;
-    int generation;
-    int uses;
-};
-
-struct GAState {
-    std::vector<AccountConfig> population;
-    int generation;
-    AccountConfig best_config;
-    double best_fitness;
-    double best_revenue;
-    std::vector<std::map<std::string, double>> history;
-};
-
-const double AVG_SESSION_PRICE = 200.0;
-const double CALL_CONVERSION_RATE = 0.20;
-const double VIEW_TO_CLICK_RATE = 0.05;
-const double BOOKING_CLOSE_RATE = 0.40;
-const double REVENUE_TARGET = 300.0;
-
-std::vector<std::string> CTAS = {
-    "Call me now to book your session",
-    "Pick up the phone and call today",
-    "Text or call — I'm available now",
-    "Don't wait — call me right now",
-    "Book now: your body will thank you",
-    "Call today for same-day availability",
-};
-
-std::vector<std::string> HEADLINES = {
-    "Elite Male Masseur in Manhattan",
-    "Your Private Massage Therapist in NYC",
-    "Deep Tissue & Sensory Massage by Request",
-    "Manhattan's Most Sought-After Masseur",
-    "Therapeutic Touch in the Heart of NYC",
-    "Late-Night Relief Available Now",
-    "Premium In-Home Massage Experience",
-    "The Masseur Who Actually Listens",
-};
-
-std::vector<std::string> PHOTO_STYLES = {
-    "professional", "casual", "athletic", "luxury", "mystery", "warm",
-};
-
-std::vector<int> PRICES = {120, 150, 180, 200, 220, 250, 280, 300};
-
-std::mt19937 rng;
-
-static std::string iso_timestamp() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
-    return std::string(buf);
-}
-
-static std::string read_file(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) return "";
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
-static void write_file(const std::string& path, const std::string& content) {
-    std::ofstream f(path);
-    if (f) f << content;
-}
-
-static double random_double() {
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    return dist(rng);
-}
-
-static int random_int(int min, int max) {
-    std::uniform_int_distribution<int> dist(min, max);
-    return dist(rng);
-}
-
-static double calculate_revenue_estimate(const std::map<std::string, int>& stats, int price) {
-    double views = stats.count("views") ? stats.at("views") : 0;
-    double phone_clicks = stats.count("phone_clicks") ? stats.at("phone_clicks") : 0;
-    double email_clicks = stats.count("email_clicks") ? stats.at("email_clicks") : 0;
-    double booking_inquiries = stats.count("booking_inquiries") ? stats.at("booking_inquiries") : 0;
-    double messages = stats.count("messages") ? stats.at("messages") : 0;
-
-    double price_factor = 1.0 - ((price - 200) / 1000.0);
-    phone_clicks *= price_factor;
-    booking_inquiries *= price_factor;
-
-    double view_revenue = views * VIEW_TO_CLICK_RATE * AVG_SESSION_PRICE;
-    double call_revenue = phone_clicks * CALL_CONVERSION_RATE * AVG_SESSION_PRICE;
-    double inquiry_revenue = booking_inquiries * BOOKING_CLOSE_RATE * AVG_SESSION_PRICE;
-    double message_revenue = messages * 0.10 * AVG_SESSION_PRICE;
-    double email_revenue = email_clicks * 0.05 * AVG_SESSION_PRICE;
-
-    return view_revenue + call_revenue + inquiry_revenue + message_revenue + email_revenue;
-}
-
-static double calculate_fitness(const std::map<std::string, int>& stats, double revenue, double target) {
-    double reward = 0;
-    reward += (stats.count("views") ? stats.at("views") : 0) * 1;
-    reward += (stats.count("email_clicks") ? stats.at("email_clicks") : 0) * 5;
-    reward += (stats.count("phone_clicks") ? stats.at("phone_clicks") : 0) * 10;
-    reward += (stats.count("booking_inquiries") ? stats.at("booking_inquiries") : 0) * 50;
-    reward += (stats.count("favorites") ? stats.at("favorites") : 0) * 3;
-    reward += (stats.count("messages") ? stats.at("messages") : 0) * 8;
-
-    double target_bonus = std::max(0.0, std::min(100.0, (revenue / target) * 100.0));
-    double target_penalty = std::abs(target - revenue) * 0.1;
-
-    return reward + target_bonus - target_penalty;
-}
-
-static AccountConfig create_random_config(int generation) {
-    AccountConfig c;
-    c.id = "cfg_" + iso_timestamp() + "_" + std::to_string(random_int(1000, 9999));
-    c.bio = "[Generated bio placeholder — C++ version uses static templates; call Python LLM for real bio]";
-    c.price = PRICES[random_int(0, PRICES.size() - 1)];
-    c.photo_style = PHOTO_STYLES[random_int(0, PHOTO_STYLES.size() - 1)];
-    c.cta = CTAS[random_int(0, CTAS.size() - 1)];
-    c.headline = HEADLINES[random_int(0, HEADLINES.size() - 1)];
-    c.fitness = 0;
-    c.revenue_estimate = 0;
-    c.reward = 0;
-    c.generation = generation;
-    c.uses = 0;
-    return c;
-}
-
-static AccountConfig mutate_config(const AccountConfig& parent, int generation) {
-    AccountConfig c = parent;
-    c.id = "cfg_" + iso_timestamp() + "_" + std::to_string(random_int(1000, 9999));
-
-    if (random_double() < 0.5) {
-        c.price = std::max(80, std::min(500, c.price + random_int(-30, 50)));
-    }
-    if (random_double() < 0.3) {
-        c.cta = CTAS[random_int(0, CTAS.size() - 1)];
-    }
-    if (random_double() < 0.3) {
-        c.headline = HEADLINES[random_int(0, HEADLINES.size() - 1)];
-    }
-    if (random_double() < 0.3) {
-        c.photo_style = PHOTO_STYLES[random_int(0, PHOTO_STYLES.size() - 1)];
-    }
-    c.generation = generation;
-    return c;
-}
-
-static AccountConfig crossover(const AccountConfig& p1, const AccountConfig& p2) {
-    AccountConfig c;
-    c.id = "cfg_" + iso_timestamp() + "_" + std::to_string(random_int(1000, 9999));
-    c.bio = random_double() > 0.5 ? p1.bio : p2.bio;
-    c.price = random_double() > 0.5 ? p1.price : p2.price;
-    c.photo_style = random_double() > 0.5 ? p1.photo_style : p2.photo_style;
-    c.cta = random_double() > 0.5 ? p1.cta : p2.cta;
-    c.headline = random_double() > 0.5 ? p1.headline : p2.headline;
-    c.fitness = 0;
-    c.revenue_estimate = 0;
-    c.reward = 0;
-    c.generation = std::max(p1.generation, p2.generation) + 1;
-    c.uses = 0;
-    return c;
-}
-
-static std::map<std::string, int> get_default_stats() {
-    return {
-        {"views", 0}, {"email_clicks", 0}, {"phone_clicks", 0},
-        {"booking_inquiries", 0}, {"messages", 0}, {"favorites", 0},
-    };
-}
-
-static std::vector<AccountConfig> evaluate_population(std::vector<AccountConfig>& pop, const std::map<std::string, int>& stats, double target) {
-    for (auto& c : pop) {
-        c.revenue_estimate = calculate_revenue_estimate(stats, c.price);
-        c.fitness = calculate_fitness(stats, c.revenue_estimate, target);
-    }
-    std::sort(pop.begin(), pop.end(), [](const auto& a, const auto& b) { return a.fitness > b.fitness; });
-    return pop;
-}
-
-static void print_report(const GAState& state) {
-    std::cout << "=" << std::string(60, '=') << "\n";
-    std::cout << "GA + RL C++ REVENUE OPTIMIZER REPORT\n";
-    std::cout << "=" << std::string(60, '=') << "\n";
-    std::cout << "Generation: " << state.generation << "\n";
-    std::cout << "Best fitness: " << state.best_fitness << "\n";
-    std::cout << "Best revenue: $" << state.best_revenue << "\n";
-    std::cout << "Target: $" << REVENUE_TARGET << "\n";
-    if (!state.best_config.id.empty()) {
-        std::cout << "\nBest config:\n";
-        std::cout << "  ID: " << state.best_config.id << "\n";
-        std::cout << "  Price: $" << state.best_config.price << "\n";
-        std::cout << "  CTA: " << state.best_config.cta << "\n";
-        std::cout << "  Headline: " << state.best_config.headline << "\n";
-        std::cout << "  Photo: " << state.best_config.photo_style << "\n";
-    }
-}
-
-static GAState evolve(int population_size, int generations, double target) {
-    GAState state;
-    state.generation = 0;
-    state.best_fitness = 0;
-    state.best_revenue = 0;
-
-    std::map<std::string, int> stats = get_default_stats();
-
-    // Initialize population
-    for (int i = 0; i < population_size; i++) {
-        state.population.push_back(create_random_config(0));
-    }
-
-    for (int gen = 1; gen <= generations; gen++) {
-        std::cout << "=== Generation " << gen << " ===\n";
-        evaluate_population(state.population, stats, target);
-
-        std::cout << "Best fitness: " << state.population[0].fitness
-                  << ", revenue: $" << state.population[0].revenue_estimate << "\n";
-
-        if (state.population[0].fitness > state.best_fitness) {
-            state.best_fitness = state.population[0].fitness;
-            state.best_revenue = state.population[0].revenue_estimate;
-            state.best_config = state.population[0];
-        }
-
-        state.generation = gen;
-
-        std::map<std::string, double> h;
-        h["generation"] = gen;
-        h["best_fitness"] = state.population[0].fitness;
-        h["best_revenue"] = state.population[0].revenue_estimate;
-        state.history.push_back(h);
-
-        // Selection + crossover + mutation
-        std::vector<AccountConfig> new_pop;
-        new_pop.push_back(state.population[0]);  // Elitism
-        new_pop.push_back(state.population[1]);
-
-        while ((int)new_pop.size() < population_size) {
-            const auto& p1 = state.population[random_int(0, state.population.size() / 2)];
-            const auto& p2 = state.population[random_int(0, state.population.size() / 2)];
-            auto child = crossover(p1, p2);
-            child = mutate_config(child, gen);
-            new_pop.push_back(child);
-        }
-
-        state.population = new_pop;
-    }
-
-    return state;
-}
-
-int main(int argc, char* argv[]) {
-    rng.seed(std::random_device()());
-
-    int population_size = 12;
-    int generations = 5;
-    double target = REVENUE_TARGET;
-    bool report = false;
-
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--population" && i + 1 < argc) population_size = std::atoi(argv[++i]);
-        else if (arg == "--generations" && i + 1 < argc) generations = std::atoi(argv[++i]);
-        else if (arg == "--target" && i + 1 < argc) target = std::atof(argv[++i]);
-        else if (arg == "--report") report = true;
-        else if (arg == "--help") {
-            std::cout << "Usage: ga_rl_optimizer [options]\n"
-                      << "  --population N    Population size\n"
-                      << "  --generations N   Number of generations\n"
-                      << "  --target X        Revenue target\n"
-                      << "  --report          Show report\n";
-            return 0;
-        }
-    }
-
-    if (report) {
-        GAState state;
-        print_report(state);
-        return 0;
-    }
-
-    auto state = evolve(population_size, generations, target);
-    print_report(state);
-
-    if (state.best_revenue >= target * 0.5) {
-        std::cout << "\nWinning config reaches target. Apply with Python ga_rl_optimizer.py --apply-winner\n";
-    } else {
-        std::cout << "\nNo config reached target threshold. Continue evolving.\n";
-    }
-
-    return 0;
-}
-
-```
-
-profile_debug.png:
-```
-Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
-```
-
-deploy_bio_experiment.py:
+daemon.py:
 ```
 #!/usr/bin/env python3
-"""One-time manual bio deployment for controlled experiment 001.
+"""
+RentMasseur Optimizer Daemon
+
+Runs all subsystems as one long-lived process:
+  - FastAPI revenue OS server
+  - rm_traffic engine cycles (availability, stats, search position)
+  - daily promotion / evidence packet generation
+  - bio view backfill
+  - health reporting
+
+Environment:
+  RM_USERNAME, RM_PASSWORD        RentMasseur credentials
+  ADMIN_TOKEN                     Required for mutation endpoints
+  HF_SPACE / SPACE_NAME           HF Space identifier
+  DAEMON_INTERVAL                 Main loop interval in seconds (default 60)
+  TRAFFIC_CYCLE_MINUTES           Traffic engine cycle interval (default 5)
+  DAILY_PROMOTION_HOUR            Hour of day for daily promotion (default 6 UTC)
+  BACKFILL_VIEWS_DAILY            If "1", run view backfill once per day
 
 Usage:
-    python3 deploy_bio_experiment.py --bio controlled_wolf_v1 --dry-run
-    python3 deploy_bio_experiment.py --bio controlled_wolf_v1
-
-This is NOT a scheduled automation. It is a one-time manual deployment
-of an approved candidate bio for a controlled experiment.
+  python daemon.py                  # run daemon in foreground
+  python daemon.py --once           # single cycle, then exit
+  python daemon.py --server-only    # only run FastAPI server
 """
+
+from __future__ import annotations
+
 import argparse
+import importlib.util
 import json
 import logging
 import os
+import subprocess
 import sys
+import threading
+import time
+import traceback
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Optional
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
-BIOS_DIR = os.path.join(CONTENT_DIR, "bios")
-EXPERIMENTS_DIR = os.path.join(CONTENT_DIR, "experiments")
-RECEIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
+APP_DIR = Path(__file__).resolve().parent
+LOG_DIR = APP_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "daemon.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("rm_daemon")
 
-def load_bio(bio_id: str) -> str:
-    path = os.path.join(BIOS_DIR, f"{bio_id}.md")
-    if not os.path.exists(path):
-        logger.error(f"Bio file not found: {path}")
-        sys.exit(1)
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().strip()
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
+class Config:
+    username: str = os.getenv("RM_USERNAME", "")
+    password: str = os.getenv("RM_PASSWORD", "")
+    admin_token: str = os.getenv("ADMIN_TOKEN", "")
+    hf_space: str = os.getenv("SPACE_NAME", os.getenv("HF_SPACE", "rentmasseur-optimizer"))
+    interval: int = int(os.getenv("DAEMON_INTERVAL", "60"))
+    traffic_cycle_minutes: int = int(os.getenv("TRAFFIC_CYCLE_MINUTES", "5"))
+    daily_promotion_hour: int = int(os.getenv("DAILY_PROMOTION_HOUR", "6"))
+    backfill_views_daily: bool = os.getenv("BACKFILL_VIEWS_DAILY", "1") == "1"
 
-def load_experiment(exp_id: str) -> dict:
-    path = os.path.join(EXPERIMENTS_DIR, f"{exp_id}.json")
-    if not os.path.exists(path):
-        logger.error(f"Experiment file not found: {path}")
-        sys.exit(1)
-    with open(path, "r") as f:
-        return json.load(f)
+# ---------------------------------------------------------------------------
+# Subsystem discovery helpers
+# ---------------------------------------------------------------------------
 
-
-def write_receipt(bio_id: str, experiment_id: str, success: bool, notes: str = ""):
-    os.makedirs(RECEIPTS_DIR, exist_ok=True)
-    ts = datetime.now(timezone.utc).isoformat()
-    receipt = {
-        "action": "bio_deploy",
-        "bio_id": bio_id,
-        "experiment_id": experiment_id,
-        "success": success,
-        "timestamp": ts,
-        "notes": notes,
-    }
-    path = os.path.join(RECEIPTS_DIR, f"deploy_{bio_id}_{ts.replace(':', '-')}.json")
-    with open(path, "w") as f:
-        json.dump(receipt, f, indent=2)
-    logger.info(f"Receipt written: {path}")
-    return path
-
-
-def deploy_bio(bio_text: str, headless: bool = False) -> bool:
-    """Log in and update the profile bio on RentMasseur via Selenium."""
-    from rentmasseur_core import setup_driver, login, update_bio, save_bio_field
-
-    driver = setup_driver(headless=headless)
+def module_available(module_path: str) -> bool:
+    """Check if a module/package is importable."""
     try:
-        if not login(driver):
-            logger.error("Login failed - cannot deploy bio")
-            return False
+        return importlib.util.find_spec(module_path) is not None
+    except Exception:
+        return False
 
-        logger.info("Login successful, locating bio field...")
-        result = update_bio(driver, "")
-        if result is None or (isinstance(result, dict) and result.get("error")):
-            logger.error("Could not find bio field on profile settings")
-            return False
 
-        field_info, current_bio = result
-        logger.info(f"Current bio preview: {current_bio[:80]}...")
+def run_subprocess(cmd: list[str], timeout: int = 300) -> tuple[int, str, str]:
+    """Run a subprocess command and return exit code + output."""
+    log.info("Running subprocess: %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=APP_DIR,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as e:
+        return -9, e.stdout or "", e.stderr or ""
+    except Exception as e:
+        return 1, "", str(e)
 
-        saved = save_bio_field(driver, field_info, bio_text)
-        if saved:
-            logger.info("Bio deployed successfully!")
+
+# ---------------------------------------------------------------------------
+# Server thread
+# ---------------------------------------------------------------------------
+
+def run_server(host: str = "0.0.0.0", port: int = 7860):
+    """Run the FastAPI server in the current thread."""
+    import uvicorn
+    log.info("Starting FastAPI server on %s:%d", host, port)
+    uvicorn.run("server:app", host=host, port=port, log_level="info")
+
+
+def start_server_thread(host: str = "0.0.0.0", port: int = 7860) -> threading.Thread:
+    t = threading.Thread(target=run_server, args=(host, port), daemon=True)
+    t.start()
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Traffic engine integration
+# ---------------------------------------------------------------------------
+
+def run_traffic_cycle() -> dict:
+    """Run one rm_traffic engine cycle."""
+    if not module_available("rm_traffic.engine"):
+        return {"status": "skipped", "reason": "rm_traffic.engine not installed"}
+    if not Config.username or not Config.password:
+        return {"status": "skipped", "reason": "RM_USERNAME/RM_PASSWORD not set"}
+
+    try:
+        sys.path.insert(0, str(APP_DIR))
+        from rm_traffic.engine import run_cycle
+        result = run_cycle()
+        return {"status": "success", "result": result}
+    except Exception as e:
+        log.error("Traffic cycle failed: %s", e)
+        return {"status": "error", "error": str(e), "trace": traceback.format_exc()}
+
+
+# ---------------------------------------------------------------------------
+# Daily promotion
+# ---------------------------------------------------------------------------
+
+def run_daily_promotion() -> dict:
+    """Generate daily evidence packet and ingest metrics."""
+    script = APP_DIR / "daily_promotion.py"
+    if not script.exists():
+        return {"status": "skipped", "reason": "daily_promotion.py not found"}
+
+    code, out, err = run_subprocess([sys.executable, str(script)])
+    return {
+        "status": "success" if code == 0 else "error",
+        "exit_code": code,
+        "stdout": out[-2000:],
+        "stderr": err[-2000:],
+    }
+
+
+# ---------------------------------------------------------------------------
+# View backfill
+# ---------------------------------------------------------------------------
+
+def run_view_backfill() -> dict:
+    """Backfill missing profile views."""
+    script = APP_DIR / "backfill_views.py"
+    if not script.exists():
+        return {"status": "skipped", "reason": "backfill_views.py not found"}
+
+    code, out, err = run_subprocess([sys.executable, str(script)], timeout=7200)
+    return {
+        "status": "success" if code == 0 else "error",
+        "exit_code": code,
+        "stdout": out[-2000:],
+        "stderr": err[-2000:],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Bio merge / data maintenance
+# ---------------------------------------------------------------------------
+
+def run_bio_merge() -> dict:
+    """Merge bios with views if merge script exists."""
+    script = APP_DIR / "merge_bios.py"
+    if not script.exists():
+        return {"status": "skipped", "reason": "merge_bios.py not found"}
+
+    code, out, err = run_subprocess([sys.executable, str(script)])
+    return {
+        "status": "success" if code == 0 else "error",
+        "exit_code": code,
+        "stdout": out[-2000:],
+        "stderr": err[-2000:],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Health / status
+# ---------------------------------------------------------------------------
+
+def write_daemon_state(state: dict):
+    state_path = APP_DIR / "content" / "daemon_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, indent=2, default=str))
+
+
+def get_health() -> dict:
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "space": Config.hf_space,
+        "subsystems": {
+            "rm_traffic.engine": module_available("rm_traffic.engine"),
+            "rm_revenue_engine.revenue_ops": module_available("rm_revenue_engine.revenue_ops"),
+            "server": True,
+        },
+        "credentials_set": bool(Config.username and Config.password),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+class Scheduler:
+    def __init__(self):
+        self.last_traffic: Optional[float] = None
+        self.last_daily_promotion: Optional[str] = None
+        self.last_view_backfill: Optional[str] = None
+        self.last_bio_merge: Optional[str] = None
+        self.history: list[dict] = []
+
+    def should_run_traffic(self) -> bool:
+        if self.last_traffic is None:
             return True
-        else:
-            logger.error("Failed to save bio")
+        return (time.time() - self.last_traffic) >= Config.traffic_cycle_minutes * 60
+
+    def should_run_daily_promotion(self) -> bool:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        now_hour = datetime.now(timezone.utc).hour
+        return today != self.last_daily_promotion and now_hour >= Config.daily_promotion_hour
+
+    def should_run_view_backfill(self) -> bool:
+        if not Config.backfill_views_daily:
             return False
-    finally:
-        driver.quit()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return today != self.last_view_backfill
+
+    def should_run_bio_merge(self) -> bool:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return today != self.last_bio_merge
+
+    def record(self, name: str, result: dict):
+        entry = {
+            "name": name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "result": result,
+        }
+        self.history.append(entry)
+        if len(self.history) > 1000:
+            self.history = self.history[-1000:]
 
 
-def main():
-    parser = argparse.ArgumentParser(description="One-time manual bio deployment for controlled experiment")
-    parser.add_argument("--bio", required=True, help="Bio ID (e.g. controlled_wolf_v1)")
-    parser.add_argument("--experiment", default="exp_001_targeted_wolf", help="Experiment ID")
-    parser.add_argument("--dry-run", action="store_true", help="Show bio without updating profile")
-    parser.add_argument("--headless", default="false", help="Run headless (true/false)")
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
-    bio_text = load_bio(args.bio)
-    exp = load_experiment(args.experiment)
+def run_once(scheduler: Scheduler) -> dict:
+    results = {}
 
-    print(f"\n{'='*60}")
-    print(f"EXPERIMENT: {exp['experiment_id']}")
-    print(f"BIO ID: {args.bio}")
-    print(f"VARIABLE: {exp['variable']}")
-    print(f"FROZEN: photos={exp['photos_frozen']} price={exp['price_frozen']} services={exp['services_frozen']} availability={exp['availability_frozen']}")
-    print(f"BIO LENGTH: {len(bio_text)} chars")
-    print(f"{'='*60}")
-    print(bio_text)
-    print(f"{'='*60}\n")
+    if scheduler.should_run_bio_merge():
+        log.info("Running bio merge")
+        results["bio_merge"] = run_bio_merge()
+        if results["bio_merge"]["status"] != "error":
+            scheduler.last_bio_merge = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        scheduler.record("bio_merge", results["bio_merge"])
 
-    if args.dry_run:
-        logger.info("Dry run - not updating profile")
-        write_receipt(args.bio, args.experiment, False, "dry_run_only")
-        return
+    if scheduler.should_run_view_backfill():
+        log.info("Running view backfill")
+        results["view_backfill"] = run_view_backfill()
+        if results["view_backfill"]["status"] != "error":
+            scheduler.last_view_backfill = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        scheduler.record("view_backfill", results["view_backfill"])
 
-    headless = args.headless.lower() == "true"
-    success = deploy_bio(bio_text, headless=headless)
-    write_receipt(args.bio, args.experiment, success, "manual_deploy" if success else "deploy_failed")
+    if scheduler.should_run_traffic():
+        log.info("Running traffic cycle")
+        results["traffic_cycle"] = run_traffic_cycle()
+        if results["traffic_cycle"]["status"] != "error":
+            scheduler.last_traffic = time.time()
+        scheduler.record("traffic_cycle", results["traffic_cycle"])
 
-    if success:
-        print("\nBio deployed. Now:")
-        print("1. Freeze all other profile variables (photos, prices, services)")
-        print("2. Wait 24-48 hours or 100+ new profile views")
-        print("3. Capture after-snapshot metrics")
-        print("4. POST to /api/metrics/ingest with after data")
-        print("5. Check /api/decision/latest for verdict")
-    else:
-        print("\nDeploy failed. Check logs above.")
-        sys.exit(1)
+    if scheduler.should_run_daily_promotion():
+        log.info("Running daily promotion")
+        results["daily_promotion"] = run_daily_promotion()
+        if results["daily_promotion"]["status"] != "error":
+            scheduler.last_daily_promotion = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        scheduler.record("daily_promotion", results["daily_promotion"])
 
-
-if __name__ == "__main__":
-    main()
-
-```
-
-price_rotator.py:
+    state = {
+        "last_run": datetime.now(timezone.utc).isoformat(),

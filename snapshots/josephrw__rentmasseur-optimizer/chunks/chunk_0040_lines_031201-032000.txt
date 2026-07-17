@@ -1,656 +1,111 @@
-
-        return failures
-
-    def scan_all(self) -> List[FailureEvent]:
-        """Run all intake scanners."""
-        all_failures = []
-        all_failures.extend(self.scan_github_actions())
-        all_failures.extend(self.scan_receipts())
-        all_failures.extend(self.scan_overclock_db())
-        all_failures.extend(self.scan_telemetry())
-        log.info(f"  ◉ Failure intake: {len(all_failures)} failures detected")
-        return all_failures
-
-    def _classify_log_error(self, content: str) -> FailureClass:
-        if "SyntaxError" in content or "IndentationError" in content:
-            return FailureClass.SYNTAX_FAILURE
-        if "AssertionError" in content or "FAILED" in content:
-            return FailureClass.TEST_FAILURE
-        if "403" in content and ("forbidden" in content.lower() or "endpoint" in content.lower()):
-            return FailureClass.MEASUREMENT_INVALID_403
-        if "ModuleNotFoundError" in content or "ImportError" in content:
-            return FailureClass.DEPENDENCY_FAILURE
-        if "groq" in content.lower() or "openrouter" in content.lower():
-            return FailureClass.LLM_PROVIDER_FAILURE
-        return FailureClass.UNKNOWN
-
-    def _is_bad_draft(self, text: str) -> bool:
-        """Check if draft text contains bad patterns."""
-        text_lower = text.lower()
-        bad_phrases = ["reaching out to us", "last-minute app", "thank you for reaching out"]
-        if any(p in text_lower for p in bad_phrases):
-            return True
-        # Check for "we/us/our" (should be first person singular)
-        if re.search(r'\b(we|us|our)\b', text_lower):
-            return True
-        # Too many words (> 80)
-        if len(text.split()) > 80:
-            return True
-        # No question mark (no next-step question)
-        if "?" not in text:
-            return True
-        return False
-
-
-# ─── Engine 2: Diagnosis ────────────────────────────────────────────
-
-class DiagnosisEngine:
-    """Maps failures to safe repair types."""
-
-    REPAIR_MAP = {
-        FailureClass.MEASUREMENT_INVALID_403: {
-            "repair_type": "measurement_invalid_self_heal",
-            "files": ["rm_traffic/reward_engine.py", "rm_traffic/state_engine.py"],
-            "description": "Mark cycle MEASUREMENT_INVALID on 403, return zero delta, skip bandit update",
-            "confidence": 0.95,
-            "tests": ["python3 -m pytest tests/test_reward_engine.py -v"],
-        },
-        FailureClass.PRIVACY_POLICY_FAILURE: {
-            "repair_type": "private_llm_policy_self_heal",
-            "files": ["rm_traffic/reply_drafter.py", "rm_traffic/llm_client.py"],
-            "description": "Block cloud providers on private client text, force local-only",
-            "confidence": 0.95,
-            "tests": ["python3 -m pytest tests/test_reply_drafter.py -v"],
-        },
-        FailureClass.BAD_DRAFT: {
-            "repair_type": "bad_draft_self_heal",
-            "files": ["rm_traffic/reply_drafter.py"],
-            "description": "Reject bad LLM output, use template fallback, add quality checks",
-            "confidence": 0.85,
-            "tests": ["python3 -m pytest tests/test_reply_drafter.py -v"],
-        },
-        FailureClass.REWARD_REGRESSION: {
-            "repair_type": "reward_poisoning_self_heal",
-            "files": ["rm_traffic/reward_engine.py"],
-            "description": "Ignore invalid post-state, null reward for invalid measurement",
-            "confidence": 0.80,
-            "tests": ["python3 -m pytest tests/test_reward_engine.py -v"],
-        },
-        FailureClass.SYNTAX_FAILURE: {
-            "repair_type": "syntax_fix",
-            "files": [],
-            "description": "Fix syntax error in identified file",
-            "confidence": 0.50,
-            "tests": ["python3 -m py_compile <target_file>"],
-        },
-        FailureClass.TEST_FAILURE: {
-            "repair_type": "test_fix",
-            "files": [],
-            "description": "Fix failing test or implementation",
-            "confidence": 0.40,
-            "tests": ["python3 -m pytest -v"],
-        },
-        FailureClass.LLM_PROVIDER_FAILURE: {
-            "repair_type": "provider_fallback_fix",
-            "files": ["rm_traffic/llm_client.py", "rm_traffic/reply_drafter.py"],
-            "description": "Fix LLM provider fallback chain, ensure local-first",
-            "confidence": 0.75,
-            "tests": ["python3 -m pytest tests/test_reply_drafter.py -v"],
-        },
-        FailureClass.DEPENDENCY_FAILURE: {
-            "repair_type": "dependency_fix",
-            "files": ["requirements.txt", "pyproject.toml"],
-            "description": "Add or pin missing dependency",
-            "confidence": 0.60,
-            "tests": ["python3 -c 'import rm_traffic'"],
-        },
-        FailureClass.API_AUTH_FAILURE: {
-            "repair_type": "manual_auth_review",
-            "files": [],
-            "description": "Auth failure — manual credential review required, no auto-patch",
-            "confidence": 0.10,
-            "tests": [],
-        },
-        FailureClass.ARTIFACT_MISSING: {
-            "repair_type": "artifact_rebuild",
-            "files": [],
-            "description": "Rebuild missing artifact",
-            "confidence": 0.30,
-            "tests": [],
-        },
-    }
-
-    def diagnose(self, failure: FailureEvent) -> RepairPlan:
-        """Map a failure to a repair plan."""
-        repair = self.REPAIR_MAP.get(failure.failure_class, {
-            "repair_type": "manual_review",
-            "files": [],
-            "description": "Unknown failure — manual review required",
-            "confidence": 0.10,
-            "tests": [],
-        })
-
-        # Validate files are allowlisted
-        safe_files = [f for f in repair["files"] if self._is_allowlisted(f)]
-
-        plan = RepairPlan(
-            failure_id=failure.failure_id,
-            failure_class=failure.failure_class,
-            repair_type=repair["repair_type"],
-            files_to_patch=safe_files[:MAX_FILES_PER_PATCH],
-            patch_description=repair["description"],
-            confidence=repair["confidence"] * failure.confidence,
-            test_commands=repair["tests"],
-            rollback_plan=f"git revert <merge_commit> within {ROLLBACK_WINDOW // 3600}h",
-            policy_checks=[
-                "no_cloud_on_private_text",
-                "no_auto_send_enable",
-                "no_direct_main_push",
-                "no_credential_edit",
-                "tests_required",
-                "measurement_invalid_not_rewarded",
-            ],
-        )
-
-        log.info(f"  ◉ Diagnosis: {failure.failure_class.value} → {plan.repair_type} "
-                 f"(confidence={plan.confidence:.2f}, files={plan.files_to_patch})")
-        return plan
-
-    def _is_allowlisted(self, filepath: str) -> bool:
-        """Check if file is in the allowlist and not protected."""
-        if filepath in PROTECTED_FILES:
-            return False
-        for allowed in ALLOWLISTED_FILES:
-            if filepath.startswith(allowed) or filepath == allowed:
-                return True
-        return False
-
-
-# ─── Engine 3: Patch Generator ──────────────────────────────────────
-
-class PatchGenerator:
-    """Creates repair branches with patches to allowlisted files only."""
-
-    def __init__(self, repo_root: str = "."):
-        self.repo_root = Path(repo_root)
-
-    def generate_branch_name(self, repair_type: str) -> str:
-        ts = int(time.time())
-        return f"{BRANCH_PREFIX}{repair_type}-{ts}"
-
-    def create_patch(self, plan: RepairPlan) -> Tuple[str, ArtifactReceipt]:
-        """Create a patch branch with the repair applied.
-        Returns (branch_name, receipt)."""
-        branch = self.generate_branch_name(plan.repair_type)
-
-        # For now, we generate the branch name and receipt.
-        # Actual file patching would be done by specific repair handlers.
-        receipt = ArtifactReceipt(
-            failure_id=plan.failure_id,
-            failure_class=plan.failure_class.value,
-            files_changed=plan.files_to_patch,
-            diff_hash="",  # filled after patch applied
-            test_command="; ".join(plan.test_commands),
-            test_result="pending",
-            policy_result="pending",
-            measurement_status=MeasurementStatus.NOT_CHECKED.value,
-            training_performed=False,
-            fine_tuning_performed=False,
-            private_cloud_used=False,
-            human_approval_required=True,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            rollback_plan=plan.rollback_plan,
-        )
-
-        log.info(f"  ◆ Patch branch: {branch} ({len(plan.files_to_patch)} files)")
-        return branch, receipt
-
-    def compute_diff_hash(self, diff_content: str) -> str:
-        """Compute SHA-256 hash of diff content for attestation."""
-        return hashlib.sha256(diff_content.encode()).hexdigest()[:16]
-
-
-# ─── Engine 4: Policy Gate ──────────────────────────────────────────
-
-class PolicyGate:
-    """Policy-as-code gate. Blocks unsafe changes before PR can be marked healthy."""
-
-    POLICIES = {
-        "no_cloud_on_private_text": {
-            "description": "Cloud LLM providers must not be called on private client text",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "no_auto_send_enable": {
-            "description": "Auto-send must not be enabled by a patch",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "no_direct_main_push": {
-            "description": "Patches must go through PR, not direct push to main",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "no_credential_edit": {
-            "description": "Credentials, secrets, and .env must not be modified",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "no_fake_visits": {
-            "description": "No fake visits, clicks, or synthetic activity generation",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "tests_required": {
-            "description": "Every patched module must have passing tests",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "measurement_invalid_not_rewarded": {
-            "description": "Invalid measurements must not produce negative rewards",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "max_files_enforced": {
-            "description": f"Max {MAX_FILES_PER_PATCH} files per patch",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "max_lines_enforced": {
-            "description": f"Max {MAX_LINES_CHANGED_PER_PATCH} lines changed per patch",
-            "severity": SEVERITY_BLOCKER,
-        },
-    }
-
-    def evaluate(self, plan: RepairPlan, diff_content: str = "",
-                 test_results: Dict = None) -> Tuple[bool, Dict]:
-        """Evaluate all policies against the repair plan.
-        Returns (passed, results_dict)."""
-        results = {}
-        all_passed = True
-
-        for policy_name, policy_def in self.POLICIES.items():
-            passed = self._check_policy(policy_name, plan, diff_content, test_results)
-            results[policy_name] = {
-                "passed": passed,
-                "severity": policy_def["severity"],
-                "description": policy_def["description"],
-            }
-            if not passed and policy_def["severity"] == SEVERITY_BLOCKER:
-                all_passed = False
-
-        log.info(f"  ◉ Policy gate: {'PASS' if all_passed else 'FAIL'} — "
-                 f"{sum(1 for r in results.values() if r['passed'])}/{len(results)} policies passed")
-        return all_passed, results
-
-    def _check_policy(self, name: str, plan: RepairPlan,
-                      diff: str, test_results: Dict) -> bool:
-        if name == "no_cloud_on_private_text":
-            # Check diff doesn't add cloud calls on private text paths
-            if "groq" in diff.lower() and "private" in diff.lower():
-                return False
-            if "openrouter" in diff.lower() and "private" in diff.lower():
-                return False
-            return True
-
-        if name == "no_auto_send_enable":
-            if "auto_send" in diff and "True" in diff:
-                return False
-            return True
-
-        if name == "no_direct_main_push":
-            # GAG never pushes to main — always branch
-            return True
-
-        if name == "no_credential_edit":
-            for f in plan.files_to_patch:
-                if f in PROTECTED_FILES or ".env" in f or "secret" in f.lower():
-                    return False
-            return True
-
-        if name == "no_fake_visits":
-            if "fake_visit" in diff.lower() or "synthetic_click" in diff.lower():
-                return False
-            return True
-
-        if name == "tests_required":
-            if not plan.test_commands:
-                return False
-            if test_results and not test_results.get("all_passed"):
-                return False
-            return True
-
-        if name == "measurement_invalid_not_rewarded":
-            # Check diff doesn't reward invalid measurements
-            if "measurement_invalid" in diff and "reward" in diff:
-                # Make sure it's setting reward to 0, not computing negative
-                if "reward = 0" not in diff and "return 0.0" not in diff:
-                    return False
-            return True
-
-        if name == "max_files_enforced":
-            return len(plan.files_to_patch) <= MAX_FILES_PER_PATCH
-
-        if name == "max_lines_enforced":
-            if diff:
-                added = sum(1 for line in diff.split("\n") if line.startswith("+") and not line.startswith("+++"))
-                removed = sum(1 for line in diff.split("\n") if line.startswith("-") and not line.startswith("---"))
-                return (added + removed) <= MAX_LINES_CHANGED_PER_PATCH
-            return True
-
-        return True
-
-
-# ─── Engine 5: Healing PR ───────────────────────────────────────────
-
-class HealingPREngine:
-    """Opens PRs with patches, evidence, tests, receipts, and rollback plans."""
-
-    def __init__(self, repo_root: str = "."):
-        self.repo_root = Path(repo_root)
-
-    def create_pr(self, branch: str, plan: RepairPlan,
-                  receipt: ArtifactReceipt, policy_results: Dict,
-                  test_results: Dict = None) -> HealingPR:
-        """Create a healing PR object with full evidence."""
-
-        confidence = plan.confidence
-        ready = (confidence >= MIN_CONFIDENCE_TO_AUTO_LABEL_READY and
-                 all(r["passed"] for r in policy_results.values()) and
-                 test_results and test_results.get("all_passed"))
-
-        pr_body = self._build_pr_body(plan, receipt, policy_results, test_results)
-
-        pr = HealingPR(
-            branch_name=branch,
-            title=f"[GAG] {plan.repair_type}: {plan.failure_class.value}",
-            body=pr_body,
-            files_changed=plan.files_to_patch,
-            receipt=receipt,
-            ready_to_merge=ready,
-            auto_merge=AUTO_MERGE_ENABLED and ready,
-        )
-
-        log.info(f"  ◆ Healing PR: {pr.title}")
-        log.info(f"    Branch: {pr.branch_name}")
-        log.info(f"    Ready: {pr.ready_to_merge} (confidence={confidence:.2f})")
-        log.info(f"    Auto-merge: {pr.auto_merge} (disabled by policy)")
-        return pr
-
-    def _build_pr_body(self, plan: RepairPlan, receipt: ArtifactReceipt,
-                       policy_results: Dict, test_results: Dict = None) -> str:
-        lines = [
-            f"## CI/CD GAG — Self-Healing PR",
-            "",
-            f"**Failure class**: `{plan.failure_class.value}`",
-            f"**Repair type**: `{plan.repair_type}`",
-            f"**Confidence**: `{plan.confidence:.2f}`",
-            f"**Files changed**: `{', '.join(plan.files_to_patch)}`",
-            "",
-            f"### Description",
-            plan.patch_description,
-            "",
-            f"### Policy Gate Results",
-            "",
-        ]
-
-        for name, result in policy_results.items():
-            icon = "✅" if result["passed"] else "❌"
-            lines.append(f"- {icon} **{name}**: {result['description']}")
-
-        lines.extend([
-            "",
-            f"### Test Results",
-            f"```json",
-            json.dumps(test_results or {}, indent=2),
-            "```",
-            "",
-            f"### Artifact Receipt",
-            f"```json",
-            json.dumps(asdict(receipt), indent=2),
-            "```",
-            "",
-            f"### Rollback Plan",
-            receipt.rollback_plan,
-            "",
-            f"### Attestation",
-            f"- `training_performed`: {receipt.training_performed}",
-            f"- `fine_tuning_performed`: {receipt.fine_tuning_performed}",
-            f"- `private_cloud_used`: {receipt.private_cloud_used}",
-            f"- `human_approval_required`: {receipt.human_approval_required}",
-            f"- `auto_merge_enabled`: {AUTO_MERGE_ENABLED}",
-            "",
-            f"---",
-            f"Generated by CI/CD GAG at {receipt.timestamp}",
-        ])
-
-        return "\n".join(lines)
-
-
-# ─── Self-Healing Rules ─────────────────────────────────────────────
-
-def rule1_403_telemetry_self_heal(failure: FailureEvent) -> RepairPlan:
-    """
-    Rule 1: 403 telemetry self-heal.
-    If post-action protected endpoints return 403, mark cycle MEASUREMENT_INVALID,
-    do not compute negative deltas, do not update bandit or hypothesis reward.
-    """
-    return RepairPlan(
-        failure_id=failure.failure_id,
-        failure_class=FailureClass.MEASUREMENT_INVALID_403,
-        repair_type="measurement_invalid_self_heal",
-        files_to_patch=["rm_traffic/reward_engine.py", "rm_traffic/state_engine.py"],
-        patch_description=(
-            "Ensure is_measurement_valid() checks both snapshots for endpoint errors. "
-            "compute_delta returns zero MetricDelta if invalid. "
-            "compute_reward returns 0.0 for invalid measurements. "
-            "Bandit update skipped when measurement_valid=False."
-        ),
-        confidence=0.95,
-        test_commands=[
-            "python3 -c 'from rm_traffic.reward_engine import is_measurement_valid; print(\"OK\")'",
-            "python3 -c 'from rm_traffic.state_engine import TrafficState; assert hasattr(TrafficState, \"measurement_valid\"); print(\"OK\")'",
-        ],
-        rollback_plan=f"git revert <merge_commit> within {ROLLBACK_WINDOW // 3600}h",
-        policy_checks=[
-            "measurement_invalid_not_rewarded",
-            "no_direct_main_push",
-            "tests_required",
-        ],
-    )
-
-
-def rule2_private_llm_policy_self_heal(failure: FailureEvent) -> RepairPlan:
-    """
-    Rule 2: Private LLM policy self-heal.
-    If reply_draft_queue attempts Groq/OpenRouter with private mailbox text,
-    block the provider, force private_local_only, and open a patch PR.
-    """
-    return RepairPlan(
-        failure_id=failure.failure_id,
-        failure_class=FailureClass.PRIVACY_POLICY_FAILURE,
-        repair_type="private_llm_policy_self_heal",
-        files_to_patch=["rm_traffic/reply_drafter.py"],
-        patch_description=(
-            "Remove cloud provider imports from reply_drafter. "
-            "Use local-only LLM (Ollama/Transformers.js) with 8s timeout. "
-            "Template is canonical — LLM is optional polish only. "
-            "No Groq, no OpenRouter on private client text."
-        ),
-        confidence=0.95,
-        test_commands=[
-            "python3 -c 'from rm_traffic.reply_drafter import draft_reply; print(\"OK\")'",
-            "python3 -c 'import inspect; from rm_traffic.reply_drafter import _try_local_llm_polish; src=inspect.getsource(_try_local_llm_polish); assert \"groq\" not in src.lower(); assert \"openrouter\" not in src.lower(); print(\"no cloud in private path OK\")'",
-        ],
-        rollback_plan=f"git revert <merge_commit> within {ROLLBACK_WINDOW // 3600}h",
-        policy_checks=[
-            "no_cloud_on_private_text",
-            "no_direct_main_push",
-            "tests_required",
-        ],
-    )
-
-
-def rule3_bad_draft_self_heal(failure: FailureEvent) -> RepairPlan:
-    """
-    Rule 3: Bad draft self-heal.
-    If local model draft contains 'we/us/our', 'app', unsupported facts,
-    raw phone when disabled, too many words, or no next-step question,
-    reject draft and use template fallback.
-    """
-    return RepairPlan(
-        failure_id=failure.failure_id,
-        failure_class=FailureClass.BAD_DRAFT,
-        repair_type="bad_draft_self_heal",
-        files_to_patch=["rm_traffic/reply_drafter.py"],
-        patch_description=(
-            "Add quality validation to LLM polish output. "
-            "Reject drafts with: 'we/us/our' pronouns, 'app' references, "
-            "known bad phrases ('reaching out to us', 'last-minute app'), "
-            ">80 words, or no question mark. "
-            "Fall back to template on rejection."
-        ),
-        confidence=0.85,
-        test_commands=[
-            "python3 -c 'from rm_traffic.reply_drafter import draft_reply; d=draft_reply(\"Hi, are you available today?\"); assert \"?\" in d.reply_text; print(\"draft has question OK\")'",
-            "python3 -c 'from rm_traffic.reply_drafter import draft_reply; d=draft_reply(\"Hi\"); assert len(d.reply_text.split()) < 80; print(\"draft length OK\")'",
-        ],
-        rollback_plan=f"git revert <merge_commit> within {ROLLBACK_WINDOW // 3600}h",
-        policy_checks=[
-            "no_cloud_on_private_text",
-            "no_direct_main_push",
-            "tests_required",
-        ],
-    )
-
-
-# ─── Main GAG Orchestrator ──────────────────────────────────────────
-
-class CICDGAG:
-    """CI/CD GitHub Actions Governor — main orchestrator."""
-
-    def __init__(self, repo_root: str = "."):
-        self.repo_root = repo_root
-        self.intake = FailureIntakeEngine(repo_root)
-        self.diagnosis = DiagnosisEngine()
-        self.patcher = PatchGenerator(repo_root)
-        self.policy = PolicyGate()
-        self.pr_engine = HealingPREngine(repo_root)
-        self.heal_history: List[Dict] = []
-        self.last_heal_time: float = 0.0
-
-    def run_healing_cycle(self) -> List[HealingPR]:
-        """Run one full healing cycle: detect → diagnose → patch → policy → PR."""
-        print(f"\n{'='*60}")
-        print(f"  CI/CD GAG — HEALING CYCLE")
-        print(f"  {datetime.now(timezone.utc).isoformat()}")
-        print(f"{'='*60}\n")
-
-        # Check cooldown
-        if self.last_heal_time and (time.time() - self.last_heal_time) < COOLDOWN_AFTER_FAILED_HEAL:
-            remaining = COOLDOWN_AFTER_FAILED_HEAL - (time.time() - self.last_heal_time)
-            print(f"  ⧖ Cooldown active — {remaining / 3600:.1f}h remaining")
-            return []
-
-        # Engine 1: Detect failures
-        print("[INTAKE] Scanning for failures...")
-        failures = self.intake.scan_all()
-        if not failures:
-            print("  ◉ No failures detected — system healthy")
-            return []
-
-        prs = []
-        for failure in failures:
-            print(f"\n[DIAGNOSE] {failure.failure_class.value}: {failure.description[:80]}")
-
-            # Engine 2: Diagnose
-            plan = self.diagnosis.diagnose(failure)
-
-            # Apply self-healing rules for known failure classes
-            if failure.failure_class == FailureClass.MEASUREMENT_INVALID_403:
-                plan = rule1_403_telemetry_self_heal(failure)
-            elif failure.failure_class == FailureClass.PRIVACY_POLICY_FAILURE:
-                plan = rule2_private_llm_policy_self_heal(failure)
-            elif failure.failure_class == FailureClass.BAD_DRAFT:
-                plan = rule3_bad_draft_self_heal(failure)
-
-            if plan.confidence < MIN_CONFIDENCE_TO_OPEN_PR:
-                print(f"  ⟁ Confidence {plan.confidence:.2f} < {MIN_CONFIDENCE_TO_OPEN_PR} — skipping")
-                continue
-
-            # Engine 3: Generate patch
-            print(f"[PATCH] Generating repair branch...")
-            branch, receipt = self.patcher.create_patch(plan)
-
-            # Engine 4: Policy gate
-            print(f"[POLICY] Evaluating policies...")
-            policy_passed, policy_results = self.policy.evaluate(plan, diff_content="", test_results=None)
-
-            if not policy_passed:
-                print(f"  ⟁ Policy gate FAILED — PR will be labeled needs-review")
-                receipt.policy_result = "failed"
-            else:
-                receipt.policy_result = "passed"
-
-            # Engine 5: Create healing PR
-            print(f"[PR] Creating healing PR...")
-            pr = self.pr_engine.create_pr(branch, plan, receipt, policy_results)
-            prs.append(pr)
-
-            # Record in history
-            self.heal_history.append({
-                "failure_id": failure.failure_id,
-                "failure_class": failure.failure_class.value,
-                "repair_type": plan.repair_type,
-                "branch": branch,
-                "confidence": plan.confidence,
-                "policy_passed": policy_passed,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-
-        self.last_heal_time = time.time()
-
-        # Summary
-        print(f"\n{'='*60}")
-        print(f"  HEALING CYCLE COMPLETE")
-        print(f"  Failures detected: {len(failures)}")
-        print(f"  PRs generated: {len(prs)}")
-        print(f"  Auto-merge: {AUTO_MERGE_ENABLED} (always disabled by policy)")
-        print(f"{'='*60}\n")
-
-        return prs
-
-    def get_status(self) -> Dict:
-        """Get GAG status summary."""
-        return {
-            "heal_history_count": len(self.heal_history),
-            "last_heal": datetime.fromtimestamp(self.last_heal_time, tz=timezone.utc).isoformat() if self.last_heal_time else None,
-            "cooldown_active": (time.time() - self.last_heal_time) < COOLDOWN_AFTER_FAILED_HEAL if self.last_heal_time else False,
-            "auto_merge_enabled": AUTO_MERGE_ENABLED,
-            "max_files_per_patch": MAX_FILES_PER_PATCH,
-            "max_lines_per_patch": MAX_LINES_CHANGED_PER_PATCH,
-            "protected_files": list(PROTECTED_FILES),
-            "allowlisted_files": list(ALLOWLISTED_FILES),
-        }
-
-
-# ─── CLI ────────────────────────────────────────────────────────────
+    cur.execute("""SELECT hypothesis_id, category, claim, reward, runs_completed, status, confidence
+                   FROM hypotheses WHERE runs_completed > 0
+                   ORDER BY reward DESC LIMIT 20""")
+    top_rows = cur.fetchall()
+
+    cur.execute("SELECT COUNT(*) as n FROM hypothesis_runs WHERE tenant_id = ?", (tenant_id,))
+    total_runs = cur.fetchone()["n"]
+
+    cur.execute("SELECT COUNT(*) as n FROM hypothesis_promotions WHERE tenant_id = ?", (tenant_id,))
+    total_promotions = cur.fetchone()["n"]
+
+    print(f"\n{'='*60}")
+    print(f"  HYPOTHESIS LAB REPORT — {tenant_id}")
+    print(f"  Generated: {datetime.now(timezone.utc).isoformat()}")
+    print(f"{'='*60}\n")
+
+    print(f"Status Summary:")
+    for r in status_rows:
+        print(f"  {r['status']:<12} {r['n']:>4}")
+
+    print(f"\nTotal runs: {total_runs}")
+    print(f"Total promotions: {total_promotions}")
+
+    if top_rows:
+        print(f"\nTop 20 Tested Hypotheses:")
+        print(f"{'ID':<6} {'Category':<12} {'Status':<10} {'Reward':>8} {'Runs':>5} {'Conf':>5} Claim")
+        print(f"{'-'*6} {'-'*12} {'-'*10} {'-'*8} {'-'*5} {'-'*5} {'-'*40}")
+        for r in top_rows:
+            print(f"{r['hypothesis_id']:<6} {r['category']:<12} {r['status']:<10} {r['reward']:>8.3f} {r['runs_completed']:>5} {r['confidence']:>5.2f} {r['claim'][:50]}")
+
+    conn.close()
+
+
+def cmd_winners(tenant_id: str):
+    """Show winning hypotheses."""
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM hypotheses WHERE status = 'winner' ORDER BY reward DESC")
+    rows = cur.fetchall()
+
+    if not rows:
+        print("No winners yet.")
+        conn.close()
+        return
+
+    print(f"\n{'='*60}")
+    print(f"  WINNING HYPOTHESES — {len(rows)}")
+    print(f"{'='*60}\n")
+
+    for r in rows:
+        print(f"  {r['hypothesis_id']} [{r['category']}] reward={r['reward']:.3f} runs={r['runs_completed']}")
+        print(f"    {r['claim']}")
+        print(f"    Action: {r['action']} | Metric: {r['primary_metric']}")
+        print()
+
+    conn.close()
+
+
+def cmd_daemon(tenant_id: str, username: str, password: str, interval: int = 300):
+    """Run hypothesis lab as daemon."""
+    print(f"Starting hypothesis lab daemon (interval={interval}s, tenant={tenant_id})")
+    while True:
+        try:
+            cmd_run_next(tenant_id, username, password)
+        except Exception as e:
+            log.error(f"Run error: {e}")
+        print(f"\nSleeping {interval}s...\n")
+        time.sleep(interval)
+
+
+# ─── CLI ───────────────────────────────────────────────────────────
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="CI/CD GAG — GitHub Actions Governor")
-    parser.add_argument("--run", action="store_true", help="Run one healing cycle")
-    parser.add_argument("--status", action="store_true", help="Show GAG status")
-    parser.add_argument("--repo-root", default=".", help="Repository root path")
+    parser = argparse.ArgumentParser(description="300-Hypothesis Growth Lab")
+    parser.add_argument("--seed-300", action="store_true", help="Seed 300 hypotheses")
+    parser.add_argument("--list", action="store_true", help="List all hypotheses")
+    parser.add_argument("--run-next", action="store_true", help="Run next best hypothesis")
+    parser.add_argument("--daemon", action="store_true", help="Run as daemon")
+    parser.add_argument("--report", action="store_true", help="Generate report")
+    parser.add_argument("--winners", action="store_true", help="Show winners")
+    parser.add_argument("--tenant", default="", help="Tenant ID")
+    parser.add_argument("--interval", type=int, default=300, help="Daemon interval (s)")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    username = os.environ.get("RENTMASSEUR_USER", os.environ.get("RM_USER", ""))
+    password = os.environ.get("RENTMASSEUR_PASS", os.environ.get("RM_PASS", ""))
+    tenant_id = args.tenant or hashlib.sha256(username.encode()).hexdigest()[:16]
 
-    gag = CICDGAG(args.repo_root)
+    if args.seed_300:
+        cmd_seed_300()
+        return
+    if args.list:
+        cmd_list()
+        return
+    if args.run_next:
+        sys.exit(cmd_run_next(tenant_id, username, password))
+        return
+    if args.daemon:
+        cmd_daemon(tenant_id, username, password, args.interval)
+        return
+    if args.report:
+        cmd_report(tenant_id)
+        return
+    if args.winners:
+        cmd_winners(tenant_id)
+        return
 
-    if args.status:
-        status = gag.get_status()
-        print(json.dumps(status, indent=2))
-    elif args.run:
-        prs = gag.run_healing_cycle()
-        for pr in prs:
-            print(f"\n  PR: {pr.title}")
-            print(f"  Branch: {pr.branch_name}")
-            print(f"  Ready: {pr.ready_to_merge}")
-    else:
-        parser.print_help()
+    parser.print_help()
 
 
 if __name__ == "__main__":
@@ -658,143 +113,688 @@ if __name__ == "__main__":
 
 ```
 
-roi_algorithm.py:
+traffic.log:
+```
+2026-06-25 15:28:57,528 [INFO] DB initialized at /Users/alep/Downloads/windsurf-smoke/rm_traffic/traffic.db
+2026-06-25 15:28:57,528 [INFO] === Single cycle ===
+2026-06-25 15:28:58,229 [INFO] Browser started (profile: /tmp/rm_traffic_chrome)
+2026-06-25 15:28:58,229 [INFO] Logging in as karpathianwolf...
+2026-06-25 15:29:12,920 [INFO] Login successful. URL: https://rentmasseur.com/
+
+```
+
+bio_ml_trainer.py:
 ```
 """
-ROI Algorithm — measurable traffic improvement tracking + value-based pricing.
+Real ML training pipeline for bio performance prediction.
 
-Proves the service works and calculates what to charge each masseur.
-
-BASELINE (7 days pre-service) → OPTIMIZE (run actions) → MEASURE (weekly deltas) → PRICE (value-delivered)
-
-Pricing:
-  base_fee = $49/month (covers LLM + infra)
-  performance_cut = max(0, additional_bookings × avg_rate × 15%)
-  GUARANTEE: if improvement < 10% vs baseline, base_fee waived that month.
+Includes:
+- k-fold cross-validation
+- backpropagation with Adam-like optimizer
+- walk-forward validation
+- online training loop
+- metrics: MAE, RMSE, R^2
 """
 
 import json
 import logging
-import sqlite3
-from datetime import datetime, timezone, timedelta
+import pickle
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-log = logging.getLogger("roi_algorithm")
+import numpy as np
 
-ROI_DB = Path(__file__).parent / "roi.db"
+from .bio_features import feature_vector
+from .bio_generator import _score_variant
+from .bio_appraiser import load_bios
 
-BASE_FEE_MONTHLY = 49.00
-COMMISSION_RATE = 0.15
-IMPROVEMENT_GUARANTEE_THRESHOLD = 0.10
-BASELINE_DAYS = 7
-MEASUREMENT_WINDOW_DAYS = 7
+log = logging.getLogger("profileops.ml_trainer")
 
-EMAIL_WEIGHTS = {"booking": 3.0, "inquiry": 2.0, "reply": 1.0, "spam": 0.0}
+MODEL_PATH = Path(__file__).parent / "data" / "models" / "bio_ml_model.pkl"
 
 
-def _db():
-    conn = sqlite3.connect(str(ROI_DB))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+class MLP:
+    """MLP with Adam optimizer and dropout."""
+
+    def __init__(self, input_size: int, hidden_size: int = 32, output_size: int = 3,
+                 seed: int = 42, dropout: float = 0.2):
+        rng = np.random.default_rng(seed)
+        self.W1 = rng.normal(0, np.sqrt(2.0 / input_size), (input_size, hidden_size))
+        self.b1 = np.zeros((1, hidden_size))
+        self.W2 = rng.normal(0, np.sqrt(2.0 / hidden_size), (hidden_size, output_size))
+        self.b2 = np.zeros((1, output_size))
+        self.dropout = dropout
+
+        # Adam moments
+        self.mW1 = np.zeros_like(self.W1)
+        self.vW1 = np.zeros_like(self.W1)
+        self.mb1 = np.zeros_like(self.b1)
+        self.vb1 = np.zeros_like(self.b1)
+        self.mW2 = np.zeros_like(self.W2)
+        self.vW2 = np.zeros_like(self.W2)
+        self.mb2 = np.zeros_like(self.b2)
+        self.vb2 = np.zeros_like(self.b2)
+        self.t = 0
+
+    def _relu(self, x):
+        return np.maximum(0, x)
+
+    def _sigmoid(self, x):
+        return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+
+    def forward(self, X, training=False):
+        self.z1 = X @ self.W1 + self.b1
+        self.a1 = self._relu(self.z1)
+        if training and self.dropout > 0:
+            self.mask = (np.random.rand(*self.a1.shape) > self.dropout).astype(float)
+            self.a1 *= self.mask / (1 - self.dropout)
+        self.z2 = self.a1 @ self.W2 + self.b2
+        self.a2 = self._sigmoid(self.z2)
+        return self.a2
+
+    def backward(self, X, y, y_pred, lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.t += 1
+        m = X.shape[0]
+
+        dz2 = (y_pred - y) / m
+        dW2 = self.a1.T @ dz2
+        db2 = np.sum(dz2, axis=0, keepdims=True)
+
+        da1 = dz2 @ self.W2.T
+        if self.dropout > 0:
+            da1 *= self.mask
+        dz1 = da1 * (self.z1 > 0)
+        dW1 = X.T @ dz1
+        db1 = np.sum(dz1, axis=0, keepdims=True)
+
+        # Adam update
+        for dW, mW, vW, W in [(dW1, self.mW1, self.vW1, self.W1),
+                                (db1, self.mb1, self.vb1, self.b1),
+                                (dW2, self.mW2, self.vW2, self.W2),
+                                (db2, self.mb2, self.vb2, self.b2)]:
+            mW[:] = beta1 * mW + (1 - beta1) * dW
+            vW[:] = beta2 * vW + (1 - beta2) * (dW ** 2)
+            m_hat = mW / (1 - beta1 ** self.t)
+            v_hat = vW / (1 - beta2 ** self.t)
+            W -= lr * m_hat / (np.sqrt(v_hat) + eps)
+
+    def train_epoch(self, X, y, lr=0.01, batch_size=64):
+        n = X.shape[0]
+        indices = np.random.permutation(n)
+        total_loss = 0
+        for i in range(0, n, batch_size):
+            idx = indices[i:i+batch_size]
+            Xb = X[idx]
+            yb = y[idx]
+            y_pred = self.forward(Xb, training=True)
+            loss = np.mean((y_pred - yb) ** 2)
+            total_loss += loss * len(idx)
+            self.backward(Xb, yb, y_pred, lr=lr)
+        return total_loss / n
+
+    def predict(self, X):
+        return self.forward(X, training=False)
+
+    def save(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def load(path: Path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
 
 
-def init_db():
-    conn = _db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS tenants (
-        tenant_id TEXT PRIMARY KEY,
-        username TEXT NOT NULL,
-        display_name TEXT,
-        email TEXT,
-        city TEXT DEFAULT 'manhattan-ny',
-        avg_session_rate REAL DEFAULT 234.0,
-        subscribed_at TEXT NOT NULL,
-        baseline_captured INTEGER DEFAULT 0,
-        baseline_start_ts TEXT,
-        baseline_end_ts TEXT,
-        active INTEGER DEFAULT 1,
-        pricing_tier TEXT DEFAULT 'performance'
-    );
-    CREATE TABLE IF NOT EXISTS daily_metrics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        date TEXT NOT NULL,
-        views INTEGER DEFAULT 0,
-        contact_clicks INTEGER DEFAULT 0,
-        emails_count INTEGER DEFAULT 0,
-        unread_emails INTEGER DEFAULT 0,
-        booking_emails INTEGER DEFAULT 0,
-        inquiry_emails INTEGER DEFAULT 0,
-        premium_senders INTEGER DEFAULT 0,
-        search_rank INTEGER DEFAULT 0,
-        available_rank INTEGER DEFAULT 0,
-        availability_option INTEGER DEFAULT 0,
-        is_hidden INTEGER DEFAULT 0,
-        headline TEXT,
-        ctr REAL DEFAULT 0.0,
-        email_rate REAL DEFAULT 0.0,
-        booking_rate REAL DEFAULT 0.0,
-        client_engagement_score REAL DEFAULT 0.0,
-        UNIQUE(tenant_id, date)
-    );
-    CREATE TABLE IF NOT EXISTS action_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        ts TEXT NOT NULL,
-        cycle_num INTEGER,
-        action_name TEXT NOT NULL,
-        category TEXT NOT NULL,
-        executed INTEGER DEFAULT 0,
-        detail TEXT,
-        views_delta INTEGER DEFAULT 0,
-        contacts_delta INTEGER DEFAULT 0,
-        emails_delta INTEGER DEFAULT 0,
-        attributed_score REAL DEFAULT 0.0
-    );
-    CREATE TABLE IF NOT EXISTS roi_reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        period_start TEXT NOT NULL,
-        period_end TEXT NOT NULL,
-        baseline_views_avg REAL,
-        current_views_avg REAL,
-        views_improvement_pct REAL,
-        baseline_contacts_avg REAL,
-        current_contacts_avg REAL,
-        contacts_improvement_pct REAL,
-        baseline_emails_avg REAL,
-        current_emails_avg REAL,
-        emails_improvement_pct REAL,
-        baseline_booking_emails_avg REAL,
-        current_booking_emails_avg REAL,
-        booking_improvement_pct REAL,
-        baseline_rank INTEGER,
-        current_rank INTEGER,
-        rank_improvement INTEGER,
-        baseline_ces REAL,
-        current_ces REAL,
-        ces_improvement_pct REAL,
-        estimated_additional_bookings REAL,
-        estimated_additional_revenue REAL,
-        monthly_charge REAL,
-        base_fee_charged REAL,
-        performance_cut_charged REAL,
-        guarantee_triggered INTEGER DEFAULT 0,
-        report_json TEXT,
-        created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS attribution_matrix (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        action_name TEXT NOT NULL,
-        total_runs INTEGER DEFAULT 0,
-        total_views_delta INTEGER DEFAULT 0,
-        total_contacts_delta INTEGER DEFAULT 0,
-        total_emails_delta INTEGER DEFAULT 0,
-        avg_attributed_score REAL DEFAULT 0.0,
-        last_run_ts TEXT,
-        UNIQUE(tenant_id, action_name)
-    );
-    CREATE INDEX IF NOT EXISTS idx_daily_tenant_date ON daily_metrics(tenant_id, date);
+def build_dataset(bios: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
+    """Build feature matrix X and label matrix y from bios."""
+    X, y = [], []
+    for bio in bios:
+        X.append(feature_vector(bio["headline"], bio["description"]))
+        scores = _score_variant(bio["headline"], bio["description"])
+        # Synthetic labels: realistic CTR/email/phone
+        ctr = min(0.08, scores["composite"] * 0.08 + 0.01)
+        email = min(0.05, scores["composite"] * 0.05 + 0.005)
+        phone = min(0.03, scores["composite"] * 0.03 + 0.003)
+        y.append([ctr, email, phone])
+    return np.array(X), np.array(y)
+
+
+def k_fold_cv(bios: List[Dict], k: int = 5, epochs: int = 100, lr: float = 0.01) -> Dict:
+    """Run k-fold cross-validation."""
+    X, y = build_dataset(bios)
+    n = X.shape[0]
+    fold_size = n // k
+    metrics = []
+
+    for fold in range(k):
+        val_start = fold * fold_size
+        val_end = val_start + fold_size
+        val_idx = np.arange(val_start, val_end)
+        train_idx = np.concatenate([np.arange(0, val_start), np.arange(val_end, n)])
+
+        X_train, y_train = X[train_idx], y[train_idx]
+        X_val, y_val = X[val_idx], y[val_idx]
+
+        model = MLP(input_size=X.shape[1], hidden_size=32, output_size=3)
+        for epoch in range(epochs):
+            model.train_epoch(X_train, y_train, lr=lr)
+
+        y_pred = model.predict(X_val)
+        mae = np.mean(np.abs(y_pred - y_val))
+        rmse = np.sqrt(np.mean((y_pred - y_val) ** 2))
+        r2 = 1 - np.sum((y_val - y_pred) ** 2) / np.sum((y_val - np.mean(y_val)) ** 2)
+        metrics.append({"mae": mae, "rmse": rmse, "r2": r2})
+        log.info("Fold %d: MAE=%.4f RMSE=%.4f R2=%.4f", fold, mae, rmse, r2)
+
+    return {
+        "folds": metrics,
+        "mean_mae": np.mean([m["mae"] for m in metrics]),
+        "mean_rmse": np.mean([m["rmse"] for m in metrics]),
+        "mean_r2": np.mean([m["r2"] for m in metrics]),
+    }
+
+
+def walk_forward_validation(bios: List[Dict], train_ratio: float = 0.8,
+                            epochs: int = 100, lr: float = 0.01) -> Dict:
+    """Train on first N% of data, validate on last (100-N)%."""
+    X, y = build_dataset(bios)
+    split = int(train_ratio * X.shape[0])
+    X_train, y_train = X[:split], y[:split]
+    X_val, y_val = X[split:], y[split:]
+
+    model = MLP(input_size=X.shape[1], hidden_size=32, output_size=3)
+    for epoch in range(epochs):
+        loss = model.train_epoch(X_train, y_train, lr=lr)
+        if epoch % 20 == 0:
+            log.info("Epoch %d: train_loss=%.4f", epoch, loss)
+
+    y_pred = model.predict(X_val)
+    mae = np.mean(np.abs(y_pred - y_val))
+    rmse = np.sqrt(np.mean((y_pred - y_val) ** 2))
+    r2 = 1 - np.sum((y_val - y_pred) ** 2) / np.sum((y_val - np.mean(y_val)) ** 2)
+
+    return {
+        "train_size": split,
+        "val_size": X.shape[0] - split,
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2,
+    }
+
+
+def online_train(bios_stream: List[Dict], model: MLP = None, epochs: int = 10,
+                 lr: float = 0.01, save_path: Path = MODEL_PATH) -> MLP:
+    """Online training: update model with new bios as they arrive."""
+    X, y = build_dataset(bios_stream)
+    if model is None:
+        model = MLP(input_size=X.shape[1], hidden_size=32, output_size=3)
+    for epoch in range(epochs):
+        loss = model.train_epoch(X, y, lr=lr)
+        log.info("Online epoch %d: loss=%.4f", epoch, loss)
+    model.save(save_path)
+    return model
+
+
+def full_training_pipeline(bios_path: Path, cv_folds: int = 5, epochs: int = 100,
+                           lr: float = 0.01) -> Dict:
+    """Run CV + walk-forward + final model training."""
+    bios = load_bios(bios_path, limit=50000)
+    log.info("Training pipeline on %d bios", len(bios))
+
+    cv_results = k_fold_cv(bios, k=cv_folds, epochs=epochs, lr=lr)
+    wf_results = walk_forward_validation(bios, train_ratio=0.8, epochs=epochs, lr=lr)
+
+    # Final model
+    X, y = build_dataset(bios)
+    model = MLP(input_size=X.shape[1], hidden_size=32, output_size=3)
+    for epoch in range(epochs):
+        model.train_epoch(X, y, lr=lr)
+    model.save(MODEL_PATH)
+
+    return {
+        "cv": cv_results,
+        "walk_forward": wf_results,
+        "model_path": str(MODEL_PATH),
+    }
+
+```
+
+api_extractor.py:
+```
+"""
+RentMasseur API Extractor — uses Selenium + CDP to intercept all network
+requests, capture request/response payloads, and generate documented API endpoints.
+
+Output:
+  - rm_traffic/api_endpoints.json  (structured API spec)
+  - rm_traffic/api_endpoints.md    (human-readable docs)
+  - rm_traffic/api_capture.log     (raw network log)
+"""
+
+import json
+import os
+import re
+import time
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from collections import defaultdict
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import (
+    NoSuchElementException, StaleElementReferenceException, WebDriverException,
+)
+
+BASE_URL = "https://rentmasseur.com"
+USERNAME = "karpathianwolf"
+PASSWORD = os.environ.get("RM_PASSWORD", "")
+CHROME_PROFILE = "/tmp/rm_api_chrome"
+OUT_DIR = Path(__file__).parent
+LOG_FILE = OUT_DIR / "api_capture.log"
+SPEC_JSON = OUT_DIR / "api_endpoints.json"
+SPEC_MD = OUT_DIR / "api_endpoints.md"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(str(LOG_FILE)),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("api_extractor")
+
+
+class NetworkInterceptor:
+    """Captures all network requests via Chrome DevTools Protocol."""
+
+    def __init__(self, driver):
+        self.driver = driver
+        self.captured = []  # list of request dicts
+        self._requests = {}  # request_id -> partial data
+        self._setup_cdp()
+
+    def _setup_cdp(self):
+        """Enable network tracking via CDP."""
+        self.driver.execute_cdp_cmd("Network.enable", {})
+        self.driver.execute_cdp_cmd("Network.setBypassServiceWorker", {"bypass": True})
+
+        # We'll use performance logs as fallback, but primary method is
+        # injecting a fetch/XHR interceptor via CDP script
+        script = """
+        (function() {
+            window.__api_capture = [];
+            const origFetch = window.fetch;
+            window.fetch = function(...args) {
+                const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+                const method = (args[1]?.method) || (args[0]?.method) || 'GET';
+                const body = args[1]?.body || null;
+                const headers = args[1]?.headers || {};
+                const entry = {
+                    type: 'fetch',
+                    url: url,
+                    method: method,
+                    body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null,
+                    headers: headers,
+                    ts: new Date().toISOString()
+                };
+                window.__api_capture.push(entry);
+                return origFetch.apply(this, args).then(resp => {
+                    const clone = resp.clone();
+                    clone.text().then(text => {
+                        entry.status = resp.status;
+                        entry.response = text.substring(0, 5000);
+                        entry.responseHeaders = {};
+                        resp.headers.forEach((v, k) => { entry.responseHeaders[k] = v; });
+                    }).catch(() => {});
+                    return resp;
+                });
+            };
+
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                this.__api_entry = {
+                    type: 'xhr',
+                    url: url,
+                    method: method,
+                    body: null,
+                    headers: {},
+                    ts: new Date().toISOString()
+                };
+                return origOpen.call(this, method, url, ...rest);
+            };
+            XMLHttpRequest.prototype.send = function(body) {
+                if (this.__api_entry) {
+                    this.__api_entry.body = body ? String(body).substring(0, 2000) : null;
+                    window.__api_capture.push(this.__api_entry);
+                    this.addEventListener('load', function() {
+                        this.__api_entry.status = this.status;
+                        this.__api_entry.response = this.responseText.substring(0, 5000);
+                    });
+                }
+                return origSend.call(this, body);
+            };
+
+            // Also intercept axios if present
+            if (window.axios) {
+                const origAxios = window.axios.request;
+                window.axios.request = function(config) {
+                    window.__api_capture.push({
+                        type: 'axios',
+                        url: config.url,
+                        method: config.method || 'GET',
+                        body: config.data ? JSON.stringify(config.data).substring(0, 2000) : null,
+                        headers: config.headers || {},
+                        ts: new Date().toISOString()
+                    });
+                    return origAxios.apply(this, arguments).then(resp => {
+                        const e = window.__api_capture[window.__api_capture.length - 1];
+                        if (e && e.url === config.url) {
+                            e.status = resp.status;
+                            e.response = JSON.stringify(resp.data).substring(0, 5000);
+                        }
+                        return resp;
+                    });
+                };
+            }
+        })();
+        """
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": script
+        })
+        log.info("CDP network interceptor installed")
+
+    def collect(self):
+        """Pull captured requests from the page."""
+        try:
+            entries = self.driver.execute_script(
+                "return window.__api_capture ? JSON.parse(JSON.stringify(window.__api_capture)) : [];"
+            )
+        except WebDriverException:
+            return []
+
+        new_entries = []
+        seen_urls = {e["url"] for e in self.captured}
+        for entry in entries:
+            if entry.get("url") and entry["url"] not in seen_urls:
+                self.captured.append(entry)
+                seen_urls.add(entry["url"])
+                new_entries.append(entry)
+        return new_entries
+
+    def flush(self):
+        """Get all captured entries."""
+        self.collect()
+        return self.captured
+
+
+def create_driver():
+    opts = Options()
+    opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument(f"--user-data-dir={CHROME_PROFILE}")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    return webdriver.Chrome(options=opts)
+
+
+def dismiss_popups(driver):
+    time.sleep(1)
+    for xpath in [
+        "//button[contains(text(),'Not now')]",
+        "//button[contains(text(),'Accept all')]",
+        "//button[contains(text(),'Close')]",
+        "//*[contains(@aria-label,'Close')]",
+    ]:
+        try:
+            for el in driver.find_elements(By.XPATH, xpath):
+                if el.is_displayed():
+                    el.click()
+                    time.sleep(0.5)
+        except Exception:
+            pass
+
+
+def login(driver):
+    log.info("Logging in as %s...", USERNAME)
+    driver.get(f"{BASE_URL}/login")
+    time.sleep(4)
+    dismiss_popups(driver)
+
+    email = None
+    pwd = None
+    for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
+        itype = (inp.get_attribute("type") or "").lower()
+        iname = (inp.get_attribute("name") or "").lower()
+        if itype == "email" or "email" in iname or "user" in iname:
+            if inp.is_displayed():
+                email = inp
+        if itype == "password" and inp.is_displayed():
+            pwd = inp
+
+    if not email or not pwd:
+        log.error("Login fields not found")
+        return False
+
+    email.clear()
+    email.send_keys(USERNAME)
+    pwd.clear()
+    pwd.send_keys(PASSWORD)
+    time.sleep(0.3)
+
+    for by, sel in [
+        (By.CSS_SELECTOR, "button[type='submit']"),
+        (By.XPATH, "//button[contains(text(),'LOG')]"),
+        (By.XPATH, "//button[contains(text(),'Log')]"),
+        (By.CSS_SELECTOR, "form button"),
+    ]:
+        els = driver.find_elements(by, sel)
+        for el in els:
+            if el.is_displayed():
+                el.click()
+                time.sleep(6)
+                break
+        else:
+            continue
+        break
+
+    dismiss_popups(driver)
+    if "/login" in driver.current_url:
+        log.error("Login failed")
+        return False
+
+    log.info("Login OK. URL: %s", driver.current_url)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Pages to visit for API discovery
+# ---------------------------------------------------------------------------
+
+PAGES_TO_VISIT = [
+    ("Homepage", "/"),
+    ("Login", "/login"),
+    ("Search Manhattan", "/gay-massage/manhattan-ny/"),
+    ("Search Available", "/gay-massage/manhattan-ny/?available=1"),
+    ("Settings Dashboard", "/settings"),
+    ("Settings Availability", "/settings?availability=1"),
+    ("Profile", "/ArmyMike"),
+    ("Reviews", "/ArmyMike/reviews"),
+    ("Blog", "/blog"),
+    ("Available Now", "/gay-massage/manhattan-ny/?available=1"),
+]
+
+# Actions that trigger API calls
+def trigger_actions(driver, interceptor):
+    """Interact with the page to trigger API calls."""
+
+    # 1. Open availability modal on settings
+    log.info("Triggering availability modal...")
+    driver.get(f"{BASE_URL}/settings?availability=1")
+    time.sleep(5)
+    dismiss_popups(driver)
+    interceptor.collect()
+
+    try:
+        panel = driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
+        panel.click()
+        time.sleep(2)
+        interceptor.collect()
+        log.info("  Captured availability modal API calls")
+    except Exception:
+        log.warning("  Could not open availability modal")
+
+    # 2. Toggle visibility
+    log.info("Triggering visibility toggle...")
+    driver.get(f"{BASE_URL}/settings")
+    time.sleep(4)
+    dismiss_popups(driver)
+    try:
+        vis_toggle = driver.find_element(By.CSS_SELECTOR, "#visibility")
+        vis_toggle.click()
+        time.sleep(2)
+        interceptor.collect()
+        log.info("  Captured visibility toggle API calls")
+    except Exception:
+        log.warning("  Could not toggle visibility")
+
+    # 3. Toggle SMS alerts
+    try:
+        sms_toggle = driver.find_element(By.CSS_SELECTOR, "#sms")
+        sms_toggle.click()
+        time.sleep(2)
+        interceptor.collect()
+        log.info("  Captured SMS toggle API calls")
+    except Exception:
+        log.warning("  Could not toggle SMS")
+
+    # 4. Toggle track actions
+    try:
+        track_toggle = driver.find_element(By.CSS_SELECTOR, "#trackActions")
+        track_toggle.click()
+        time.sleep(2)
+        interceptor.collect()
+        log.info("  Captured track actions toggle API calls")
+    except Exception:
+        log.warning("  Could not toggle track actions")
+
+    # 5. Search with filters
+    log.info("Triggering search with filters...")
+    driver.get(f"{BASE_URL}/gay-massage/manhattan-ny/")
+    time.sleep(4)
+    dismiss_popups(driver)
+    interceptor.collect()
+
+    # 6. Scroll to trigger lazy loading
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(3)
+    interceptor.collect()
+    log.info("  Captured search/scroll API calls")
+
+    # 7. Click "Load more" if present
+    try:
+        load_more = driver.find_element(By.XPATH, "//button[contains(text(),'Load more')]")
+        load_more.click()
+        time.sleep(3)
+        interceptor.collect()
+        log.info("  Captured 'Load more' API calls")
+    except Exception:
+        pass
+
+    # 8. Visit a profile to trigger profile API calls
+    log.info("Triggering profile view API calls...")
+    driver.get(f"{BASE_URL}/ArmyMike")
+    time.sleep(4)
+    interceptor.collect()
+
+    # 9. Check mailbox
+    log.info("Triggering mailbox API calls...")
+    driver.get(f"{BASE_URL}/settings/mailbox")
+    time.sleep(4)
+    dismiss_popups(driver)
+    interceptor.collect()
+
+
+# ---------------------------------------------------------------------------
+# API Spec Generation
+# ---------------------------------------------------------------------------
+
+def classify_endpoint(url, method, body, response):
+    """Classify an API endpoint by its URL pattern and response."""
+    url_lower = url.lower()
+
+    # Skip static assets
+    if any(url_lower.endswith(ext) for ext in [
+        ".js", ".css", ".png", ".jpg", ".jpeg", ".svg", ".gif", ".woff",
+        ".woff2", ".ico", ".webp", ".map", ".mp4", ".webm",
+    ]):
+        return None
+    if "/_next/static/" in url_lower:
+        return None
+    if "/images/" in url_lower:
+        return None
+
+    # Classify
+    category = "unknown"
+    name = url
+
+    patterns = {
+        "auth": ["login", "logout", "auth", "token", "session", "register"],
+        "availability": ["avail", "status", "online"],
+        "search": ["search", "masseur", "gay-massage", "find"],
+        "profile": ["profile", "user", "account", "card"],
+        "settings": ["settings", "setting", "config"],
+        "mailbox": ["mail", "message", "inbox", "conversation"],
+        "reviews": ["review", "rating", "feedback"],
+        "stats": ["statistic", "stats", "analytics", "visit", "view"],
+        "photos": ["photo", "image", "upload", "gallery"],
+        "rates": ["rate", "price", "service", "massage"],
+        "travels": ["travel", "location", "city"],
+        "blog": ["blog", "post", "article"],
+        "advertise": ["advert", "sponsor", "banner", "boost", "visibility"],
+        "interview": ["interview"],
+        "membership": ["membership", "payment", "subscription", "plan", "billing"],
+        "social": ["twitter", "facebook", "instagram", "x.com"],
+        "notification": ["notif", "alert", "push"],
+    }
+
+    for cat, keywords in patterns.items():
+        if any(kw in url_lower for kw in keywords):
+            category = cat
+            break
+
+    # Try to extract a clean endpoint name
+    m = re.search(r'/api/([^/?]+)', url)
+    if m:
+        name = m.group(1)
+    else:
+        # Use last path segment
+        parts = url.split("?")[0].rstrip("/").split("/")
+        if parts:
+            name = parts[-1]
+
+    # Parse response as JSON if possible
+    resp_data = None
+    if response:
+        try:
+            resp_data = json.loads(response)
+        except (json.JSONDecodeError, TypeError):
+            resp_data = response[:500] if isinstance(response, str) else None
+
+    # Parse body
+    body_data = None
+    if body:
+        try:
+            body_data = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            body_data = body[:500] if isinstance(body, str) else None
+
+    return {
+        "url": url,

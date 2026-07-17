@@ -1,800 +1,800 @@
-        reward += 0.3 * ignored                 # catching suppressions is valuable
-        reward += 0.1 * p0                      # identifying urgent recovery targets
+    for i, a in enumerate(ranked):
+        log.info("  ⟡ #%d %s — %s", i + 1, a.get("action", "?"), a.get("reason", "")[:60])
 
-        # Real reward from downstream outcomes
-        reward += 2.0 * reply_sent              # approved reply actually sent
-        reward += 5.0 * client_replied          # client responded to our reply
-        reward += 10.0 * call_received          # real call
-        reward += 20.0 * booking_confirmed      # booking confirmed
-        reward += 50.0 * session_completed      # session completed = revenue
+    # 4. Execute actions
+    log.info("  ⌁ Executing actions...")
+    results = []
+    for a in ranked:
+        action_name = a.get("action", "")
+        if not action_name or action_name not in ACTION_EXECUTORS:
+            continue
+        log.info("  ⌁ Executing: %s", action_name)
+        executor = ACTION_EXECUTORS[action_name]
+        try:
+            result = executor(api, tenant_id, cycle_num, before)
+            result["action"] = action_name
+            result["priority"] = a.get("priority", 0)
+            results.append(result)
+            glyph = "◆" if result["executed"] else "◌"
+            log.info("  %s %s — %s", glyph, action_name, result.get("detail", "")[:60])
+        except Exception as e:
+            log.error("  ⟁ %s failed: %s", action_name, e)
+            results.append({"action": action_name, "executed": False, "detail": str(e)[:100]})
+        time.sleep(1)
 
-        if cloud_leaked:
-            reward -= 2.0                       # penalty: cloud on private data
+    # 5. Collect after metrics
+    log.info("  ⌁ Collecting after metrics...")
+    after = collect_metrics(api, tenant_id)
+    log.info("  ◉ After: views=%s contacts=%s emails=%s rank=%s",
+             after.get("views", 0), after.get("contact_clicks", 0),
+             after.get("emails_count", 0), after.get("search_rank", 0))
 
-        return round(reward, 3)
+    # 6. Check if baseline should be finalized
+    if not roi.is_baseline_captured(tenant_id):
+        bl = roi.finalize_baseline(tenant_id)
+        if bl.get("captured"):
+            log.info("  ◆ Baseline captured: %s", bl)
 
-    # ─── Standard traffic-delta reward for other actions ───
-    reward = (
-        5.0 * max(0, delta.booking_intent_delta)
-        + 3.0 * max(0, delta.contact_clicks_delta)
-        + 2.0 * max(0, delta.emails_delta)
-        + 1.0 * max(0, delta.views_delta) * 0.01
+    # 7. Store cycle record
+    executed = sum(1 for r in results if r.get("executed"))
+    receipt_data = json.dumps({"before": before, "after": after, "results": results}, default=str)
+    receipt_hash = hashlib.sha256(receipt_data.encode()).hexdigest()[:16]
+
+    conn = _sdb()
+    conn.execute(
+        """INSERT INTO service_cycles
+           (tenant_id, ts, cycle_num, actions_executed, actions_passed, llm_calls,
+            views_before, views_after, contacts_before, contacts_after,
+            emails_before, emails_after, search_rank_before, search_rank_after, receipt_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (tenant_id, ts, cycle_num, len(results), executed, 1,
+         before.get("views", 0), after.get("views", 0),
+         before.get("contact_clicks", 0), after.get("contact_clicks", 0),
+         before.get("emails_count", 0), after.get("emails_count", 0),
+         before.get("search_rank", 0), after.get("search_rank", 0), receipt_hash)
     )
+    conn.commit()
+    conn.close()
 
-    # Penalty for negative deltas (only if measurement is valid)
-    if delta.booking_intent_delta < 0:
-        reward += 3.0 * delta.booking_intent_delta
-    if delta.contact_clicks_delta < 0:
-        reward += 2.0 * delta.contact_clicks_delta
+    log.info("  ◆ Cycle %d complete for %s: %d actions, %d executed",
+             cycle_num, tenant_id, len(results), executed)
 
-    # Rank improvement is good (lower rank number = better)
-    if delta.rank_delta < 0:
-        reward += 1.0 * abs(delta.rank_delta) * 0.5
-
-    # Error penalty
-    if error:
-        reward -= 2.0
-
-    # Compliance risk
-    risky_actions = {"rate_position_test", "photo_order_test"}
-    if action in risky_actions:
-        reward -= 0.5
-
-    # Excessive mutation penalty
-    mutation_actions = {"headline_variant_test", "bio_variant_test", "photo_order_test", "rate_position_test"}
-    if action in mutation_actions:
-        if delta.contact_clicks_delta == 0 and delta.booking_intent_delta == 0:
-            reward -= 1.0
-
-    # Availability fix reward
-    if action == "refresh_availability" and delta.availability_changed:
-        reward += 2.0
-
-    # Visibility fix reward
-    if action == "ensure_visible" and delta.visibility_changed:
-        reward += 2.0
-
-    return round(reward, 3)
-
-
-def delta_to_dict(delta: MetricDelta) -> Dict:
     return {
-        "views_delta": delta.views_delta,
-        "contact_clicks_delta": delta.contact_clicks_delta,
-        "emails_delta": delta.emails_delta,
-        "booking_intent_delta": delta.booking_intent_delta,
-        "rank_delta": delta.rank_delta,
-        "availability_changed": delta.availability_changed,
-        "visibility_changed": delta.visibility_changed,
+        "tenant_id": tenant_id, "cycle_num": cycle_num, "timestamp": ts,
+        "before": before, "after": after,
+        "actions": results,
+        "receipt_hash": receipt_hash,
     }
 
-```
-
-daemon.py:
-```
-"""
-RM ProfileOps Daemon — safe, bounded, receipt-bearing account ops engine.
-
-Modes:
-    audit   — read only, change nothing
-    guard   — fix visibility + availability only
-    draft   — generate content drafts, do not publish
-    daemon  — run safe loop continuously
-
-The daemon never:
-- fakes reviews
-- fakes visits
-- auto-sends messages
-- auto-publishes blogs
-- auto-changes interview
-- makes destructive changes without backup
-"""
-
-import json
-import logging
-import os
-import sys
-import time
-from datetime import datetime, timezone
-
-from .db import init_db, write_receipt, get_latest_traffic_snapshot
-from .api_client import RentMasseurAPI
-from .auth import AuthSession
-from .state import snapshot_state, save_snapshot
-from .visibility_guard import ensure_visible
-from .availability_guard import check_availability, refresh_availability
-from .stats_collector import collect_snapshot
-from .content_optimizer import run_daily_draft_cycle
-from .blog_agent import generate_blog_drafts, save_blog_drafts_to_disk, get_blog_status
-from .interview_agent import monitor_interview, generate_interview_drafts
-
-log = logging.getLogger("profileops.daemon")
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Multi-Tenant Daemon
 # ---------------------------------------------------------------------------
 
-CHECK_INTERVAL = 5 * 60           # 5 minutes
-AVAILABILITY_CHECK_INTERVAL = 30 * 60  # 30 minutes
-DAILY_DRAFT_INTERVAL = 24 * 60 * 60      # 24 hours
+def run_daemon(cycle_interval: int = 3600):
+    """Run optimization cycles for all active tenants."""
+    log.info("  ═══ RM TRAFFIC SERVICE DAEMON ═══")
+    init_db()
 
+    while True:
+        tenants = roi.list_tenants(active_only=True)
+        if not tenants:
+            log.info("  No active tenants. Waiting...")
+            time.sleep(60)
+            continue
 
-class ProfileOpsDaemon:
-    def __init__(self, mode: str = "daemon", city: str = "manhattan-ny",
-                 session_file: str = "rm_traffic/session.json"):
-        self.mode = mode
-        self.city = city
-        self.api = RentMasseurAPI(min_request_interval=2.0)
-        self.auth = AuthSession(self.api, session_file=session_file)
-        self.running = True
-        self.last_check = 0
-        self.last_availability_check = 0
-        self.last_daily_draft = 0
-
-    def login(self) -> bool:
-        ok = self.auth.login()
-        if not ok:
-            log.error("Login failed")
-        return ok
-
-    def audit(self) -> dict:
-        """Read everything. Change nothing."""
-        state = snapshot_state(self.api)
-        save_snapshot(state)
-        keep = state.get("keeponline", {})
-        avail = state.get("availability", {})
-        about = state.get("about", {})
-        assets = about.get("userProps", {}).get("assets", {})
-        stats = state.get("stats", {}).get("profileStatistics", {})
-        dashboard = state.get("dashboard", {})
-
-        report = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "visible": not bool(keep.get("isAdHidden", 0)),
-            "available": avail.get("selected", "unknown"),
-            "availability_countdown": avail.get("countdown", 0),
-            "views": stats.get("totalPageViews"),
-            "contact_clicks": stats.get("totalContactClicks"),
-            "new_visits": keep.get("newVisits"),
-            "new_emails": keep.get("newEmails"),
-            "online_bookmarks": dashboard.get("onlineBookmarks"),
-            "headline": assets.get("headline"),
-            "description_len": len(assets.get("description", "")),
-            "review_url": dashboard.get("reviewUrl"),
-            "is_frozen": keep.get("isFrozen"),
-            "is_ad_hidden": keep.get("isAdHidden"),
-        }
-        write_receipt("audit_v1", "audit", {}, report, verified=True)
-        return report
-
-    def guard(self) -> dict:
-        """Fix low-risk operational issues only."""
-        state = snapshot_state(self.api)
-        save_snapshot(state)
-
-        # Visibility guard
-        visible_ok = ensure_visible(self.api)
-
-        # Availability guard
-        avail_status = check_availability(self.api)
-        if avail_status["needs_refresh"]:
-            refresh_availability(self.api)
-            avail_status = check_availability(self.api)
-
-        # Stats snapshot
-        collect_snapshot(self.api)
-
-        write_receipt("guard_cycle_v1", "guard", {}, {
-            "visible_ok": visible_ok,
-            "availability": avail_status,
-        }, verified=True)
-
-        return {
-            "visible_ok": visible_ok,
-            "availability": avail_status,
-        }
-
-    def draft(self) -> dict:
-        """Generate content drafts. Do not publish."""
-        return run_daily_draft_cycle(self.api)
-
-    def run_cycle(self):
-        """One daemon cycle."""
-        now = time.time()
-        if not self.auth.is_authenticated():
-            log.info("Session not authenticated. Re-logging in...")
-            if not self.login():
-                log.error("Could not re-authenticate. Sleeping.")
-                return
-
-        # Always guard
-        result = self.guard()
-        self.last_check = now
-
-        # Availability check every 30 min
-        if now - self.last_availability_check >= AVAILABILITY_CHECK_INTERVAL:
-            self.last_availability_check = now
-
-        # Daily draft
-        if now - self.last_daily_draft >= DAILY_DRAFT_INTERVAL:
-            if self.mode != "guard":
-                bio_drafts = run_daily_draft_cycle(self.api)
-                blog_drafts = generate_blog_drafts(count=1)
-                save_blog_drafts_to_disk(blog_drafts)
-                interview_drafts = generate_interview_drafts()
-                monitor_interview(self.api)
-                log.info("Daily drafts: bio=%s blog=%s interview=%s",
-                         bio_drafts.get("bio_draft")["variant_id"] if bio_drafts.get("bio_draft") else None,
-                         [d["variant_id"] for d in blog_drafts],
-                         [d["variant_id"] for d in interview_drafts])
-            self.last_daily_draft = now
-
-    def run(self):
-        log.info("=== RM ProfileOps Daemon starting in %s mode ===", self.mode)
-        if not self.login():
-            log.error("Initial login failed")
-            return
-
-        if self.mode == "audit":
-            print(json.dumps(self.audit(), indent=2, default=str))
-            return
-
-        if self.mode == "guard":
-            print(json.dumps(self.guard(), indent=2, default=str))
-            return
-
-        if self.mode == "draft":
-            print(json.dumps(self.draft(), indent=2, default=str))
-            return
-
-        while self.running:
+        for tenant in tenants:
+            tid = tenant["tenant_id"]
             try:
-                self.run_cycle()
-            except KeyboardInterrupt:
-                log.info("Shutdown requested")
-                self.running = False
-                break
-            except Exception as e:
-                log.error("Cycle error: %s", e)
-                write_receipt("daemon_error_v1", "error", {}, {"error": str(e)}, verified=False)
-            time.sleep(CHECK_INTERVAL)
+                # Get cycle count
+                conn = _sdb()
+                row = conn.execute(
+                    "SELECT MAX(cycle_num) as max_cycle FROM service_cycles WHERE tenant_id = ?",
+                    (tid,)
+                ).fetchone()
+                conn.close()
+                cycle_num = (row["max_cycle"] or 0) + 1
 
-        log.info("Daemon stopped")
+                run_cycle(tid, cycle_num)
+
+                # Generate weekly ROI report
+                if cycle_num % 7 == 0 and roi.is_baseline_captured(tid):
+                    report = roi.generate_roi_report(tid)
+                    if "error" not in report:
+                        p = report.get("pricing", {})
+                        log.info("  ◆ ROI report for %s: improvement=%.1f%% charge=$%.2f",
+                                 tid, report["improvement"]["overall_pct"],
+                                 p.get("monthly_charge", 0))
+
+            except Exception as e:
+                log.error("  ⟁ Tenant %s cycle failed: %s", tid, e)
+
+            time.sleep(10)  # gap between tenants
+
+        log.info("  ⧖ Next cycle in %ds...", cycle_interval)
+        time.sleep(cycle_interval)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    import argparse
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+def main():
+    parser = argparse.ArgumentParser(
+        description="RM Traffic Service — unified multi-tenant optimization"
     )
-    parser = argparse.ArgumentParser(description="RM ProfileOps Daemon")
-    parser.add_argument("mode", choices=["audit", "guard", "draft", "daemon"], default="audit", nargs="?")
-    parser.add_argument("--city", default="manhattan-ny")
-    parser.add_argument("--session", default="rm_traffic/session.json")
+    parser.add_argument("--register", action="store_true", help="Register a new tenant")
+    parser.add_argument("--username", help="RentMasseur username for registration")
+    parser.add_argument("--password", help="RentMasseur password for registration")
+    parser.add_argument("--display-name", default="", help="Display name for tenant")
+    parser.add_argument("--email", default="", help="Contact email")
+    parser.add_argument("--city", default="manhattan-ny", help="Target city")
+    parser.add_argument("--avg-rate", type=float, default=234.0, help="Average session rate")
+    parser.add_argument("--once", action="store_true", help="Run one cycle for --tenant")
+    parser.add_argument("--daemon", action="store_true", help="Run continuously for all tenants")
+    parser.add_argument("--tenant", help="Tenant ID for single operations")
+    parser.add_argument("--report", action="store_true", help="Generate ROI report for --tenant")
+    parser.add_argument("--list-tenants", action="store_true", help="List all tenants")
+    parser.add_argument("--interval", type=int, default=3600, help="Seconds between daemon cycles")
     args = parser.parse_args()
 
     init_db()
-    daemon = ProfileOpsDaemon(mode=args.mode, city=args.city, session_file=args.session)
-    daemon.run()
+
+    if args.list_tenants:
+        tenants = roi.list_tenants(active_only=False)
+        if not tenants:
+            print("No tenants registered.")
+            return
+        print(f"\n  {'ID':<20} {'Username':<20} {'City':<15} {'Baseline':<10} {'Active'}")
+        print(f"  {'-'*20} {'-'*20} {'-'*15} {'-'*10} {'-'*6}")
+        for t in tenants:
+            print(f"  {t['tenant_id'][:18]:<20} {t['username'][:18]:<20} {t.get('city','')[:13]:<15} {'✓' if t['baseline_captured'] else '✗':<10} {'✓' if t['active'] else '✗'}")
+        return
+
+    if args.register:
+        if not args.username or not args.password:
+            print("--username and --password required for registration")
+            sys.exit(1)
+        tenant_id = args.username.lower().replace(" ", "_") + "_" + hashlib.sha256(
+            args.username.encode()
+        ).hexdigest()[:6]
+        roi.register_tenant(
+            tenant_id, args.username, args.display_name, args.email,
+            args.city, args.avg_rate
+        )
+        store_credentials(tenant_id, args.username, args.password)
+        print(f"Registered tenant: {tenant_id}")
+        print(f"Username: {args.username}")
+        print(f"City: {args.city}")
+        print(f"\nRun a cycle: python3 -m rm_traffic.service --once --tenant {tenant_id}")
+        return
+
+    if args.report:
+        if not args.tenant:
+            print("--tenant required for --report")
+            sys.exit(1)
+        report = roi.generate_roi_report(args.tenant)
+        if "error" in report:
+            print(f"Error: {report['error']}")
+            sys.exit(1)
+        print(f"\n  ═══ ROI REPORT for {report.get('tenant_name', args.tenant)} ═══")
+        print(f"  Period: {report['period_start']} → {report['period_end']}")
+        print(f"\n  Baseline ({report['baseline']['days']} days):")
+        print(f"    Views/day:     {report['baseline']['avg_views']}")
+        print(f"    Contacts/day:  {report['baseline']['avg_contacts']}")
+        print(f"    Emails/day:    {report['baseline']['avg_emails']}")
+        print(f"    Bookings/day:  {report['baseline']['avg_booking_emails']}")
+        print(f"\n  Current ({report['current']['days']} days):")
+        print(f"    Views/day:     {report['current']['avg_views']}")
+        print(f"    Contacts/day:  {report['current']['avg_contacts']}")
+        print(f"    Emails/day:    {report['current']['avg_emails']}")
+        print(f"    Bookings/day:  {report['current']['avg_booking_emails']}")
+        imp = report["improvement"]
+        print(f"\n  Improvement:")
+        print(f"    Views:     {imp['views_pct']:+.1f}%")
+        print(f"    Contacts:  {imp['contacts_pct']:+.1f}%")
+        print(f"    Emails:    {imp['emails_pct']:+.1f}%")
+        print(f"    Bookings:  {imp['bookings_pct']:+.1f}%")
+        print(f"    Overall:   {imp['overall_pct']:+.1f}%")
+        p = report["pricing"]
+        print(f"\n  Pricing:")
+        print(f"    Base fee:          ${p['base_fee']:.2f}")
+        if p["guarantee_triggered"]:
+            print(f"    ⚠ GUARANTEE TRIGGERED — base fee waived (improvement < {p['guarantee_threshold_pct']:.0f}%)")
+        print(f"    Base charged:      ${p['base_fee_charged']:.2f}")
+        print(f"    Performance cut:   ${p['performance_cut']:.2f}")
+        print(f"    ─────────────────────────")
+        print(f"    Monthly charge:    ${p['monthly_charge']:.2f}")
+        print(f"    Est. extra revenue: ${p['additional_revenue_estimated']:.2f}")
+        print(f"\n  Attribution (top actions):")
+        for a in report.get("attribution", [])[:5]:
+            print(f"    {a['action_name']:<25} runs={a['total_runs']:3d} score={a['avg_attributed_score']:.1f}")
+        return
+
+    if args.once:
+        if not args.tenant:
+            print("--tenant required for --once")
+            sys.exit(1)
+        conn = _sdb()
+        row = conn.execute(
+            "SELECT MAX(cycle_num) as max_cycle FROM service_cycles WHERE tenant_id = ?",
+            (args.tenant,)
+        ).fetchone()
+        conn.close()
+        cycle_num = (row["max_cycle"] or 0) + 1
+        result = run_cycle(args.tenant, cycle_num)
+        print(json.dumps(result, indent=2, default=str))
+        return
+
+    if args.daemon:
+        run_daemon(cycle_interval=args.interval)
+        return
+
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
 
 ```
 
-state.py:
+recover_scrape.py:
 ```
-"""
-State Snapshotter — capture complete profile state.
-"""
-
-import json
+import json, time, re, requests
 from pathlib import Path
-from typing import Dict
-from datetime import datetime, timezone
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from rm_traffic.api_client import RentMasseurAPI
+from rm_traffic.bio_scraper import CITIES, extract_bios_from_results
 
-from .api_client import RentMasseurAPI
+OUT = Path("rm_traffic/data/real_bios_with_views.jsonl")
+RANKED = Path("rm_traffic/data/real_bios_ranked.txt")
+RAW = Path("rm_traffic/data/real_bios_raw_deep.jsonl")
 
-SNAPSHOT_DIR = Path(__file__).parent / "data" / "profile_snapshots"
+api = RentMasseurAPI()
+api.login("karpathianwolf", "os.environ.get("RM_PASSWORD", "")")
 
+seen = set()
+bios = []
+print(f"Searching {len(CITIES)} cities serially...")
+for city in CITIES:
+    city_count = 0
+    for page in range(1, 11):
+        try:
+            results = api.search(city=city, page=page)
+            page_bios = extract_bios_from_results(results, city)
+            if not page_bios:
+                break
+            new_count = 0
+            for b in page_bios:
+                uid = b.get("id") or b.get("username")
+                if uid and uid not in seen:
+                    seen.add(uid)
+                    bios.append(b)
+                    new_count += 1
+            city_count += len(page_bios)
+            print(f"{city} p{page}: {len(page_bios)} bios, {new_count} new, total={len(bios)}")
+            if new_count == 0 and page > 1:
+                break
+            time.sleep(0.25)
+        except Exception as e:
+            print(f"{city} p{page} ERROR: {e}")
+            break
 
-def snapshot_state(api: RentMasseurAPI) -> Dict:
-    """Capture a full snapshot of profile state."""
-    state = api.full_status()
-    state["timestamp"] = datetime.now(timezone.utc).isoformat()
-    return state
+print(f"\nSearch complete: {len(bios)} unique real bios")
+RAW.parent.mkdir(parents=True, exist_ok=True)
+with RAW.open("w") as f:
+    for b in bios:
+        f.write(json.dumps(b, ensure_ascii=False) + "\n")
 
+headers = {"User-Agent": "Mozilla/5.0"}
 
-def save_snapshot(state: Dict, snapshot_dir: Path = SNAPSHOT_DIR):
-    """Save a snapshot to disk for forensic rollback."""
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    ts = state["timestamp"].replace(":", "-")
-    path = snapshot_dir / f"snapshot_{ts}.json"
-    path.write_text(json.dumps(state, indent=2, default=str))
-    return path
+def fetch_views(username):
+    try:
+        r = requests.get(f"https://rentmasseur.com/{username}", headers=headers, timeout=12)
+        if r.status_code != 200:
+            return {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
+        member = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
+        member_since = member.group(1).strip() if member else ""
+        visit_values = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
+        visits = max(visit_values) if visit_values else 0
+        days_online = 0
+        if member_since:
+            try:
+                joined = datetime.strptime(member_since, "%b %d, %Y")
+                days_online = max(1, (datetime.now() - joined).days)
+            except Exception:
+                days_online = 0
+        views_per_day = visits / days_online if days_online else 0
+        return {
+            "visits": visits,
+            "member_since": member_since,
+            "days_online": days_online,
+            "views_per_day": views_per_day,
+        }
+    except Exception:
+        return {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
 
+print(f"\nFetching public visit counts for {len(bios)} profiles...")
+usernames = [b.get("username") for b in bios if b.get("username")]
+with ThreadPoolExecutor(max_workers=32) as pool:
+    view_map = dict(zip(usernames, pool.map(fetch_views, usernames)))
 
-def load_latest_snapshot(snapshot_dir: Path = SNAPSHOT_DIR) -> Dict:
-    """Load the most recent snapshot."""
-    files = sorted(snapshot_dir.glob("snapshot_*.json"), reverse=True)
-    if not files:
-        return {}
-    return json.loads(files[0].read_text())
+for b in bios:
+    b.update(view_map.get(b.get("username"), {}))
+
+bios.sort(key=lambda x: x.get("views_per_day", 0), reverse=True)
+
+with OUT.open("w") as f:
+    for b in bios:
+        f.write(json.dumps(b, ensure_ascii=False) + "\n")
+
+with RANKED.open("w") as f:
+    for i, b in enumerate(bios, 1):
+        desc = (b.get("description") or "").replace("\n", " | ")
+        f.write(
+            f"#{i} | {b.get('username')} | {b.get('city')} | "
+            f"visits={b.get('visits',0)} | days={b.get('days_online',0)} | "
+            f"views/day={b.get('views_per_day',0):.2f} | "
+            f"rating={b.get('ratingAverage')} | reviews={b.get('reviewsCount')} | "
+            f"gold={b.get('isGold')} | available={b.get('isAvailable')}\n"
+        )
+        f.write(f"HEADLINE: {b.get('headline')}\n")
+        f.write(f"DESC: {desc[:1200]}\n")
+        f.write(f"SERVICES: {b.get('services')}\n")
+        f.write(f"MEMBER SINCE: {b.get('member_since')}\n\n")
+
+print(f"\nDONE: {len(bios)} real bios scored")
+print(f"Saved full scored data: {OUT}")
+print(f"Saved ranked text report: {RANKED}")
+print("\nTop 25:")
+for i, b in enumerate(bios[:25], 1):
+    print(
+        f"#{i:03d} {b.get('username'):<22} "
+        f"{b.get('city'):<18} "
+        f"v/day={b.get('views_per_day',0):>8.2f} "
+        f"visits={b.get('visits',0):>8} "
+        f"reviews={b.get('reviewsCount',0):>4} "
+        f"headline={b.get('headline')}"
+    )
 
 ```
 
-content_policy.py:
+bio_token_backend.py:
 ```
 """
-Content Policy — block risky marketing claims and spam patterns.
-
-Reference: FTC Consumer Reviews and Testimonials Rule; Google spam policies.
+Deep token backend — unigrams, bigrams, trigrams, subword tokens, syllable tokens.
 """
 
 import re
-
-# Risky patterns that should not appear in public profile copy
-RISKY_PATTERNS = [
-    (r"\b(cure|heal|healing|treat|treatment|medical|diagnose|therapy|therapeutic)\b", "medical_claim", 0.4),
-    (r"\b(guaranteed|guarantee|100%|money back|promise)\b", "guarantee", 0.5),
-    (r"\b(fake|buy reviews|fake testimonials|fake clients)\b", "fake_engagement", 1.0),
-    (r"\b(best|top|number one|#1|award winning)\b", "superlative", 0.3),
-    (r"\b(cheap|discount|free|sale|limited time)\b", "discount_spam", 0.3),
-    (r"\b(click here|call now|book now|hurry)\b", "urgency_spam", 0.2),
-    (r"\b(sex|escort|happy ending|full service|nude|naked)\b", "explicit", 1.0),
-    (r"\b(bot|automated|ai-generated|auto-post|spam)\b", "spam_signal", 0.6),
-]
-
-# Cap maximum risk score
-MAX_RISK = 1.0
-
-
-def check_bio_risk(text: str) -> float:
-    """Return risk score 0.0-1.0. Higher is riskier."""
-    if not text:
-        return 0.0
-    text_lower = text.lower()
-    risk = 0.0
-    reasons = []
-    for pattern, reason, weight in RISKY_PATTERNS:
-        if re.search(pattern, text_lower):
-            risk += weight
-            reasons.append(reason)
-    # Keyword stuffing penalty
-    word_count = len(text.split())
-    if word_count > 400:
-        risk += 0.1
-    # Normalize
-    return min(risk, MAX_RISK)
-
-
-def check_headline_risk(text: str) -> float:
-    """Headlines are more visible; stricter."""
-    if not text:
-        return 0.5
-    risk = check_bio_risk(text)
-    if len(text) > 120:
-        risk += 0.2
-    return min(risk, MAX_RISK)
-
-
-def check_blog_risk(title: str, body: str) -> float:
-    """Blog posts are public content."""
-    return max(check_bio_risk(title), check_bio_risk(body))
-
-
-def explain_risk(text: str) -> dict:
-    """Return risk score and matching reasons."""
-    text_lower = text.lower()
-    reasons = []
-    risk = 0.0
-    for pattern, reason, weight in RISKY_PATTERNS:
-        if re.search(pattern, text_lower):
-            risk += weight
-            reasons.append(reason)
-    return {"score": min(risk, MAX_RISK), "reasons": reasons}
-
-```
-
-receipts.py:
-```
-"""
-Receipts — tamper-evident receipt ledger with OpenTelemetry-style traces.
-
-Every action writes a receipt:
-  tenant_id
-  timestamp
-  state_before_hash
-  action
-  reason
-  model_used
-  state_after_hash
-  metric_delta
-  reward
-  error
-  revenue_estimate
-
-Receipts are append-only and hash-chained for tamper evidence.
-"""
-
-import hashlib
 import json
-import logging
-import sqlite3
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, Optional
-
-log = logging.getLogger("receipts")
-
-RECEIPT_DB = Path(__file__).parent / "overclock_receipts.db"
-
-
-@dataclass
-class Receipt:
-    # Trace
-    trace_id: str = ""
-    span_id: str = ""
-
-    # Identity
-    tenant_id: str = ""
-    timestamp: str = ""
-
-    # State
-    state_before_hash: str = ""
-    state_after_hash: str = ""
-
-    # Action
-    action: str = ""
-    reason: str = ""
-    model_used: str = ""
-
-    # Outcome
-    metric_delta: Dict = field(default_factory=dict)
-    reward: float = 0.0
-    error: str = ""
-    revenue_estimate: float = 0.0
-
-    # Tamper evidence
-    prev_hash: str = ""
-    receipt_hash: str = ""
-
-
-def _db():
-    conn = sqlite3.connect(str(RECEIPT_DB))
-    conn.row_factory = sqlite3.Row
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS receipts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        trace_id TEXT,
-        span_id TEXT,
-        tenant_id TEXT,
-        timestamp TEXT,
-        state_before_hash TEXT,
-        state_after_hash TEXT,
-        action TEXT,
-        reason TEXT,
-        model_used TEXT,
-        metric_delta TEXT,
-        reward REAL,
-        error TEXT,
-        revenue_estimate REAL,
-        prev_hash TEXT,
-        receipt_hash TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_tenant ON receipts(tenant_id);
-    CREATE INDEX IF NOT EXISTS idx_action ON receipts(action);
-    CREATE INDEX IF NOT EXISTS idx_trace ON receipts(trace_id);
-    """)
-    conn.commit()
-    return conn
-
-
-def _last_hash(conn: sqlite3.Connection, tenant_id: str) -> str:
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT receipt_hash FROM receipts WHERE tenant_id = ? ORDER BY id DESC LIMIT 1",
-        (tenant_id,)
-    )
-    row = cur.fetchone()
-    return row["receipt_hash"] if row else "genesis"
-
-
-def write_receipt(receipt: Receipt) -> str:
-    """Write a tamper-evident receipt. Returns the receipt hash."""
-    conn = _db()
-
-    if not receipt.timestamp:
-        receipt.timestamp = datetime.now(timezone.utc).isoformat()
-
-    if not receipt.trace_id:
-        receipt.trace_id = hashlib.sha256(
-            f"{receipt.tenant_id}:{receipt.timestamp}".encode()
-        ).hexdigest()[:16]
-
-    if not receipt.span_id:
-        receipt.span_id = hashlib.sha256(
-            f"{receipt.trace_id}:{receipt.action}".encode()
-        ).hexdigest()[:8]
-
-    receipt.prev_hash = _last_hash(conn, receipt.tenant_id)
-
-    # Compute receipt hash (chain)
-    chain_data = f"{receipt.prev_hash}:{receipt.tenant_id}:{receipt.action}:{receipt.reward}:{receipt.timestamp}"
-    receipt.receipt_hash = hashlib.sha256(chain_data.encode()).hexdigest()[:16]
-
-    conn.execute(
-        """INSERT INTO receipts
-        (trace_id, span_id, tenant_id, timestamp, state_before_hash, state_after_hash,
-         action, reason, model_used, metric_delta, reward, error, revenue_estimate,
-         prev_hash, receipt_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (receipt.trace_id, receipt.span_id, receipt.tenant_id, receipt.timestamp,
-         receipt.state_before_hash, receipt.state_after_hash,
-         receipt.action, receipt.reason, receipt.model_used,
-         json.dumps(receipt.metric_delta), receipt.reward, receipt.error,
-         receipt.revenue_estimate, receipt.prev_hash, receipt.receipt_hash)
-    )
-    conn.commit()
-    conn.close()
-
-    log.info(f"  ◉ Receipt: {receipt.receipt_hash} | action={receipt.action} reward={receipt.reward:.3f}")
-    return receipt.receipt_hash
-
-
-def get_recent_receipts(tenant_id: str, limit: int = 10) -> list:
-    """Get recent receipts for a tenant."""
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM receipts WHERE tenant_id = ? ORDER BY id DESC LIMIT ?",
-        (tenant_id, limit)
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def verify_chain(tenant_id: str) -> bool:
-    """Verify the receipt chain is not tampered."""
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT prev_hash, receipt_hash FROM receipts WHERE tenant_id = ? ORDER BY id ASC",
-        (tenant_id,)
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    prev = "genesis"
-    for row in rows:
-        if row["prev_hash"] != prev:
-            return False
-        prev = row["receipt_hash"]
-    return True
-
-```
-
-reports.py:
-```
-"""
-Daily Report Generator — human-readable profile operations report.
-"""
-
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, Any
-
-from .db import get_latest_traffic_snapshot, get_open_experiments, get_variant_history
-from .traffic_analyzer import analyze_trend, conversion_rate
-from .search_rank import check_all_search_ranks
-
-
-def generate_report(username: str, state: Dict, ranks: Dict) -> str:
-    """Generate a daily report string."""
-    snapshots = get_latest_traffic_snapshot(2)
-    current = snapshots[0] if snapshots else {}
-    baseline = snapshots[-1] if len(snapshots) > 1 else current
-    trend = analyze_trend(hours=24)
-    open_exps = get_open_experiments()
-    pending = [v for v in get_variant_history("bio", 20) if v["status"] == "pending_approval"]
-
-    keep = state.get("keeponline", {})
-    avail = state.get("availability", {})
-    about = state.get("about", {})
-    assets = about.get("userProps", {}).get("assets", {})
-    stats = state.get("stats", {}).get("profileStatistics", {})
-    dashboard = state.get("dashboard", {})
-
-    ts = datetime.now(timezone.utc).isoformat()[:19]
-    report = f"""
-# ProfileOps Report — {ts} UTC
-
-## Account Health
-- Visibility: {'Visible' if not keep.get('isAdHidden') else 'HIDDEN'}
-- Availability: {avail.get('selected', 'unknown')} ({max(0, int(avail.get('countdown', 0) - __import__('time').time()) // 60)} minutes left)
-- Profile: {dashboard.get('profileStatus', 'unknown')}
-- Membership: {dashboard.get('membership', 'unknown')}
-- Frozen: {bool(keep.get('isFrozen'))}
-
-## Traffic
-- Profile views: {current.get('profile_views', 'N/A')}
-- Contact clicks: {current.get('contact_clicks', 'N/A')}
-- Contact click rate: {conversion_rate(current.get('profile_views') or 0, current.get('contact_clicks') or 0):.2%}
-- New visits: {keep.get('newVisits', 'N/A')}
-- New emails: {keep.get('newEmails', 'N/A')}
-- Online bookmarks: {dashboard.get('onlineBookmarks', 'N/A')}
-
-## 24h Trend
-- Status: {trend.get('status', 'N/A')}
-- Delta views: {trend.get('comparison', {}).get('delta_views', 'N/A')}
-- Delta contacts: {trend.get('comparison', {}).get('delta_clicks', 'N/A')}
-- Rate change: {trend.get('comparison', {}).get('rate_delta', 'N/A')}
-- Alert: {trend.get('alert', False)}
-
-## Search Presence
-- All results: {ranks.get('all', {}).get('position', 'not found')}/{ranks.get('all', {}).get('total', 'N/A')}
-- Available Now: {ranks.get('available_now', {}).get('position', 'not found')}/{ranks.get('available_now', {}).get('total', 'N/A')}
-
-## Current Copy
-- Headline: {assets.get('headline', 'N/A')}
-- Bio length: {len(assets.get('description', ''))} characters
-
-## Pending Actions
-- Bio drafts: {len(pending)}
-- Open experiments: {len(open_exps)}
-
-## Recommended Next Action
-"""
-    if not keep.get('isAdHidden'):
-        report += "- Profile is visible. Focus on availability + copy optimization.\n"
-    else:
-        report += "- CRITICAL: Profile is hidden. Fix visibility immediately.\n"
-
-    if avail.get('selected') != 'Available':
-        report += "- Availability is off. Turn on when actually available.\n"
-    elif max(0, int(avail.get('countdown', 0) - __import__('time').time()) // 60) < 60:
-        report += "- Availability expires within 1 hour. Refresh soon.\n"
-
-    if trend.get('alert'):
-        report += "- Traffic drop detected. Consider testing a new bio variant.\n"
-    elif pending:
-        report += f"- {len(pending)} bio draft(s) pending approval.\n"
-    else:
-        report += "- Traffic stable. Generate a new bio variant to test.\n"
-
-    return report
-
-
-def save_report(report: str, path: Path = Path("rm_traffic/data/reports")):
-    path.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).isoformat()[:19].replace(":", "-")
-    file_path = path / f"report_{ts}.md"
-    file_path.write_text(report)
-    return file_path
-
-
-def print_report(username: str, state: Dict, ranks: Dict):
-    print(generate_report(username, state, ranks))
-
-```
-
-bio_appraiser.py:
-```
-"""
-Bio Appraiser — measure novelty and quality of generated bios.
-"""
-
-import json
-import random
 from collections import Counter
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+from .bio_tokenizer import tokenize, _syllable_count
+
+
+def extract_ngrams(tokens: List[str], n: int = 2) -> List[Tuple[str, ...]]:
+    """Extract n-grams from token list."""
+    return [tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
+
+
+def extract_subword_tokens(word: str, min_len: int = 3) -> List[str]:
+    """Extract subword chunks: prefixes, suffixes, roots."""
+    if len(word) <= min_len:
+        return [word]
+    chunks = []
+    # Prefix 3, suffix 3, middle
+    for i in range(0, len(word) - min_len + 1):
+        chunks.append(word[i:i+min_len])
+    return chunks
+
+
+def extract_syllable_tokens(text: str) -> List[str]:
+    """Extract syllable-count tokens per word."""
+    words = tokenize(text)
+    return [f"{w}:{_syllable_count(w)}" for w in words]
+
+
+def extract_positional_tokens(text: str) -> List[str]:
+    """Extract tokens with position: first, middle, last sentence."""
+    sentences = re.split(r'[.!?]+', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    result = []
+    for i, sent in enumerate(sentences):
+        words = tokenize(sent)
+        for j, w in enumerate(words):
+            if i == 0 and j == 0:
+                result.append(f"FIRST:{w}")
+            elif i == len(sentences) - 1 and j == len(words) - 1:
+                result.append(f"LAST:{w}")
+            else:
+                result.append(f"MID:{w}")
+    return result
+
+
+def extract_structural_tokens(text: str) -> List[str]:
+    """Extract structure signals: paragraphs, sentence count, punctuation."""
+    paragraphs = len([p for p in text.split("\n") if p.strip()])
+    sentences = len(re.split(r'[.!?]+', text))
+    questions = text.count("?")
+    exclamations = text.count("!")
+    return [
+        f"PARA:{paragraphs}",
+        f"SENTS:{min(sentences, 10)}",
+        f"Q:{questions}",
+        f"EX:{exclamations}",
+    ]
+
+
+def deep_tokenize(headline: str, description: str) -> Dict:
+    """Full token extraction."""
+    text = headline + " " + description
+    tokens = tokenize(text)
+    return {
+        "unigrams": tokens,
+        "bigrams": [" ".join(bg) for bg in extract_ngrams(tokens, 2)],
+        "trigrams": [" ".join(tg) for tg in extract_ngrams(tokens, 3)],
+        "subwords": [sw for w in tokens for sw in extract_subword_tokens(w)],
+        "syllables": extract_syllable_tokens(text),
+        "positional": extract_positional_tokens(text),
+        "structural": extract_structural_tokens(text),
+    }
+
+
+def build_deep_vocab(bios: List[Dict], output_path: Path = None) -> Dict:
+    """Build deep vocabulary across all token types."""
+    counters = {
+        "unigrams": Counter(),
+        "bigrams": Counter(),
+        "trigrams": Counter(),
+        "subwords": Counter(),
+        "syllables": Counter(),
+        "positional": Counter(),
+        "structural": Counter(),
+    }
+    for bio in bios:
+        toks = deep_tokenize(bio["headline"], bio["description"])
+        for k, v in toks.items():
+            counters[k].update(v)
+
+    vocab = {
+        "total_bios": len(bios),
+        "token_types": {
+            k: {
+                "unique": len(c),
+                "total": sum(c.values()),
+                "top_50": dict(c.most_common(50)),
+            }
+            for k, c in counters.items()
+        },
+    }
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(vocab, indent=2))
+    return vocab
+
+```
+
+blog_agent.py:
+```
+"""
+Blog Draft Engine — high-quality blog drafts, never auto-published.
+
+Confirmed: GET /api/v1/blogs?page=1
+Not confirmed: create/edit endpoints (use CDP discovery first)
+
+Policy: 1-2 posts per week, useful content, no fake claims.
+"""
+
+import logging
+import time
 from pathlib import Path
 from typing import Dict, List
 
-from .bio_features import extract_features
-from .bio_generator import _score_variant
-from .bio_tokenizer import tokenize, build_vocab
+from .db import write_receipt, upsert_content_variant
+from .content_policy import check_blog_risk
+from .api_client import RentMasseurAPI
+from .blog_optimizer import select_best, generate_optimized_blog
+
+log = logging.getLogger("profileops.blog")
+
+BLOG_TOPICS = [
+    {
+        "title": "Why Manhattan Clients Book Deep Tissue After Long Desk Days",
+        "body": """Desk work in Manhattan builds tension in shoulders, neck, and lower back. Deep tissue massage targets those overworked areas with sustained pressure and slow, deliberate work. It is not about relaxation — it is about restoring movement and reducing the tightness that accumulates from hours in front of a screen. The best sessions start with clear communication: where you feel it, how long it has been there, and what kind of pressure you respond to.""",
+        "hypothesis": "Professional, local content attracts long-tail search traffic.",
+    },
+    {
+        "title": "Sports Recovery Massage in Manhattan: What to Expect",
+        "body": """After heavy training, the body needs more than rest. It needs targeted work on the muscle groups that took the load. A sports recovery session focuses on hips, hamstrings, glutes, shoulders, and back — the areas that tighten from lifting, running, and repetitive motion. The pressure is firm, the pace is intentional, and the goal is simple: help you move better tomorrow than you did today.""",
+        "hypothesis": "Sports/recovery angle captures fitness-focused readers.",
+    },
+    {
+        "title": "Neck and Shoulder Tension: How It Builds and How to Release It",
+        "body": """Most neck and shoulder tension does not come from one bad night of sleep. It comes from weeks of forward head posture, shallow breathing, and stress held in the upper back. Targeted massage works through the levator scapulae, upper traps, and rhomboids to restore range of motion and reduce the dull ache that follows you through the day.""",
+        "hypothesis": "Pain-specific content increases relevance and trust.",
+    },
+    {
+        "title": "What to Expect From Your First Professional Massage Session",
+        "body": """A professional session starts with clear boundaries and a clear plan. We discuss focus areas, pressure preferences, and any injuries or sensitivities. The room is clean, the temperature is comfortable, and the work is focused on your goals. You can communicate at any time if the pressure is too much or too little. The point is not to endure — it is to get real relief.""",
+        "hypothesis": "Trust-building content reduces friction for first-time clients.",
+    },
+    {
+        "title": "Incall vs Outcall Massage in Manhattan: How to Choose",
+        "body": """Incall means you come to a private, prepared space. Outcall means the session comes to you. Incall is usually better for controlled environment, equipment, and focus. Outcall works for clients who prefer their own space. In Manhattan, both have a place — the right choice depends on your schedule, privacy preference, and how much you want to travel after the session.""",
+        "hypothesis": "Comparison content captures high-intent searches.",
+    },
+    {
+        "title": "Travel Stiffness Relief for Frequent Flyers",
+        "body": """Long flights compress the spine, tighten hips, and leave the neck locked in one position. Travel stiffness is real, and it does not go away with a hot shower. A focused session on the lower back, hip flexors, and neck can reset the body after a trip and make the next flight easier.""",
+        "hypothesis": "Travel-specific content reaches transient Manhattan visitors.",
+    },
+    {
+        "title": "The Truth About Deep Tissue Massage in Manhattan",
+        "body": """Deep tissue massage is not a magic cure. It is focused, sustained pressure on muscle groups that have tightened from training, posture, or stress. The real results come from consistency, clear communication, and a therapist who knows how deep is too deep. In Manhattan, the difference is usually the therapist, not the room.""",
+        "hypothesis": "Truth-based content builds authority and trust.",
+    },
+    {
+        "title": "Why Your Shoulders Feel Like Concrete by Wednesday",
+        "body": """By midweek, most Manhattan desk workers have shoulders up to their ears. The cause is not one bad email. It is hours of forward head posture, shallow breathing, and a laptop that is too low. The fix is targeted work on the upper back, neck, and shoulders — plus the occasional reminder to breathe.""",
+        "hypothesis": "Relatable midweek content increases engagement.",
+    },
+    {
+        "title": "Karpathian Wolf's Guide to Not Walking Like a Robot",
+        "body": """If you sit in meetings all day and then hit the gym, your body is confused. It is stiff from the chair and then hammered by the weights. The result is a human who moves like a robot. Deep tissue work helps reconnect the muscles that the desk disconnected. The wolf is here to help.""",
+        "hypothesis": "Funny, branded content increases shareability and memorability.",
+    },
+    {
+        "title": "Why Do My Hips Hurt After Squats? A Manhattan Guide",
+        "body": """Squats do not hurt your hips. Bad recovery hurts your hips. If you train legs and then sit at a desk for ten hours, the hip flexors tighten and the glutes check out. The fix is targeted work on the front of the hips and the sides of the glutes. Your squat will thank you.""",
+        "hypothesis": "Fitness-specific pain points drive high-intent searches.",
+    },
+    {
+        "title": "The Real Difference Between a Spa Massage and Recovery Work",
+        "body": """A spa massage is about atmosphere. Recovery work is about results. One uses light oil and quiet music. The other uses pressure, communication, and a plan for the muscle groups that are actually limiting you. Both have value, but if you are training hard or sitting long hours, you probably need the second one.""",
+        "hypothesis": "Comparison content educates clients and improves lead quality.",
+    },
+]
 
 
-def load_bios(path: Path, limit: int = None) -> List[Dict]:
-    bios = []
-    with open(path, "r") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            bio = json.loads(line)
-            bios.append(bio)
-            if limit and len(bios) >= limit:
-                break
-    return bios
+def generate_blog_drafts(count: int = 1) -> List[Dict]:
+    """Generate optimized blog drafts without publishing."""
+    candidates = [generate_optimized_blog(t) for t in BLOG_TOPICS]
+    selected = []
+    for i in range(min(count, len(candidates))):
+        if not candidates:
+            break
+        best_idx = max(range(len(candidates)), key=lambda j: candidates[j]["scores"]["composite"])
+        best = candidates.pop(best_idx)
+        if best["scores"]["risk"] > 0.7:
+            log.error("Blog draft rejected by policy: %s", best["title"])
+            continue
+        variant_id = f"blog_{int(time.time())}_{i}"
+        upsert_content_variant(
+            variant_id, "blog",
+            headline=best["title"], description=best["body"],
+            title=best["title"], body=best["body"],
+            hypothesis=best["hypothesis"],
+            status="draft"
+        )
+        write_receipt(
+            "blog_draft_created_v1",
+            "generate_blog_draft",
+            {},
+            {"variant_id": variant_id, "title": best["title"], "scores": best["scores"]},
+            verified=True,
+        )
+        selected.append({
+            "variant_id": variant_id,
+            "title": best["title"],
+            "body": best["body"],
+            "hypothesis": best["hypothesis"],
+            "scores": best["scores"],
+        })
+        log.info("Blog draft created: %s (score=%.3f)", best["title"], best["scores"]["composite"])
+    return selected
 
 
-def appraise_novelty(bios: List[Dict]) -> Dict:
-    """Measure how unique the bios are."""
-    headlines = [b["headline"] for b in bios]
-    descriptions = [b["description"] for b in bios]
-    unique_headlines = len(set(headlines))
-    unique_descriptions = len(set(descriptions))
-    unique_pairs = len(set((h, d) for h, d in zip(headlines, descriptions)))
-    return {
-        "total": len(bios),
-        "unique_headlines": unique_headlines,
-        "unique_descriptions": unique_descriptions,
-        "unique_pairs": unique_pairs,
-        "headline_novelty": round(unique_headlines / len(bios), 4),
-        "description_novelty": round(unique_descriptions / len(bios), 4),
-        "pair_novelty": round(unique_pairs / len(bios), 4),
-    }
+def get_blog_drafts_dir() -> Path:
+    d = Path(__file__).parent / "data" / "drafts" / "blog"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-def appraise_quality(bios: List[Dict], sample_size: int = 500) -> Dict:
-    """Sample and score quality."""
-    sample = random.sample(bios, min(sample_size, len(bios)))
-    scores = []
-    for bio in sample:
-        s = _score_variant(bio["headline"], bio["description"])
-        scores.append(s)
-    avg_composite = sum(s["composite"] for s in scores) / len(scores)
-    avg_risk = sum(max(s["headline_risk"], s["bio_risk"]) for s in scores) / len(scores)
-    avg_sentiment = sum(s["sentiment"]["score"] for s in scores) / len(scores)
-    return {
-        "sample_size": len(sample),
-        "avg_composite_score": round(avg_composite, 4),
-        "avg_risk": round(avg_risk, 4),
-        "avg_sentiment": round(avg_sentiment, 4),
-        "top_10_percent": round(sorted([s["composite"] for s in scores], reverse=True)[int(len(scores)*0.1)], 4),
-        "bottom_10_percent": round(sorted([s["composite"] for s in scores])[int(len(scores)*0.1)], 4),
-    }
+def save_blog_drafts_to_disk(drafts: List[Dict]):
+    """Save blog drafts to markdown files for review."""
+    d = get_blog_drafts_dir()
+    for draft in drafts:
+        path = d / f"{draft['variant_id']}.md"
+        path.write_text(f"# {draft['title']}\n\n{draft['body']}\n\n**Hypothesis:** {draft['hypothesis']}\n")
 
 
-def appraise_vocabulary(bios: List[Dict]) -> Dict:
-    """Build vocabulary and report richness."""
-    vocab = build_vocab(bios, min_freq=1)
-    return {
-        "unique_tokens": vocab["unique_tokens"],
-        "total_tokens": vocab["total_tokens"],
-        "top_20": list(vocab["token_freq"].items())[:20],
-    }
-
-
-def full_appraisal(path: Path, sample_size: int = 500) -> Dict:
-    bios = load_bios(path)
-    return {
-        "file": str(path),
-        "novelty": appraise_novelty(bios),
-        "quality": appraise_quality(bios, sample_size),
-        "vocabulary": appraise_vocabulary(bios),
-    }
+def get_blog_status(api: RentMasseurAPI) -> Dict:
+    """Get current blog list."""
+    return api.get_blogs(page=1)
 
 ```
 
-revenue_overclock_ai.py:
+score_bios.py:
+```
+import json, re, requests
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+h = {"User-Agent": "Mozilla/5.0"}
+
+def fv(u):
+    try:
+        r = requests.get(f"https://rentmasseur.com/{u}", headers=h, timeout=10)
+        if r.status_code != 200:
+            return 0, "", 0
+        m = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
+        ms = m.group(1).strip() if m else ""
+        vs = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
+        v = max(vs) if vs else 0
+        d = 0
+        if ms:
+            try:
+                d = max(1, (datetime.now() - datetime.strptime(ms, "%b %d, %Y")).days)
+            except:
+                pass
+        return v, ms, d
+    except:
+        return 0, "", 0
+
+bios = [json.loads(l) for l in open("rm_traffic/data/real_bios.jsonl")]
+us = [b["username"] for b in bios]
+print(f"Fetching {len(us)} profiles...")
+res = dict(zip(us, ThreadPoolExecutor(max_workers=10).map(fv, us)))
+
+for b in bios:
+    v, ms, d = res.get(b["username"], (0, "", 0))
+    b["visits"] = v
+    b["member_since"] = ms
+    b["days_online"] = d
+    b["views_per_day"] = v / d if d > 0 else 0
+
+# Save with views
+out = Path("rm_traffic/data/real_bios_with_views.jsonl")
+out.parent.mkdir(parents=True, exist_ok=True)
+with open(out, "w") as f:
+    for b in bios:
+        f.write(json.dumps(b, default=str) + "\n")
+
+# Rank
+bios.sort(key=lambda b: b.get("views_per_day", 0), reverse=True)
+
+print(f"\n{'#':>3} {'Username':<18} {'City':<14} {'Visits':>7} {'Days':>5} {'V/Day':>7} {'R':>2} {'Rev':>3}")
+print("-" * 70)
+for i, b in enumerate(bios):
+    r = float(b.get("ratingAverage", 0) or 0)
+    print(f"{i+1:>3} {b['username']:<18} {b['city']:<14} {b['visits']:>7} {b['days_online']:>5} {b['views_per_day']:>7.1f} {r:>2} {b.get('reviewsCount',0):>3}")
+
+# Save ranked report
+ranked_path = Path("rm_traffic/data/real_bios_ranked.txt")
+with open(ranked_path, "w") as f:
+    for i, b in enumerate(bios):
+        r = float(b.get("ratingAverage", 0) or 0)
+        vpd = b.get("views_per_day", 0)
+        f.write(f"#{i+1} | {b['username']} | {b['city']} | visits={b['visits']} | days={b['days_online']} | views/day={vpd:.1f} | rating={r} | reviews={b.get('reviewsCount',0)}\n")
+        f.write(f"  Headline: {b['headline']}\n")
+        desc = b["description"].replace("\n", " | ")[:500]
+        f.write(f"  Desc: {desc}\n")
+        f.write(f"  Services: {b.get('services', [])}\n")
+        f.write(f"  Member since: {b.get('member_since', 'N/A')}\n")
+        f.write(f"  Gold: {b.get('isGold', 0)} | Avail: {b.get('isAvailable', 0)} | Certified: {b.get('isCertified', 0)}\n\n")
+
+print(f"\nSaved to {out} and {ranked_path}")
+
+```
+
+blog_optimizer.py:
 ```
 """
-RM Revenue Overclock AI Layer — the proprietary AI control layer.
+Blog Optimizer — GA-style optimization for blog topics, titles, and content.
 
-Sits above every RM module and decides what action is most likely to
-increase real contact actions, calls, inquiries, and booked sessions.
+Scores each blog candidate for:
+- local SEO (Manhattan area terms)
+- marketing angle (problem → solution → CTA)
+- readability (sentence length, structure)
+- uniqueness (avoid repetition)
+- engagement (funny/quirky hook)
 
-Does NOT replace profileops.py, availability_keeper.py, service.py, or roi_algorithm.py.
-It ORCHESTRATES them.
-
-5 Engines:
-  1. Traffic State Engine     — reads live RM metrics into TrafficState
-  2. Revenue Pressure Engine  — scores how urgently the account needs action
-  3. Action Selection Engine  — contextual bandit with ROA scoring
-  4. Client Intent Engine     — local Ollama intent classifier
-  5. Proof + ROI Engine       — tamper-evident receipts with metric deltas
-
-CLI:
-  python3 -m rm_traffic.revenue_overclock_ai --once --tenant <id>
-  python3 -m rm_traffic.revenue_overclock_ai --daemon
-  python3 -m rm_traffic.revenue_overclock_ai --report --tenant <id>
-  python3 -m rm_traffic.revenue_overclock_ai --explain-last --tenant <id>
+Then selects the best candidate.
 """
 
-import argparse
+import re
+import random
+from typing import Dict, List
+
+from .content_policy import check_blog_risk
+
+LOCAL_AREAS = [
+    "Manhattan", "Chelsea", "Midtown", "Hell's Kitchen", "Upper West Side",
+    "Upper East Side", "Tribeca", "SoHo", "West Village", "East Village",
+    "Financial District", "Flatiron", "Gramercy", "Murray Hill", "NoMad",
+]
+
+KEYWORDS = [
+    "deep tissue", "sports recovery", "massage", "bodywork", "shoulder tension",
+    "neck pain", "back pain", "hip relief", "stress relief", "desk worker",
+    "travel stiffness", "recovery massage", "professional massage", "Manhattan massage",
+]
+
+
+def _local_seo_score(title: str, body: str) -> float:
+    text = (title + " " + body).lower()
+    matches = sum(1 for a in LOCAL_AREAS if a.lower() in text)
+    keyword_matches = sum(1 for k in KEYWORDS if k.lower() in text)
+    return min(1.0, (matches * 0.15 + keyword_matches * 0.08))
+
+
+def _marketing_score(title: str, body: str) -> float:
+    score = 0.0
+    text = (title + " " + body).lower()
+    # Problem-solution structure
+    if any(w in text for w in ["tension", "pain", "stress", "stiff", "tight"]):
+        score += 0.3
+    if any(w in text for w in ["relief", "recover", "release", "better", "help"]):
+        score += 0.3
+    if any(w in text for w in ["book", "message", "contact", "session", "schedule"]):
+        score += 0.2
+    if re.search(r"\bManhattan\b", text, re.I):
+        score += 0.2
+    return min(1.0, score)
+
+
+def _readability_score(title: str, body: str) -> float:
+    sentences = re.split(r'[.!?]+', body)
+    if not sentences:
+        return 0.0
+    avg_len = sum(len(s.split()) for s in sentences if s.strip()) / max(1, len([s for s in sentences if s.strip()]))
+    # Ideal average sentence length: 15-20 words
+    if avg_len <= 10:
+        return 0.6
+    if avg_len <= 25:
+        return 1.0
+    return max(0.4, 1.0 - (avg_len - 25) / 50)
+
+
+def _engagement_score(title: str, body: str) -> float:
+    score = 0.0
+    text = title + " " + body
+    # Funny/quirky elements
+    if "wolf" in text.lower() or "smile" in text.lower() or "howl" in text.lower():
+        score += 0.4
+    if any(w in text.lower() for w in ["secret", "truth", "myth", "why", "how to"]):
+        score += 0.3
+    if len(title) <= 80 and len(title) >= 20:
+        score += 0.3
+    return min(1.0, score)
+
+
+def _risk_score(title: str, body: str) -> float:
+    return check_blog_risk(title, body)
+
+
+def score_blog(title: str, body: str) -> Dict:
+    """Return composite score for a blog candidate."""
+    local = _local_seo_score(title, body)
+    marketing = _marketing_score(title, body)
+    readability = _readability_score(title, body)
+    engagement = _engagement_score(title, body)
+    risk = _risk_score(title, body)
+    composite = (local * 0.25 + marketing * 0.25 + readability * 0.2 + engagement * 0.2) * (1 - risk)
+    return {
+        "local_seo": round(local, 2),
+        "marketing": round(marketing, 2),
+        "readability": round(readability, 2),
+        "engagement": round(engagement, 2),
+        "risk": round(risk, 2),
+        "composite": round(composite, 3),
+    }
+
+
+def select_best(candidates: List[Dict]) -> Dict:
+    """Select the highest-scoring blog candidate."""
+    if not candidates:

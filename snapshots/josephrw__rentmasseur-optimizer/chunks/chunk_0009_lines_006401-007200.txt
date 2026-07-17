@@ -1,3 +1,175 @@
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.7,
+                "max_tokens": max_tokens,
+            },
+            timeout=90,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.error("Groq API error: %s", e)
+        return None
+
+
+def collect_weekly_stats() -> dict:
+    """Collect stats for the past 7 days."""
+    now = datetime.now()
+    week_ago = now - timedelta(days=7)
+    date_prefixes = [(now - timedelta(days=i)).strftime("%Y%m%d") for i in range(7)]
+
+    stats = {
+        "period": f"{week_ago.strftime('%Y-%m-%d')} to {now.strftime('%Y-%m-%d')}",
+        "bios": 0,
+        "blog_posts": 0,
+        "interview_questions": 0,
+        "social_posts": 0,
+        "email_templates": 0,
+        "seo_keywords": 0,
+        "mass_analyses": 0,
+        "competitor_data": False,
+        "strategies_covered": set(),
+    }
+
+    for subdir, key in [
+        ("bios", "bios"),
+        ("blog_posts", "blog_posts"),
+        ("interview_questions", "interview_questions"),
+        ("social_posts", "social_posts"),
+        ("email_templates", "email_templates"),
+        ("seo_keywords", "seo_keywords"),
+    ]:
+        directory = os.path.join(CONTENT_DIR, subdir)
+        if os.path.exists(directory):
+            ext = "json" if key == "seo_keywords" else "md"
+            for dp in date_prefixes:
+                files = glob.glob(os.path.join(directory, f"{dp}_*.{ext}"))
+                stats[key] += len(files)
+                for f in files:
+                    basename = os.path.basename(f)
+                    if "_" in basename:
+                        strategy = basename.split("_", 1)[1].rsplit(".", 1)[0]
+                        stats["strategies_covered"].add(strategy)
+
+    # Mass analyses
+    for dp in date_prefixes:
+        analyses = glob.glob(os.path.join(CONTENT_DIR, f"mass_analysis_{dp}.md"))
+        stats["mass_analyses"] += len(analyses)
+
+    # Competitor data
+    competitor_path = os.path.join(CONTENT_DIR, "competitor_data.json")
+    stats["competitor_data"] = os.path.exists(competitor_path)
+
+    stats["strategies_covered"] = list(sorted(stats["strategies_covered"]))
+    return stats
+
+
+def generate_report(stats: dict) -> str:
+    """Generate the weekly report using Groq."""
+    system_prompt = (
+        "You are a marketing analyst for a massage therapy business in Manhattan, NYC. "
+        "Generate a comprehensive weekly report in markdown format. "
+        "Include: executive summary, content production metrics, strategy coverage, "
+        "recommendations for next week, and action items. "
+        "Be specific and data-driven."
+    )
+
+    user_prompt = (
+        f"Weekly Stats:\n{json.dumps(stats, indent=2)}\n\n"
+        f"Generate the weekly report."
+    )
+
+    report = _groq_chat(system_prompt, user_prompt)
+    if not report:
+        report = f"# Weekly Report — {stats['period']}\n\n## Stats\n\n```json\n{json.dumps(stats, indent=2)}\n```"
+    return report
+
+
+def main():
+    output_path = os.path.join(CONTENT_DIR, f"weekly_report_{datetime.now().strftime('%Y%m%d')}.md")
+    os.makedirs(CONTENT_DIR, exist_ok=True)
+
+    logger.info("Collecting weekly stats...")
+    stats = collect_weekly_stats()
+    logger.info("Stats: %s", json.dumps({k: v for k, v in stats.items() if k != "strategies_covered"}, indent=2))
+
+    logger.info("Generating report with Groq...")
+    report = generate_report(stats)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    logger.info("Report saved: %s (%d chars)", output_path, len(report))
+
+    print(f"\nReport: {output_path}")
+    print(f"Strategies covered: {len(stats['strategies_covered'])}")
+    print(f"Total content: {sum(v for k, v in stats.items() if isinstance(v, int))}")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+rentmasseur_coordinator.py:
+```
+#!/usr/bin/env python3
+"""
+RentMasseur Coordinator — uses intent router to pick top strategies,
+generates bios, auto-saves to files, and updates the best one to the site.
+"""
+
+import os
+import sys
+import json
+import logging
+import time
+from typing import List, Optional
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+# Strategy definitions
+STRATEGIES = {
+    "sensory_luxury": "Write a luxurious, sensory-rich bio. Vivid imagery: warm oils, candlelight, silk, aromatherapy. Premium experience, discretion, bespoke sessions. Sophisticated, intimate, high-end. CTA.",
+    "therapeutic_expert": "Professional, therapeutic bio. Certifications, deep tissue, Swedish, sports, trigger point. Pain relief, recovery, wellness. Clinical yet warm, authoritative. CTA.",
+    "mystery_desire": "Magnetic, mysterious bio. Tease the experience. Confident, alluring. Curiosity and urgency. Enigmatic, seductive-but-classy. Strong CTA.",
+    "local_hustle": "Grounded, local-vibe for Manhattan NYC. Neighborhood energy, convenience, go-to masseur. Friendly, approachable, confident. CTA for easy booking.",
+    "transformation_story": "Mini-story bio. Client problem (stress, tension, exhaustion) leads to your massage as solution. Empathetic, inspiring, results-oriented. Emotional hook + CTA.",
+    "night_owl": "Late-night availability angle. Available when others aren't. Private evening sessions for busy professionals. Intimate, exclusive, after-hours. CTA.",
+    "athlete_recovery": "Target gym-goers and athletes. Pre/post-workout massage, muscle recovery, injury prevention. Performance-focused, energetic, results-driven. CTA.",
+    "ceo_executive": "Executive wellness bio. High-stress relief for CEOs, founders, professionals. Time-efficient, powerful, transformative. Discreet, premium. CTA.",
+    "spiritual_healer": "Holistic, spiritual approach. Energy work, chakras, mindfulness, breathwork. Calming, nurturing, soulful. CTA for inner peace.",
+    "traveler_companion": "Bio for out-of-town visitors. Jet lag relief, welcome to NYC, concierge-style service. Friendly, worldly, accommodating. CTA.",
+    "medical_referral": "Clinical, doctor-recommended angle. Back pain, sciatica, posture correction. Evidence-based, professional, reassuring. CTA.",
+    "artist_soul": "Creative, artistic bio. Massage as art form, body as canvas, intuitive touch. Poetic, expressive, unique. CTA.",
+    "discrete_confidential": "Absolute discretion angle. Private studio, no waiting room, confidential, judgment-free. Safe, secure, trusted. CTA for VIP clients.",
+    "first_timer": "Welcoming first-timers. No experience needed, guided session, gentle introduction. Warm, patient, educational. CTA.",
+    "seasonal_special": "Seasonal theme. Winter warmth, summer cool-down, holiday stress relief. Timely, festive, relevant. CTA.",
+    "couples_duo": "Couples massage angle. Partners, friends, duet sessions. Romantic, bonding, shared experience. CTA.",
+    "bodybuilder_therapy": "Heavy lifting recovery. Deep pressure, muscle breakdown, fascia release. Intense, powerful, respected. CTA.",
+    "yoga_fusion": "Yoga + massage fusion. Stretching, flexibility, mind-body connection. Flow, balance, zen. CTA.",
+    "luxury_concierge": "White-glove service. In-home, hotel, personal concierge. Elite, effortless, bespoke. CTA for VIP booking.",
+    "recovery_addiction": "Sober wellness angle. Clean living, recovery support, healthy coping. Supportive, non-judgmental, empowering. CTA.",
+    "military_veteran": "Veteran-friendly, service-member respect. Camaraderie, PT recovery, brotherhood. Honorable, strong, understanding. CTA.",
+    "lgbtq_pride": "Pride-forward, inclusive bio. Safe space, community, authentic self-expression. Celebratory, welcoming, proud. CTA.",
+    "senior_gentle": "Senior-friendly, gentle touch. Mobility, arthritis, circulation. Patient, respectful, nurturing. CTA.",
+    "office_relief": "Desk job recovery. Neck pain, carpal tunnel, posture. Corporate warrior relief. Practical, relatable, urgent. CTA.",
+    "dancer_flexibility": "Dancer and performer focused. Flexibility, maintenance, injury prevention. Graceful, dedicated, artistic. CTA.",
+    "meditation_guide": "Guided meditation + massage. Mindfulness, breath, presence. Tranquil, centered, deep. CTA.",
+    "hot_stone_specialist": "Hot stone specialty. Warm stones, heat therapy, deep relaxation. Expert, unique, indulgent. CTA.",
+    "quick_lunch": "Express lunch-break massage. 30-45 min, in-and-out, midday recharge. Fast, effective, convenient. CTA.",
     "birthday_gift": "Gift-worthy experience. Treat yourself, special occasion, deserved indulgence. Celebratory, gift-like, memorable. CTA.",
     "weekly_ritual": "Subscription/recurring angle. Weekly maintenance, body upkeep, ritual. Committed, long-term, investment in self. CTA for repeat booking.",
 }
@@ -475,16 +647,26 @@ if __name__ == "__main__":
 *.env
 session.json
 *cookies*
+*.sqlite
+*.db
 __MACOSX/
 .DS_Store
 __pycache__/
 *.pyc
 .git/
+rm_traffic/
+data/batch/
 *bios_1m*.jsonl
 *bios_v2_1m*.jsonl
 *bios_300k*.jsonl
 *bios_30k*.jsonl
 *bios_3k*.jsonl
+*real_bios_raw*.jsonl
+*real_bios_with_views*.jsonl
+profileops.db
+traffic.db
+fortress.db
+*.pkl
 private_secrets_quarantine/
 api_map.json
 *.secret.json
@@ -616,185 +798,3 @@ def run_rotator_pick() -> dict:
     print(f"Rotator exit code: {result.returncode}")
     print(f"Rotator stdout: {result.stdout.strip()}")
     if result.stderr:
-        print(f"Rotator stderr: {result.stderr.strip()}")
-
-    if result.returncode != 0:
-        print("Rotator failed to pick a bio")
-        sys.exit(1)
-
-    # Parse output: "Next bio: bio_D_funny_direct_cta (strategy: funny_direct_cta, uses: 0, reward: 0)"
-    output = result.stdout.strip()
-    for variant in BIO_VARIANTS:
-        if variant["id"] in output:
-            print(f"Selected bio: {variant['id']} (strategy: {variant['strategy']})")
-            return variant
-
-    print(f"Could not parse selected bio from: {output}")
-    sys.exit(1)
-
-
-def push_bio_to_profile(variant: dict):
-    """Login to RentMasseur and push the selected bio."""
-    bio_content = load_bio_content(variant["file"])
-
-    # Verify rebrandly link
-    if REBRANDLY_LINK not in bio_content:
-        print(f"ERROR: Bio does not contain rebrandly link: {REBRANDLY_LINK}")
-        sys.exit(1)
-
-    print(f"\nBio to push ({variant['id']}):")
-    print(f"  Headline: {variant['headline']}")
-    print(f"  Length: {len(bio_content)} chars")
-    print(f"  Rebrandly link: PRESENT")
-    print(f"  Content preview: {bio_content[:200]}...")
-
-    # Load credentials from .env
-    from dotenv import load_dotenv
-    env_path = Path(__file__).parent / ".env"
-    load_dotenv(env_path)
-
-    username = os.environ.get("RENTMASSEUR_USERNAME")
-    password = os.environ.get("RENTMASSEUR_PASSWORD")
-
-    if not username or not password or username == "REDACTED_ROTATE_ME":
-        print("ERROR: No valid credentials in .env")
-        sys.exit(1)
-
-    print(f"\nLogging in as {username}...")
-    api = RentMasseurAPI(min_request_interval=2.0)
-
-    if not api.login(username, password):
-        print("ERROR: Login failed")
-        sys.exit(1)
-
-    print("Login successful")
-
-    # Check current bio first
-    print("\nFetching current bio...")
-    try:
-        current = api.get_about()
-        print(f"Current headline: {current.get('headline', 'unknown')}")
-        current_desc = current.get("description", "")
-        if REBRANDLY_LINK in current_desc:
-            print("Current bio already has rebrandly link")
-    except Exception as e:
-        print(f"Warning: Could not fetch current bio: {e}")
-
-    # Push new bio
-    print(f"\nPushing bio: {variant['id']}")
-    print(f"  Headline: {variant['headline']}")
-    print(f"  Description: {bio_content[:100]}...")
-
-    try:
-        result = api.set_about(headline=variant["headline"], description=bio_content)
-        print(f"API response: {json.dumps(result, indent=2)}")
-        print("BIO UPDATED SUCCESSFULLY")
-    except Exception as e:
-        print(f"ERROR: Failed to update bio: {e}")
-        sys.exit(1)
-
-    # Write receipt
-    write_receipt(variant, bio_content, result)
-
-    # Verify
-    print("\nVerifying update...")
-    try:
-        verify = api.get_about()
-        print(f"Verified headline: {verify.get('headline', 'unknown')}")
-        verified_desc = verify.get("description", "")
-        if REBRANDLY_LINK in verified_desc:
-            print("VERIFIED: Rebrandly link is live in profile bio")
-        else:
-            print("WARNING: Rebrandly link not found in verified bio")
-        print(f"Verified bio length: {len(verified_desc)} chars")
-    except Exception as e:
-        print(f"Warning: Could not verify: {e}")
-
-
-def write_receipt(variant: dict, bio_content: str, api_result: dict):
-    """Write a receipt for the bio update."""
-    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc)
-    receipt = {
-        "action": "bio_rotation_push",
-        "timestamp": ts.isoformat(),
-        "variant_id": variant["id"],
-        "strategy": variant["strategy"],
-        "headline": variant["headline"],
-        "bio_length": len(bio_content),
-        "rebrandly_link": REBRANDLY_LINK,
-        "rebrandly_present": REBRANDLY_LINK in bio_content,
-        "api_result": api_result,
-        "status": "pushed",
-    }
-    receipt_path = RECEIPTS_DIR / f"bio_push_{ts.strftime('%Y%m%d_%H%M%S')}.json"
-    receipt_path.write_text(json.dumps(receipt, indent=2))
-    print(f"\nReceipt written: {receipt_path}")
-
-
-def main():
-    print("=" * 60)
-    print("RM-PRI BIO ROTATION PIPELINE")
-    print("=" * 60)
-
-    # Step 1: Seed rotator
-    print("\n--- Step 1: Seed rotator ---")
-    seed_rotator()
-
-    # Step 2: Pick best bio via C++ rotator
-    print("\n--- Step 2: Rotator picks next bio ---")
-    selected = run_rotator_pick()
-
-    # Step 3: Push to live profile
-    print("\n--- Step 3: Push bio to live profile ---")
-    push_bio_to_profile(selected)
-
-    # Step 4: Show rotator report
-    print("\n--- Step 4: Rotator report ---")
-    rotator = Path(__file__).parent / "rotator_engine"
-    report = subprocess.run(
-        ["./rotator_engine", "--report", "--dir", str(CONTENT_DIR)],
-        cwd=Path(__file__).parent, capture_output=True, text=True
-    )
-    print(report.stdout)
-
-    print("\n" + "=" * 60)
-    print("PIPELINE COMPLETE")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-settings_avail.png:
-```
-Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
-```
-
-requirements.txt:
-```
-fastapi>=0.104.0
-uvicorn>=0.24.0
-requests>=2.31.0
-
-```
-
-daily_promotion.py:
-```
-#!/usr/bin/env python3
-"""
-Daily Promotion Script — the bridge between rm_traffic and the runtime.
-
-rm_traffic/profileops.db → sanitize → hash → compact → daily_evidence_packet.json
-
-Usage:
-    python3 daily_promotion.py [--traffic-db PATH] [--out PATH] [--ingest-url URL]
-"""
-
-import argparse
-import json
-import os
-import sqlite3
-import hashlib

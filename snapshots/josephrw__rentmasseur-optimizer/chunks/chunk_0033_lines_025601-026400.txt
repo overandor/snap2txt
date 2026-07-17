@@ -1,585 +1,172 @@
-        return resp.json()
+    init_db()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
 
-    def search(self, city: str = "manhattan-ny", available_only: bool = True,
-               page: int = 1, skip: int = 0) -> Dict:
-        body = {"searchCity": city, "page": page, "skipUsers": str(skip)}
-        if available_only:
-            body["available"] = 1
-        resp = self._post("/search", body)
-        resp.raise_for_status()
-        return resp.json()
+    stats = {
+        "cycle": cycle_num,
+        "timestamp": _ts(),
+        "platforms": platforms,
+        "posts_scraped": 0,
+        "leads_stored": 0,
+        "leads_classified": 0,
+        "high_intent": 0,
+        "responses_generated": 0,
+        "duplicates_skipped": 0,
+        "errors": 0,
+        "by_platform": {},
+        "by_intent": {},
+    }
 
-    def get_rates(self) -> Dict:
-        resp = self._get("/settings/rates")
-        resp.raise_for_status()
-        return resp.json()
+    all_posts = []
+    if platforms in ("all", "reddit"):
+        reddit_posts = scrape_reddit()
+        all_posts.extend(reddit_posts)
+        stats["by_platform"]["reddit"] = len(reddit_posts)
 
-    def get_locations(self) -> Dict:
-        resp = self._get("/locations", params={"withMasseurs": 1})
-        resp.raise_for_status()
-        return resp.json()
+    if platforms in ("all", "x"):
+        x_posts = scrape_x()
+        all_posts.extend(x_posts)
+        stats["by_platform"]["x"] = len(x_posts)
 
-    def get_blogs(self, page: int = 1) -> Dict:
-        resp = self._get("/blogs", params={"page": page})
-        resp.raise_for_status()
-        return resp.json()
+    stats["posts_scraped"] = len(all_posts)
 
-    def full_status(self) -> Dict:
-        return {
-            "dashboard": self.get_dashboard(),
-            "availability": self.get_availability(),
-            "stats": self.get_stats(),
-            "keeponline": self.get_keeponline(),
-            "about": self.get_about(),
-            "mailbox": self.get_mailbox(),
-        }
+    if not all_posts:
+        log.info("No posts scraped — nothing to do")
+        conn.close()
+        receipt_id = write_receipt(stats)
+        stats["receipt_id"] = receipt_id
+        return stats
 
+    for post in all_posts:
+        lead = dict(post)
+        stored = store_lead(conn, lead)
+        if not stored:
+            stats["duplicates_skipped"] += 1
+            continue
+        stats["leads_stored"] += 1
 
-# ---------------------------------------------------------------------------
-# Bio Content Generator
-# ---------------------------------------------------------------------------
+        intent, confidence = classify_intent(post)
+        lead["intent"] = intent
+        lead["confidence"] = confidence
+        stats["leads_classified"] += 1
+        stats["by_intent"][intent] = stats["by_intent"].get(intent, 0) + 1
 
-BIO_HEADLINES = [
-    "You bring the smile, I bring the Wolf.",
-    "Manhattan bodywork. Deep. Intentional. Real.",
-    "Large hands. Clear purpose. Better movement.",
-    "Your shoulders called. The Wolf answered.",
-    "Deep tissue therapy, Chelsea to Midtown.",
-    "No crystals. No fluff. Just effective bodywork.",
-    "7 years of convincing muscles to behave.",
-    "The body keeps score. I audit the books.",
-    "Professional massage for people who sit too hard.",
-    "From desk goblin to functional human.",
-]
+        c_hash = _hash(f"{lead['platform']}:{lead.get('url', '')}:{lead.get('title', '')}")
+        conn.execute(
+            "UPDATE leads SET intent=?, confidence=? WHERE content_hash=?",
+            (intent, confidence, c_hash),
+        )
 
-BIO_VARIATIONS = [
-    """🐺 KARPATHIAN WOLF
-
-74,000+ profile views.
-
-7 years specializing in deep tissue, sports recovery, and mobility work.
-
-I work with desk professionals, gym athletes, frequent flyers, and anyone whose shoulders are trying to become earrings.
-
-Common feedback: "I can move my neck again," and "I didn't know I was carrying all that stress."
-
-Approach: find the restriction, address it directly, restore function.
-
-No gimmicks. No energy portals. Just clean, effective bodywork from a large Ukrainian therapist in Manhattan.
-
-📍 Manhattan, NYC
-""",
-    """🐺 KARPATHIAN WOLF
-
-Professional deep tissue and therapeutic bodywork in Manhattan.
-
-What I do: identify the real source of tension, work it with depth and precision, and help you move better.
-
-Who I see: office workers, athletes, travelers, and anyone with chronic tightness.
-
-What to expect: clear communication, firm pressure, and a session that actually changes how you feel.
-
-📍 Manhattan, NYC
-""",
-    """🐺 KARPATHIAN WOLF
-
-Your body keeps score. I help audit the books.
-
-7 years of hands-on experience. Deep tissue, sports recovery, stress relief.
-
-I work with people who sit too long, lift too hard, or fly too often. If your neck, shoulders, or back feel like they own you, we fix that.
-
-Sessions are professional, direct, and focused on results.
-
-📍 Manhattan, NYC
-""",
-]
-
-def suggest_bio(current_headline: str = "", current_description: str = "") -> Dict:
-    """Generate a new bio variant that is different from current."""
-    headline = random.choice([h for h in BIO_HEADLINES if h != current_headline])
-    desc = random.choice([d for d in BIO_VARIATIONS if d.strip()[:100] != current_description.strip()[:100]])
-    return {"headline": headline, "description": desc}
-
-def draft_blog() -> Dict:
-    """Draft a blog post. Returns draft only — does NOT publish."""
-    titles = [
-        "What to expect from your first deep tissue session",
-        "Why your shoulders hurt and what actually helps",
-        "Desk work vs. your neck: how to fight back",
-        "The difference between spa massage and therapeutic bodywork",
-        "Recovery tips for athletes who train hard",
-    ]
-    snippets = [
-        "Most people think massage is about relaxation. Therapeutic work is about restoring movement.",
-        "Your shoulders are not supposed to live next to your ears. If they do, we can fix that.",
-        "Deep tissue should not mean painful. It means precise, patient, and targeted.",
-        "The best recovery combines sleep, movement, water, and occasional professional bodywork.",
-        "If you fly often, your hips and lower back are paying for it. Regular sessions help.",
-    ]
-    title = random.choice(titles)
-    body = random.choice(snippets) + "\n\nThis is a draft. Review before publishing."
-    return {"title": title, "body": body}
-
-# ---------------------------------------------------------------------------
-# ProfileOps Engine
-# ---------------------------------------------------------------------------
-
-class ProfileOps:
-    """Main operations engine."""
-
-    def __init__(self, username: str, password: str, city: str = "manhattan-ny", manual_captcha: bool = False):
-        self.api = RentMasseurAPI()
-        self.username = username
-        self.password = password
-        self.city = city
-        self.manual_captcha = manual_captcha
-        self.last_visibility_check = 0
-        self.last_avail_check = 0
-        self.last_stats_check = 0
-        self.last_bio_check = 0
-        self.last_dashboard_print = 0
-        self.running = True
-        self.current_state = {}
-
-    def login(self) -> bool:
-        if self.manual_captcha:
-            ok = self.api.login_manual_captcha(self.username, self.password)
-            receipt("login", ok, "Manual captcha login")
-            return ok
-        ok = self.api.login(self.username, self.password)
-        receipt("login", ok, "API login")
-        return ok
-
-    def ensure_visible(self, force: bool = False):
-        """Guard profile visibility. Fix it if hidden."""
-        try:
-            keep = self.api.get_keeponline()
-            is_hidden = bool(keep.get("isAdHidden", 0))
-            if is_hidden or force:
-                before = {"isAdHidden": is_hidden}
-                result = self.api.set_visibility(True)
-                after = {"isAdHidden": 0, "response": result}
-                receipt("set_visibility", True, "Profile was hidden, now shown", before, after)
-                record_alert("critical", "visibility_hidden", "Profile was hidden from search. Auto-fixed.")
-                log.info("Profile visibility: HIDDEN → SHOWN")
-            else:
-                log.info("Profile visibility: shown")
-        except Exception as e:
-            receipt("ensure_visible", False, str(e))
-            log.error("Visibility check failed: %s", e)
-
-    def ensure_available(self):
-        """Refresh availability only if near expiry."""
-        try:
-            avail = self.api.get_availability()
-            selected = avail.get("selected", "")
-            countdown = avail.get("countdown", 0)
-            now = time.time()
-            remaining = max(0, int(countdown - now))
-
-            log.info("Availability: %s (remaining ~%ds)", selected, remaining)
-
-            if selected != "Available" or remaining < AVAIL_REFRESH_THRESHOLD:
-                before = {"selected": selected, "remaining": remaining}
-                # Try to set availability via dashboard about endpoint
-                # Note: the exact set-availability endpoint wasn't confirmed.
-                # We log that it needs refresh and attempt the best-known path.
-                # For now, we flag this as needing manual/agent confirmation.
-                receipt("ensure_available", False,
-                        f"Availability needs refresh ({selected}, {remaining}s left). Endpoint not confirmed.")
-                record_alert("warning", "availability_low",
-                             f"Availability low/expired: {selected}, {remaining}s remaining. Need refresh.")
-            else:
-                receipt("ensure_available", True, f"Availability OK: {selected}, {remaining}s left")
-        except Exception as e:
-            receipt("ensure_available", False, str(e))
-            log.error("Availability check failed: %s", e)
-
-    def collect_stats(self):
-        """Collect traffic and profile stats."""
-        try:
-            dash = self.api.get_dashboard()
-            stats = self.api.get_stats()
-            keep = self.api.get_keeponline()
-            about = self.api.get_about()
-            mail = self.api.get_mailbox()
-
-            prof_stats = stats.get("profileStatistics", {}) or {}
-            assets = about.get("userProps", {}).get("assets", {})
-
-            record_stats(
-                views=prof_stats.get("totalPageViews"),
-                contact_clicks=prof_stats.get("totalContactClicks"),
-                visits=keep.get("newVisits"),
-                bookmarks=dash.get("onlineBookmarks"),
-                new_emails=keep.get("newEmails"),
-                is_ad_hidden=keep.get("isAdHidden"),
-                available=dash.get("userSetting", {}).get("availability", {}).get("available"),
-                availability_remaining=str(dash.get("userSetting", {}).get("availability", {}).get("validTo", "")),
-                headline=assets.get("headline"),
-                description_len=len(assets.get("description", "")),
-                city=self.city,
-            )
-
-            log.info("Stats recorded: views=%s contacts=%s visits=%s bookmarks=%s",
-                     prof_stats.get("totalPageViews"),
-                     prof_stats.get("totalContactClicks"),
-                     keep.get("newVisits"),
-                     dash.get("onlineBookmarks"))
-
-            self.current_state = {
-                "views": prof_stats.get("totalPageViews"),
-                "contacts": prof_stats.get("totalContactClicks"),
-                "visits": keep.get("newVisits"),
-                "bookmarks": dash.get("onlineBookmarks"),
-                "is_ad_hidden": keep.get("isAdHidden"),
-                "available": dash.get("userSetting", {}).get("availability", {}).get("available"),
-                "headline": assets.get("headline"),
-            }
-            receipt("collect_stats", True, "Traffic stats collected")
-        except Exception as e:
-            receipt("collect_stats", False, str(e))
-            log.error("Stats collection failed: %s", e)
-
-    def check_search_position(self):
-        """Check search position for target city."""
-        try:
-            results = self.api.search(self.city, available_only=False, page=1)
-            avail_results = self.api.search(self.city, available_only=True, page=1)
-
-            # Find our position by looking for our username in result items
-            pos = self._find_position(results)
-            avail_pos = self._find_position(avail_results)
-
-            total = len(results.get("masseurs", [])) if isinstance(results.get("masseurs"), list) else 0
-            avail_total = len(avail_results.get("masseurs", [])) if isinstance(avail_results.get("masseurs"), list) else 0
-
-            record_stats(
-                city=self.city,
-                search_position=pos,
-                search_available_position=avail_pos,
-                search_total=total,
-                search_available_total=avail_total,
-            )
-            log.info("Search position: #%s/%s (available #%s/%s)", pos, total, avail_pos, avail_total)
-            receipt("check_search_position", True,
-                    f"Position #{pos}/{total}, available #{avail_pos}/{avail_total}")
-        except Exception as e:
-            receipt("check_search_position", False, str(e))
-            log.error("Search position check failed: %s", e)
-
-    def _find_position(self, results: Dict) -> Optional[int]:
-        masseurs = results.get("masseurs") if isinstance(results.get("masseurs"), list) else []
-        for i, m in enumerate(masseurs):
-            uname = (m.get("username") or m.get("userCard", {}).get("username") or "").lower()
-            if uname == self.username.lower():
-                return i + 1
-        return None
-
-    def bio_experiment(self, auto_apply: bool = False):
-        """Run controlled bio experiment with LLM-driven analysis. One change per day."""
-        try:
-            # Check if we already changed bio today
-            conn = db()
-            row = conn.execute(
-                "SELECT ts FROM bio_versions WHERE applied=1 ORDER BY ts DESC LIMIT 1"
-            ).fetchone()
-            conn.close()
-            if row:
-                last_change = datetime.fromisoformat(row["ts"])
-                if datetime.now(timezone.utc) - last_change < timedelta(days=1):
-                    log.info("Bio experiment: skipped — last change was within 24h")
-                    return
-
-            # Pull real profile data for LLM analysis
-            profile_data = self.api.full_status()
-            about = profile_data.get("about", {})
-            assets = about.get("userProps", {}).get("assets", {})
-            current_headline = assets.get("headline", "")
-            current_desc = assets.get("description", "")
-
-            # Get recent stats history
-            conn = db()
-            stats_history = [dict(r) for r in conn.execute(
-                "SELECT ts, views, contact_clicks, visits FROM stats ORDER BY ts DESC LIMIT 7"
-            ).fetchall()]
-            conn.close()
-
-            # Generate with LLM
-            from rm_traffic.llm_bio_writer import generate_bio_with_llm
-            suggestion = generate_bio_with_llm(
-                profile_data, stats_history, current_headline, current_desc,
-                city=self.city, provider=os.environ.get("LLM_PROVIDER"),
-                model=os.environ.get("LLM_MODEL")
-            )
-
-            # Fallback to templates if LLM fails
-            if not suggestion:
-                suggestion = suggest_bio(current_headline, current_desc)
-                log.warning("LLM bio generation failed, using template fallback")
-
-            stats = self.api.get_stats()
-            views_before = (stats.get("profileStatistics") or {}).get("totalPageViews")
-            contacts_before = (stats.get("profileStatistics") or {}).get("totalContactClicks")
-
-            conn = db()
-            conn.execute(
-                "INSERT INTO bio_versions (ts, headline, description, reason, applied, views_before, contacts_before) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (datetime.now(timezone.utc).isoformat(), suggestion["headline"],
-                 suggestion["bio"], "llm_daily_variant", 0, views_before, contacts_before)
-            )
-            conn.commit()
-            conn.close()
-
-            log.info("Bio experiment suggestion: headline='%s'", suggestion["headline"])
-
-            if auto_apply:
-                before = {"headline": current_headline, "description": current_desc[:200]}
-                self.api.set_about(suggestion["headline"], suggestion["bio"])
-                conn = db()
+        if intent in HIGH_INTENT:
+            stats["high_intent"] += 1
+            response = generate_response(post)
+            if response:
+                lead["generated_response"] = response
+                stats["responses_generated"] += 1
                 conn.execute(
-                    "UPDATE bio_versions SET applied=1 WHERE ts=(SELECT ts FROM bio_versions ORDER BY ts DESC LIMIT 1)"
+                    "UPDATE leads SET generated_response=?, status='response_ready' WHERE content_hash=?",
+                    (response, c_hash),
                 )
-                conn.commit()
-                conn.close()
-                after = {"headline": suggestion["headline"], "description": suggestion["bio"][:200]}
-                receipt("bio_experiment", True, "Applied new LLM bio variant", before, after)
-                log.info("Bio experiment applied (auto)")
+                log.info(f"  ◆ {lead['platform']}/{lead.get('subreddit', '?')}: intent={intent} response generated ({len(response)} chars)")
             else:
-                receipt("bio_experiment", True,
-                        f"LLM bio variant drafted (not applied). Headline: {suggestion['headline']}")
-                record_alert("info", "bio_suggestion",
-                             f"New LLM bio variant drafted: {suggestion['headline']}")
-        except Exception as e:
-            receipt("bio_experiment", False, str(e))
-            log.error("Bio experiment failed: %s", e)
+                conn.execute(
+                    "UPDATE leads SET status='high_intent' WHERE content_hash=?",
+                    (c_hash,),
+                )
+                log.info(f"  ▲ {lead['platform']}/{lead.get('subreddit', '?')}: intent={intent} (no response)")
+        else:
+            conn.execute(
+                "UPDATE leads SET status='low_intent' WHERE content_hash=?",
+                (c_hash,),
+            )
 
-    def draft_blog_post(self):
-        """Draft a blog post. Never auto-publish."""
-        draft = draft_blog()
-        receipt("draft_blog", True, f"Drafted blog: {draft['title']}")
-        log.info("Blog draft (not published): %s", draft["title"])
-        return draft
+    conn.commit()
 
-    def print_dashboard(self):
-        """Print current status dashboard."""
-        try:
-            dash = self.api.get_dashboard()
-            stats = self.api.get_stats()
-            keep = self.api.get_keeponline()
-            about = self.api.get_about()
-            avail = self.api.get_availability()
-
-            prof = stats.get("profileStatistics", {}) or {}
-            assets = about.get("userProps", {}).get("assets", {})
-            us = dash.get("userSetting", {})
-
-            print(f"\n{'='*60}")
-            print(f"  PROFILEOPS DASHBOARD")
-            print(f"{'='*60}")
-            print(f"  Timestamp: {datetime.now(timezone.utc).isoformat()[:19]} UTC")
-            print(f"  Username:  {self.username}")
-            print(f"  Visibility: {'HIDDEN' if keep.get('isAdHidden') else 'SHOWN'}")
-            print(f"  Availability: {us.get('availability', {}).get('message', 'N/A')} "
-                  f"(validTo={us.get('availability', {}).get('validTo', 'N/A')})")
-            print(f"  Profile Views:   {prof.get('totalPageViews', 'N/A')}")
-            print(f"  Contact Clicks:  {prof.get('totalContactClicks', 'N/A')}")
-            print(f"  New Visits:      {keep.get('newVisits', 'N/A')}")
-            print(f"  New Emails:      {keep.get('newEmails', 'N/A')}")
-            print(f"  Bookmarks:       {dash.get('onlineBookmarks', 'N/A')}")
-            print(f"  Headline:        {assets.get('headline', 'N/A')}")
-            print(f"  Description:     {len(assets.get('description', ''))} chars")
-            print(f"  Track Actions:   {'ON' if us.get('trackActions') else 'OFF'}")
-            print(f"  SMS Alerts:      {'ON' if us.get('sms') else 'OFF'}")
-            print(f"{'='*60}\n")
-            receipt("print_dashboard", True, "Dashboard printed")
-        except Exception as e:
-            receipt("print_dashboard", False, str(e))
-            log.error("Dashboard print failed: %s", e)
-
-    def cycle(self):
-        """One daemon cycle."""
-        now = time.time()
-
-        if now - self.last_visibility_check >= VISIBILITY_CHECK_INTERVAL:
-            self.ensure_visible()
-            self.last_visibility_check = now
-
-        if now - self.last_avail_check >= AVAIL_CHECK_INTERVAL:
-            self.ensure_available()
-            self.last_avail_check = now
-
-        if now - self.last_stats_check >= STATS_INTERVAL:
-            self.collect_stats()
-            self.check_search_position()
-            self.last_stats_check = now
-
-        if now - self.last_bio_check >= BIO_EXPERIMENT_INTERVAL:
-            self.bio_experiment(auto_apply=False)
-            self.last_bio_check = now
-
-        if now - self.last_dashboard_print >= DASHBOARD_INTERVAL:
-            self.print_dashboard()
-            self.last_dashboard_print = now
-
-    def run_once(self):
-        if not self.login():
-            return
-        self.print_dashboard()
-        self.ensure_visible()
-        self.ensure_available()
-        self.collect_stats()
-        self.check_search_position()
-        self.bio_experiment(auto_apply=False)
-        draft = self.draft_blog_post()
-        print(f"\nBlog draft (not published):\n{draft['title']}\n{draft['body']}\n")
-
-    def run_daemon(self):
-        log.info("=== ProfileOps daemon starting ===")
-        if not self.login():
-            log.error("Initial login failed, retrying in 60s")
-            time.sleep(60)
-            if not self.login():
-                log.error("Login failed twice, exiting")
-                return
-
-        self.print_dashboard()
-        while self.running:
-            try:
-                self.cycle()
-            except KeyboardInterrupt:
-                log.info("Shutdown requested")
-                self.running = False
-                break
-            except Exception as e:
-                log.error("Cycle error: %s", e)
-                receipt("daemon_cycle", False, str(e))
-                time.sleep(30)
-            time.sleep(60)
-        log.info("ProfileOps daemon stopped")
-
-
-# ---------------------------------------------------------------------------
-# CLI commands
-# ---------------------------------------------------------------------------
-
-def cmd_status(ops: ProfileOps):
-    if not ops.login():
-        print("Login failed")
-        sys.exit(1)
-    ops.print_dashboard()
-
-
-def cmd_once(ops: ProfileOps):
-    ops.run_once()
-
-
-def cmd_history():
-    conn = db()
-    print("\n=== RECENT ACTIONS ===")
-    for r in conn.execute("SELECT * FROM receipts ORDER BY ts DESC LIMIT 30"):
-        print(f"  {r['ts'][:19]} | {'OK' if r['success'] else 'FAIL'} | {r['action']:25s} | {r['detail'][:60]}")
-    print("\n=== RECENT STATS ===")
-    for r in conn.execute("SELECT * FROM stats ORDER BY ts DESC LIMIT 10"):
-        print(f"  {r['ts'][:19]} | views={r['views'] or '-':6} contacts={r['contact_clicks'] or '-':4} "
-              f"visits={r['visits'] or '-':4} | visible={r['is_ad_hidden'] or 0} avail={r['available'] or '-'} "
-              f"| pos={r['search_position'] or '-':4}/{r['search_total'] or '-':4}")
-    print("\n=== BIO VERSIONS ===")
-    for r in conn.execute("SELECT * FROM bio_versions ORDER BY ts DESC LIMIT 10"):
-        print(f"  {r['ts'][:19]} | {'APPLIED' if r['applied'] else 'DRAFT'} | {r['headline'][:50]}")
-    print("\n=== UNACKED ALERTS ===")
-    for r in conn.execute("SELECT * FROM alerts WHERE acknowledged=0 ORDER BY ts DESC LIMIT 10"):
-        print(f"  {r['ts'][:19]} | [{r['severity']:8s}] {r['type']:20s} | {r['message']}")
+    conn.execute(
+        "INSERT INTO tunnel_cycles (cycle_num, platform, posts_scraped, leads_classified, "
+        "high_intent, responses_generated, errors, timestamp) VALUES (?,?,?,?,?,?,?,?)",
+        (cycle_num, platforms, stats["posts_scraped"], stats["leads_classified"],
+         stats["high_intent"], stats["responses_generated"], stats["errors"], _ts()),
+    )
+    conn.commit()
     conn.close()
 
+    receipt_id = write_receipt(stats)
+    stats["receipt_id"] = receipt_id
 
-def cmd_suggest_bio(ops: ProfileOps):
-    if not ops.login():
-        print("Login failed")
-        sys.exit(1)
-    ops.bio_experiment(auto_apply=False)
-    # Print the latest draft
-    conn = db()
-    row = conn.execute("SELECT * FROM bio_versions ORDER BY ts DESC LIMIT 1").fetchone()
+    log.info(f"  ═══ Social Tunnel Cycle {cycle_num} Complete ═══")
+    log.info(f"  Scraped: {stats['posts_scraped']} | Stored: {stats['leads_stored']} | Duplicates: {stats['duplicates_skipped']}")
+    log.info(f"  Classified: {stats['leads_classified']} | High intent: {stats['high_intent']} | Responses: {stats['responses_generated']}")
+    log.info(f"  By intent: {json.dumps(stats['by_intent'])}")
+    log.info(f"  Receipt: {receipt_id}")
+
+    return stats
+
+
+def show_stats():
+    """Show tunnel statistics."""
+    init_db()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+
+    total = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+    by_platform = {r["platform"]: r["count"] for r in conn.execute(
+        "SELECT platform, COUNT(*) as count FROM leads GROUP BY platform").fetchall()}
+    by_intent = {r["intent"]: r["count"] for r in conn.execute(
+        "SELECT intent, COUNT(*) as count FROM leads GROUP BY intent").fetchall()}
+    by_status = {r["status"]: r["count"] for r in conn.execute(
+        "SELECT status, COUNT(*) as count FROM leads GROUP BY status").fetchall()}
+    cycles = conn.execute("SELECT COUNT(*) FROM tunnel_cycles").fetchone()[0]
+    recent_cycles = [dict(r) for r in conn.execute(
+        "SELECT * FROM tunnel_cycles ORDER BY timestamp DESC LIMIT 5").fetchall()]
+
+    print(f"\n  ═══ Social Traffic Tunnel Stats ═══")
+    print(f"  Total leads: {total}")
+    print(f"  Total cycles: {cycles}")
+    print(f"  By platform: {json.dumps(by_platform, indent=2)}")
+    print(f"  By intent: {json.dumps(by_intent, indent=2)}")
+    print(f"  By status: {json.dumps(by_status, indent=2)}")
+    print(f"  Recent cycles:")
+    for c in recent_cycles:
+        print(f"    ◉ cycle {c['cycle_num']}: {c['platform']} | scraped={c['posts_scraped']} "
+              f"classified={c['leads_classified']} high_intent={c['high_intent']} "
+              f"responses={c['responses_generated']}")
+
+    high_intent_leads = [dict(r) for r in conn.execute(
+        "SELECT platform, subreddit, author, title, intent, generated_response, url, created_at "
+        "FROM leads WHERE status='response_ready' ORDER BY created_at DESC LIMIT 10").fetchall()]
+    if high_intent_leads:
+        print(f"\n  ═══ Recent High-Intent Leads (response ready) ═══")
+        for lead in high_intent_leads:
+            print(f"  ◉ [{lead['platform']}] {lead.get('subreddit', '')} — {lead['title'][:60]}")
+            print(f"    intent: {lead['intent']} | author: {lead['author']}")
+            print(f"    url: {lead['url']}")
+            if lead["generated_response"]:
+                print(f"    response: {lead['generated_response'][:120]}...")
+            print()
+
     conn.close()
-    if row:
-        print(f"\n=== LLM BIO SUGGESTION ===")
-        print(f"Headline: {row['headline']}")
-        print(f"\nBio:\n{row['description']}")
-        print(f"\nApplied: {bool(row['applied'])}")
-        print(f"Views before: {row['views_before']}")
-        print(f"Contacts before: {row['contacts_before']}")
-
-
-
-def cmd_set_bio(ops: ProfileOps):
-    if not ops.login():
-        print("Login failed")
-        sys.exit(1)
-    about = ops.api.get_about()
-    assets = about.get("userProps", {}).get("assets", {})
-    before = {"headline": assets.get("headline"), "description": assets.get("description")}
-    print("Enter headline:")
-    headline = input("> ")
-    print("Enter description (Ctrl+D when done):")
-    desc_lines = []
-    try:
-        while True:
-            desc_lines.append(input())
-    except EOFError:
-        pass
-    description = "\n".join(desc_lines)
-    ops.api.set_about(headline, description)
-    after = {"headline": headline, "description": description}
-    receipt("set_bio", True, "Manual bio update", before, after)
-    print("Bio updated.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ProfileOps — RentMasseur Profile Operations Agent")
-    parser.add_argument("--daemon", action="store_true", help="Run as daemon")
-    parser.add_argument("--status", action="store_true", help="Print current status")
-    parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
-    parser.add_argument("--history", action="store_true", help="Show history and stats")
-    parser.add_argument("--suggest-bio", action="store_true", help="Generate bio variant draft via LLM")
-    parser.add_argument("--set-bio", action="store_true", help="Manually set bio via stdin")
-    parser.add_argument("--city", default="manhattan-ny", help="City to track search position")
-    parser.add_argument("--llm-provider", default="ollama", help="ollama/groq/openrouter")
-    parser.add_argument("--llm-model", help="Model name, e.g. llama-3.1-8b-instant")
-    parser.add_argument("--manual-captcha", action="store_true", help="Open visible browser for manual captcha solve")
+    parser = argparse.ArgumentParser(description="Social Traffic Tunnel — Reddit + X.com")
+    parser.add_argument("--reddit", action="store_true", help="Scrape Reddit only")
+    parser.add_argument("--x", action="store_true", help="Scrape X.com only")
+    parser.add_argument("--stats", action="store_true", help="Show statistics")
+    parser.add_argument("--cycle", type=int, default=0, help="Cycle number")
     args = parser.parse_args()
 
-    init_db()
+    if args.stats:
+        show_stats()
+        return
 
-    username = os.environ.get("RM_USER")
-    password = os.environ.get("RM_PASS")
-    if not username or not password:
-        print("ERROR: Set RM_USER and RM_PASS environment variables.")
-        print("Do not hardcode credentials.")
-        sys.exit(1)
+    platforms = "all"
+    if args.reddit and not args.x:
+        platforms = "reddit"
+    elif args.x and not args.reddit:
+        platforms = "x"
 
-    os.environ.setdefault("LLM_PROVIDER", args.llm_provider)
-    if args.llm_model:
-        os.environ.setdefault("LLM_MODEL", args.llm_model)
-
-    ops = ProfileOps(username, password, city=args.city, manual_captcha=args.manual_captcha)
-
-    if args.status:
-        cmd_status(ops)
-    elif args.once:
-        cmd_once(ops)
-    elif args.history:
-        cmd_history()
-    elif args.suggest_bio:
-        cmd_suggest_bio(ops)
-    elif args.set_bio:
-        cmd_set_bio(ops)
-    elif args.daemon:
-        ops.run_daemon()
-    else:
-        parser.print_help()
+    run_tunnel_cycle(cycle_num=args.cycle, platforms=platforms)
 
 
 if __name__ == "__main__":
@@ -587,214 +174,627 @@ if __name__ == "__main__":
 
 ```
 
-analyze_bios.py:
+bio_generator:
 ```
+Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
+```
+
+state_engine.py:
+```
+"""
+Traffic State Engine — reads live RM metrics from verified endpoints and
+turns raw API responses into a canonical TrafficState object.
+
+Verified endpoints (2026-07-09):
+  GET /account/dashboard              → profileStatistics, userSetting, isAdHidden
+  GET /account/dashboard/availability → selected, list, countdown
+  GET /account/dashboard/ad-statistics→ profileStatistics.totalPageViews, totalContactClicks, visits
+  GET /account/keeponline             → newEmails, newVisits, isAdHidden, issues
+  GET /settings/about                 → userProps.assets.headline, userProps.information
+  GET /mailbox                        → emails[] with userCard.username, lastMessage, createdAt
+  POST /search                        → users[], pagination, search rank
+
+Dead endpoints (removed):
+  GET /settings/interview → 404
+"""
+
+import hashlib
 import json
+import logging
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
 
-bios = [json.loads(l) for l in open("rm_traffic/data/real_bios_with_views.jsonl")]
-bios.sort(key=lambda b: b.get("views_per_day", 0), reverse=True)
+log = logging.getLogger("state_engine")
 
-print("=" * 80)
-print("TOP 15 BIOS BY VIEWS/DAY")
-print("=" * 80)
-for i, b in enumerate(bios[:15]):
-    r = float(b.get("ratingAverage", 0) or 0)
-    vpd = b.get("views_per_day", 0)
-    print(f"\n#{i+1} {b['username']} | {b['city']} | {vpd:.1f} v/day | {b['visits']} visits | R={r} Rev={b['reviewsCount']}")
-    print(f"  HEADLINE: {b['headline']}")
-    print(f"  SINCE: {b['member_since']} ({b['days_online']} days)")
-    print(f"  SERVICES: {b.get('services', [])}")
-    desc = b["description"].replace("\n", " ")
-    print(f"  DESC: {desc[:500]}")
 
-print("\n" + "=" * 80)
-print("BOTTOM 5")
-print("=" * 80)
-for i, b in enumerate(bios[-5:]):
-    r = float(b.get("ratingAverage", 0) or 0)
-    vpd = b.get("views_per_day", 0)
-    rank = len(bios) - 4 + i
-    print(f"\n#{rank} {b['username']} | {vpd:.1f} v/day | {b['visits']} visits | R={r} Rev={b['reviewsCount']}")
-    print(f"  HEADLINE: {b['headline']}")
-    desc = b["description"].replace("\n", " ")
-    print(f"  DESC: {desc[:300]}")
+@dataclass
+class TrafficState:
+    """Canonical state object — what the account looks like right now."""
+    # Identity
+    tenant_id: str = ""
+    timestamp: str = ""
 
-# Pattern analysis
-print("\n" + "=" * 80)
-print("PATTERN ANALYSIS")
-print("=" * 80)
+    # Traffic metrics
+    views: int = 0
+    contact_clicks: int = 0
+    contact_rate: float = 0.0  # contact_clicks / views * 100
+    emails: int = 0
+    new_visits: int = 0
+    new_emails: int = 0
 
-top10 = bios[:10]
-bot10 = bios[-10:]
+    # Availability
+    available_status: str = ""  # "Available", "Not Set", "Not Available"
+    availability_countdown: int = 0  # epoch seconds when availability expires
+    availability_seconds_left: float = 0.0
 
-def avg(lst):
-    return sum(lst) / len(lst) if lst else 0
+    # Profile
+    profile_hidden: bool = False
+    headline: str = ""
+    search_rank: int = 0
+    search_total: int = 0
 
-# Headline length
-hl_top = avg([len(b["headline"]) for b in top10])
-hl_bot = avg([len(b["headline"]) for b in bot10])
-print(f"Avg headline length: TOP={hl_top:.0f} chars vs BOT={hl_bot:.0f} chars")
+    # Mailbox
+    mailbox_count: int = 0
+    mailbox_intent_score: float = 0.0  # 0-1, how booking-ready are the messages
+    mailbox_leads: List[Dict] = field(default_factory=list)
 
-# Description length
-dl_top = avg([len(b["description"]) for b in top10])
-dl_bot = avg([len(b["description"]) for b in bot10])
-print(f"Avg desc length: TOP={dl_top:.0f} chars vs BOT={dl_bot:.0f} chars")
+    # Derived pressure
+    revenue_pressure: float = 0.0
+    pressure_components: Dict[str, float] = field(default_factory=dict)
 
-# Emoji usage
-import re
-emoji_top = avg([len(re.findall(r'[\U0001F000-\U0001FFFF]|[\u2600-\u27BF]', b["description"])) for b in top10])
-emoji_bot = avg([len(re.findall(r'[\U0001F000-\U0001FFFF]|[\u2600-\u27BF]', b["description"])) for b in bot10])
-print(f"Avg emoji count: TOP={emoji_top:.1f} vs BOT={emoji_bot:.1f}")
+    # Endpoint health (for measurement validity)
+    endpoint_errors: List[str] = field(default_factory=list)
+    endpoint_error_count: int = 0
+    measurement_valid: bool = True
 
-# Price mentions
-price_top = sum([1 for b in top10 if re.search(r'\$\d+', b["description"])])
-price_bot = sum([1 for b in bot10 if re.search(r'\$\d+', b["description"])])
-print(f"Mentions price: TOP={price_top}/10 vs BOT={price_bot}/10")
+    # State hash (for receipt comparison)
+    state_hash: str = ""
 
-# "Available now" / urgency
-urg_top = sum([1 for b in top10 if re.search(r'available|now|today|text|call', b["description"], re.I)])
-urg_bot = sum([1 for b in bot10 if re.search(r'available|now|today|text|call', b["description"], re.I)])
-print(f"Urgency/CTA: TOP={urg_top}/10 vs BOT={urg_bot}/10")
+    # Raw (for debugging, not persisted in receipts)
+    _raw: Dict[str, Any] = field(default_factory=dict)
 
-# Services count
-svc_top = avg([len(b.get("services") or []) for b in top10])
-svc_bot = avg([len(b.get("services") or []) for b in bot10])
-print(f"Avg services listed: TOP={svc_top:.1f} vs BOT={svc_bot:.1f}")
+    def compute_hash(self) -> str:
+        d = {k: v for k, v in asdict(self).items() if k not in ("_raw", "mailbox_leads", "pressure_components", "endpoint_errors")}
+        self.state_hash = hashlib.sha256(
+            json.dumps(d, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
+        return self.state_hash
 
-# Certified
-cert_top = sum([1 for b in top10 if b.get("isCertified")])
-cert_bot = sum([1 for b in bot10 if b.get("isCertified")])
-print(f"Certified: TOP={cert_top}/10 vs BOT={cert_bot}/10")
+    def to_dict(self) -> Dict:
+        return asdict(self)
 
-# Gold
-gold_top = sum([1 for b in top10 if b.get("isGold")])
-gold_bot = sum([1 for b in bot10 if b.get("isGold")])
-print(f"Gold: TOP={gold_top}/10 vs BOT={gold_bot}/10")
 
-# Days online
-days_top = avg([b.get("days_online", 0) for b in top10])
-days_bot = avg([b.get("days_online", 0) for b in bot10])
-print(f"Avg days online: TOP={days_top:.0f} vs BOT={days_bot:.0f}")
+def collect_state(api, tenant_id: str = "") -> TrafficState:
+    """Read all verified endpoints and build a TrafficState."""
+    state = TrafficState(tenant_id=tenant_id, timestamp=datetime.now(timezone.utc).isoformat())
 
-```
+    # 1. Dashboard — visibility + profile stats
+    try:
+        dash = api.get_dashboard()
+        state._raw["dashboard"] = dash
+        ps = dash.get("profileStatistics") or {}
+        state.views = int(ps.get("totalPageViews", 0))
+        state.contact_clicks = int(ps.get("totalContactClicks", 0))
+        if state.views > 0:
+            state.contact_rate = round(state.contact_clicks / state.views * 100, 2)
+        state.profile_hidden = dash.get("isAdHidden", False)
+        log.info(f"  ◉ Dashboard: views={state.views} contacts={state.contact_clicks} CTR={state.contact_rate}%")
+    except Exception as e:
+        err = str(e)
+        state.endpoint_errors.append(f"dashboard:{err[:60]}")
+        log.warning(f"  ⟁ dashboard error: {e}")
 
-data.zip:
-```
-version https://git-lfs.github.com/spec/v1
-oid sha256:bcc015cf01168bfd09b8909c40ba49aa0351a45ce57b9b2b52e583a6071f8233
-size 127354778
+    # 2. Ad statistics — same profileStatistics but with visits breakdown
+    try:
+        stats = api.get_ad_statistics()
+        state._raw["ad_statistics"] = stats
+        ps = stats.get("profileStatistics", {})
+        if not state.views:
+            state.views = int(ps.get("totalPageViews", 0))
+        if not state.contact_clicks:
+            state.contact_clicks = int(ps.get("totalContactClicks", 0))
+            if state.views > 0:
+                state.contact_rate = round(state.contact_clicks / state.views * 100, 2)
+    except Exception as e:
+        err = str(e)
+        state.endpoint_errors.append(f"ad_statistics:{err[:60]}")
+        log.warning(f"  ⟁ ad_statistics error: {e}")
 
-```
+    # 3. KeepOnline — new emails, new visits, frozen status
+    try:
+        keep = api.get_keeponline()
+        state._raw["keeponline"] = keep
+        state.new_emails = int(keep.get("newEmails", 0))
+        state.new_visits = int(keep.get("newVisits", 0))
+        state.profile_hidden = state.profile_hidden or keep.get("isAdHidden", False)
+        log.info(f"  ◉ KeepOnline: new_emails={state.new_emails} new_visits={state.new_visits}")
+    except Exception as e:
+        err = str(e)
+        state.endpoint_errors.append(f"keeponline:{err[:60]}")
+        log.warning(f"  ⟁ keeponline error: {e}")
 
-bio_ml.cpp:
-```
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <random>
-#include <cmath>
-#include <algorithm>
-#include <chrono>
-#include <unordered_map>
-#include <numeric>
-#include <iomanip>
+    # 4. Availability — selected label + countdown
+    try:
+        avail = api.get_availability()
+        state._raw["availability"] = avail
+        state.available_status = avail.get("selected", "Unknown")
+        countdown = avail.get("countdown", 0)
+        state.availability_countdown = int(countdown) if countdown else 0
+        if state.availability_countdown:
+            state.availability_seconds_left = max(0, state.availability_countdown - time.time())
+        log.info(f"  ◉ Availability: {state.available_status} ({state.availability_seconds_left:.0f}s left)")
+    except Exception as e:
+        err = str(e)
+        state.endpoint_errors.append(f"availability:{err[:60]}")
+        log.warning(f"  ⟁ availability error: {e}")
 
-// ---------------------------------------------------------------------------
-// JSON parsing helpers (minimal)
-// ---------------------------------------------------------------------------
+    # 5. About — headline
+    try:
+        about = api.get_about()
+        state._raw["about"] = about
+        props = about.get("userProps", {})
+        assets = props.get("assets", {})
+        state.headline = assets.get("headline", "")
+        log.info(f"  ◉ Headline: '{state.headline}'")
+    except Exception as e:
+        err = str(e)
+        state.endpoint_errors.append(f"about:{err[:60]}")
+        log.warning(f"  ⟁ about error: {e}")
 
-std::string json_unescape(const std::string& s) {
-    std::string out;
-    for (size_t i = 0; i < s.size(); i++) {
-        if (s[i] == '\\' && i + 1 < s.size()) {
-            char next = s[i+1];
-            if (next == 'n') out += '\n';
-            else if (next == 't') out += '\t';
-            else if (next == 'r') out += '\r';
-            else out += next;
-            i++;
-        } else if (s[i] != '"') {
-            out += s[i];
-        }
+    # 6. Mailbox — leads
+    try:
+        mailbox = api.get_mailbox(page=1, folder=1, sort=1)
+        state._raw["mailbox"] = mailbox
+        emails = mailbox.get("emails", [])
+        state.mailbox_count = len(emails)
+        state.emails = state.mailbox_count
+
+        # Score mailbox intent
+        booking_kw = ["book", "available", "today", "tonight", "tomorrow", "session", "time", "schedule"]
+        price_kw = ["price", "rate", "cost", "how much"]
+        intent_scores = []
+        for email in emails:
+            msg = (email.get("lastMessage", "") or "").lower()
+            score = 0.0
+            if any(kw in msg for kw in booking_kw):
+                score += 0.5
+            if any(kw in msg for kw in price_kw):
+                score += 0.3
+            if msg.strip():
+                score += 0.2
+            intent_scores.append(min(1.0, score))
+
+        state.mailbox_intent_score = round(
+            sum(intent_scores) / len(intent_scores), 2
+        ) if intent_scores else 0.0
+
+        # Store lead summaries (no raw PII in state)
+        for email in emails:
+            uc = email.get("userCard", {})
+            state.mailbox_leads.append({
+                "username": uc.get("username", ""),
+                "is_premium": bool(uc.get("isPremium", 0)),
+                "unread": bool(email.get("unread", 0)),
+                "created_at": email.get("createdAt", 0),
+                "intent_score": min(1.0, (
+                    0.5 if any(kw in (email.get("lastMessage", "") or "").lower() for kw in booking_kw) else 0.0
+                ) + (0.3 if any(kw in (email.get("lastMessage", "") or "").lower() for kw in price_kw) else 0.0)
+                + (0.2 if (email.get("lastMessage", "") or "").strip() else 0.0)),
+            })
+
+        log.info(f"  ◉ Mailbox: {state.mailbox_count} conversations, intent={state.mailbox_intent_score}")
+    except Exception as e:
+        err = str(e)
+        state.endpoint_errors.append(f"mailbox:{err[:60]}")
+        log.warning(f"  ⟁ mailbox error: {e}")
+
+    # 7. Search rank (optional — can be slow)
+    try:
+        results = api.search_masseurs(city="manhattan-ny", page=1)
+        users = results.get("users", [])
+        state.search_total = len(users)
+        # Find our position
+        my_username = ""
+        try:
+            my_username = api.session.headers.get("X-RM-Username", "")
+        except Exception:
+            pass
+        for i, user in enumerate(users):
+            if user.get("username") == my_username:
+                state.search_rank = i + 1
+                break
+        log.info(f"  ◉ Search: rank=#{state.search_rank} of {state.search_total}")
+    except Exception as e:
+        err = str(e)
+        state.endpoint_errors.append(f"search:{err[:60]}")
+        log.warning(f"  ⟁ search error: {e}")
+
+    # Determine measurement validity — 3+ endpoint errors = invalid
+    state.endpoint_error_count = len(state.endpoint_errors)
+    critical_endpoints = {"dashboard", "ad_statistics", "keeponline", "availability", "mailbox"}
+    critical_failures = sum(1 for e in state.endpoint_errors if any(c in e for c in critical_endpoints))
+    if critical_failures >= 3:
+        state.measurement_valid = False
+        log.warning(f"  ⟁ MEASUREMENT INVALID: {critical_failures} critical endpoint failures")
+
+    # Compute revenue pressure
+    compute_revenue_pressure(state)
+
+    # Compute state hash
+    state.compute_hash()
+
+    return state
+
+
+def compute_revenue_pressure(state: TrafficState) -> None:
+    """
+    Revenue Pressure Engine — scores how urgently the account needs action.
+
+    revenue_pressure =
+      0.30 * contact_rate_gap      (low CTR = high pressure to fix profile)
+    + 0.20 * availability_risk     (not available = high pressure)
+    + 0.20 * rank_decay            (low rank = high pressure)
+    + 0.15 * unanswered_intent     (mailbox with intent but no replies)
+    + 0.10 * profile_fatigue       (hidden or stale)
+    + 0.05 * traffic_drop          (low views)
+    """
+    # Contact rate gap: target 5%, below that = pressure
+    contact_rate_gap = max(0, (5.0 - state.contact_rate) / 5.0) if state.views > 0 else 0.5
+
+    # Availability risk: not available = 1.0, available with <1h left = 0.5
+    if state.available_status != "Available":
+        availability_risk = 1.0
+    elif state.availability_seconds_left < 3600:
+        availability_risk = 0.5
+    else:
+        availability_risk = 0.0
+
+    # Rank decay: rank > 20 = high pressure, rank 1-5 = low
+    if state.search_rank == 0:
+        rank_decay = 0.3  # unknown
+    elif state.search_rank > 20:
+        rank_decay = 0.8
+    elif state.search_rank > 10:
+        rank_decay = 0.5
+    else:
+        rank_decay = 0.1
+
+    # Unanswered intent: mailbox with high intent but no recent replies
+    unanswered = state.mailbox_intent_score if state.mailbox_count > 0 else 0.0
+
+    # Profile fatigue: hidden or no headline
+    profile_fatigue = 0.0
+    if state.profile_hidden:
+        profile_fatigue += 0.5
+    if not state.headline:
+        profile_fatigue += 0.3
+
+    # Traffic drop: very low views
+    traffic_drop = 0.3 if state.views < 100 else 0.0
+
+    state.pressure_components = {
+        "contact_rate_gap": round(contact_rate_gap, 3),
+        "availability_risk": round(availability_risk, 3),
+        "rank_decay": round(rank_decay, 3),
+        "unanswered_intent": round(unanswered, 3),
+        "profile_fatigue": round(profile_fatigue, 3),
+        "traffic_drop": round(traffic_drop, 3),
     }
-    return out;
-}
 
-std::string extract_json_string(const std::string& line, const std::string& key) {
-    size_t pos = line.find("\"" + key + "\":");
-    if (pos == std::string::npos) return "";
-    pos = line.find("\"", pos + key.size() + 3);
-    if (pos == std::string::npos) return "";
-    size_t end = pos + 1;
-    while (end < line.size() && (line[end] != '"' || line[end-1] == '\\')) end++;
-    return json_unescape(line.substr(pos + 1, end - pos - 1));
-}
+    state.revenue_pressure = round(
+        0.30 * contact_rate_gap
+        + 0.20 * availability_risk
+        + 0.20 * rank_decay
+        + 0.15 * unanswered
+        + 0.10 * profile_fatigue
+        + 0.05 * traffic_drop,
+        3
+    )
 
-// ---------------------------------------------------------------------------
-// Feature extraction
-// ---------------------------------------------------------------------------
+```
 
-const std::vector<std::string> local_areas = {
-    "manhattan", "chelsea", "midtown", "hell's kitchen", "upper west side",
-    "upper east side", "tribeca", "soho", "west village", "east village",
-    "financial district", "flatiron", "gramercy", "murray hill", "nomad", "nyc", "new york"
-};
+stats_dashboard.py:
+```
+"""
+Stats Dashboard — generate a simple HTML stats page for the ProfileOps engine.
+"""
 
-const std::vector<std::string> service_words = {
-    "deep tissue", "sports", "recovery", "massage", "bodywork", "relief",
-    "therapy", "knots", "tension", "pressure", "shoulder", "back", "hip",
-    "neck", "glute", "stress", "desk", "travel", "athlete", "professional"
-};
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 
-const std::vector<std::string> cta_words = {
-    "message", "text", "email", "book", "call", "contact", "dm", "schedule", "reach out"
-};
+from .db import get_conn
+from .traffic_analyzer import conversion_rate, analyze_trend
 
-const std::vector<std::string> trust_words = {
-    "professional", "clean", "private", "respect", "discreet", "boundaries", "communication"
-};
 
-const std::vector<std::string> humor_words = {
-    "wolf", "robot", "concrete", "phone cord", "group chat", "screaming", "dramatic", "hostile", "no fluff", "feather", "magic", "gps"
-};
+def _get_latest_state():
+    conn = get_conn()
+    snap = conn.execute("SELECT * FROM traffic_snapshots ORDER BY created_at DESC LIMIT 1").fetchone()
+    conn.close()
+    return dict(snap) if snap else {}
 
-std::string to_lower(const std::string& s) {
-    std::string r = s;
-    std::transform(r.begin(), r.end(), r.begin(), ::tolower);
-    return r;
-}
 
-std::vector<std::string> tokenize(const std::string& text) {
-    std::vector<std::string> tokens;
-    std::string cur;
-    for (char c : text) {
-        if (std::isalpha(static_cast<unsigned char>(c)) || c == '\'') {
-            cur += std::tolower(c);
-        } else if (!cur.empty()) {
-            tokens.push_back(cur);
-            cur.clear();
+def _get_experiment_count():
+    conn = get_conn()
+    total = conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
+    open_ = conn.execute("SELECT COUNT(*) FROM experiments WHERE ended_at IS NULL").fetchone()[0]
+    conn.close()
+    return {"total": total, "open": open_}
+
+
+def _get_draft_count():
+    conn = get_conn()
+    bio = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='bio' AND status='draft'").fetchone()[0]
+    blog = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='blog' AND status='draft'").fetchone()[0]
+    interview = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='interview' AND status='draft'").fetchone()[0]
+    conn.close()
+    return {"bio": bio, "blog": blog, "interview": interview}
+
+
+def _get_receipt_count():
+    conn = get_conn()
+    total = conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0]
+    verified = conn.execute("SELECT COUNT(*) FROM receipts WHERE verified=1").fetchone()[0]
+    conn.close()
+    return {"total": total, "verified": verified}
+
+
+def _get_recent_receipts(limit: int = 10):
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM receipts ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def generate_html(state: dict = None, output_path: Path = None) -> Path:
+    if state is None:
+        state = _get_latest_state()
+    trend = analyze_trend(hours=24)
+    experiments = _get_experiment_count()
+    drafts = _get_draft_count()
+    receipts = _get_receipt_count()
+    recent = _get_recent_receipts(10)
+
+    views = state.get("profile_views") or 0
+    contacts = state.get("contact_clicks") or 0
+    rate = conversion_rate(views, contacts)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RM ProfileOps Stats Dashboard</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f7; color: #1d1d1f; }}
+        h1 {{ font-size: 32px; margin-bottom: 8px; }}
+        .timestamp {{ color: #86868b; font-size: 14px; margin-bottom: 24px; }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }}
+        .card {{ background: white; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+        .card h2 {{ font-size: 14px; color: #86868b; margin: 0 0 8px 0; text-transform: uppercase; letter-spacing: 0.5px; }}
+        .card .value {{ font-size: 32px; font-weight: 600; margin: 0; }}
+        .card .sub {{ font-size: 14px; color: #86868b; margin-top: 4px; }}
+        .section {{ background: white; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+        .section h2 {{ font-size: 18px; margin-top: 0; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+        th, td {{ text-align: left; padding: 10px; border-bottom: 1px solid #eee; }}
+        th {{ color: #86868b; font-weight: 500; }}
+        .ok {{ color: #34c759; }}
+        .warn {{ color: #ff9500; }}
+        .bad {{ color: #ff3b30; }}
+    </style>
+</head>
+<body>
+    <h1>RM ProfileOps Stats Dashboard</h1>
+    <div class="timestamp">Generated: {datetime.now(timezone.utc).isoformat()} UTC</div>
+
+    <div class="grid">
+        <div class="card">
+            <h2>Profile Views</h2>
+            <p class="value">{views}</p>
+        </div>
+        <div class="card">
+            <h2>Contact Clicks</h2>
+            <p class="value">{contacts}</p>
+        </div>
+        <div class="card">
+            <h2>Contact Rate</h2>
+            <p class="value">{rate:.2%}</p>
+        </div>
+        <div class="card">
+            <h2>Receipts</h2>
+            <p class="value">{receipts['total']}</p>
+            <p class="sub">{receipts['verified']} verified</p>
+        </div>
+        <div class="card">
+            <h2>Experiments</h2>
+            <p class="value">{experiments['total']}</p>
+            <p class="sub">{experiments['open']} open</p>
+        </div>
+        <div class="card">
+            <h2>Drafts</h2>
+            <p class="value">{drafts['bio'] + drafts['blog'] + drafts['interview']}</p>
+            <p class="sub">bio {drafts['bio']} | blog {drafts['blog']} | interview {drafts['interview']}</p>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>24h Trend</h2>
+        <p><strong>Status:</strong> {trend.get('status', 'N/A')}</p>
+        <p><strong>Delta views:</strong> {trend.get('comparison', {}).get('delta_views', 'N/A')}</p>
+        <p><strong>Delta contacts:</strong> {trend.get('comparison', {}).get('delta_clicks', 'N/A')}</p>
+        <p><strong>Rate change:</strong> {trend.get('comparison', {}).get('rate_delta', 'N/A')}</p>
+        <p><strong>Alert:</strong> <span class="{'bad' if trend.get('alert') else 'ok'}">{'YES' if trend.get('alert') else 'NO'}</span></p>
+    </div>
+
+    <div class="section">
+        <h2>Recent Receipts</h2>
+        <table>
+            <tr><th>Time</th><th>Action</th><th>Verified</th></tr>
+            {''.join(f'<tr><td>{r["created_at"]}</td><td>{r["action"]}</td><td class="{"ok" if r["verified"] else "bad"}">{"YES" if r["verified"] else "NO"}</td></tr>' for r in recent)}
+        </table>
+    </div>
+</body>
+</html>
+"""
+
+    output_path = output_path or Path(__file__).parent / "data" / "dashboard" / "index.html"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html)
+    return output_path
+
+
+def generate_dashboard() -> Path:
+    return generate_html()
+
+```
+
+content_optimizer.py:
+```
+"""
+Content Optimizer — conservative bio A/B testing.
+
+Rules:
+- One bio change per 24 hours max.
+- Only rotate through known, hypothesis-driven variants.
+- Store before/after metrics and receipt.
+- Never auto-generate random spam.
+"""
+
+import logging
+import random
+import time
+from datetime import datetime, timezone
+
+from .db import (
+    write_receipt,
+    upsert_content_variant,
+    set_variant_status,
+    get_active_variant,
+    get_variant_history,
+    start_experiment,
+    end_experiment,
+    get_open_experiments,
+    get_latest_traffic_snapshot,
+)
+from .api_client import RentMasseurAPI
+from .bio_variants import get_variant, list_variant_ids
+from .bio_variants_library import get_variant as get_library_variant, list_all as list_all_library_variants, count as library_count
+from .llm_bio_writer import generate_bio_with_llm
+from .content_policy import check_bio_risk
+
+log = logging.getLogger("profileops.content")
+
+MIN_SECONDS_BETWEEN_BIO_CHANGES = 24 * 60 * 60
+
+
+def _last_bio_change_time() -> float:
+    """Return timestamp of last applied bio variant, or 0."""
+    history = get_variant_history("bio", limit=1)
+    if not history:
+        return 0
+    row = history[0]
+    if row.get("status") == "active" and row.get("applied_at"):
+        dt = datetime.fromisoformat(row["applied_at"])
+        return dt.timestamp()
+    return 0
+
+
+def _can_change_bio() -> bool:
+    last = _last_bio_change_time()
+    if not last:
+        return True
+    return (time.time() - last) >= MIN_SECONDS_BETWEEN_BIO_CHANGES
+
+
+def _pick_next_variant(current_id: str) -> dict:
+    """Pick a different variant than the current one."""
+    candidates = [vid for vid in list_variant_ids() if vid != current_id]
+    if not candidates:
+        return None
+    return get_variant(random.choice(candidates))
+
+
+def draft_bio_variant(api: RentMasseurAPI, use_llm: bool = True) -> dict:
+    """
+    Draft a new bio variant. Uses LLM if configured, otherwise library.
+    Does NOT apply it.
+    """
+    about = api.get_about()
+    assets = about.get("userProps", {}).get("assets", {})
+    current_headline = assets.get("headline", "")
+    current_description = assets.get("description", "")
+
+    raw_history = get_latest_traffic_snapshot(7)
+    history = [
+        {"ts": r["created_at"], "views": r["profile_views"], "contact_clicks": r["contact_clicks"], "visits": r["new_visits"]}
+        for r in raw_history
+    ]
+    suggestion = None
+    if use_llm:
+        import os
+        suggestion = generate_bio_with_llm(
+            {"about": about, "stats": {}}, history,
+            current_headline, current_description,
+            city="Manhattan, NYC", provider=os.environ.get("LLM_PROVIDER"),
+            model=os.environ.get("LLM_MODEL")
+        )
+
+    if suggestion:
+        variant_id = f"llm_{int(time.time())}"
+        variant = {
+            "variant_id": variant_id,
+            "headline": suggestion["headline"],
+            "description": suggestion["bio"],
+            "hypothesis": "LLM-generated variant based on profile and recent traffic.",
         }
-    }
-    if (!cur.empty()) tokens.push_back(cur);
-    return tokens;
-}
+    else:
+        active = get_active_variant("bio")
+        current_idx = -1
+        if active:
+            try:
+                current_idx = int(active["variant_id"].replace("module_", ""))
+            except Exception:
+                pass
+        # Pick next from 30-module library
+        next_idx = (current_idx + 1) % library_count()
+        variant = get_library_variant(next_idx)
+        if not variant:
+            log.warning("No alternative variant found")
+            return None
 
-std::vector<std::string> split_sentences(const std::string& text) {
-    std::vector<std::string> sents;
-    std::string cur;
-    for (char c : text) {
-        cur += c;
-        if (c == '.' || c == '!' || c == '?') {
-            if (!cur.empty()) {
-                sents.push_back(cur);
-                cur.clear();
-            }
-        }
-    }
-    if (!cur.empty()) sents.push_back(cur);
-    return sents;
-}
+    # Policy check
+    risk = check_bio_risk(variant["headline"] + " " + variant["description"])
+    variant["risk_score"] = risk
+    if risk > 0.7:
+        log.error("Draft rejected by policy: risk=%.2f", risk)
+        return None
 
-int syllable_count(const std::string& word) {
+    upsert_content_variant(
+        variant["variant_id"], "bio",
+        variant["headline"], variant["description"],
+        hypothesis=variant["hypothesis"],
+        status="draft"
+    )
+    write_receipt(
+        "bio_draft_created_v1",
+        "draft_bio_variant",
+        {"current_headline": current_headline},
+        variant,
+        verified=True,
+    )
+    log.info("Bio draft created: %s", variant["variant_id"])
+    return variant
+
+
+def apply_bio_variant(api: RentMasseurAPI, variant_id: str) -> bool:
+    """
+    Apply a drafted bio variant. Enforces 24-hour cooldown and policy.
+    """
+    if not _can_change_bio():
+        log.warning("Bio change blocked: within 24-hour cooldown")
+        return False
+
+    from .db import get_conn
