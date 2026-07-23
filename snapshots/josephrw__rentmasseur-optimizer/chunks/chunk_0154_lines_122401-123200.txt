@@ -1,0 +1,800 @@
+                "endpoint": "/query/sql/{file_id}",
+                "method": "POST",
+                "body": {"sql": "SELECT ..."},
+            },
+            {
+                "name": "get_chunk",
+                "description": "Retrieve a specific chunk's content",
+                "endpoint": "/chunk/{file_id}/{chunk_idx}",
+                "method": "GET",
+            },
+            {
+                "name": "get_summary",
+                "description": "Get file structure and samples",
+                "endpoint": "/summary/{file_id}",
+                "method": "GET",
+            },
+            {
+                "name": "get_meta",
+                "description": "Get file metadata",
+                "endpoint": "/meta/{file_id}",
+                "method": "GET",
+            },
+            {
+                "name": "list_chunks",
+                "description": "List semantic chunks",
+                "endpoint": "/chunks/{file_id}",
+                "method": "GET",
+            },
+        ],
+        "available_files": [
+            {"file_id": fid, "filename": info["filename"], "size": info["meta"].get("size_human", "?")}
+            for fid, info in reg.items()
+        ],
+    }
+
+
+@app.post("/mcp/query")
+async def mcp_query(body: dict = None):
+    """MCP query endpoint — unified query interface for AI tools."""
+    params = body or {}
+    action = params.get("action", "search")
+    file_id = params.get("file_id", "")
+    query = params.get("query", "")
+
+    if action == "list_files" or not file_id:
+        reg = load_registry()
+        files = [{"file_id": fid, "filename": info["filename"]} for fid, info in reg.items()]
+        if not file_id and action != "list_files":
+            if not files:
+                return {"files": [], "message": "No files indexed yet. Upload a .idx file first."}
+            # Auto-select first file for console convenience
+            file_id = files[0]["file_id"]
+        else:
+            return {"files": files}
+
+    if action == "search":
+        return await search(file_id, q=query)
+    elif action == "summary":
+        return await get_summary(file_id)
+    elif action == "meta":
+        return await get_meta(file_id)
+    elif action == "chunk":
+        idx = params.get("chunk_idx", 0)
+        return await get_chunk(file_id, idx)
+    elif action == "sql":
+        return await query_sql(file_id, {"sql": query})
+    elif action == "capabilities":
+        return await get_capabilities(file_id)
+    elif action == "list_chunks":
+        return await list_chunks(file_id)
+    else:
+        raise HTTPException(400, f"Unknown action: {action}. Use: search, summary, meta, chunk, sql, capabilities, list_chunks, list_files")
+
+
+@app.get("/stats/{file_id}")
+async def get_stats(file_id: str):
+    """Query statistics for a file."""
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT query_type, COUNT(*) as count, MAX(timestamp) as last_query FROM query_log WHERE file_id = ? GROUP BY query_type",
+        [file_id]
+    ).fetchall()
+    conn.close()
+    return {"file_id": file_id, "stats": [dict(r) for r in rows]}
+
+
+@app.delete("/revoke/{file_id}")
+async def revoke_access(file_id: str, authorization: str = Header(None)):
+    """Revoke AI access to a file by deleting its index."""
+    check_auth(authorization)
+    reg = load_registry()
+    if file_id not in reg:
+        raise HTTPException(404, {
+            "status": "session_not_found",
+            "file_id": file_id,
+            "message": "This Jorki session is expired, revoked, or unavailable.",
+            "next": "Create a new Jorki session."
+        })
+    path = reg[file_id]["path"]
+    try:
+        Path(path).unlink(missing_ok=True)
+    except:
+        pass
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.execute("DELETE FROM files WHERE file_id = ?", [file_id])
+    conn.execute("DELETE FROM query_log WHERE file_id = ?", [file_id])
+    conn.commit()
+    conn.close()
+    return {"status": "revoked", "file_id": file_id}
+
+
+# --- GraphQL endpoint ---
+@app.post("/graphql")
+async def graphql(body: dict = None):
+    """Minimal GraphQL-like query endpoint."""
+    params = body or {}
+    query = params.get("query", "")
+    # Parse simple GraphQL: { file(id: "xxx") { filename size format } }
+    import re
+    file_match = re.search(r'file\s*\(\s*id:\s*"([^"]+)"\s*\)', query)
+    if file_match:
+        fid = file_match.group(1)
+        reg = load_registry()
+        if fid not in reg:
+            return {"errors": [{"message": f"file_id '{fid}' not found"}]}
+        info = reg[fid]
+        meta = info["meta"]
+        fields = re.findall(r'(\w+)', query.split("}", 1)[0])
+        result = {}
+        for f in fields:
+            if f in ("filename",): result["filename"] = meta.get("filename", "unknown")
+            elif f in ("size", "size_human"): result["size"] = meta.get("size_human", "?")
+            elif f in ("format",): result["format"] = meta.get("format", "?")
+            elif f in ("merkle", "merkle_root"): result["merkle_root"] = meta.get("merkle_root", "?")
+            elif f in ("lines", "total_lines"): result["total_lines"] = meta.get("total_lines", "?")
+            elif f in ("entropy",): result["entropy"] = meta.get("entropy", "?")
+            elif f in ("engine", "engine_version"): result["engine_version"] = meta.get("engine_version", "1.0")
+        return {"data": {"file": result}}
+    # List all files
+    if "files" in query:
+        reg = load_registry()
+        return {"data": {"files": [{"file_id": fid, "filename": info["filename"]} for fid, info in reg.items()]}}
+    return {"errors": [{"message": "Unsupported query. Use: { file(id: \"xxx\") { filename size format } } or { files { filename } }"}]}
+
+
+# --- Clipboard Superposition ---
+# Multiple Jorki sessions encoded into a single base64 blob for clipboard.
+# Format: JORKI:v1:<base64(json({sessions: [{file_id, filename, url, added_at}]}))>
+
+SUPERPOSE_PREFIX = "JORKI:v1:"
+
+def encode_superposition(file_ids: list) -> str:
+    """Pack multiple file_ids into a single base64 clipboard string."""
+    reg = load_registry()
+    sessions = []
+    for fid in file_ids:
+        if fid in reg:
+            info = reg[fid]
+            sessions.append({
+                "file_id": fid,
+                "filename": info["meta"].get("filename", "unknown"),
+                "size": info["meta"].get("size_human", "?"),
+                "url": f"/meta/{fid}",
+                "added_at": time.time(),
+            })
+    payload = json.dumps({"sessions": sessions, "created_at": time.time()}).encode()
+    return SUPERPOSE_PREFIX + base64.b64encode(payload).decode()
+
+def decode_superposition(blob: str) -> dict:
+    """Unpack a superposition blob into session list."""
+    blob = blob.strip()
+    if not blob.startswith(SUPERPOSE_PREFIX):
+        raise HTTPException(400, {"status": "invalid_blob", "message": "Not a Jorki superposition blob."})
+    try:
+        payload = base64.b64decode(blob[len(SUPERPOSE_PREFIX):])
+        return json.loads(payload)
+    except Exception:
+        raise HTTPException(400, {"status": "invalid_blob", "message": "Corrupted superposition blob."})
+
+@app.post("/superpose/encode")
+async def superpose_encode(file_ids: list = Body(...)):
+    """Encode multiple file_ids into a single clipboard-ready base64 blob.
+    Paste the blob into any LLM — it can decode and query all files at once."""
+    if not file_ids:
+        raise HTTPException(400, {"status": "error", "message": "Provide a list of file_ids."})
+    blob = encode_superposition(file_ids)
+    reg = load_registry()
+    valid = [fid for fid in file_ids if fid in reg]
+    return {
+        "blob": blob,
+        "sessions": len(valid),
+        "file_ids": valid,
+        "format": "JORKI:v1:base64",
+        "usage": "Copy the blob field. Paste into any LLM. The LLM can POST it to /superpose/query to query all files at once.",
+    }
+
+@app.post("/superpose/decode")
+async def superpose_decode(blob: str = Body(..., embed=True)):
+    """Decode a superposition blob back into session list with live status."""
+    data = decode_superposition(blob)
+    reg = load_registry()
+    for s in data["sessions"]:
+        s["live"] = s["file_id"] in reg
+        s["status"] = "live" if s["live"] else "expired"
+    data["active_sessions"] = sum(1 for s in data["sessions"] if s["live"])
+    data["expired_sessions"] = sum(1 for s in data["sessions"] if not s["live"])
+    return data
+
+@app.post("/superpose/query")
+async def superpose_query(body: dict = Body(...)):
+    """Query across ALL files in a superposition blob simultaneously.
+    The LLM posts the blob + a query, gets aggregated results from every file."""
+    blob = body.get("blob", "")
+    query = body.get("query", "")
+    action = body.get("action", "search")
+
+    if not blob:
+        raise HTTPException(400, {"status": "error", "message": "Provide a superposition blob."})
+
+    data = decode_superposition(blob)
+    reg = load_registry()
+    results = []
+    total_matches = 0
+
+    for s in data["sessions"]:
+        fid = s["file_id"]
+        if fid not in reg:
+            results.append({
+                "file_id": fid,
+                "filename": s.get("filename", "?"),
+                "status": "expired",
+                "matches": 0,
+            })
+            continue
+
+        try:
+            if action == "search" and query:
+                conn = open_index(fid)
+                try:
+                    file_results = {}
+                    searches = {
+                        "lines": ("line_index", "preview"),
+                        "words": ("word_freq", "word"),
+                        "symbols": ("code_symbols", "symbol"),
+                        "headers": ("section_headers", "header"),
+                        "functions": ("function_index", "symbol"),
+                        "chunks": ("semantic_chunks", "preview"),
+                    }
+                    for key, (table, col) in searches.items():
+                        try:
+                            rows = conn.execute(
+                                f"SELECT * FROM {table} WHERE {col} LIKE ? LIMIT 10",
+                                [f"%{query}%"]
+                            ).fetchall()
+                            if rows:
+                                file_results[key] = [dict(r) for r in rows]
+                        except:
+                            pass
+                    matches = sum(len(v) for v in file_results.values())
+                    total_matches += matches
+                    results.append({
+                        "file_id": fid,
+                        "filename": s.get("filename", reg[fid]["meta"].get("filename", "?")),
+                        "status": "live",
+                        "matches": matches,
+                        "results": file_results,
+                    })
+                finally:
+                    close_index(conn)
+            elif action == "meta":
+                results.append({
+                    "file_id": fid,
+                    "filename": reg[fid]["meta"].get("filename", "?"),
+                    "status": "live",
+                    "meta": reg[fid]["meta"],
+                })
+                total_matches += 1
+            elif action == "summary":
+                conn = open_index(fid)
+                try:
+                    meta = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM file_meta")}
+                    chunks_count = conn.execute("SELECT COUNT(*) FROM semantic_chunks").fetchone()[0]
+                    results.append({
+                        "file_id": fid,
+                        "filename": reg[fid]["meta"].get("filename", "?"),
+                        "status": "live",
+                        "total_lines": meta.get("total_lines"),
+                        "chunks": chunks_count,
+                        "format": meta.get("format"),
+                    })
+                    total_matches += 1
+                except:
+                    results.append({"file_id": fid, "status": "live", "error": "summary failed"})
+                finally:
+                    close_index(conn)
+            elif action == "state":
+                stats_conn = sqlite3.connect(str(REGISTRY_DB))
+                stats_conn.row_factory = sqlite3.Row
+                stats = stats_conn.execute(
+                    "SELECT query_type, COUNT(*) as count FROM query_log WHERE file_id = ? GROUP BY query_type",
+                    [fid]
+                ).fetchall()
+                stats_conn.close()
+                results.append({
+                    "file_id": fid,
+                    "filename": reg[fid]["meta"].get("filename", "?"),
+                    "status": "live",
+                    "queries": [dict(r) for r in stats],
+                    "total_queries": sum(r["count"] for r in stats),
+                })
+                total_matches += 1
+        except Exception as e:
+            results.append({
+                "file_id": fid,
+                "filename": s.get("filename", "?"),
+                "status": "error",
+                "error": str(e),
+            })
+
+    return {
+        "blob_sessions": len(data["sessions"]),
+        "active": sum(1 for r in results if r.get("status") == "live"),
+        "expired": sum(1 for r in results if r.get("status") == "expired"),
+        "total_matches": total_matches,
+        "query": query,
+        "action": action,
+        "results": results,
+    }
+
+@app.get("/superpose/state/{file_id}")
+async def superpose_state(file_id: str):
+    """Get the live state of a single file in the superposition —
+    query count, last access, session status, data returned."""
+    reg = load_registry()
+    if file_id not in reg:
+        raise HTTPException(404, {
+            "status": "session_not_found",
+            "file_id": file_id,
+            "message": "This Jorki session is expired, revoked, or unavailable.",
+            "next": "Create a new Jorki session."
+        })
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.row_factory = sqlite3.Row
+    stats = conn.execute(
+        "SELECT query_type, COUNT(*) as count, MAX(timestamp) as last_query FROM query_log WHERE file_id = ? GROUP BY query_type",
+        [file_id]
+    ).fetchall()
+    total_queries = sum(r["count"] for r in stats)
+    last_access = max((r["last_query"] for r in stats), default=None)
+    conn.close()
+
+    info = reg[file_id]
+    path = info["path"]
+    file_exists = Path(path).exists()
+
+    return {
+        "file_id": file_id,
+        "filename": info["meta"].get("filename", "?"),
+        "session_status": "live" if file_exists else "index_gone",
+        "uploaded_at": info.get("uploaded_at"),
+        "last_access": last_access,
+        "total_queries": total_queries,
+        "query_breakdown": [dict(r) for r in stats],
+        "index_size_bytes": Path(path).stat().st_size if file_exists else 0,
+        "original_size": info["meta"].get("size_human", "?"),
+        "compression_ratio": f"{Path(path).stat().st_size / 1024:.1f}KB index" if file_exists else "gone",
+        "endpoints": {
+            "meta": f"/meta/{file_id}",
+            "summary": f"/summary/{file_id}",
+            "search": f"/search/{file_id}?q=",
+            "chunk": f"/chunk/{file_id}/{{idx}}",
+            "sql": f"/query/sql/{file_id}",
+            "stats": f"/stats/{file_id}",
+        },
+    }
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+```
+
+LLMFileProxyBar:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
+```
+
+Dockerfile:
+```
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY hf_space.py .
+
+# Persistent storage mount point
+RUN mkdir -p /data/indexes
+
+ENV PORT=7860
+EXPOSE 7860
+
+CMD ["python", "hf_space.py"]
+
+```
+
+engine:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
+```
+
+launch.sh:
+```
+#!/bin/bash
+# launch.sh — Start LLM File Proxy + Cloudflare Quick Tunnel, copy URL to clipboard
+# Usage: launch.sh /path/to/file
+# Outputs the public URL and copies it to clipboard
+
+set -euo pipefail
+
+FILE_PATH="$1"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PORT="${2:-8765}"
+
+if [ -z "$FILE_PATH" ] || [ ! -f "$FILE_PATH" ]; then
+    echo "ERROR: Provide a valid file path" >&2
+    echo "Usage: $0 /path/to/file [port]" >&2
+    exit 1
+fi
+
+# Start the proxy server in background
+echo "Starting LLM File Proxy for: $(basename "$FILE_PATH")" >&2
+python3 "$SCRIPT_DIR/llm_proxy.py" "$FILE_PATH" --port "$PORT" &
+PROXY_PID=$!
+
+# Wait for server to be ready
+for i in $(seq 1 10); do
+    if curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+done
+
+if ! curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    echo "ERROR: Proxy server failed to start" >&2
+    kill $PROXY_PID 2>/dev/null || true
+    exit 1
+fi
+
+echo "Proxy server running on http://127.0.0.1:$PORT" >&2
+
+# Start Cloudflare Quick Tunnel (no account needed, free, instant)
+echo "Starting Cloudflare Quick Tunnel..." >&2
+cloudflared tunnel --url "http://127.0.0.1:$PORT" 2>&1 | while IFS= read -r line; do
+    # Cloudflare prints the tunnel URL in a line like:
+    # "Your quick Tunnel has been created! Visit it at: https://xxx.trycloudflare.com"
+    if echo "$line" | grep -q "trycloudflare.com"; then
+        TUNNEL_URL=$(echo "$line" | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com')
+        if [ -n "$TUNNEL_URL" ]; then
+            echo "$TUNNEL_URL" | pbcopy
+            echo ""
+            echo "========================================" >&2
+            echo "  LLM URL copied to clipboard!" >&2
+            echo "  URL: $TUNNEL_URL" >&2
+            echo "========================================" >&2
+            echo ""
+            echo "$TUNNEL_URL"
+            # Show macOS notification
+            osascript -e "display notification \"URL copied to clipboard: $TUNNEL_URL\" with title \"LLM File Proxy\" sound name \"Glass\"" 2>/dev/null || true
+        fi
+    fi
+    # Keep tunnel running
+done
+
+# Cleanup if tunnel exits
+kill $PROXY_PID 2>/dev/null || true
+
+```
+
+rotation_20260629_021330.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-06-29T02:13:30Z",
+  "run_id": "28344082039",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28344082039"
+},
+  "availability_step": "skipped_in_dry_run_or_disabled_for_platform_safety",
+  "content_changed": " M content/decisions/latest_decision.json ?? content/blog_posts/20260629_the_art_of_touch.md ?? content/interview_questions/20260629_celebrity_encounter.md ?? content/interview_questions/20260629_morning_routine.md ?? production_control_loop ?? receipts/rotation_20260629_021330.json ",
+  "status": "completed"
+}
+
+```
+
+metrics_20260712_044032.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-12T04:40:32.367222+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-17T17-26-35.574481-00-00.json:
+```
+{
+  "id": "kpi_1784309195",
+  "timestamp": "2026-07-17T17:26:35.574481+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-17T17:26:35.574389+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-07-16T17-08-16.086460-00-00.json:
+```
+{
+  "id": "kpi_1784221696",
+  "timestamp": "2026-07-16T17:08:16.086460+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-16T17:08:16.086370+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+rotation_20260714_082507.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-14T08:25:07Z",
+  "run_id": "29317456253",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29317456253"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260714_082507.json ",
+  "status": "completed"
+}
+
+```
+
+kpi_2026-06-29T19-44-41.742729-00-00.json:
+```
+{
+  "id": "kpi_1782762281",
+  "timestamp": "2026-06-29T19:44:41.742729+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-29T19:44:41.742651+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260713_155602.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-13T15:56:02Z",
+  "run_id": "29263963390",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+metrics_20260709_234126.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-09T23:41:26.471019+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-06-30T23-59-52.790695-00-00.json:
+```
+{
+  "id": "kpi_1782863992",
+  "timestamp": "2026-06-30T23:59:52.790695+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-30T23:59:52.790610+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260716_224230.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-16T22:42:30.135386+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+metrics_20260712_163800.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-12T16:38:00.100596+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+pipeline_20260712_233132.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-12T23:31:32Z",
+  "run_id": "29213409537",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+rotation_20260703_164757.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-03T16:47:57Z",
+  "run_id": "28673086772",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28673086772"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260703_164757.json ",
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-16T10-38-38.066944-00-00.json:
+```
+{
+  "id": "kpi_1784198318",
+  "timestamp": "2026-07-16T10:38:38.066944+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-16T10:38:38.066893+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260713_203832.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-13T20:38:32.599076+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-07T22-56-28.823737-00-00.json:
+```
+{
+  "id": "kpi_1783464988",
+  "timestamp": "2026-07-07T22:56:28.823737+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-07T22:56:28.823658+00:00",
+    "immortality": {

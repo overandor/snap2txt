@@ -1,800 +1,800 @@
+            api_call = {
+                "method": method,
+                "path": clean,
+                "full_url": url,
+                "request_body": parse_body(call.get("body")),
+                "request_headers": call.get("headers", {}),
+                "response_status": call.get("status"),
+                "response": parse_response(call.get("response")),
+            }
+            api_calls.append(api_call)
 
-Reward only counts when real metrics move:
-  reward = 5.0 * booking_intent_delta
-         + 3.0 * contact_click_delta
-         + 2.0 * email_delta
-         + 1.0 * view_delta
-         - 2.0 * error_penalty
-         - 3.0 * compliance_risk
-         - 1.0 * excessive_mutation_penalty
+        api_map[action_name] = {
+            "action": action_name,
+            "api_calls": api_calls,
+            "call_count": len(api_calls),
+        }
+
+    return api_map
+
+
+def write_output(api_map):
+    """Write JSON + readable summary."""
+    # JSON
+    with open(CAPTURE_FILE, "w") as f:
+        json.dump(api_map, f, indent=2, default=str)
+
+    # Console summary
+    print(f"\n{'='*60}")
+    print(f"  ACTION → API ENDPOINT MAP")
+    print(f"{'='*60}\n")
+
+    for action_name, data in api_map.items():
+        calls = data["api_calls"]
+        print(f"  [{action_name}] — {len(calls)} API calls")
+        for c in calls:
+            status = c.get("response_status") or "?"
+            body = ""
+            if c.get("request_body"):
+                body = f" body={json.dumps(c['request_body'], default=str)[:60]}"
+            resp = ""
+            if c.get("response") and isinstance(c["response"], dict):
+                if "keys" in c["response"]:
+                    resp = f" → {c['response']['keys'][:5]}"
+                elif "type" in c["response"]:
+                    resp = f" → {c['response']['type']}"
+            print(f"    {c['method']:6s} {status} {c['path'][:60]}{body}{resp}")
+        print()
+
+    print(f"  Output: {CAPTURE_FILE}")
+    print(f"  Total actions: {len(api_map)}")
+    total = sum(d["call_count"] for d in api_map.values())
+    print(f"  Total API calls captured: {total}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def run():
+    log.info("=== Action → API Capture ===")
+    driver = create_driver()
+    cap = ActionCapture(driver)
+
+    try:
+        if not login(driver):
+            log.error("Login failed")
+            return
+
+        # Install interceptor AFTER login
+        cap.install()
+        # Navigate to settings to reload with interceptor active
+        driver.get(f"{BASE_URL}/settings")
+        time.sleep(3)
+
+        # Run all actions
+        actions = [
+            action_load_settings,
+            action_open_availability_modal,
+            action_set_availability,
+            action_toggle_visibility,
+            action_toggle_sms,
+            action_toggle_track_actions,
+            action_search_city,
+            action_search_available,
+            action_load_more,
+            action_view_profile,
+            action_load_mailbox,
+            action_get_stats,
+        ]
+
+        results = []
+        for action_fn in actions:
+            log.info("Running: %s", action_fn.__name__)
+            try:
+                name, calls = action_fn(cap)
+                api_calls = [c for c in calls if is_api_call(c)]
+                log.info("  → %d API calls captured", len(api_calls))
+                results.append((name, calls))
+            except Exception as e:
+                log.error("  FAILED: %s", e)
+
+        # Build and write output
+        api_map = build_api_map(results)
+        write_output(api_map)
+
+    except Exception as e:
+        log.error("Fatal: %s", e)
+        import traceback
+        traceback.print_exc()
+    finally:
+        driver.quit()
+        log.info("Done")
+
+
+if __name__ == "__main__":
+    run()
+
+```
+
+db.py:
+```
+"""
+ProfileOps database — SQLite persistence for receipts, traffic snapshots,
+content variants, experiments, and endpoint map.
 """
 
 import json
-import logging
-import math
-import os
 import sqlite3
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Dict, Any, List
 
-log = logging.getLogger("action_bandit")
-
-BANDIT_DB = Path(__file__).parent / "overclock_bandit.db"
-
-# All action arms
-ACTIONS = [
-    "refresh_availability",
-    "ensure_visible",
-    "check_search_rank",
-    "mailbox_intent_scan",
-    "reply_draft_queue",
-    "visitor_revisit",
-    "headline_variant_test",
-    "bio_variant_test",
-    "photo_order_test",
-    "rate_position_test",
-    "city_rank_scan",
-    "traffic_report",
-    "do_nothing",
-]
-
-# Actions that mutate the profile (need mutation cost)
-MUTATION_ACTIONS = {
-    "headline_variant_test",
-    "bio_variant_test",
-    "photo_order_test",
-    "rate_position_test",
-}
-
-# Actions that are always safe (no platform risk)
-SAFE_ACTIONS = {
-    "refresh_availability",
-    "ensure_visible",
-    "check_search_rank",
-    "mailbox_intent_scan",
-    "reply_draft_queue",
-    "visitor_revisit",
-    "city_rank_scan",
-    "traffic_report",
-    "do_nothing",
-}
+DB_PATH = Path(__file__).parent / "profileops.db"
 
 
-@dataclass
-class ActionOutcome:
-    action: str
-    reward: float
-    metric_delta: Dict[str, float] = field(default_factory=dict)
-    timestamp: str = ""
-    state_before_hash: str = ""
-    state_after_hash: str = ""
-    error: str = ""
-
-
-def _db():
-    conn = sqlite3.connect(str(BANDIT_DB))
+def get_conn():
+    conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS action_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT,
-        action TEXT,
-        reward REAL,
-        metric_delta TEXT,
-        state_before_hash TEXT,
-        state_after_hash TEXT,
-        error TEXT,
-        timestamp TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_action ON action_history(action);
-    CREATE INDEX IF NOT EXISTS idx_tenant ON action_history(tenant_id);
-    """)
-    conn.commit()
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
-def get_action_stats(conn: sqlite3.Connection, tenant_id: str = "") -> Dict[str, Dict]:
-    """Get per-action stats: count, avg_reward, confidence."""
-    cur = conn.cursor()
-    stats = {}
-    for action in ACTIONS:
-        cur.execute(
-            "SELECT COUNT(*) as n, AVG(reward) as avg_r, "
-            "SUM(CASE WHEN reward > 0 THEN 1 ELSE 0 END) as wins "
-            f"FROM action_history WHERE action = ? AND tenant_id = ?",
-            (action, tenant_id)
-        )
-        row = cur.fetchone()
-        n = row["n"] or 0
-        avg_r = row["avg_r"] or 0.0
-        wins = row["wins"] or 0
-        # Wilson score interval lower bound as confidence
-        if n > 0:
-            z = 1.96
-            p = wins / n
-            denominator = 1 + z * z / n
-            center = (p + z * z / (2 * n)) / denominator
-            margin = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n) / denominator
-            confidence = max(0, center - margin)
-        else:
-            confidence = 0.0
-        stats[action] = {
-            "n": n,
-            "avg_reward": round(avg_r, 3),
-            "win_rate": round(wins / n, 3) if n > 0 else 0.0,
-            "confidence": round(confidence, 3),
-        }
-    return stats
+def init_db():
+    conn = get_conn()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS receipts (
+        receipt_hash TEXT PRIMARY KEY,
+        receipt_type TEXT NOT NULL,
+        action TEXT NOT NULL,
+        input_hash TEXT,
+        output_hash TEXT,
+        verified INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        raw_json TEXT NOT NULL
+    );
 
+    CREATE TABLE IF NOT EXISTS traffic_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        profile_views INTEGER,
+        contact_clicks INTEGER,
+        new_visits INTEGER,
+        new_emails INTEGER,
+        is_hidden INTEGER,
+        is_available INTEGER,
+        availability_valid_to INTEGER,
+        headline TEXT,
+        description_len INTEGER,
+        raw_json TEXT
+    );
 
-def compute_roa(action: str, state, stats: Dict) -> float:
-    """
-    ROA = Revenue Overclock Advantage
+    CREATE TABLE IF NOT EXISTS content_variants (
+        variant_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        headline TEXT,
+        description TEXT,
+        title TEXT,
+        body TEXT,
+        status TEXT NOT NULL,
+        hypothesis TEXT,
+        created_at TEXT NOT NULL,
+        applied_at TEXT,
+        removed_at TEXT
+    );
 
-    ROA = expected_revenue_lift × confidence × attribution_weight × repeatability
-          − compliance_risk − mutation_cost − platform_error_risk
-    """
-    s = stats.get(action, {"avg_reward": 0, "confidence": 0, "n": 0})
+    CREATE TABLE IF NOT EXISTS experiments (
+        experiment_id TEXT PRIMARY KEY,
+        variant_id TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        baseline_views INTEGER,
+        baseline_clicks INTEGER,
+        final_views INTEGER,
+        final_clicks INTEGER,
+        result_json TEXT
+    );
 
-    # Expected revenue lift: use avg reward as base, adjust for current state
-    expected_lift = s["avg_reward"]
+    CREATE TABLE IF NOT EXISTS endpoint_map (
+        endpoint_id TEXT PRIMARY KEY,
+        method TEXT NOT NULL,
+        path TEXT NOT NULL,
+        action_name TEXT,
+        request_schema TEXT,
+        response_schema TEXT,
+        discovered_at TEXT NOT NULL
+    );
 
-    # State-based adjustments
-    pressure = state.revenue_pressure
-
-    if action == "refresh_availability":
-        if state.available_status != "Available":
-            expected_lift = 2.0  # high value when not available
-        elif state.availability_seconds_left < 3600:
-            expected_lift = 1.0  # medium value when expiring
-        else:
-            expected_lift = 0.1  # low value when already available
-
-    elif action == "ensure_visible":
-        expected_lift = 2.0 if state.profile_hidden else 0.1
-
-    elif action == "mailbox_intent_scan":
-        expected_lift = 0.5 + (state.mailbox_intent_score * 2.0)
-
-    elif action == "reply_draft_queue":
-        expected_lift = 1.0 + (state.mailbox_intent_score * 3.0)
-
-    elif action == "check_search_rank":
-        expected_lift = 0.3
-
-    elif action == "city_rank_scan":
-        expected_lift = 0.3
-
-    elif action == "headline_variant_test":
-        # Only valuable when contact rate is low
-        expected_lift = max(0, (5.0 - state.contact_rate) / 5.0) * 1.5
-
-    elif action == "bio_variant_test":
-        expected_lift = max(0, (5.0 - state.contact_rate) / 5.0) * 1.0
-
-    elif action == "rate_position_test":
-        expected_lift = 0.2  # risky, low default
-
-    elif action == "photo_order_test":
-        expected_lift = 0.3
-
-    elif action == "traffic_report":
-        expected_lift = 0.2
-
-    elif action == "do_nothing":
-        expected_lift = 0.0
-
-    # Confidence from bandit history
-    confidence = s["confidence"] if s["n"] >= 3 else 0.3  # default low confidence
-
-    # Attribution weight: safe actions have higher attribution reliability
-    attribution_weight = 0.9 if action in SAFE_ACTIONS else 0.6
-
-    # Repeatability: can we do this again and again?
-    repeatability = 0.8 if action in SAFE_ACTIONS else 0.4
-
-    # Compliance risk
-    compliance_risk = 0.0 if action in SAFE_ACTIONS else 0.3
-
-    # Mutation cost: penalize frequent profile changes
-    mutation_cost = 0.5 if action in MUTATION_ACTIONS else 0.0
-
-    # Platform error risk
-    platform_error_risk = 0.1 if action in SAFE_ACTIONS else 0.2
-
-    roa = (
-        expected_lift * confidence * attribution_weight * repeatability
-        - compliance_risk
-        - mutation_cost
-        - platform_error_risk
-    )
-
-    return round(roa, 3)
-
-
-def select_action(state, tenant_id: str = "") -> Tuple[str, Dict[str, float]]:
-    """
-    Select best action using contextual bandit.
-
-    Returns (action_name, roa_scores).
-    """
-    conn = _db()
-    stats = get_action_stats(conn, tenant_id)
-
-    roa_scores = {}
-    for action in ACTIONS:
-        roa_scores[action] = compute_roa(action, state, stats)
-
+    CREATE INDEX IF NOT EXISTS idx_receipts_created_at ON receipts(created_at);
+    CREATE INDEX IF NOT EXISTS idx_traffic_snapshots_created_at ON traffic_snapshots(created_at);
+    CREATE INDEX IF NOT EXISTS idx_experiments_variant_id ON experiments(variant_id);
+    """)
+    conn.commit()
     conn.close()
 
-    # argmax ROA
-    best = max(roa_scores, key=roa_scores.get)
-    return best, roa_scores
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def record_outcome(outcome: ActionOutcome, tenant_id: str = ""):
-    """Record action outcome for bandit learning."""
-    conn = _db()
+def sha_hash(s: str) -> str:
+    import hashlib
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def write_receipt(receipt_type: str, action: str, before: Any, after: Any, verified: bool = False) -> str:
+    created_at = now_iso()
+    before_json = json.dumps(before, sort_keys=True, default=str)
+    after_json = json.dumps(after, sort_keys=True, default=str)
+    input_hash = sha_hash(before_json)
+    output_hash = sha_hash(after_json)
+    receipt_hash = sha_hash(f"{created_at}|{receipt_type}|{action}|{input_hash}|{output_hash}")
+    raw = json.dumps({
+        "receipt_hash": receipt_hash,
+        "receipt_type": receipt_type,
+        "action": action,
+        "input_hash": input_hash,
+        "output_hash": output_hash,
+        "verified": int(verified),
+        "created_at": created_at,
+        "before": before,
+        "after": after,
+    }, sort_keys=True, default=str)
+    conn = get_conn()
     conn.execute(
-        "INSERT INTO action_history (tenant_id, action, reward, metric_delta, state_before_hash, state_after_hash, error, timestamp) "
+        "INSERT INTO receipts (receipt_hash, receipt_type, action, input_hash, output_hash, verified, created_at, raw_json) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (tenant_id, outcome.action, outcome.reward,
-         json.dumps(outcome.metric_delta),
-         outcome.state_before_hash, outcome.state_after_hash,
-         outcome.error, outcome.timestamp or datetime.now(timezone.utc).isoformat())
+        (receipt_hash, receipt_type, action, input_hash, output_hash, int(verified), created_at, raw)
     )
     conn.commit()
     conn.close()
-    log.info(f"  ◉ Recorded: {outcome.action} reward={outcome.reward:.3f}")
+    return receipt_hash
 
 
-def explain_last_action(tenant_id: str = "") -> str:
-    """Explain the last action taken and why."""
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM action_history WHERE tenant_id = ? ORDER BY id DESC LIMIT 1",
-        (tenant_id,)
+def write_traffic_snapshot(data: Dict[str, Any]):
+    created_at = now_iso()
+    raw = json.dumps(data, sort_keys=True, default=str)
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO traffic_snapshots (created_at, profile_views, contact_clicks, new_visits, new_emails, "
+        "is_hidden, is_available, availability_valid_to, headline, description_len, raw_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            created_at,
+            data.get("profile_views"),
+            data.get("contact_clicks"),
+            data.get("new_visits"),
+            data.get("new_emails"),
+            data.get("is_hidden"),
+            data.get("is_available"),
+            data.get("availability_valid_to"),
+            data.get("headline"),
+            data.get("description_len"),
+            raw,
+        )
     )
-    row = cur.fetchone()
+    conn.commit()
     conn.close()
 
-    if not row:
-        return "No actions recorded yet."
 
-    stats = get_action_stats(_db(), tenant_id)
-    action = row["action"]
-    s = stats.get(action, {})
+def get_latest_traffic_snapshot(limit: int = 1) -> List[Dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM traffic_snapshots ORDER BY created_at DESC LIMIT ?",
+        (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
-    return (
-        f"Last action: {action}\n"
-        f"  Reward: {row['reward']:.3f}\n"
-        f"  Metric delta: {row['metric_delta']}\n"
-        f"  Error: {row['error'] or 'none'}\n"
-        f"  Timestamp: {row['timestamp']}\n"
-        f"  History: {s['n']} runs, avg_reward={s['avg_reward']:.3f}, win_rate={s['win_rate']:.1%}\n"
-        f"  Confidence: {s['confidence']:.3f}"
+
+def upsert_content_variant(variant_id: str, kind: str, headline: str, description: str,
+                           title: str = "", body: str = "", status: str = "draft",
+                           hypothesis: str = ""):
+    created_at = now_iso()
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO content_variants (variant_id, kind, headline, description, title, body, status, hypothesis, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(variant_id) DO UPDATE SET "
+        "headline=excluded.headline, description=excluded.description, title=excluded.title, "
+        "body=excluded.body, status=excluded.status, hypothesis=excluded.hypothesis",
+        (variant_id, kind, headline, description, title, body, status, hypothesis, created_at)
     )
+    conn.commit()
+    conn.close()
+
+
+def set_variant_status(variant_id: str, status: str, timestamp_field: str = "applied_at"):
+    conn = get_conn()
+    now = now_iso()
+    if timestamp_field == "applied_at":
+        conn.execute("UPDATE content_variants SET status=?, applied_at=? WHERE variant_id=?", (status, now, variant_id))
+    elif timestamp_field == "removed_at":
+        conn.execute("UPDATE content_variants SET status=?, removed_at=? WHERE variant_id=?", (status, now, variant_id))
+    else:
+        conn.execute("UPDATE content_variants SET status=? WHERE variant_id=?", (status, variant_id))
+    conn.commit()
+    conn.close()
+
+
+def get_active_variant(kind: str) -> Optional[Dict]:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM content_variants WHERE kind=? AND status='active' ORDER BY applied_at DESC LIMIT 1",
+        (kind,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_variant_history(kind: str, limit: int = 20) -> List[Dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM content_variants WHERE kind=? ORDER BY created_at DESC LIMIT ?",
+        (kind, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def start_experiment(experiment_id: str, variant_id: str, baseline_views: int, baseline_clicks: int):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO experiments (experiment_id, variant_id, started_at, baseline_views, baseline_clicks) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (experiment_id, variant_id, now_iso(), baseline_views, baseline_clicks)
+    )
+    conn.commit()
+    conn.close()
+
+
+def end_experiment(experiment_id: str, final_views: int, final_clicks: int, result: Dict):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE experiments SET ended_at=?, final_views=?, final_clicks=?, result_json=? WHERE experiment_id=?",
+        (now_iso(), final_views, final_clicks, json.dumps(result, sort_keys=True, default=str), experiment_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_open_experiments() -> List[Dict]:
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM experiments WHERE ended_at IS NULL").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def upsert_endpoint(method: str, path: str, action_name: str, request_schema: str = "", response_schema: str = ""):
+    endpoint_id = sha_hash(f"{method}:{path}")
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO endpoint_map (endpoint_id, method, path, action_name, request_schema, response_schema, discovered_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(endpoint_id) DO UPDATE SET "
+        "action_name=excluded.action_name, request_schema=excluded.request_schema, response_schema=excluded.response_schema",
+        (endpoint_id, method, path, action_name, request_schema, response_schema, now_iso())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_endpoints() -> List[Dict]:
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM endpoint_map ORDER BY discovered_at DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 ```
 
-reply_drafter.py:
+availability_keeper.py:
 ```
 """
-LLM Reply Drafter — template-first reply drafting for client messages.
+RM Availability Keeper — standalone 24/7 daemon.
 
-Template is canonical. LLM is optional polish only (local, 8s timeout).
-Uses local-only providers for private client text:
-  template canonical → local Ollama/Transformers optional polish → template retained if invalid.
-No Groq. No OpenRouter. No cloud fallback.
+Keeps the profile "Available" at all times. Re-authenticates automatically.
+Refreshes availability before expiry. Handles session drops.
 
-Drafts replies, does NOT auto-send. Human approval required for first contact.
-Ready-for-fast-approval only for repeat/opt-in clients with valid templates.
-
-Reply structure (always):
-  - availability
-  - location / incall-outcall boundary
-  - rate clarity
-  - session length
-  - professional tone
-  - one next-step question
-  - no spammy pressure
-  - no weird sexual escalation
+Usage:
+    python3 -m rm_traffic.availability_keeper              # 24/7 daemon
+    python3 -m rm_traffic.availability_keeper --once       # single check + refresh
+    python3 -m rm_traffic.availability_keeper --status     # show current state
 """
 
+import argparse
 import json
 import logging
 import os
-import re
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+import signal
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
-from .intent_engine import classify, IntentResult
+ENV_PATH = Path(__file__).parent.parent / ".env"
+if ENV_PATH.exists():
+    for line in open(ENV_PATH):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
 
-# Local-only LLM imports — NO cloud providers for private client text
-try:
-    from .llm_client import LLMClient
-    _HAS_LLM = True
-except ImportError:
-    _HAS_LLM = False
+os.environ.setdefault("RM_USER", os.environ.get("RENTMASSEUR_USER", ""))
+os.environ.setdefault("RM_PASS", os.environ.get("RENTMASSEUR_PASS", ""))
 
-log = logging.getLogger("reply_drafter")
+from .api_client import RentMasseurAPI
+from .auth import AuthSession
 
-# Reply classes
-REPLY_BOOKING_NOW = "booking_now_reply"
-REPLY_PRICE_QUESTION = "price_question_reply"
-REPLY_LOCATION_QUESTION = "location_question_reply"
-REPLY_REPEAT_CLIENT = "repeat_client_reply"
-REPLY_INQUIRY = "inquiry_reply"
-REPLY_FOLLOW_UP = "follow_up_reply"
-REPLY_CLOSE_LOOP = "close_loop_reply"
-REPLY_AVAILABILITY_QUESTION = "availability_reply"
-REPLY_HIGH_VALUE_REPEAT = "high_value_repeat_reply"
-REPLY_NONE = "none"
+log = logging.getLogger("availability_keeper")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(str(Path(__file__).parent / "availability_keeper.log")),
+    ],
+)
 
-# Risk levels
-RISK_SAFE = "safe"
-RISK_REVIEW = "review"
-RISK_BLOCKED = "blocked"
+KEEPER_DB = Path(__file__).parent / "availability_keeper.db"
+SESSION_FILE = str(Path(__file__).parent / "session.json")
 
-
-@dataclass
-class DraftReply:
-    username: str = ""
-    intent_class: str = ""
-    confidence: float = 0.0
-    booking_probability: float = 0.0
-    reply_text: str = ""
-    reply_class: str = ""
-    risk_level: str = RISK_SAFE
-    needs_human_approval: bool = True
-    reason: str = ""
-    suggested_time_slots: List[str] = field(default_factory=list)
-    error: str = ""
+# Refresh when less than this many seconds remain
+REFRESH_THRESHOLD_SEC = 30 * 60  # 30 min before expiry
+# How often to check (when availability is far from expiring)
+CHECK_INTERVAL_SEC = 5 * 60      # 5 min
+# Max duration index (5 = 6 hours, the longest for "Available")
+MAX_DURATION = 5
 
 
-def _build_polish_prompt(template_text: str, message: str, intent: IntentResult, context: Dict) -> str:
-    """Build LLM prompt for polishing an existing template draft.
-    The model rewrites the template for clarity — it does NOT generate from scratch."""
-    username = context.get("username", "")
-    is_repeat = intent.classification in ("repeat_client", "high_value_repeat")
-
-    prompt = f"""Rewrite this existing draft only for clarity. Do not add facts. Do not change rates, location, session length, phone, or availability. Return one reply only.
-
-Existing draft:
-"{template_text}"
-
-Client message: "{message[:300]}"
-Client username: {username}
-Intent: {intent.classification}
-Is repeat client: {is_repeat}
-
-Rules:
-- Rewrite the existing draft for clarity and warmth only
-- Do NOT add new facts, rates, locations, or availability not in the existing draft
-- Do NOT change the rate, location, session length, or phone number
-- Keep it under 80 words
-- End with exactly ONE next-step question
-- Professional tone, first person singular (I/my, not we/us/our)
-- No sexual language, no innuendo
-- Return only the rewritten reply text, nothing else
-
-Rewritten reply:"""
-
-    return prompt
+def _db():
+    conn = sqlite3.connect(str(KEEPER_DB))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 
-def _clean_llm_output(text: str) -> str:
-    """Clean LLM output — remove quotes, markdown, extra whitespace."""
-    if not text:
-        return ""
-    text = text.strip()
-    # Remove surrounding quotes
-    if text.startswith('"') and text.endswith('"'):
-        text = text[1:-1]
-    # Remove markdown
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'\*(.+?)\*', r'\1', text)
-    # Remove any "Reply:" prefix
-    text = re.sub(r'^(Reply|Response|Message):\s*', '', text, flags=re.IGNORECASE)
-    # Normalize whitespace
-    text = ' '.join(text.split())
-    return text.strip()
+def init_db():
+    conn = _db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS availability_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        action TEXT NOT NULL,
+        option INTEGER,
+        duration INTEGER,
+        remaining_sec INTEGER,
+        success INTEGER DEFAULT 1,
+        detail TEXT
+    );
+    """)
+    conn.commit()
+    conn.close()
 
 
-def _template_fallback(intent: IntentResult, context: Dict) -> str:
-    """Fixed template fallback when LLM is unavailable."""
-    rate = context.get("rate", "$200")
-    phone = context.get("phone", "")
-    cls = intent.classification
-
-    if cls == "booking_now":
-        return (
-            f"Yes — I'm available today. I have openings at 7:30 or 9 PM. "
-            f"Manhattan incall, {rate} for 60 min. "
-            f"Which time works for you? Text {phone} to confirm."
-        )
-
-    if cls == "price_question":
-        return (
-            f"Rate is {rate} for 60 min, $280 for 90 min, $360 for 120 min. "
-            f"Manhattan incall. What duration and time work for you? "
-            f"Text {phone} to book."
-        )
-
-    if cls == "availability_question":
-        return (
-            f"I'm available today and this week. "
-            f"Manhattan incall, {rate} for 60 min. "
-            f"What day and time work for you? Text {phone} to schedule."
-        )
-
-    if cls == "location_question":
-        return (
-            f"I'm based in Manhattan — private incall space. "
-            f"Outcall available within Manhattan for additional travel fee. "
-            f"Rate is {rate}. Text {phone} for faster booking."
-        )
-
-    if cls in ("repeat_client", "high_value_repeat"):
-        return (
-            f"Great to hear from you again! "
-            f"I have openings today. Same location in Manhattan. "
-            f"Text {phone} to confirm your time."
-        )
-
-    if cls == "ghosted_lead":
-        return (
-            f"Hi — following up. I'm available this week if you'd like to book. "
-            f"Manhattan incall, {rate} for 60 min. "
-            f"Text {phone} to schedule."
-        )
-
-    return (
-        f"Hi! Thanks for your interest. "
-        f"I offer deep tissue and sports recovery massage in Manhattan. "
-        f"Rate is {rate} for 60 min. "
-        f"What questions can I answer? Text {phone} for faster response."
+def _log(action: str, option: int = None, duration: int = None,
+         remaining: int = None, success: bool = True, detail: str = ""):
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = _db()
+    conn.execute(
+        "INSERT INTO availability_log (ts, action, option, duration, remaining_sec, success, detail) VALUES (?,?,?,?,?,?,?)",
+        (ts, action, option, duration, remaining, int(success), detail[:200])
     )
+    conn.commit()
+    conn.close()
 
 
-def _determine_reply_class(intent: IntentResult) -> str:
-    """Map intent classification to reply class."""
-    mapping = {
-        "booking_now": REPLY_BOOKING_NOW,
-        "price_question": REPLY_PRICE_QUESTION,
-        "availability_question": REPLY_AVAILABILITY_QUESTION,
-        "location_question": REPLY_LOCATION_QUESTION,
-        "repeat_client": REPLY_REPEAT_CLIENT,
-        "high_value_repeat": REPLY_HIGH_VALUE_REPEAT,
-        "ghosted_lead": REPLY_FOLLOW_UP,
-        "do_not_contact": REPLY_NONE,
-        "spam": REPLY_NONE,
-        "unknown": REPLY_INQUIRY,
-    }
-    return mapping.get(intent.classification, REPLY_INQUIRY)
+class AvailabilityKeeper:
+    def __init__(self):
+        self.api = RentMasseurAPI(min_request_interval=2.0)
+        self.auth = AuthSession(self.api, session_file=SESSION_FILE)
+        self.username = os.environ.get("RM_USER", "")
+        self.password = os.environ.get("RM_PASS", "")
+        self.running = True
+        self.last_login = 0
+        self.consecutive_failures = 0
 
-
-def _determine_risk(intent: IntentResult, is_first_contact: bool = True) -> str:
-    """Determine risk level for the reply."""
-    if intent.classification in ("do_not_contact", "spam"):
-        return RISK_BLOCKED
-    if "unsafe" in (intent.risk_flags or []):
-        return RISK_BLOCKED
-    if "opt_out" in (intent.risk_flags or []):
-        return RISK_BLOCKED
-    if is_first_contact:
-        return RISK_REVIEW
-    return RISK_SAFE
-
-
-def validate_reply_text(text: str, context: Dict = None) -> Tuple[bool, str]:
-    """Validate reply text against quality and safety rules.
-    Returns (is_valid, reason)."""
-    if not text or not text.strip():
-        return False, "empty_text"
-
-    if context is None:
-        context = {}
-
-    text_lower = text.lower()
-    word_count = len(text.split())
-
-    # ─── Reject: bad pronouns (first person plural = wrong voice) ───
-    if re.search(r'\b(we|us|our)\b', text_lower):
-        return False, "first_person_plural_detected"
-
-    # ─── Reject: "app" reference ───
-    if re.search(r'\bapp\b', text_lower):
-        return False, "app_reference_detected"
-
-    # ─── Reject: known bad phrases ───
-    bad_phrases = ["sorry to hear", "reaching out to us", "last-minute app",
-                   "thank you for reaching out"]
-    if any(p in text_lower for p in bad_phrases):
-        return False, f"bad_phrase_detected"
-
-    # ─── Reject: sexual/innuendo terms ───
-    sexual_kw = ["sexual", "erotic", "sensual", "nude", "naked", "happy ending",
-                 "full service", "extras", "menu", "gfe", "bb", "bareback"]
-    if any(kw in text_lower for kw in sexual_kw):
-        return False, "sexual_innuendo_detected"
-
-    # ─── Reject: phone number when not allowed ───
-    allow_phone = os.environ.get("ALLOW_PHONE_IN_DRAFT", "false").lower() == "true"
-    if not allow_phone:
-        phone_in_context = context.get("phone", "")
-        # Check for raw phone numbers (not the word "text")
-        if re.search(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', text):
-            return False, "raw_phone_in_draft_not_allowed"
-        if phone_in_context and phone_in_context in text and not allow_phone:
-            return False, "phone_in_draft_not_allowed"
-
-    # ─── Reject: over 80 words ───
-    if word_count > 80:
-        return False, f"too_many_words ({word_count})"
-
-    # ─── Reject: no question mark (no next-step question) ───
-    if "?" not in text:
-        return False, "no_next_step_question"
-
-    # ─── Reject: multiple questions (rule is one next-step question) ───
-    question_count = text.count("?")
-    if question_count > 2:  # allow up to 2 for compound questions like "What time and duration?"
-        return False, f"too_many_questions ({question_count})"
-
-    # ─── Reject: missing rate (for booking/price/location intents) ───
-    rate = context.get("rate", "$200")
-    intent_class = context.get("intent_class", "")
-    if intent_class in ("booking_now", "price_question", "location_question", "availability_question"):
-        if rate and rate not in text:
-            return False, "missing_rate"
-
-    # ─── Reject: missing location ───
-    location = context.get("location", "Manhattan")
-    if location and location.lower() not in text_lower and "manhattan" not in text_lower:
-        return False, "missing_location"
-
-    # ─── Reject: missing session length ───
-    if intent_class in ("booking_now", "price_question"):
-        if not re.search(r'\b(60|90|120)\s*min', text_lower) and "min" not in text_lower:
-            return False, "missing_session_length"
-
-    return True, "valid"
-
-
-def _try_local_llm_polish(template_text: str, message: str, intent: IntentResult,
-                            context: Dict, timeout_seconds: int = 8) -> Optional[str]:
-    """Try local-only LLM (Ollama or Transformers.js) for light polish.
-    Rewrites the existing template — does NOT generate from scratch.
-    NO cloud providers. Returns None if unavailable or too slow."""
-    if not _HAS_LLM:
-        return None
-
-    import threading
-
-    prompt = _build_polish_prompt(template_text, message, intent, context)
-
-    result = [None]
-    def _call():
-        try:
-            # Try Ollama only (local), then Transformers.js (local)
-            # NO Groq, NO OpenRouter — private client text stays local
-            for provider, model in [("ollama", "llama3.2"), ("transformers", None)]:
-                try:
-                    client = LLMClient(provider=provider, model=model)
-                    resp = client.generate(prompt, max_tokens=150)
-                    if resp and len(resp) > 20:
-                        result[0] = resp
-                        return
-                except Exception:
-                    continue
-        except Exception:
-            return
-
-    t = threading.Thread(target=_call, daemon=True)
-    t.start()
-    t.join(timeout=timeout_seconds)
-
-    if t.is_alive():
-        log.info(f"  ⟁ Local LLM timed out ({timeout_seconds}s) — using template")
-        return None
-
-    return result[0]
-
-
-def draft_reply(message: str, context: Dict = None) -> DraftReply:
-    """
-    Generate a template-first draft reply for a client message.
-
-    Template is canonical. LLM is optional polish only (local, 8s timeout).
-    No cloud providers ever called on private client text.
-    All first-contact drafts are approval-gated.
-
-    Args:
-        message: The client's message text
-        context: Dict with username, is_premium, rate, phone, location, is_first_contact
-
-    Returns:
-        DraftReply with reply_text, risk_level, needs_human_approval
-    """
-    if context is None:
-        context = {}
-
-    # Classify intent
-    intent = classify(message, context.get("username", ""))
-
-    # Build draft
-    draft = DraftReply(
-        username=context.get("username", ""),
-        intent_class=intent.classification,
-        confidence=intent.confidence,
-        booking_probability=intent.booking_probability,
-        reply_class=_determine_reply_class(intent),
-        risk_level=_determine_risk(intent, context.get("is_first_contact", True)),
-        reason=f"Intent: {intent.classification} (conf={intent.confidence:.2f})",
-    )
-
-    # Blocked — no reply
-    if draft.risk_level == RISK_BLOCKED:
-        draft.reply_text = ""
-        draft.needs_human_approval = False
-        draft.reason = f"BLOCKED: {intent.classification} with risk flags {intent.risk_flags}"
-        return draft
-
-    # ─── Template first (canonical) ───
-    draft.reply_text = _template_fallback(intent, context)
-    draft.reason += " | template-canonical"
-    log.info(f"  ◉ Template reply for {draft.username}: {draft.reply_text[:80]}...")
-
-    # ─── Optional local LLM polish (8s timeout, no cloud) ───
-    polished = _try_local_llm_polish(draft.reply_text, message, intent, context, timeout_seconds=8)
-    if polished:
-        cleaned = _clean_llm_output(polished)
-        # Validate polished output against strict quality rules
-        validation_context = {**context, "intent_class": intent.classification}
-        is_valid, reject_reason = validate_reply_text(cleaned, validation_context)
-        if is_valid:
-            draft.reply_text = cleaned
-            draft.reason += " | llm-polished"
-            log.info(f"  ◉ Polished reply for {draft.username}: {draft.reply_text[:80]}...")
+    def login(self) -> bool:
+        if not self.username or not self.password:
+            log.error("RM_USER / RM_PASS not set")
+            return False
+        ok = self.auth.login(self.username, self.password)
+        if ok:
+            self.last_login = time.time()
+            self.consecutive_failures = 0
+            _log("login", success=True, detail=f"logged in as {self.username}")
+            log.info("Login OK as %s", self.username)
         else:
-            draft.reason += f" | llm-polish-rejected:{reject_reason}"
-            log.info(f"  ⟁ LLM polish rejected ({reject_reason}) — keeping template")
+            self.consecutive_failures += 1
+            _log("login", success=False, detail=f"login failed (attempt {self.consecutive_failures})")
+            log.error("Login failed (attempt %d)", self.consecutive_failures)
+        return ok
 
-    # Approval gate — all first contact needs approval
-    is_repeat = intent.classification in ("repeat_client", "high_value_repeat")
-    if is_repeat and not context.get("is_first_contact", True):
-        draft.needs_human_approval = False
-    else:
-        draft.needs_human_approval = True
+    def ensure_session(self) -> bool:
+        # Re-login if > 50 min since last login
+        if time.time() - self.last_login > 3000:
+            log.info("Session aging, re-logging in...")
+            return self.login()
+        # Test session with a lightweight call
+        try:
+            self.api.get_keeponline()
+            return True
+        except Exception as e:
+            log.warning("Session check failed (%s), re-logging in...", str(e)[:60])
+            return self.login()
 
-    # Suggested time slots for booking intent
-    if intent.classification in ("booking_now", "high_value_repeat"):
-        draft.suggested_time_slots = ["7:30 PM", "9:00 PM", "Tomorrow 12:00 PM"]
+    def get_remaining_sec(self, avail: dict) -> int:
+        countdown = avail.get("countdown", 0)
+        if not countdown:
+            return 0
+        remaining = int(countdown - time.time())
+        return max(0, remaining)
 
-    return draft
+    def check_and_refresh(self) -> dict:
+        """Check availability. Refresh if not Available or near expiry."""
+        result = {"action": "noop", "refreshed": False, "remaining": 0, "detail": ""}
+
+        if not self.ensure_session():
+            result["detail"] = "auth failed"
+            return result
+
+        try:
+            avail = self.api.get_availability()
+        except Exception as e:
+            log.error("get_availability failed: %s", e)
+            # Try re-login once
+            if self.login():
+                try:
+                    avail = self.api.get_availability()
+                except Exception as e2:
+                    result["detail"] = f"get_availability failed after relogin: {e2}"
+                    _log("check", success=False, detail=result["detail"])
+                    return result
+            else:
+                result["detail"] = "relogin failed"
+                _log("check", success=False, detail=result["detail"])
+                return result
+
+        option = avail.get("selected", "")
+        remaining = self.get_remaining_sec(avail)
+
+        log.info("Availability: %s, remaining=%ds (%.1fh)", option, remaining, remaining / 3600)
+
+        needs_refresh = False
+        reason = ""
+
+        if option != "Available":
+            needs_refresh = True
+            reason = f"not Available (was: {option})"
+        elif remaining < REFRESH_THRESHOLD_SEC:
+            needs_refresh = True
+            reason = f"expiring soon ({remaining}s left, threshold {REFRESH_THRESHOLD_SEC}s)"
+
+        if not needs_refresh:
+            result["remaining"] = remaining
+            result["detail"] = f"OK: {option}, {remaining}s left"
+            _log("check", option=1 if option == "Available" else 0, remaining=remaining, success=True, detail=result["detail"])
+            return result
+
+        # Refresh
+        log.info("Refreshing availability: %s", reason)
+        try:
+            self.api.set_availability(option=1, duration=MAX_DURATION)
+            result["action"] = "refresh"
+            result["refreshed"] = True
+            result["detail"] = f"set to Available for 6h ({reason})"
+            _log("refresh", option=1, duration=MAX_DURATION, remaining=remaining, success=True, detail=result["detail"])
+            log.info("◆ Refreshed: set to Available (6h)")
+
+            # Verify
+            time.sleep(2)
+            try:
+                after = self.api.get_availability()
+                after_remaining = self.get_remaining_sec(after)
+                result["remaining"] = after_remaining
+                if after.get("selected") == "Available":
+                    log.info("Verified: Available, %ds remaining", after_remaining)
+                else:
+                    log.warning("Verify mismatch: selected=%s", after.get("selected"))
+            except Exception as e:
+                log.warning("Verify check failed: %s", e)
+
+        except Exception as e:
+            result["detail"] = f"refresh failed: {e}"
+            _log("refresh", option=1, duration=MAX_DURATION, remaining=remaining, success=False, detail=str(e)[:200])
+            log.error("Refresh failed: %s", e)
+
+            # Try re-login and one more attempt
+            if self.consecutive_failures < 3:
+                log.info("Retrying after relogin...")
+                if self.login():
+                    try:
+                        self.api.set_availability(option=1, duration=MAX_DURATION)
+                        result["refreshed"] = True
+                        result["detail"] = f"set to Available on retry"
+                        _log("refresh_retry", option=1, duration=MAX_DURATION, success=True, detail="retry success")
+                        log.info("◆ Refreshed on retry")
+                    except Exception as e2:
+                        log.error("Retry also failed: %s", e2)
+                        _log("refresh_retry", success=False, detail=str(e2)[:200])
+
+        return result
+
+    def run_forever(self):
+        log.info("═══ AVAILABILITY KEEPER STARTING ═══")
+        log.info("User: %s", self.username)
+        log.info("Check interval: %ds", CHECK_INTERVAL_SEC)
+        log.info("Refresh threshold: %ds before expiry", REFRESH_THRESHOLD_SEC)
+        log.info("Max duration: 6h (index %d)", MAX_DURATION)
+
+        if not self.login():
+            log.error("Initial login failed. Exiting.")
+            sys.exit(1)
+
+        # Set up signal handler for clean shutdown
+        def handle_sigterm(sig, frame):
+            log.info("Received signal %d, shutting down...", sig)
+            self.running = False
+        signal.signal(signal.SIGINT, handle_sigterm)
+        signal.signal(signal.SIGTERM, handle_sigterm)
+
+        while self.running:
+            try:
+                self.check_and_refresh()
+            except Exception as e:
+                log.error("Cycle error: %s", e)
+                _log("cycle_error", success=False, detail=str(e)[:200])
+                # Backoff on repeated failures
+                if self.consecutive_failures > 5:
+                    log.error("Too many failures, backing off 10 min...")
+                    time.sleep(600)
+                    self.consecutive_failures = 0
+
+            # Sleep in small increments so signal handler can interrupt
+            slept = 0
+            while slept < CHECK_INTERVAL_SEC and self.running:
+                time.sleep(5)
+                slept += 5
+
+        log.info("Availability keeper stopped.")
+
+    def run_once(self):
+        log.info("═══ AVAILABILITY KEEPER (single run) ═══")
+        if not self.login():
+            sys.exit(1)
+        result = self.check_and_refresh()
+        print(json.dumps(result, indent=2))
+        return result
+
+    def show_status(self):
+        log.info("═══ AVAILABILITY KEEPER STATUS ═══")
+        if not self.login():
+            sys.exit(1)
+        try:
+            avail = self.api.get_availability()
+            remaining = self.get_remaining_sec(avail)
+            keep = self.api.get_keeponline()
+
+            print(f"\n  {'='*50}")
+            print(f"  AVAILABILITY KEEPER STATUS")
+            print(f"  {'='*50}")
+            print(f"  User:         {self.username}")
+            print(f"  Available:    {avail.get('selected', '?')}")
+            print(f"  Remaining:    {remaining}s ({remaining/3600:.1f}h)")
+            print(f"  Hidden:       {'YES' if keep.get('isAdHidden') else 'NO'}")
+            print(f"  New visits:   {keep.get('newVisits', '?')}")
+            print(f"  New emails:   {keep.get('newEmails', '?')}")
+            print(f"  {'='*50}")
+
+            # Show recent log
+            conn = _db()
+            rows = conn.execute(
+                "SELECT * FROM availability_log ORDER BY id DESC LIMIT 10"
+            ).fetchall()
+            conn.close()
+            if rows:
+                print(f"\n  Recent actions:")
+                for r in rows:
+                    glyph = "◆" if r["success"] else "⟁"
+                    print(f"    {glyph} {r['ts'][:19]}  {r['action']:12s}  {r['detail'][:50]}")
+            print()
+        except Exception as e:
+            log.error("Status check failed: %s", e)
+            sys.exit(1)
 
 
-def draft_mailbox_replies(emails: List[Dict], context: Dict = None) -> List[DraftReply]:
-    """
-    Generate draft replies for all mailbox conversations.
+def main():
+    parser = argparse.ArgumentParser(description="RM Availability Keeper — 24/7 availability daemon")
+    parser.add_argument("--once", action="store_true", help="Single check + refresh")
+    parser.add_argument("--status", action="store_true", help="Show current availability status")
+    parser.add_argument("--check-interval", type=int, default=CHECK_INTERVAL_SEC, help="Seconds between checks (default: 300)")
+    args = parser.parse_args()
 
-    Args:
-        emails: List of email dicts from api.get_mailbox()
-        context: Base context (rate, phone, location)
+    init_db()
+    keeper = AvailabilityKeeper()
+    keeper.check_interval = args.check_interval
 
-    Returns:
-        List of DraftReply objects
-    """
-    if context is None:
-        context = {}
+    if args.status:
+        keeper.show_status()
+        return
 
-    drafts = []
-    for email in emails:
-        uc = email.get("userCard", {})
-        msg = email.get("lastMessage", "")
-        username = uc.get("username", "")
+    if args.once:
+        keeper.run_once()
+        return
 
-        email_context = {
-            **context,
-            "username": username,
-            "is_premium": bool(uc.get("isPremium", 0)),
-            "is_first_contact": not bool(email.get("lastMessage", "")),
-        }
-
-        draft = draft_reply(msg, email_context)
-        drafts.append(draft)
-
-    return drafts
+    keeper.run_forever()
 
 
-def format_drafts_summary(drafts: List[DraftReply]) -> str:
-    """Format drafts for display."""
-    lines = [f"\n{'='*60}", f"  REPLY DRAFT QUEUE — {len(drafts)} drafts", f"{'='*60}\n"]
-
-    for d in drafts:
-        if d.risk_level == RISK_BLOCKED:
-            lines.append(f"  🚫 {d.username} [{d.intent_class}] — BLOCKED")
-            lines.append(f"     {d.reason}")
-            continue
-
-        approval = "🔒 approval" if d.needs_human_approval else "⚡ ready_for_fast_approval"
-        lines.append(f"  ◉ {d.username} [{d.intent_class}] conf={d.confidence:.2f} {approval}")
-        lines.append(f"    Reply: \"{d.reply_text[:120]}\"")
-        if d.suggested_time_slots:
-            lines.append(f"    Slots: {', '.join(d.suggested_time_slots)}")
-        lines.append("")
-
-    return "\n".join(lines)
+if __name__ == "__main__":
+    main()
 
 ```
 
-bio_generator.cpp:
+bio_variants.py:
 ```
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <random>
-#include <chrono>
-#include <sstream>
+"""
+Bio variant library — conservative, tested headline + bio copy.
 
-std::vector<std::string> headlines = {
-    "Deep Tissue & {thing} — Manhattan",
-    "{adjective} Bodywork in Manhattan",
-    "{name} Does {thing} — Manhattan",
-    "The Wolf's {thing} — Manhattan",
-    "{thing} for {person} — Manhattan",
-    "Manhattan's {adjective} {thing}",
-    "Not Your Average {thing} — Manhattan",
-    "Real {thing} for {person}",
-    "{thing}: No Fluff, Just Pressure",
-    "Bring the {body_part}, Bring the Wolf — Manhattan",
-    "{adjective} {thing} in Manhattan, NYC",
-    "The {person}'s {thing} — Manhattan",
-    "Wolf-Level {thing} — Manhattan",
-    "{body_part} Rescue in Manhattan",
-    "From {city} Stress to {thing}",
-};
+These are not random mutations. Each variant has a hypothesis and is tracked.
+"""
 
-std::vector<std::string> hooks = {
-    "Your shoulders called. They want out of this meeting.",
-    "I don't do feathers. I do fixes.",
-    "You bring the stress, I bring the Wolf.",
-    "If your body were a group chat, your hips would be the one screaming.",
-    "Some people meditate. I prefer pressure.",
-    "Desk life: 1. Your posture: 0. I can fix that.",
-    "Your back is not a storage unit for stress.",
-    "I work on humans, not mannequins.",
-    "The gym builds muscle. I build recovery.",
-    "Tight neck? Tight shoulders? Tight everything? Same.",
-    "Wolf knows where the knots hide.",
-    "You can't out-train bad recovery, but you can out-massage it.",
-    "Manhattan is stressful. Your body doesn't have to be.",
-    "My hands are GPS for tension.",
-    "If your muscles wrote a Yelp review, it would not be five stars.",
-    "I find the thing that hurts and make it stop hurting.",
-    "Your body is a resume. Let's edit it.",
-    "Squats gave you glutes. I give them back their range of motion.",
-    "The only thing I ghost is tension.",
-    "I've got strong hands and zero patience for bad posture.",
-};
+BIO_VARIANTS = {
+    "direct_recovery": {
+        "headline": "Deep Recovery Massage — Manhattan",
+        "description": (
+            "I work with men who train hard, sit long hours, or carry stress in their shoulders and lower back. "
+            "My sessions are pressure-forward, slow, and deliberate — built around what your body actually needs "
+            "that day. Incall in Manhattan. Outcall available. Same-day when my schedule allows."
+        ),
+        "hypothesis": "Recovery-focused copy increases contact clicks from serious clients.",
+    },
+    "professional_discretion": {
+        "headline": "Discreet Therapeutic Massage — Manhattan",
+        "description": (
+            "Private, professional massage in a clean Manhattan space. I focus on therapeutic work first — "
+            "neck, shoulders, back, and hips — with a calm, confident presence. No rushed sessions. "
+            "Respectful clients only. Available for incall and selective outcall."
+        ),
+        "hypothesis": "Professional/discretion framing increases trust and booking quality.",
+    },
+    "luxury_manhattan": {
+        "headline": "Premium Bodywork — Manhattan, NYC",
+        "description": (
+            "Athletic, intuitive bodywork for men who want more than a standard massage. "
+            "I combine deep tissue, pressure-point work, and full-body flow in a private Manhattan studio. "
+            "Clean, quiet, and comfortable. Incall preferred. Outcall considered for established clients."
+        ),
+        "hypothesis": "Premium positioning attracts higher-value bookings.",
+    },
+    "sports_deep_tissue": {
+        "headline": "Sports & Deep Tissue — Manhattan",
+        "description": (
+            "Built for lifters, runners, and guys who beat up their bodies. My sessions target the muscle groups "
+            "that actually hurt: hips, hamstrings, shoulders, lats. Strong pressure. No fluff. "
+            "Manhattan incall. Book when available."
+        ),
+        "hypothesis": "Sports positioning captures fitness-focused traffic.",
+    },
+    "last_minute": {
+        "headline": "Same-Day Massage — Manhattan",
+        "description": (
+            "When you need real bodywork today, not next week. I keep blocks open for same-day bookings in Manhattan "
+            "when I am available. Clean private space, strong hands, no attitude. Text or email. "
+            "Respectful clients only."
+        ),
+        "hypothesis": "Last-minute availability angle converts urgent search traffic.",
+    },
+}
 
-std::vector<std::string> specialties = {
-    "I specialize in deep tissue, sports recovery, and targeted relief for shoulders, neck, back, and hips.",
-    "My focus is pressure-forward work: slow, deliberate, and built around the muscle groups that actually need it.",
-    "I do deep tissue, recovery bodywork, and the kind of pressure that actually changes how you move.",
-    "Sports recovery, deep tissue, and hip/glute work are my main zones.",
-    "I work on the tension that builds from training, travel, and ten-hour desk days.",
-};
 
-std::vector<std::string> clients = {
-    "Best for lifters, runners, desk workers, and anyone who treats their body like a rental.",
-    "Great if you sit all day, train hard, or fly too much.",
-    "If your neck feels like a phone cord from 1997, you're my people.",
-    "For clients who want real pressure, clear communication, and a clean space.",
-    "You don't need to be an athlete. You need to be tight.",
+def get_variant(variant_id: str) -> dict:
+    v = BIO_VARIANTS.get(variant_id)
+    if not v:
+        return None
+    return {
+        "variant_id": variant_id,
+        "headline": v["headline"],
+        "description": v["description"],
+        "hypothesis": v["hypothesis"],

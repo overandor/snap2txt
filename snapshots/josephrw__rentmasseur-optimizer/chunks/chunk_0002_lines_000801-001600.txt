@@ -1,629 +1,708 @@
-# Paths
-SCRIPT_DIR = Path(__file__).resolve().parent
-WINDSURF_DIR = Path("/Users/alep/Downloads/windsurf-smoke")
-AGI_BINARY = WINDSURF_DIR / "rm_agi" / "rm_agi"
-REAL_BIOS = WINDSURF_DIR / "rm_traffic" / "data" / "real_bios.jsonl"
-AGI_DATA = WINDSURF_DIR / "rm_agi" / "data"
-CANDIDATES_DIR = AGI_DATA / "candidates"
-MODELS_DIR = AGI_DATA / "models"
-RECEIPTS_DIR = AGI_DATA / "receipts"
-PIPELINE_DIR = SCRIPT_DIR / "pipeline_output"
-PIPELINE_DIR.mkdir(exist_ok=True)
-
-for d in [CANDIDATES_DIR, MODELS_DIR, RECEIPTS_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
-
-
-# ─── Receipt Ledger ───
-
-class ReceiptLedger:
-    def __init__(self, path: Path):
-        self.path = path
-        self.entries: List[dict] = []
-        self._load()
-
-    def _load(self):
-        if self.path.exists():
-            for line in self.path.open():
-                if line.strip():
-                    self.entries.append(json.loads(line))
-
-    def add(self, action: str, description: str, data: dict) -> dict:
-        prev_hash = self.entries[-1]["hash"] if self.entries else "0" * 64
-        ts = datetime.now(timezone.utc).isoformat()
-        entry = {
-            "index": len(self.entries),
-            "timestamp": ts,
-            "action": action,
-            "description": description,
-            "data": data,
-            "prev_hash": prev_hash,
-        }
-        entry_str = json.dumps(entry, sort_keys=True)
-        entry["hash"] = hashlib.sha256(entry_str.encode()).hexdigest()
-        self.entries.append(entry)
-        with self.path.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
-        return entry
-
-    def verify(self) -> bool:
-        for i, entry in enumerate(self.entries):
-            prev = self.entries[i - 1]["hash"] if i > 0 else "0" * 64
-            if entry["prev_hash"] != prev:
-                return False
-            check = {k: v for k, v in entry.items() if k != "hash"}
-            check_str = json.dumps(check, sort_keys=True)
-            expected = hashlib.sha256(check_str.encode()).hexdigest()
-            if entry["hash"] != expected:
-                return False
-        return True
-
-    def summary(self) -> dict:
-        return {
-            "total_receipts": len(self.entries),
-            "chain_valid": self.verify(),
-            "last_action": self.entries[-1]["action"] if self.entries else None,
-        }
-
-
-ledger = ReceiptLedger(PIPELINE_DIR / "pipeline_receipts.jsonl")
-
-
-def run_cmd(cmd: List[str], cwd: Optional[Path] = None, timeout: int = 300) -> tuple:
-    logger.info("RUN: %s (cwd=%s)", " ".join(cmd), cwd or ".")
-    try:
-        r = subprocess.run(
-            cmd, cwd=str(cwd) if cwd else None,
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if r.returncode != 0:
-            logger.error("FAIL (%d): %s", r.returncode, r.stderr[:500])
-        return r.returncode, r.stdout, r.stderr
-    except subprocess.TimeoutExpired:
-        logger.error("TIMEOUT after %ds", timeout)
-        return -1, "", "timeout"
-    except Exception as e:
-        logger.error("EXCEPTION: %s", e)
-        return -1, "", str(e)
-
-
-# ─── Stage 1: Live Scrape ───
-
-def stage_live_scrape() -> dict:
-    logger.info("=" * 60)
-    logger.info("STAGE 1: Live competitor availability scrape")
-    logger.info("=" * 60)
-    rc, out, err = run_cmd(
-        ["python3", "checker.py", "--output", "availability.json"],
-        cwd=SCRIPT_DIR, timeout=120,
-    )
-    result = {"stage": "live_scrape", "exit_code": rc, "timestamp": datetime.now(timezone.utc).isoformat()}
-    if rc == 0:
-        data = json.loads((SCRIPT_DIR / "availability.json").read_text())
-        result["mode"] = data.get("mode")
-        result["providers_scraped"] = data.get("count", 0)
-        result["errors"] = len(data.get("errors", []))
-        result["providers"] = [
-            {"slug": p.get("slug"), "status": p.get("status"), "location": p.get("location"), "rate": p.get("rate")}
-            for p in data.get("providers", [])
-        ]
-        logger.info("Scraped %d providers, %d errors, mode=%s", result["providers_scraped"], result["errors"], result["mode"])
-    else:
-        result["error"] = err[:500]
-        logger.error("Live scrape failed: %s", err[:200])
-    ledger.add("live_scrape", "Scraped real competitor availability from rentmasseur.com", result)
-    return result
-
-
-# ─── Stage 2: AGI Train ───
-
-def stage_agi_train(label: str = "reviews", cv: int = 5, walk_forward: bool = True, epochs: int = 100) -> dict:
-    logger.info("=" * 60)
-    logger.info("STAGE 2: Train C++ MLP on 2,723 real bios")
-    logger.info("=" * 60)
-    cmd = [str(AGI_BINARY), "train", str(REAL_BIOS), "--label", label, "--cv", str(cv), "--epochs", str(epochs)]
-    if walk_forward:
-        cmd.append("--walk-forward")
-    rc, out, err = run_cmd(cmd, cwd=WINDSURF_DIR, timeout=600)
-    result = {
-        "stage": "agi_train", "exit_code": rc, "label": label,
-        "corpus": str(REAL_BIOS), "cv": cv, "walk_forward": walk_forward,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    if rc == 0:
-        result["output"] = out[:2000]
-        model_path = MODELS_DIR / "bio_model.bin"
-        result["model_path"] = str(model_path)
-        result["model_exists"] = model_path.exists()
-        if model_path.exists():
-            result["model_size_bytes"] = model_path.stat().st_size
-        logger.info("Training complete, model=%s", result.get("model_path"))
-    else:
-        result["error"] = err[:500]
-        logger.error("Training failed: %s", err[:200])
-    ledger.add("agi_train", "Trained MLP on real bio corpus", result)
-    return result
-
-
-# ─── Stage 3: AGI Generate + Score + Evolve + Select ───
-
-def stage_agi_pipeline(count: int = 100000, generations: int = 100, top: int = 25) -> dict:
-    logger.info("=" * 60)
-    logger.info("STAGE 3: AGI generate %d → score → evolve %d gen → select top %d", count, generations, top)
-    logger.info("=" * 60)
-    candidates_path = CANDIDATES_DIR / "pipeline_candidates.jsonl"
-    scored_path = CANDIDATES_DIR / "pipeline_scored.jsonl"
-    evolved_path = CANDIDATES_DIR / "pipeline_evolved.jsonl"
-    selected_path = CANDIDATES_DIR / f"pipeline_top_{top}.jsonl"
-    model_path = MODELS_DIR / "bio_model.bin"
-
-    # Generate
-    rc1, out1, err1 = run_cmd(
-        [str(AGI_BINARY), "generate", "--count", str(count), "--mode", "speech", "--out", str(candidates_path)],
-        cwd=WINDSURF_DIR, timeout=120,
-    )
-    gen_result = {"exit_code": rc1, "count": count}
-    if rc1 == 0 and candidates_path.exists():
-        gen_result["file_size"] = candidates_path.stat().st_size
-        logger.info("Generated %d candidates", count)
-    else:
-        gen_result["error"] = err1[:300]
-        logger.error("Generate failed")
-        result = {"stage": "agi_pipeline", "generate": gen_result, "exit_code": rc1}
-        ledger.add("agi_pipeline", "AGI generate/score/evolve/select", result)
-        return result
-
-    # Score
-    rc2, out2, err2 = run_cmd(
-        [str(AGI_BINARY), "score", str(candidates_path), "--model", str(model_path), "--out", str(scored_path)],
-        cwd=WINDSURF_DIR, timeout=300,
-    )
-    score_result = {"exit_code": rc2}
-    if rc2 == 0 and scored_path.exists():
-        score_result["file_size"] = scored_path.stat().st_size
-        logger.info("Scored candidates")
-    else:
-        score_result["error"] = err2[:300]
-        logger.error("Score failed")
-
-    # Evolve
-    rc3, out3, err3 = run_cmd(
-        [str(AGI_BINARY), "evolve", str(scored_path), "--population", "10000", "--generations", str(generations), "--elites", "50"],
-        cwd=WINDSURF_DIR, timeout=600,
-    )
-    evolve_result = {"exit_code": rc3, "generations": generations}
-    if rc3 == 0:
-        evolve_result["output"] = out3[:1000]
-        logger.info("Evolution complete")
-    else:
-        evolve_result["error"] = err3[:300]
-        logger.error("Evolve failed")
-
-    # Select
-    rc4, out4, err4 = run_cmd(
-        [str(AGI_BINARY), "select", str(evolved_path), "--top", str(top), "--diversity", "0.85", "--max-risk", "0.10"],
-        cwd=WINDSURF_DIR, timeout=120,
-    )
-    select_result = {"exit_code": rc4, "top": top}
-    agi_bios = []
-    if rc4 == 0 and selected_path.exists():
-        select_result["file_size"] = selected_path.stat().st_size
-        for line in selected_path.open():
-            if line.strip():
-                agi_bios.append(json.loads(line))
-        select_result["selected_count"] = len(agi_bios)
-        logger.info("Selected %d top bios", len(agi_bios))
-    else:
-        select_result["error"] = err4[:300]
-        logger.error("Select failed")
-
-    result = {
-        "stage": "agi_pipeline",
-        "generate": gen_result,
-        "score": score_result,
-        "evolve": evolve_result,
-        "select": select_result,
-        "agi_bios": agi_bios,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    ledger.add("agi_pipeline", "AGI generate→score→evolve→select on real corpus", result)
-    return result
-
-
-# ─── Stage 4: Groq Intent Router + LLM Bio Generation ───
-
-def stage_groq_bios(top_n: int = 5) -> dict:
-    logger.info("=" * 60)
-    logger.info("STAGE 4: Groq intent routing + LLM bio generation (top %d strategies)", top_n)
-    logger.info("=" * 60)
-
-    # Import from extension modules
-    sys.path.insert(0, str(SCRIPT_DIR))
-    from intent_router import route_intents
-    from rentmasseur_core import groq_generate_bio
-
-    # Route intents
-    top_strategies = route_intents(top_n)
-    logger.info("Intent router selected: %s", top_strategies)
-
-    # Strategy prompts (from coordinator)
-    from rentmasseur_coordinator import STRATEGIES
-
-    groq_bios = []
-    for strategy_name in top_strategies:
-        prompt = STRATEGIES.get(strategy_name)
-        if not prompt:
-            continue
-        bio = groq_generate_bio(strategy_name, prompt, current_bio=None)
-        if bio:
-            groq_bios.append({
-                "strategy": strategy_name,
-                "bio": bio,
-                "chars": len(bio),
-                "source": "groq_llm",
-            })
-            logger.info("Generated Groq bio: strategy=%s chars=%d", strategy_name, len(bio))
-        time.sleep(1)
-
-    result = {
-        "stage": "groq_bios",
-        "top_strategies": top_strategies,
-        "bios_generated": len(groq_bios),
-        "groq_bios": groq_bios,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    ledger.add("groq_bios", "Groq LLM generated bios for top strategies", result)
-    return result
-
-
-# ─── Stage 5: Merge + Rank ───
-
-def stage_merge_rank(agi_result: dict, groq_result: dict) -> dict:
-    logger.info("=" * 60)
-    logger.info("STAGE 5: Merge AGI + Groq candidate pools, rank by score")
-    logger.info("=" * 60)
-
-    all_candidates = []
-
-    # AGI bios
-    for bio in agi_result.get("agi_bios", []):
-        all_candidates.append({
-            "source": "agi_cpp",
-            "bio": bio.get("bio", bio.get("description", "")),
-            "headline": bio.get("headline", ""),
-            "score": bio.get("score", 0),
-            "risk": bio.get("risk", 0),
-            "rank": bio.get("rank", 0),
-            "strategy": "agi_evolved",
-        })
-
-    # Groq bios
-    for bio in groq_result.get("groq_bios", []):
-        all_candidates.append({
-            "source": "groq_llm",
-            "bio": bio["bio"],
-            "headline": "",
-            "score": 0,
-            "risk": 0,
-            "rank": 0,
-            "strategy": bio["strategy"],
-            "chars": bio["chars"],
-        })
-
-    # Sort: AGI bios by score (higher=better), Groq bios by chars (proxy for content richness)
-    # Then interleave: best AGI first, then best Groq
-    agi_sorted = sorted([c for c in all_candidates if c["source"] == "agi_cpp"], key=lambda x: x["score"], reverse=True)
-    groq_sorted = sorted([c for c in all_candidates if c["source"] == "groq_llm"], key=lambda x: x.get("chars", 0), reverse=True)
-
-    # Pick best overall: prefer AGI if available (trained on real data), else Groq
-    merged = agi_sorted + groq_sorted
-
-    best = merged[0] if merged else None
-
-    result = {
-        "stage": "merge_rank",
-        "total_candidates": len(all_candidates),
-        "agi_count": len(agi_sorted),
-        "groq_count": len(groq_sorted),
-        "best_source": best["source"] if best else None,
-        "best_strategy": best["strategy"] if best else None,
-        "best_score": best["score"] if best else 0,
-        "best_bio_preview": best["bio"][:200] if best else "",
-        "all_candidates": merged,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    logger.info("Merged %d candidates (AGI=%d, Groq=%d). Best: %s/%s",
-                result["total_candidates"], result["agi_count"], result["groq_count"],
-                result["best_source"], result["best_strategy"])
-    ledger.add("merge_rank", "Merged and ranked AGI + Groq candidate pools", result)
-    return result
-
-
-# ─── Stage 6: Selenium — Login, Availability, Apply Bio ───
-
-def stage_selenium(merge_result: dict, skip_availability: bool = False, skip_bio: bool = False) -> dict:
-    logger.info("=" * 60)
-    logger.info("STAGE 6: Selenium — login, set 24/7 availability, apply best bio")
-    logger.info("=" * 60)
-
-    sys.path.insert(0, str(SCRIPT_DIR))
-    from rentmasseur_core import setup_driver, login, set_availability_24_7, update_bio, save_bio_field
-
-    best = None
-    for c in merge_result.get("all_candidates", []):
-        if c.get("bio") and len(c["bio"]) > 50:
-            best = c
-            break
-
-    result = {
-        "stage": "selenium",
-        "login": False,
-        "availability": False,
-        "bio_applied": False,
-        "best_bio_source": best["source"] if best else None,
-        "best_bio_strategy": best["strategy"] if best else None,
-        "best_bio_chars": len(best["bio"]) if best else 0,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-    driver = setup_driver(headless=True)
-    try:
-        if not login(driver):
-            result["error"] = "Login failed"
-            logger.error("Login failed — cannot proceed")
-            ledger.add("selenium", "Selenium automation (login failed)", result)
-            return result
-        result["login"] = True
-        logger.info("Login successful")
-
-        if not skip_availability:
-            result["availability"] = set_availability_24_7(driver)
-            logger.info("Availability 24/7: %s", result["availability"])
-
-        if not skip_bio and best:
-            bio_text = best["bio"]
-            bio_res = update_bio(driver, "")
-            if bio_res and not (isinstance(bio_res, dict) and bio_res.get("error")):
-                field_info, current_bio = bio_res
-                logger.info("Current bio: %d chars", len(current_bio))
-                result["previous_bio_chars"] = len(current_bio)
-                result["previous_bio_preview"] = current_bio[:200]
-                saved = save_bio_field(driver, field_info, bio_text)
-                result["bio_applied"] = saved
-                if saved:
-                    result["new_bio_preview"] = bio_text[:200]
-                    logger.info("Bio updated on live profile")
-                else:
-                    logger.error("Bio save failed")
-            else:
-                logger.error("Could not find bio field")
-                result["bio_error"] = "no_bio_field"
-        elif skip_bio:
-            result["bio_applied"] = "skipped"
-
-    finally:
-        driver.quit()
-
-    ledger.add("selenium", "Selenium: login + availability + bio update on live rentmasseur.com", result)
-    return result
-
-
-# ─── Stage 7: Save + Summary ───
-
-def stage_save(scrape_res, agi_train_res, agi_pipe_res, groq_res, merge_res, selenium_res) -> dict:
-    logger.info("=" * 60)
-    logger.info("STAGE 7: Save all results + receipt summary")
-    logger.info("=" * 60)
-
-    summary = {
-        "pipeline_run": datetime.now(timezone.utc).isoformat(),
-        "stages": {
-            "live_scrape": {"providers": scrape_res.get("providers_scraped", 0), "mode": scrape_res.get("mode")},
-            "agi_train": {"exit_code": agi_train_res.get("exit_code"), "model": agi_train_res.get("model_exists", False)},
-            "agi_pipeline": {
-                "generate": agi_pipe_res.get("generate", {}).get("exit_code"),
-                "score": agi_pipe_res.get("score", {}).get("exit_code"),
-                "evolve": agi_pipe_res.get("evolve", {}).get("exit_code"),
-                "select": agi_pipe_res.get("select", {}).get("exit_code"),
-                "selected_count": agi_pipe_res.get("select", {}).get("selected_count", 0),
-            },
-            "groq_bios": {"strategies": groq_res.get("top_strategies", []), "bios_generated": groq_res.get("bios_generated", 0)},
-            "merge": {"total": merge_res.get("total_candidates", 0), "best_source": merge_res.get("best_source")},
-            "selenium": {
-                "login": selenium_res.get("login", False),
-                "availability": selenium_res.get("availability", False),
-                "bio_applied": selenium_res.get("bio_applied", False),
-            },
-        },
-        "receipts": ledger.summary(),
-    }
-
-    summary_path = PIPELINE_DIR / "pipeline_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, default=str))
-
-    # Save all candidates
-    candidates_path = PIPELINE_DIR / "all_candidates.json"
-    candidates_path.write_text(json.dumps(merge_res.get("all_candidates", []), indent=2, default=str))
-
-    # Save best bio
-    best_bio_path = PIPELINE_DIR / "best_bio.txt"
-    for c in merge_res.get("all_candidates", []):
-        if c.get("bio") and len(c["bio"]) > 50:
-            best_bio_path.write_text(c["bio"])
-            break
-
-    logger.info("Summary saved: %s", summary_path)
-    logger.info("Candidates saved: %s", candidates_path)
-    logger.info("Best bio saved: %s", best_bio_path)
-    logger.info("Receipts: %d total, chain valid: %s", ledger.summary()["total_receipts"], ledger.summary()["chain_valid"])
-
-    ledger.add("pipeline_complete", "Full production pipeline completed", summary)
-    return summary
-
-
-# ─── Main ───
-
-def main():
-    parser = argparse.ArgumentParser(description="RentMasseur Production Pipeline")
-    parser.add_argument("--skip-scrape", action="store_true", help="Skip live competitor scrape")
-    parser.add_argument("--skip-selenium", action="store_true", help="Skip Selenium automation (login/availability/bio)")
-    parser.add_argument("--skip-availability", action="store_true", help="Skip availability setting in Selenium")
-    parser.add_argument("--skip-bio", action="store_true", help="Skip bio update in Selenium")
-    parser.add_argument("--agi-only", action="store_true", help="Only run AGI pipeline (no Groq, no Selenium)")
-    parser.add_argument("--groq-only", action="store_true", help="Only run Groq bios (no AGI, no Selenium)")
-    parser.add_argument("--count", type=int, default=100000, help="AGI generate count")
-    parser.add_argument("--generations", type=int, default=100, help="GA generations")
-    parser.add_argument("--top", type=int, default=25, help="Top N to select")
-    parser.add_argument("--strategies", type=int, default=5, help="Top N strategies for Groq")
-    parser.add_argument("--label", default="reviews", choices=["reviews", "views_per_day", "rating"])
-    parser.add_argument("--epochs", type=int, default=100, help="MLP training epochs")
-    args = parser.parse_args()
-
-    start = time.time()
-    logger.info("=" * 60)
-    logger.info("RENTMASSEUR PRODUCTION PIPELINE — ALL REAL, NO MOCK")
-    logger.info("=" * 60)
-
-    # Check prerequisites
-    if not AGI_BINARY.exists():
-        logger.error("AGI binary not found at %s — compile with: g++ -O3 -std=c++17 rm_agi.cpp -o rm_agi", AGI_BINARY)
-        sys.exit(1)
-    if not REAL_BIOS.exists():
-        logger.error("Real bios corpus not found at %s", REAL_BIOS)
-        sys.exit(1)
-
-    # Stage 1: Live scrape
-    scrape_res = {"providers_scraped": 0}
-    if not args.skip_scrape:
-        scrape_res = stage_live_scrape()
-
-    # Stage 2: AGI train
-    agi_train_res = stage_agi_train(label=args.label, epochs=args.epochs)
-
-    # Stage 3: AGI pipeline
-    agi_pipe_res = stage_agi_pipeline(count=args.count, generations=args.generations, top=args.top)
-
-    # Stage 4: Groq bios
-    groq_res = {"groq_bios": [], "top_strategies": [], "bios_generated": 0}
-    if not args.agi_only:
-        groq_res = stage_groq_bios(top_n=args.strategies)
-
-    # Stage 5: Merge + rank
-    merge_res = stage_merge_rank(agi_pipe_res, groq_res)
-
-    # Stage 6: Selenium
-    selenium_res = {"login": False, "availability": False, "bio_applied": False}
-    if not args.skip_selenium and not args.agi_only and not args.groq_only:
-        selenium_res = stage_selenium(merge_res, skip_availability=args.skip_availability, skip_bio=args.skip_bio)
-
-    # Stage 7: Save
-    summary = stage_save(scrape_res, agi_train_res, agi_pipe_res, groq_res, merge_res, selenium_res)
-
-    elapsed = time.time() - start
-    logger.info("=" * 60)
-    logger.info("PIPELINE COMPLETE in %.1fs", elapsed)
-    logger.info("=" * 60)
-    logger.info("Receipts: %d (chain valid: %s)", ledger.summary()["total_receipts"], ledger.summary()["chain_valid"])
-    logger.info("Output: %s", PIPELINE_DIR)
-    print(json.dumps(summary, indent=2, default=str))
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-Dockerfile.daemon:
-```
-FROM python:3.11-slim
-
-WORKDIR /app
-
-# Install system deps for Selenium/Chrome
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget gnupg ca-certificates fonts-liberation libnss3 libxss1 \
-    libappindicator3-1 libasound2 libatk-bridge2.0-0 libgtk-3-0 \
-    libgbm1 libdrm2 libxcomposite1 libxdamage1 libxrandr2 xdg-utils \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Chrome
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
-    && apt-get update && apt-get install -y google-chrome-stable \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir selenium
-
-# Copy all subsystem code
-COPY server.py daemon.py daily_promotion.py app.py ./
-COPY rm_revenue_engine/ rm_revenue_engine/
-COPY rm_pri/ rm_pri/
-COPY rm_traffic/ rm_traffic/
-COPY content/ content/
-
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
-EXPOSE 7860
-
-CMD ["python", "daemon.py"]
-
-```
-
-popup.html:
-```
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    body { width: 260px; padding: 14px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a1f; color: #f0f0f5; margin: 0; }
-    h2 { margin: 0 0 10px 0; font-size: 15px; }
-    .field { margin-bottom: 10px; }
-    label { display: block; font-size: 11px; color: #9a9aa3; margin-bottom: 3px; }
-    input { width: 100%; padding: 6px; background: #0f0f12; border: 1px solid #333; border-radius: 6px; color: #f0f0f5; font-size: 13px; }
-    button { width: 100%; padding: 8px; background: #cc8b4a; border: none; border-radius: 6px; color: #fff; font-weight: 600; cursor: pointer; margin-top: 6px; }
-    button:hover { background: #e09d5a; }
-    .status { font-size: 12px; color: #9a9aa3; margin-top: 10px; text-align: center; }
-    .status.ok { color: #4caf50; }
-    .status.err { color: #f44336; }
-  </style>
-</head>
-<body>
-  <h2>RentMasseur Booker</h2>
-  <div class="field">
-    <label>Booking Server URL</label>
-    <input type="text" id="serverUrl" value="http://localhost:3000" placeholder="http://localhost:3000">
-  </div>
-  <button id="saveBtn">Save Settings</button>
-  <button id="openBookings" style="background:#2a2a30;margin-top:6px;">Open Booking Page</button>
-  <div class="status" id="status"></div>
-  <script src="popup.js"></script>
-</body>
-</html>
-
-```
-
-social_media_generator.py:
+receipts/pipeline_20260718_181118.json
+receipts/pipeline_20260719_101809.json
+receipts/pipeline_20260714_103357.json
+receipts/metrics_20260706_100131.json
+receipts/kpi_2026-07-10T08-42-08.988553-00-00.json
+receipts/pipeline_20260714_202624.json
+receipts/kpi_2026-07-12T04-40-32.294011-00-00.json
+receipts/pipeline_20260717_172635.json
+receipts/metrics_20260703_224515.json
+receipts/metrics_20260628_234346.json
+receipts/kpi_2026-06-29T17-28-40.389783-00-00.json
+receipts/kpi_2026-07-04T05-06-14.135385-00-00.json
+receipts/metrics_20260714_164123.json
+receipts/pipeline_20260707_051144.json
+receipts/pipeline_20260712_044032.json
+receipts/rotation_20260713_194327.json
+receipts/rotation_20260706_041137.json
+receipts/kpi_2026-07-09T14-37-50.112567-00-00.json
+receipts/rotation_20260718_192005.json
+receipts/metrics_20260717_131001.json
+receipts/metrics_20260708_050514.json
+receipts/metrics_20260704_223013.json
+receipts/metrics_20260705_053356.json
+receipts/kpi_2026-07-05T15-40-39.320879-00-00.json
+receipts/metrics_20260713_155601.json
+receipts/kpi_2026-06-29T00-02-58.271875-00-00.json
+receipts/metrics_20260710_011927.json
+receipts/metrics_20260716_234044.json
+receipts/metrics_20260710_160833.json
+receipts/kpi_2026-07-18T21-08-52.218252-00-00.json
+receipts/rotation_20260717_105944.json
+receipts/metrics_20260704_165832.json
+receipts/pipeline_20260710_235356.json
+receipts/rotation_20260717_032310.json
+receipts/pipeline_20260719_113414.json
+receipts/kpi_2026-07-09T05-34-03.136039-00-00.json
+receipts/pipeline_20260716_121239.json
+receipts/pipeline_20260706_012602.json
+receipts/metrics_20260705_233957.json
+receipts/kpi_2026-07-06T13-45-53.469868-00-00.json
+receipts/metrics_20260630_115104.json
+receipts/metrics_20260709_205209.json
+receipts/metrics_20260630_143420.json
+receipts/metrics_20260716_234045.json
+receipts/metrics_20260711_015134.json
+receipts/metrics_20260629_135611.json
+receipts/metrics_20260626_121853.json
+receipts/kpi_2026-06-27T23-59-54.015445-00-00.json
+receipts/metrics_20260706_055158.json
+receipts/metrics_20260705_053357.json
+receipts/pipeline_20260708_100312.json
+receipts/metrics_20260704_155135.json
+receipts/pipeline_20260711_101754.json
+receipts/metrics_20260708_115117.json
+receipts/metrics_20260702_001606.json
+receipts/metrics_20260718_073221.json
+receipts/pipeline_20260717_161247.json
+receipts/metrics_20260719_101809.json
+receipts/kpi_2026-06-28T14-43-16.107347-00-00.json
+receipts/metrics_20260708_134559.json
+receipts/rotation_20260627_020217.json
+receipts/pipeline_20260705_201101.json
+receipts/kpi_2026-07-17T14-56-40.763914-00-00.json
+receipts/rotation_20260707_145713.json
+receipts/pipeline_20260711_223417.json
+receipts/rotation_20260714_221137.json
+receipts/metrics_20260628_161829.json
+receipts/metrics_20260715_211800.json
+receipts/metrics_20260716_103838.json
+receipts/rotation_20260701_093231.json
+receipts/kpi_2026-07-08T05-05-15.003604-00-00.json
+receipts/rotation_20260701_193446.json
+receipts/pipeline_20260718_091311.json
+receipts/metrics_20260719_170625.json
+receipts/kpi_2026-06-29T10-24-54.090992-00-00.json
+receipts/kpi_2026-07-04T13-05-18.033254-00-00.json
+receipts/kpi_2026-07-06T05-51-58.293922-00-00.json
+receipts/metrics_20260718_231135.json
+receipts/kpi_2026-07-16T21-48-01.875778-00-00.json
+receipts/kpi_2026-07-17T22-33-57.772717-00-00.json
+receipts/rotation_20260628_131606.json
+receipts/rotation_20260710_035647.json
+receipts/pipeline_20260704_155135.json
+receipts/rotation_20260711_220409.json
+receipts/metrics_20260715_190018.json
+receipts/kpi_2026-07-18T19-26-27.379427-00-00.json
+receipts/pipeline_20260705_011958.json
+receipts/metrics_20260626_102417.json
+receipts/metrics_20260628_145645.json
+receipts/metrics_20260711_112318.json
+receipts/kpi_2026-06-27T18-06-18.135128-00-00.json
+receipts/metrics_20260627_195804.json
+receipts/rotation_20260718_133407.json
+receipts/pipeline_20260709_053403.json
+receipts/metrics_20260708_074521.json
+receipts/pipeline_20260707_182211.json
+receipts/visit_back_2026-06-26T10-02-07.796458+00-00.json
+receipts/kpi_2026-07-06T01-26-02.437293-00-00.json
+receipts/pipeline_20260707_011814.json
+receipts/metrics_20260628_204648.json
+receipts/pipeline_20260703_175133.json
+receipts/pipeline_20260704_165833.json
+receipts/kpi_2026-07-10T20-56-36.881933-00-00.json
+receipts/metrics_20260712_153556.json
+receipts/pipeline_20260717_131001.json
+receipts/kpi_2026-07-02T17-28-33.580151-00-00.json
+receipts/kpi_2026-06-27T13-13-45.190253-00-00.json
+receipts/metrics_20260626_192412.json
+receipts/pipeline_20260705_141112.json
+receipts/kpi_2026-07-15T20-08-20.205659-00-00.json
+receipts/pipeline_20260716_234045.json
+receipts/metrics_20260710_180403.json
+receipts/pipeline_20260708_074521.json
+receipts/metrics_20260719_221239.json
+receipts/metrics_20260712_115747.json
+receipts/rotation_20260711_032400.json
+receipts/metrics_20260719_113414.json
+receipts/pipeline_20260717_183620.json
+receipts/kpi_2026-07-04T14-49-17.493200-00-00.json
+receipts/kpi_2026-07-14T23-36-05.397303-00-00.json
+receipts/kpi_2026-06-30T02-33-46.330740-00-00.json
+receipts/metrics_20260701_211207.json
+receipts/kpi_2026-07-18T23-11-35.223316-00-00.json
+receipts/metrics_20260718_220955.json
+receipts/kpi_2026-07-15T23-16-23.258879-00-00.json
+receipts/metrics_20260719_211633.json
+receipts/metrics_20260715_133031.json
+receipts/metrics_20260627_195805.json
+receipts/metrics_20260706_203751.json
+receipts/kpi_2026-07-19T11-34-14.120053-00-00.json
+receipts/metrics_20260718_151632.json
+receipts/kpi_2026-07-17T08-59-36.387838-00-00.json
+receipts/metrics_20260714_202623.json
+receipts/kpi_2026-06-30T06-49-08.493719-00-00.json
+receipts/kpi_2026-07-12T15-35-56.529771-00-00.json
+receipts/metrics_20260713_233709.json
+receipts/rotation_20260626_193423.json
+receipts/kpi_2026-07-15T06-17-14.094852-00-00.json
+receipts/metrics_20260712_163759.json
+receipts/kpi_2026-06-27T02-41-49.961408-00-00.json
+receipts/kpi_2026-07-13T07-58-22.460310-00-00.json
+receipts/metrics_20260710_051347.json
+receipts/metrics_20260702_044551.json
+receipts/kpi_2026-06-28T22-56-05.826308-00-00.json
+receipts/pipeline_20260704_102800.json
+receipts/kpi_2026-07-02T22-00-56.322932-00-00.json
+receipts/rotation_20260704_192949.json
+receipts/kpi_2026-06-28T19-23-42.971975-00-00.json
+receipts/metrics_20260627_211217.json
+receipts/pipeline_20260703_122934.json
+receipts/pipeline_20260716_033803.json
+receipts/pipeline_20260714_085802.json
+receipts/kpi_2026-07-08T15-57-54.020916-00-00.json
+receipts/kpi_2026-07-11T01-51-34.563742-00-00.json
+receipts/pipeline_20260712_092104.json
+receipts/pipeline_20260718_231135.json
+receipts/kpi_2026-07-06T23-26-42.623372-00-00.json
+receipts/kpi_2026-07-09T08-56-06.190025-00-00.json
+receipts/rotation_20260706_201310.json
+receipts/metrics_20260711_154205.json
+receipts/rotation_20260708_084507.json
+receipts/metrics_20260709_170935.json
+receipts/kpi_2026-07-15T19-00-18.069011-00-00.json
+receipts/metrics_20260714_131351.json
+receipts/rotation_20260714_025943.json
+receipts/metrics_20260712_213632.json
+receipts/kpi_2026-06-27T20-03-47.370040-00-00.json
+receipts/kpi_2026-06-28T16-03-29.778348-00-00.json
+receipts/metrics_20260711_163650.json
+receipts/kpi_2026-07-12T09-21-04.542955-00-00.json
+receipts/metrics_20260705_083047.json
+receipts/rotation_20260717_220559.json
+receipts/kpi_2026-07-07T23-52-31.425806-00-00.json
+receipts/metrics_20260719_062735.json
+receipts/rotation_20260705_135956.json
+receipts/pipeline_20260711_015134.json
+receipts/rotation_20260717_162803.json
+receipts/kpi_2026-07-01T19-40-36.595899-00-00.json
+receipts/metrics_20260627_164429.json
+receipts/metrics_20260711_090236.json
+receipts/kpi_2026-07-02T02-29-23.276775-00-00.json
+receipts/metrics_20260702_175615.json
+receipts/kpi_2026-07-11T04-59-58.837402-00-00.json
+receipts/kpi_2026-07-14T01-06-56.021432-00-00.json
+receipts/rotation_20260714_140430.json
+receipts/metrics_20260705_141112.json
+receipts/metrics_20260716_194235.json
+receipts/rotation_20260704_221046.json
+receipts/pipeline_20260718_104321.json
+receipts/rotation_20260630_135714.json
+receipts/metrics_20260710_084209.json
+receipts/pipeline_20260706_220659.json
+receipts/metrics_20260709_221835.json
+receipts/metrics_20260715_061714.json
+receipts/metrics_20260627_152238.json
+receipts/kpi_2026-07-15T17-59-17.508489-00-00.json
+receipts/metrics_20260630_190259.json
+receipts/metrics_20260716_033803.json
+receipts/metrics_20260705_174834.json
+receipts/metrics_20260711_135610.json
+receipts/metrics_20260716_170815.json
+receipts/pipeline_20260704_050614.json
+receipts/pipeline_20260708_015257.json
+receipts/pipeline_20260719_211634.json
+receipts/kpi_2026-07-05T21-22-34.184558-00-00.json
+receipts/metrics_20260716_103837.json
+receipts/metrics_20260719_181046.json
+receipts/rotation_20260707_222329.json
+receipts/metrics_20260706_220659.json
+receipts/rotation_20260705_040503.json
+receipts/metrics_20260707_225628.json
+receipts/pipeline_20260716_182233.json
+receipts/kpi_2026-07-18T03-37-09.467180-00-00.json
+receipts/kpi_2026-07-02T23-56-37.152577-00-00.json
+receipts/rotation_20260713_172629.json
+receipts/metrics_20260716_155723.json
+receipts/metrics_20260706_232642.json
+receipts/pipeline_20260712_183954.json
+receipts/rotation_20260705_193417.json
+receipts/rotation_20260707_172952.json
+receipts/kpi_2026-07-14T13-13-51.142179-00-00.json
+receipts/metrics_20260717_103432.json
+receipts/kpi_2026-06-26T18-53-12.838593-00-00.json
+receipts/kpi_2026-07-17T20-39-22.203104-00-00.json
+receipts/kpi_2026-07-08T18-57-26.686920-00-00.json
+receipts/pipeline_20260713_044800.json
+receipts/rotation_20260713_094514.json
+receipts/pipeline_20260704_115420.json
+receipts/pipeline_20260709_170935.json
+receipts/rotation_20260704_034635.json
+receipts/metrics_20260627_224145.json
+receipts/metrics_20260718_033709.json
+receipts/kpi_2026-06-28T12-17-36.099367-00-00.json
+receipts/kpi_2026-06-27T06-23-20.401464-00-00.json
+receipts/pipeline_20260717_203922.json
+receipts/rotation_20260706_105609.json
+receipts/metrics_20260702_224223.json
+receipts/metrics_20260708_234844.json
+receipts/kpi_2026-07-15T15-10-56.566800-00-00.json
+receipts/kpi_2026-07-12T23-31-32.799503-00-00.json
+receipts/metrics_20260713_131653.json
+receipts/metrics_20260715_175917.json
+receipts/metrics_20260713_155602.json
+receipts/kpi_2026-07-01T04-16-51.624942-00-00.json
+receipts/metrics_20260707_202610.json
+receipts/rotation_20260717_082654.json
+receipts/rotation_20260716_083102.json
+receipts/metrics_20260716_170816.json
+receipts/pipeline_20260706_134553.json
+receipts/metrics_20260716_203755.json
+receipts/pipeline_20260719_202741.json
+receipts/pipeline_20260704_144917.json
+receipts/rotation_20260710_221827.json
+receipts/metrics_20260701_121941.json
+receipts/metrics_20260718_001845.json
+receipts/rotation_20260707_095939.json
+receipts/pipeline_20260714_063714.json
+receipts/rotation_20260629_193759.json
+receipts/metrics_20260712_213633.json
+receipts/rotation_20260710_144745.json
+receipts/pipeline_20260706_055158.json
+receipts/metrics_20260705_212234.json
+receipts/kpi_2026-07-11T19-54-51.829258-00-00.json
+receipts/metrics_20260702_132313.json
+receipts/pipeline_20260713_010616.json
+receipts/kpi_2026-07-19T20-27-41.016051-00-00.json
+receipts/pipeline_20260705_174835.json
+receipts/kpi_2026-06-29T23-55-10.226906-00-00.json
+receipts/rotation_20260709_223439.json
+receipts/metrics_20260714_085802.json
+receipts/rotation_20260717_135707.json
+receipts/metrics_20260709_205210.json
+receipts/metrics_20260714_190729.json
+receipts/kpi_2026-07-11T10-17-54.849186-00-00.json
+receipts/metrics_20260629_092100.json
+receipts/metrics_20260711_144848.json
+receipts/metrics_20260712_195244.json
+receipts/metrics_20260705_185038.json
+receipts/kpi_2026-07-18T00-18-45.976848-00-00.json
+receipts/metrics_20260704_115420.json
+receipts/pipeline_20260705_053357.json
+receipts/metrics_20260718_201535.json
+receipts/pipeline_20260712_110126.json
+receipts/kpi_2026-06-30T20-52-08.508262-00-00.json
+receipts/pipeline_20260710_205636.json
+receipts/kpi_2026-07-12T19-52-45.006635-00-00.json
+receipts/pipeline_20260718_141118.json
+receipts/pipeline_20260716_060713.json
+receipts/metrics_20260714_223452.json
+receipts/metrics_20260703_144221.json
+receipts/metrics_20260713_223927.json
+receipts/metrics_20260628_050823.json
+receipts/kpi_2026-07-08T10-03-12.732949-00-00.json
+receipts/pipeline_20260718_192627.json
+receipts/kpi_2026-07-04T18-01-13.122341-00-00.json
+receipts/pipeline_20260709_012036.json
+receipts/kpi_2026-07-08T11-51-17.432972-00-00.json
+receipts/pipeline_20260710_133808.json
+receipts/kpi_2026-07-13T01-06-16.545330-00-00.json
+receipts/kpi_2026-06-26T18-53-24.441865-00-00.json
+receipts/pipeline_20260717_223357.json
+receipts/metrics_20260709_012036.json
+receipts/metrics_20260715_190017.json
+receipts/metrics_20260715_103155.json
+receipts/metrics_20260716_142322.json
+receipts/kpi_2026-07-03T22-45-15.720194-00-00.json
+receipts/kpi_2026-07-14T17-50-35.999748-00-00.json
+receipts/kpi_2026-07-18T20-15-35.411328-00-00.json
+receipts/metrics_20260708_185726.json
+receipts/rotation_20260708_111720.json
+receipts/pipeline_20260712_204013.json
+receipts/kpi_2026-07-10T23-53-56.597983-00-00.json
+receipts/pipeline_20260705_164555.json
+receipts/metrics_20260704_190650.json
+receipts/metrics_20260718_210852.json
+receipts/kpi_2026-07-10T21-56-40.775695-00-00.json
+receipts/rotation_20260704_135248.json
+receipts/kpi_2026-07-09T20-52-10.007578-00-00.json
+receipts/rotation_20260715_110327.json
+receipts/metrics_20260630_001154.json
+receipts/metrics_20260706_100132.json
+receipts/metrics_20260708_155754.json
+receipts/kpi_2026-07-12T07-18-49.950696-00-00.json
+receipts/rotation_20260703_093534.json
+receipts/kpi_2026-07-04T22-30-13.974251-00-00.json
+receipts/metrics_20260714_175035.json
+receipts/pipeline_20260715_010314.json
+receipts/metrics_20260703_161633.json
+receipts/rotation_20260716_111148.json
+receipts/rotation_20260719_033135.json
+receipts/pipeline_20260711_071111.json
+receipts/kpi_2026-07-11T13-56-10.279978-00-00.json
+receipts/kpi_2026-06-28T10-59-23.372886-00-00.json
+receipts/rotation_20260719_192059.json
+receipts/rotation_20260626_140211.json
+receipts/pipeline_20260718_210852.json
+receipts/rotation_20260705_221458.json
+receipts/kpi_2026-06-28T21-55-23.133996-00-00.json
+receipts/kpi_2026-07-04T10-28-00.770502-00-00.json
+receipts/metrics_20260719_160444.json
+receipts/kpi_2026-07-14T16-41-23.949453-00-00.json
+receipts/pipeline_20260711_195451.json
+receipts/metrics_20260718_181118.json
+receipts/metrics_20260713_044800.json
+receipts/metrics_20260702_193938.json
+receipts/metrics_20260715_200820.json
+receipts/kpi_2026-07-12T21-36-33.089113-00-00.json
+receipts/pipeline_20260711_144848.json
+receipts/kpi_2026-07-15T04-02-42.568082-00-00.json
+receipts/pipeline_20260713_105455.json
+receipts/pipeline_20260719_181046.json
+receipts/pipeline_20260713_175311.json
+receipts/pipeline_20260711_233247.json
+receipts/kpi_2026-07-14T19-07-29.404440-00-00.json
+receipts/kpi_2026-07-10T22-56-16.283778-00-00.json
+receipts/metrics_20260717_194928.json
+receipts/pipeline_20260719_123203.json
+receipts/metrics_20260709_190351.json
+receipts/rotation_20260718_080836.json
+receipts/rotation_20260708_194922.json
+receipts/pipeline_20260719_221239.json
+receipts/kpi_2026-07-14T08-58-02.635859-00-00.json
+receipts/metrics_20260704_050613.json
+receipts/metrics_20260628_220854.json
+receipts/kpi_2026-07-04T01-20-05.457302-00-00.json
+receipts/pipeline_20260706_203751.json
+receipts/rotation_20260703_221719.json
+receipts/metrics_20260705_201101.json
+receipts/metrics_20260704_130518.json
+receipts/metrics_20260717_063848.json
+receipts/kpi_2026-07-14T10-33-56.950696-00-00.json
+receipts/pipeline_20260714_115939.json
+receipts/metrics_20260703_202619.json
+receipts/pipeline_20260715_133031.json
+receipts/pipeline_20260718_201535.json
+receipts/metrics_20260719_202740.json
+receipts/kpi_2026-06-27T22-57-20.106391-00-00.json
+receipts/kpi_2026-07-18T09-13-11.433966-00-00.json
+receipts/rotation_20260630_085930.json
+receipts/metrics_20260705_011958.json
+receipts/metrics_20260714_010655.json
+receipts/metrics_20260703_001355.json
+receipts/metrics_20260701_001321.json
+receipts/metrics_20260717_161247.json
+receipts/metrics_20260703_175133.json
+receipts/kpi_2026-07-08T01-52-57.750110-00-00.json
+receipts/metrics_20260626_151723.json
+receipts/rotation_20260715_025817.json
+receipts/pipeline_20260709_234126.json
+receipts/metrics_20260704_130517.json
+receipts/metrics_20260715_151056.json
+receipts/metrics_20260716_060713.json
+receipts/metrics_20260705_223311.json
+receipts/pipeline_20260705_154039.json
+receipts/kpi_2026-07-07T08-42-51.306474-00-00.json
+receipts/kpi_2026-07-18T18-11-18.811894-00-00.json
+receipts/rotation_20260710_095333.json
+receipts/metrics_20260717_232909.json
+receipts/metrics_20260713_213804.json
+receipts/kpi_2026-07-19T14-04-42.598595-00-00.json
+receipts/pipeline_20260711_112318.json
+receipts/rotation_20260708_165137.json
+receipts/kpi_2026-07-07T01-18-14.254281-00-00.json
+receipts/pipeline_20260719_170625.json
+receipts/kpi_2026-07-18T10-43-21.747599-00-00.json
+receipts/metrics_20260627_101655.json
+receipts/kpi_2026-07-15T12-01-53.762038-00-00.json
+receipts/metrics_20260629_191022.json
+receipts/kpi_2026-07-06T22-06-59.379335-00-00.json
+receipts/kpi_2026-06-29T22-47-48.726167-00-00.json
+receipts/rotation_20260714_193439.json
+receipts/rotation_20260712_192010.json
+receipts/metrics_20260718_104321.json
+receipts/rotation_20260708_032825.json
+receipts/metrics_20260708_214214.json
+receipts/kpi_2026-07-08T20-21-11.122671-00-00.json
+receipts/metrics_20260703_103214.json
+receipts/kpi_2026-07-14T22-34-52.402774-00-00.json
+receipts/rotation_20260701_021323.json
+receipts/metrics_20260715_040242.json
+receipts/metrics_20260717_213524.json
+receipts/metrics_20260704_180112.json
+receipts/metrics_20260712_183954.json
+receipts/pipeline_20260704_233352.json
+receipts/metrics_20260707_182211.json
+receipts/pipeline_20260715_061714.json
+receipts/kpi_2026-07-13T21-38-04.780167-00-00.json
+receipts/pipeline_20260717_213524.json
+receipts/rotation_20260719_220705.json
+receipts/kpi_2026-07-08T23-48-44.370019-00-00.json
+receipts/kpi_2026-07-01T11-52-50.025231-00-00.json
+receipts/kpi_2026-07-05T22-33-11.938925-00-00.json
+receipts/rotation_20260709_035451.json
+receipts/kpi_2026-07-12T11-01-26.789656-00-00.json
+receipts/pipeline_20260712_010831.json
+receipts/kpi_2026-06-30T13-04-43.863030-00-00.json
+receipts/pipeline_20260708_214214.json
+receipts/kpi_2026-07-17T04-27-16.369830-00-00.json
+receipts/kpi_2026-06-27T21-55-41.535228-00-00.json
+receipts/kpi_2026-07-12T17-45-20.172105-00-00.json
+receipts/pipeline_20260712_130143.json
+receipts/kpi_2026-07-07T18-22-11.871140-00-00.json
+receipts/kpi_2026-07-03T17-51-33.502178-00-00.json
+receipts/pipeline_20260708_050515.json
+receipts/kpi_2026-07-15T01-03-14.599792-00-00.json
+receipts/metrics_20260713_105455.json
+receipts/kpi_2026-07-03T02-31-42.587882-00-00.json
+receipts/metrics_20260714_103356.json
+receipts/metrics_20260719_202741.json
+receipts/pipeline_20260718_151633.json
+receipts/kpi_2026-07-12T18-39-54.586874-00-00.json
+receipts/kpi_2026-07-05T08-30-47.838007-00-00.json
+receipts/metrics_20260717_223357.json
+receipts/kpi_2026-07-17T19-49-28.566442-00-00.json
+receipts/metrics_20260710_225616.json
+receipts/rotation_20260719_134312.json
+receipts/metrics_20260703_103213.json
+receipts/rotation_20260718_054013.json
+receipts/pipeline_20260703_224515.json
+receipts/metrics_20260708_015257.json
+receipts/metrics_20260713_075822.json
+receipts/metrics_20260716_214801.json
+receipts/metrics_20260711_121548.json
+receipts/metrics_20260709_053403.json
+receipts/kpi_2026-07-17T16-12-47.836251-00-00.json
+receipts/pipeline_20260715_231623.json
+receipts/metrics_20260705_104048.json
+receipts/metrics_20260626_211217.json
+receipts/rotation_20260713_033742.json
+receipts/metrics_20260627_075601.json
+receipts/metrics_20260630_210628.json
+receipts/rotation_20260708_222115.json
+receipts/rotation_20260715_054549.json
+receipts/kpi_2026-07-17T06-38-48.847659-00-00.json
+receipts/metrics_20260626_172213.json
+receipts/pipeline_20260703_144221.json
+receipts/pipeline_20260711_163650.json
+receipts/pipeline_20260714_010656.json
+receipts/metrics_20260710_160834.json
+receipts/metrics_20260719_170624.json
+receipts/kpi_2026-07-06T20-37-51.130142-00-00.json
+receipts/pipeline_20260705_120726.json
+receipts/metrics_20260629_224202.json
+receipts/pipeline_20260714_042004.json
+receipts/kpi_2026-07-01T14-11-07.309663-00-00.json
+receipts/metrics_20260709_115506.json
+receipts/metrics_20260719_150436.json
+receipts/metrics_20260713_044759.json
+receipts/kpi_2026-07-18T15-16-32.996969-00-00.json
+receipts/metrics_20260712_195245.json
+receipts/kpi_2026-07-13T22-39-26.944482-00-00.json
+receipts/rotation_20260702_084658.json
+receipts/rotation_20260706_222631.json
+receipts/metrics_20260707_202609.json
+receipts/pipeline_20260711_174411.json
+receipts/pipeline_20260705_185038.json
+receipts/rotation_20260708_143442.json
+receipts/metrics_20260709_085606.json
+receipts/pipeline_20260708_115117.json
+receipts/metrics_20260701_152437.json
+receipts/kpi_2026-07-11T21-35-36.798364-00-00.json
+receipts/pipeline_20260716_194235.json
+receipts/rotation_20260628_021239.json
+receipts/pipeline_20260712_115748.json
+receipts/kpi_2026-07-07T13-38-54.965086-00-00.json
+receipts/kpi_2026-07-09T01-20-36.538498-00-00.json
+receipts/pipeline_20260710_160834.json
+receipts/kpi_2026-07-10T19-40-16.585965-00-00.json
+receipts/pipeline_20260717_115759.json
+receipts/kpi_2026-07-19T12-32-03.540440-00-00.json
+receipts/pipeline_20260714_150713.json
+receipts/metrics_20260706_012602.json
+receipts/metrics_20260707_161449.json
+receipts/kpi_2026-07-12T20-40-13.810332-00-00.json
+receipts/kpi_2026-07-01T23-03-48.191705-00-00.json
+receipts/pipeline_20260715_103155.json
+receipts/pipeline_20260717_063848.json
+receipts/kpi_2026-07-19T21-16-34.067392-00-00.json
+receipts/metrics_20260701_225250.json
+receipts/kpi_2026-06-30T10-26-58.173219-00-00.json
+receipts/deploy_controlled_wolf_v1_2026-06-26T09-51-31.699810+00-00.json
+receipts/kpi_2026-07-11T15-42-05.282590-00-00.json
+receipts/kpi_2026-07-11T14-48-48.393933-00-00.json
+receipts/rotation_20260718_220443.json
+receipts/metrics_20260712_010831.json
+receipts/pipeline_20260707_133855.json
+receipts/metrics_20260702_211545.json
+receipts/rotation_20260707_040151.json
+receipts/pipeline_20260716_214801.json
+receipts/pipeline_20260719_084515.json
+receipts/metrics_20260707_133855.json
+receipts/pipeline_20260707_084251.json
+receipts/metrics_20260715_010314.json
+receipts/kpi_2026-06-29T14-42-45.712262-00-00.json
+receipts/kpi_2026-07-17T01-14-48.829317-00-00.json
+receipts/pipeline_20260705_104048.json
+receipts/kpi_2026-07-04T16-58-32.976831-00-00.json
+receipts/kpi_2026-07-17T10-34-32.648750-00-00.json
+receipts/kpi_2026-07-11T17-44-11.654833-00-00.json
+receipts/pipeline_20260718_113956.json
+receipts/kpi_2026-07-07T20-26-10.088463-00-00.json
+receipts/kpi_2026-07-10T13-38-08.199744-00-00.json
+receipts/kpi_2026-07-17T21-35-24.103331-00-00.json
+receipts/rotation_20260709_095955.json
+receipts/metrics_20260719_035443.json
+receipts/kpi_2026-07-18T22-09-55.516369-00-00.json
+receipts/metrics_20260709_143749.json
+receipts/kpi_2026-07-05T01-19-58.139426-00-00.json
+receipts/kpi_2026-07-09T17-09-35.662288-00-00.json
+receipts/metrics_20260628_193001.json
+receipts/metrics_20260703_043052.json
+receipts/kpi_2026-07-04T23-33-52.647614-00-00.json
+receipts/rotation_20260705_162148.json
+receipts/kpi_2026-07-04T21-29-59.893992-00-00.json
+receipts/rotation_20260713_221013.json
+receipts/kpi_2026-07-09T22-18-35.174043-00-00.json
+receipts/metrics_20260628_083726.json
+receipts/metrics_20260712_142921.json
+receipts/pipeline_20260711_204321.json
+receipts/rotation_20260704_085343.json
+receipts/pipeline_20260708_224631.json
+receipts/pipeline_20260709_221835.json
+receipts/kpi_2026-07-07T16-14-49.448722-00-00.json
+receipts/pipeline_20260707_225628.json
+receipts/kpi_2026-07-13T13-16-53.217140-00-00.json
+receipts/kpi_2026-07-07T11-33-32.190578-00-00.json
+receipts/kpi_2026-07-16T23-40-44.962352-00-00.json
+receipts/pipeline_20260719_001140.json
+receipts/metrics_20260710_051348.json
+receipts/metrics_20260703_080011.json
+receipts/rotation_20260630_193609.json
+receipts/rotation_20260709_152933.json
+receipts/kpi_2026-07-02T12-03-32.001723-00-00.json
+receipts/metrics_20260718_151633.json
+receipts/pipeline_20260716_155723.json
+receipts/kpi_2026-07-12T16-38-00.020602-00-00.json
+receipts/kpi_2026-06-27T09-23-56.358376-00-00.json
+receipts/kpi_2026-07-01T17-07-58.319784-00-00.json
+receipts/kpi_2026-07-18T11-39-56.630265-00-00.json
+receipts/metrics_20260712_204013.json
+receipts/rotation_20260718_161035.json
+receipts/metrics_20260717_203922.json
+receipts/metrics_20260716_224229.json
+receipts/pipeline_20260712_153556.json
+receipts/pipeline_20260717_085936.json
+receipts/metrics_20260702_081743.json
+receipts/kpi_2026-07-02T20-55-30.375457-00-00.json
+receipts/kpi_2026-07-13T19-17-07.925461-00-00.json
+receipts/kpi_2026-07-03T12-29-34.291844-00-00.json
+receipts/pipeline_20260703_161633.json
+receipts/rotation_20260711_191948.json
+receipts/metrics_20260703_214230.json
+receipts/metrics_20260712_110126.json
+receipts/visit_back_2026-06-26T09-57-44.960549+00-00.json
+receipts/kpi_2026-07-05T23-39-57.460051-00-00.json
+receipts/metrics_20260714_164124.json
+receipts/metrics_20260705_164555.json
+receipts/pipeline_20260718_001846.json
+receipts/kpi_2026-07-15T10-31-55.358974-00-00.json
+receipts/metrics_20260713_223926.json
+receipts/metrics_20260712_092104.json
+receipts/metrics_20260717_183620.json
+receipts/rotation_20260715_140159.json
+receipts/pipeline_20260704_012005.json
+receipts/metrics_20260710_215640.json
+receipts/kpi_2026-06-27T11-21-31.445040-00-00.json
+receipts/metrics_20260715_061713.json
+receipts/pipeline_20260709_190351.json
+receipts/pipeline_20260712_142921.json
+receipts/pipeline_20260707_113332.json
+receipts/rotation_20260714_054356.json
+receipts/rotation_20260716_141326.json
+receipts/metrics_20260629_165855.json
+receipts/metrics_20260719_084515.json
+receipts/kpi_2026-07-18T12-41-07.869781-00-00.json
+receipts/metrics_20260716_121238.json
+receipts/kpi_2026-06-26T23-56-26.086558-00-00.json
+receipts/pipeline_20260715_211800.json
+receipts/metrics_20260708_172447.json
+receipts/rotation_20260712_104635.json
+receipts/kpi_2026-07-14T11-59-39.733358-00-00.json
+receipts/kpi_2026-07-16T20-37-55.683894-00-00.json
+receipts/kpi_2026-06-28T17-59-02.989819-00-00.json
+receipts/pipeline_20260713_213804.json
+receipts/kpi_2026-07-05T10-40-48.750062-00-00.json
+receipts/metrics_20260711_195451.json
+receipts/kpi_2026-07-19T06-27-35.180165-00-00.json
+receipts/pipeline_20260704_180113.json
+receipts/metrics_20260711_233247.json
+receipts/pipeline_20260718_055544.json
+receipts/metrics_20260627_044021.json
+receipts/rotation_20260706_155209.json
+receipts/pipeline_20260710_011927.json
+receipts/kpi_2026-07-13T15-56-01.961148-00-00.json
+receipts/kpi_2026-07-17T23-29-09.170414-00-00.json
+receipts/kpi_2026-07-04T08-08-39.336970-00-00.json
+receipts/rotation_20260702_020614.json
+receipts/metrics_20260711_071111.json
+receipts/metrics_20260714_202624.json
+receipts/rotation_20260716_030527.json
+receipts/metrics_20260707_215433.json
+receipts/kpi_2026-07-16T18-22-33.486904-00-00.json
+receipts/metrics_20260712_233132.json
+receipts/metrics_20260711_101754.json
+receipts/pipeline_20260706_100132.json
+receipts/pipeline_20260713_075822.json
+receipts/kpi_2026-07-04T15-51-35.709644-00-00.json
+receipts/metrics_20260719_001140.json
+receipts/pipeline_20260709_205210.json
+receipts/kpi_2026-07-07T05-11-44.324478-00-00.json
+receipts/pipeline_20260715_040242.json
+receipts/metrics_20260709_143750.json
+receipts/pipeline_20260719_193332.json
+receipts/kpi_2026-07-15T21-18-00.739078-00-00.json
+receipts/metrics_20260717_011448.json
+receipts/kpi_2026-06-26T18-54-03.195045-00-00.json
+receipts/metrics_20260712_071850.json
+logs/daemon.log
+debug/debug_login_no_password_20260626_053649.html
+debug/debug_login_no_password_20260626_053649.png
+data/pipeline_summary.json
+data/pipeline_receipts.jsonl
+data/all_candidates.json
+data/SouthPark_Lines.csv
+data/availability.json
+data/top_25.jsonl
+data/ga_elites.jsonl
+quarantine/content_generator.py
+pipeline_output/pipeline_summary.json
+pipeline_output/pipeline_receipts.jsonl
+pipeline_output/all_candidates.json
+pipeline_output/best_bio.txt
+rm_revenue_engine/market_scan.py
+rm_revenue_engine/experiment_runner.py
+rm_revenue_engine/state_db.py
+rm_revenue_engine/daemon.py
+rm_revenue_engine/cli.py
+rm_revenue_engine/revenue_ops.py
+rm_revenue_engine/__init__.py
+docs/PROVIDER_GROWTH_CRM.md
+docs/PROVIDER_GROWTH_CRM_PRODUCTION_NOTES.md
+
+File Contents:
+content_generator.py:
 ```
 #!/usr/bin/env python3
-"""Social media post generator — creates platform-specific posts from daily content.
+"""Daily content generator for RentMasseur profile optimization.
 
-Generates posts for Twitter/X, Instagram, Facebook, and LinkedIn based on
-the daily bios, blog posts, and interview questions.
+Generates bios, blog posts, and interview questions using Groq LLM.
+Runs mass analysis across all 30 strategies and collects the best versions.
+Designed to run daily in CI/CD.
 
 Usage:
-    python3 social_media_generator.py
-    python3 social_media_generator.py --platform twitter
+    python3 content_generator.py                    # generate all content
+    python3 content_generator.py --bios-only        # bios only
+    python3 content_generator.py --blogs-only       # blog posts only
+    python3 content_generator.py --questions-only   # interview questions only
 """
 
 import argparse
 import json
 import os
 import sys
-import glob
 import time
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -643,158 +722,79 @@ load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
 
 CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
-SOCIAL_DIR = os.path.join(CONTENT_DIR, "social_posts")
-
-PLATFORMS = {
-    "twitter": {"max_chars": 280, "style": "concise, punchy, with hashtags"},
-    "instagram": {"max_chars": 2200, "style": "visual, emoji-rich, story-driven, with hashtags"},
-    "facebook": {"max_chars": 5000, "style": "conversational, community-focused, engaging"},
-    "linkedin": {"max_chars": 3000, "style": "professional, thought-leadership, industry-focused"},
-}
+BIOS_DIR = os.path.join(CONTENT_DIR, "bios")
+BLOGS_DIR = os.path.join(CONTENT_DIR, "blog_posts")
+QUESTIONS_DIR = os.path.join(CONTENT_DIR, "interview_questions")
+HISTORY_FILE = os.path.join(CONTENT_DIR, "content_history.json")
 
 STRATEGIES = [
-    "sensory_luxury", "therapeutic_expert", "mystery_desire", "local_hustle",
-    "transformation_story", "night_owl", "athlete_recovery", "ceo_executive",
-    "spiritual_healer", "traveler_companion", "medical_referral", "artist_soul",
-    "discrete_confidential", "first_timer", "seasonal_special", "couples_duo",
-    "bodybuilder_therapy", "yoga_fusion", "luxury_concierge", "recovery_addiction",
-    "military_veteran", "lgbtq_pride", "senior_gentle", "office_relief",
-    "dancer_flexibility", "meditation_guide", "hot_stone_specialist", "quick_lunch",
-    "birthday_gift", "weekly_ritual",
+    ("sensory_luxury", "Luxurious sensory experience, premium oils, candlelight, high-end clientele"),
+    ("therapeutic_expert", "Clinical therapeutic massage, pain relief, certifications, back/neck focus"),
+    ("mystery_desire", "Mysterious, alluring, teases the experience, curiosity-driven bookings"),
+    ("local_hustle", "Manhattan local vibe, neighborhood energy, approachable, easy booking"),
+    ("transformation_story", "Story-based, stress-to-relief transformation, emotional hook"),
+    ("night_owl", "Late-night availability, after-hours, private evening sessions"),
+    ("athlete_recovery", "Gym-goers, pre/post-workout, muscle recovery, sports performance"),
+    ("ceo_executive", "Executive wellness, CEO/founder stress relief, time-efficient, premium"),
+    ("spiritual_healer", "Holistic, energy work, chakras, mindfulness, breathwork"),
+    ("traveler_companion", "Out-of-town visitors, jet lag, hotel-friendly, concierge service"),
+    ("medical_referral", "Doctor-recommended, clinical back pain, sciatica, posture correction"),
+    ("artist_soul", "Creative artistic approach, massage as art, intuitive touch"),
+    ("discrete_confidential", "Absolute privacy, VIP clients, judgment-free, confidential studio"),
+    ("first_timer", "Welcoming newcomers, gentle introduction, no experience needed"),
+    ("seasonal_special", "Seasonal themes, winter warmth, summer cool-down, holiday stress"),
+    ("couples_duo", "Couples, partners, duet sessions, romantic bonding experience"),
+    ("bodybuilder_therapy", "Heavy lifters, deep pressure, fascia release, intense muscle work"),
+    ("yoga_fusion", "Yoga + massage, stretching, flexibility, mind-body connection"),
+    ("luxury_concierge", "White-glove in-home/hotel service, elite concierge, effortless booking"),
+    ("recovery_addiction", "Sober wellness, recovery support, clean living, healthy coping"),
+    ("military_veteran", "Veteran-friendly, service member respect, PT recovery, brotherhood"),
+    ("lgbtq_pride", "Inclusive pride-forward, safe space, community, authentic expression"),
+    ("senior_gentle", "Senior-friendly, gentle touch, mobility, arthritis, circulation"),
+    ("office_relief", "Desk job recovery, neck pain, carpal tunnel, corporate warrior"),
+    ("dancer_flexibility", "Dancers/performers, flexibility maintenance, injury prevention"),
+    ("meditation_guide", "Guided meditation + massage, mindfulness, breath, tranquility"),
+    ("hot_stone_specialist", "Hot stone specialty, heat therapy, deep relaxation, indulgence"),
+    ("quick_lunch", "Express 30-45 min lunch-break massage, fast, effective, convenient"),
+    ("birthday_gift", "Gift-worthy special occasion, treat yourself, memorable experience"),
+    ("weekly_ritual", "Recurring weekly maintenance, body upkeep, long-term investment"),
 ]
 
 
-def _groq_chat(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> Optional[str]:
+def _ensure_dirs():
+    for d in [CONTENT_DIR, BIOS_DIR, BLOGS_DIR, QUESTIONS_DIR]:
+        os.makedirs(d, exist_ok=True)
+
+
+def _load_history() -> list:
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def _save_history(history: list):
+    _ensure_dirs()
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history[-200:], f, indent=2)
+    except Exception as e:
+        logger.warning("Failed to save history: %s", e)
+
+
+def _content_hash(text: str) -> str:
+    return hashlib.md5(text.strip().lower().encode()).hexdigest()[:12]
+
+
+def _groq_chat(system_prompt: str, user_prompt: str, temperature: float = 0.9, max_tokens: int = 800, retries: int = 3) -> Optional[str]:
     if not GROQ_API_KEY:
         logger.error("No GROQ_API_KEY")
         return None
-    try:
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.9,
-                "max_tokens": max_tokens,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.error("Groq API error: %s", e)
-        return None
-
-
-def generate_social_posts(platform: str, strategy: str) -> Optional[str]:
-    """Generate social media posts for a specific platform and strategy."""
-    config = PLATFORMS[platform]
-    system_prompt = (
-        f"You are a social media manager for a male massage therapist in Manhattan, NYC. "
-        f"Create a {platform} post that is {config['style']}. "
-        f"Maximum {config['max_chars']} characters. "
-        f"Avoid explicit content. Include relevant hashtags. "
-        f"Drive bookings to the RentMasseur profile. Write ONLY the post text."
-    )
-    user_prompt = (
-        f"Strategy angle: {strategy}\n"
-        f"Create a compelling {platform} post for a massage therapist. "
-        f"Make it engaging and booking-oriented."
-    )
-    return _groq_chat(system_prompt, user_prompt)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Generate social media posts from daily content")
-    parser.add_argument("--platform", choices=list(PLATFORMS.keys()), help="Generate for specific platform only")
-    parser.add_argument("--strategies", nargs="*", default=STRATEGIES, help="Strategies to generate for")
-    args = parser.parse_args()
-
-    os.makedirs(SOCIAL_DIR, exist_ok=True)
-    today = datetime.now().strftime("%Y%m%d")
-    platforms = [args.platform] if args.platform else list(PLATFORMS.keys())
-    total = 0
-
-    for platform in platforms:
-        platform_dir = os.path.join(SOCIAL_DIR, platform)
-        os.makedirs(platform_dir, exist_ok=True)
-        logger.info("=== Generating %s posts ===", platform)
-
-        for strategy in args.strategies:
-            post = generate_social_posts(platform, strategy)
-            if post:
-                filepath = os.path.join(platform_dir, f"{today}_{strategy}.md")
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(post)
-                total += 1
-                logger.info("%s/%s: %d chars", platform, strategy, len(post))
-            time.sleep(0.5)
-
-    logger.info("=== Generated %d social media posts ===", total)
-    print(json.dumps({"total_posts": total, "platforms": platforms, "date": today}, indent=2))
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-llm_file_proxy.zip:
-```
-Error reading file: 'utf-8' codec can't decode byte 0x9b in position 10: invalid start byte
-```
-
-.gitignore:
-```
-__pycache__/
-*.pyc
-jobs.sqlite
-revenue_ops.db
-.env
-*.env
-*.sqlite
-*.db
-cookies*.json
-session*.json
-.DS_Store
-__MACOSX/
-rm_traffic/
-content/daily_evidence_packet.json
-private_secrets_quarantine/
-api_map.json
-*.secret.json
-
-```
-
-_diag_login.py:
-```
-#!/usr/bin/env python3
-"""Quick screenshot of rentmasseur login page to diagnose what's there."""
-import time, os
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-
-opts = Options()
-opts.add_argument("--no-sandbox")
-opts.add_argument("--disable-dev-shm-usage")
-opts.add_argument("--window-size=1280,900")
-
-driver = webdriver.Chrome(options=opts)
-try:
-    driver.set_page_load_timeout(90)
-    driver.get("https://rentmasseur.com/login")
-    time.sleep(10)
-    
-    # Screenshot
-    shot_path = "/Users/alep/Downloads/rentmasseur-optimizer/login_screenshot.png"
-    driver.save_screenshot(shot_path)
-    print(f"Screenshot saved: {shot_path}")
-    
-    # Dump page source
+    for attempt in range(retries):
+        try:

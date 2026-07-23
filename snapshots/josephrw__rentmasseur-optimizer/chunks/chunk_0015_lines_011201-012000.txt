@@ -1,800 +1,800 @@
-    if JORKI_REGISTRY_PATH.exists():
-        return json.loads(JORKI_REGISTRY_PATH.read_text())
-    return {}
-
-def _jorki_save_registry(reg):
-    JORKI_REGISTRY_PATH.write_text(json.dumps(reg, indent=2))
-
-# ── Fast-path index schema (created once, reused) ──
-_INDEX_SCHEMA_SQL = [
-    "CREATE TABLE IF NOT EXISTS file_meta (key TEXT, value TEXT)",
-    "CREATE TABLE IF NOT EXISTS chunks (idx INTEGER, line_start INTEGER, line_end INTEGER, boundary_type TEXT, preview TEXT, line_count INTEGER)",
-    "CREATE TABLE IF NOT EXISTS word_freq (word TEXT, count INTEGER)",
-    "CREATE TABLE IF NOT EXISTS symbols (line INTEGER, name TEXT, type TEXT)",
-    "CREATE TABLE IF NOT EXISTS capabilities (id INTEGER, name TEXT)",
-    "CREATE TABLE IF NOT EXISTS kpis (id INTEGER, name TEXT, value TEXT, line INTEGER, category TEXT, confidence REAL)",
-    "CREATE TABLE IF NOT EXISTS dna (key TEXT, value TEXT)",
-    "CREATE TABLE IF NOT EXISTS access_control (password_hash TEXT, salt TEXT, hint TEXT, created_at REAL)",
-]
-_CAPS_LIST = [(i, name) for i, name in enumerate(["sql", "nosql", "search", "chunk", "summary", "meta", "mcp", "word_freq", "symbols", "chunks", "merkle", "sha256", "capabilities", "revocation", "kpi", "dna", "password"])]
-
-import concurrent.futures
-_INDEX_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8)
-
-def _jorki_index_file(filepath, fast=False):
-    path = _Path(filepath)
-    content = path.read_bytes()
-    size = len(content)
-    merkle_root = hashlib.sha256(content).hexdigest()
-    file_id = merkle_root[:12]
-    text = content.decode("utf-8", errors="replace")
-    lines = text.split("\n")
-    line_count = len(lines)
-    words = re.findall(r"\b\w+\b", text)
-    word_freq = {}
-    for w in words:
-        word_freq[w] = word_freq.get(w, 0) + 1
-    top_words = sorted(word_freq.items(), key=lambda x: -x[1])[:20]
-
-    chunks = []
-    current_chunk = []
-    chunk_start = 0
-    for i, line in enumerate(lines):
-        current_chunk.append(line)
-        is_boundary = (
-            (line.strip() == "" and len(current_chunk) > 5)
-            or line.strip().startswith("def ")
-            or line.strip().startswith("class ")
-            or line.strip().startswith("func ")
-            or line.strip().startswith("workflow:")
-        )
-        if is_boundary and len(current_chunk) >= 3:
-            chunks.append({"idx": len(chunks), "line_start": chunk_start, "line_end": i,
-                           "boundary_type": "function" if line.strip().startswith(("def ", "class ", "func ")) else "paragraph",
-                           "preview": "\n".join(current_chunk[:3])[:200], "line_count": len(current_chunk)})
-            current_chunk = []
-            chunk_start = i + 1
-    if current_chunk:
-        chunks.append({"idx": len(chunks), "line_start": chunk_start, "line_end": line_count - 1,
-                       "boundary_type": "final", "preview": "\n".join(current_chunk[:3])[:200], "line_count": len(current_chunk)})
-
-    symbols = []
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        for prefix in ["def ", "class ", "func ", "async def "]:
-            if stripped.startswith(prefix):
-                name = stripped[len(prefix):].split("(")[0].split(":")[0].strip()
-                symbols.append({"line": i + 1, "name": name, "type": prefix.strip()})
-
-    # ── KPI Extraction (skip in fast mode for speed) ──
-    kpis = [] if fast else _jorki_extract_kpis(text, lines, word_freq)
-
-    # ── DNA Fingerprint (skip in fast mode for speed) ──
-    dna = {"species": "textus", "complexity_score": 0, "genes": {}, "dna_sequence": "", "genome_size": 0} if fast else _jorki_compute_dna(content, text, lines, symbols, word_freq, chunks, path.name)
-
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    conn = sqlite3.connect(str(idx_path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=OFF")
-    for sql in _INDEX_SCHEMA_SQL:
-        conn.execute(sql)
-    # Fast clear — drop and recreate is faster than DELETE for large tables
-    conn.executescript("""
-        DELETE FROM file_meta; DELETE FROM chunks; DELETE FROM word_freq;
-        DELETE FROM symbols; DELETE FROM capabilities; DELETE FROM kpis;
-        DELETE FROM dna; DELETE FROM access_control;
-    """)
-    meta = {"filename": path.name, "size_bytes": str(size), "total_lines": str(line_count),
-            "total_words": str(len(words)), "merkle_root": merkle_root,
-            "total_chunks": str(len(chunks)), "total_symbols": str(len(symbols)),
-            "file_id": file_id, "size_human": f"{size/1024:.1f}KB" if size < 1048576 else f"{size/1048576:.1f}MB"}
-    # Batch all inserts with executemany
-    conn.executemany("INSERT INTO file_meta VALUES (?,?)", [(k, str(v)) for k, v in meta.items()])
-    conn.executemany("INSERT INTO chunks VALUES (?,?,?,?,?,?)",
-        [(c["idx"], c["line_start"], c["line_end"], c["boundary_type"], c["preview"], c["line_count"]) for c in chunks])
-    conn.executemany("INSERT INTO word_freq VALUES (?,?)", top_words)
-    conn.executemany("INSERT INTO symbols VALUES (?,?,?)",
-        [(s["line"], s["name"], s["type"]) for s in symbols])
-    conn.executemany("INSERT INTO capabilities VALUES (?,?)", _CAPS_LIST)
-    conn.executemany("INSERT INTO kpis VALUES (?,?,?,?,?,?)",
-        [(k["id"], k["name"], k["value"], k["line"], k["category"], k["confidence"]) for k in kpis])
-    conn.executemany("INSERT INTO dna VALUES (?,?)",
-        [(k, json.dumps(v) if isinstance(v, dict) else str(v)) for k, v in dna.items()])
-    conn.commit()
-    conn.close()
-
-    index_size = idx_path.stat().st_size
-    return {"file_id": file_id, "filename": path.name, "size_bytes": size,
-            "size_human": f"{size/1024:.1f}KB" if size < 1048576 else f"{size/1048576:.1f}MB",
-            "total_lines": line_count, "total_words": len(words),
-            "total_chunks": len(chunks), "total_symbols": len(symbols),
-            "merkle_root": merkle_root, "index_size_bytes": index_size,
-            "index_ratio": round(index_size / max(size, 1) * 100, 1),
-            "kpi_count": len(kpis), "dna": dna.get("dna_sequence", "")[:32]}
-
-# ─── KPI Extraction ─────────────────────────────────────────────────────
-
-def _jorki_extract_kpis(text, lines, word_freq):
-    kpis = []
-    kid = 0
-
-    # Financial patterns
-    money_re = re.compile(r'\$[\d,]{3,}(?:\.\d{2})?|\bUSD\s*[\d,]{3,}|\bEUR\s*[\d,]{3,}|\bGBP\s*[\d,]{3,}', re.I)
-    pct_re = re.compile(r'\b(\d+\.?\d*)\s*%', re.I)
-    rev_re = re.compile(r'\b(revenue|income|profit|loss|ebitda|margin|cost|budget|spend|valuation|capex|opex|mrr|arr|ltv|cac|churn|burn\s*rate|runway)\s*[:=]?\s*\$?[\d,]{3,}(?:\.\d+)?', re.I)
-    date_re = re.compile(r'\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]20\d{2}|Q[1-4]\s*20\d{2}|FY20\d{2})\b', re.I)
-    metric_re = re.compile(r'(users|customers|sessions|requests|latency|uptime|throughput|qps|rps|errors|failures|success\s*rate)\s*[:=]?\s*[\d,]+(?:\.\d+)?', re.I)
-    table_re = re.compile(r'^\s*\|.*\|.*\|', re.MULTILINE)
-    api_re = re.compile(r'(GET|POST|PUT|DELETE|PATCH)\s+(/[^\s]+)', re.I)
-    key_val_re = re.compile(r'^\s*([A-Z][A-Z_]{2,30})\s*[:=]\s*(.+)$', re.MULTILINE)
-
-    for i, line in enumerate(lines):
-        for m in money_re.finditer(line):
-            kpis.append({"id": kid, "name": "monetary_value", "value": m.group(), "line": i + 1, "category": "financial", "confidence": 0.9})
-            kid += 1
-        for m in rev_re.finditer(line):
-            kpis.append({"id": kid, "name": "revenue_metric", "value": m.group().strip(), "line": i + 1, "category": "financial", "confidence": 0.85})
-            kid += 1
-        for m in pct_re.finditer(line):
-            val = float(m.group(1))
-            if val > 0 and val <= 100:
-                kpis.append({"id": kid, "name": "percentage", "value": m.group(), "line": i + 1, "category": "financial", "confidence": 0.7})
-                kid += 1
-        for m in metric_re.finditer(line):
-            kpis.append({"id": kid, "name": "operational_metric", "value": m.group().strip(), "line": i + 1, "category": "operational", "confidence": 0.8})
-            kid += 1
-        for m in api_re.finditer(line):
-            kpis.append({"id": kid, "name": "api_endpoint", "value": f"{m.group(1)} {m.group(2)}", "line": i + 1, "category": "technical", "confidence": 0.9})
-            kid += 1
-        for m in key_val_re.finditer(line):
-            val = m.group(2).strip()
-            if len(val) < 100 and not val.lower() in ("true", "false", "none", "null"):
-                kpis.append({"id": kid, "name": "config_value", "value": f"{m.group(1)}={val}", "line": i + 1, "category": "config", "confidence": 0.6})
-                kid += 1
-
-    for m in date_re.finditer(text):
-        kpis.append({"id": kid, "name": "date_reference", "value": m.group(), "line": text[:m.start()].count("\n") + 1, "category": "temporal", "confidence": 0.75})
-        kid += 1
-
-    if table_re.search(text):
-        table_count = len(table_re.findall(text))
-        kpis.append({"id": kid, "name": "table_count", "value": str(table_count), "line": 0, "category": "structural", "confidence": 0.9})
-        kid += 1
-
-    # Top words as KPIs
-    for w, cnt in sorted(word_freq.items(), key=lambda x: -x[1])[:5]:
-        if len(w) > 3 and cnt > 2:
-            kpis.append({"id": kid, "name": "dominant_term", "value": f"{w} ({cnt}x)", "line": 0, "category": "linguistic", "confidence": 0.5})
-            kid += 1
-
-    # Deduplicate by value
-    seen = set()
-    unique = []
-    for k in kpis:
-        key = (k["name"], k["value"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(k)
-    for i, k in enumerate(unique):
-        k["id"] = i
-    return unique
-
-# ─── DNA Fingerprint ────────────────────────────────────────────────────
-
-def _jorki_compute_dna(content, text, lines, symbols, word_freq, chunks, filename=""):
-    h = hashlib.sha256(content).hexdigest()
-    # Structural genes
-    gene_1 = len(lines)          # height
-    gene_2 = max(len(l) for l in lines) if lines else 0  # max width
-    gene_3 = len(symbols)        # symbol density
-    gene_4 = len(chunks)         # chunk count
-    gene_5 = len(word_freq)      # vocabulary richness
-    gene_6 = sum(len(l) for l in lines) / max(len(lines), 1)  # avg line length
-    gene_7 = len([l for l in lines if l.strip() == ""]) / max(len(lines), 1)  # blank ratio
-    gene_8 = len([l for l in lines if l.strip().startswith("#")]) / max(len(lines), 1)  # comment ratio
-    # Entropy
-    from collections import Counter
-    byte_counts = Counter(content[:4096])
-    total = sum(byte_counts.values())
-    import math
-    entropy = -sum((c / total) * math.log2(c / total) for c in byte_counts.values() if c > 0) if total > 0 else 0
-
-    # DNA sequence: 16-gene hex string
-    genes = [
-        f"{gene_1:04x}",     # height
-        f"{gene_2:04x}",     # max width
-        f"{gene_3:04x}",     # symbols
-        f"{gene_4:04x}",     # chunks
-        f"{gene_5:04x}",     # vocab
-        f"{int(gene_6 * 100):04x}",  # avg line len
-        f"{int(gene_7 * 65535):04x}",  # blank ratio
-        f"{int(gene_8 * 65535):04x}",  # comment ratio
-        f"{int(entropy * 1000):04x}",  # entropy
-        h[:4],               # first 4 of merkle
-    ]
-    dna_seq = "".join(genes)
-
-    # Species classification — prefer file extension, fall back to content
-    file_ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    ext_map = {"py": "pythonicus", "js": "javascriptus", "jsx": "javascriptus", "ts": "javascriptus",
-               "tsx": "javascriptus", "json": "jsonicus", "html": "markupus", "xml": "markupus",
-               "svg": "markupus", "csv": "tabularis", "tsv": "tabularis", "md": "textus",
-               "txt": "textus", "yml": "configus", "yaml": "configus", "toml": "configus",
-               "sh": "scripticus", "go": "golangus", "rs": "rusticus", "c": "ceplusplus", "cpp": "ceplusplus"}
-    if file_ext in ext_map:
-        species = ext_map[file_ext]
-    elif "import " in text or "def " in text or "class " in text:
-        species = "pythonicus"
-    elif "function " in text or "const " in text or "=>" in text:
-        species = "javascriptus"
-    elif text.strip().startswith("{") or text.strip().startswith("["):
-        species = "jsonicus"
-    elif "<html" in text[:200].lower() or "<!doctype" in text[:200].lower():
-        species = "markupus"
-    elif "|" in text and text.count("|") > 10:
-        species = "tabularis"
+        return next(s for s in PRICE_STRATEGIES if s["name"] == "premium_peak")
+    elif day_of_week in (0, 6):
+        return next(s for s in PRICE_STRATEGIES if s["name"] == "weekend_warrior")
     else:
-        species = "textus"
+        return random.choice(PRICE_STRATEGIES)
 
-    return {
-        "dna_sequence": dna_seq,
-        "species": species,
-        "genes": {
-            "height": gene_1,
-            "max_width": gene_2,
-            "symbol_density": gene_3,
-            "chunk_count": gene_4,
-            "vocab_richness": gene_5,
-            "avg_line_length": round(gene_6, 1),
-            "blank_ratio": round(gene_7, 3),
-            "comment_ratio": round(gene_8, 3),
-            "entropy": round(entropy, 2),
-            "merkle_prefix": h[:8],
-        },
-        "complexity_score": round(min((gene_3 * 10 + gene_4 * 0.5 + min(gene_5, 500) * 0.01 + entropy * 0.5 + gene_6 * 0.1) / max(gene_1, 1) * 100, 100), 1),
-        "genome_size": len(dna_seq),
-    }
 
-# JORKI query tracking
-_jorki_query_log = {}
-
-def _jorki_track_query(file_id, query_type):
-    if file_id not in _jorki_query_log:
-        _jorki_query_log[file_id] = {"total_queries": 0, "query_breakdown": {}}
-    _jorki_query_log[file_id]["total_queries"] += 1
-    _jorki_query_log[file_id]["query_breakdown"][query_type] = _jorki_query_log[file_id]["query_breakdown"].get(query_type, 0) + 1
-    _jorki_query_log[file_id]["last_access"] = time.time()
-
-@app.post("/index")
-async def jorki_index_upload(file: UploadFile = File(...)):
-    content = await file.read()
-    upload_path = JORKI_DATA_DIR / "uploads" / file.filename
-    upload_path.parent.mkdir(parents=True, exist_ok=True)
-    upload_path.write_bytes(content)
-    result = _jorki_index_file(str(upload_path))
-    reg = _jorki_load_registry()
-    reg[result["file_id"]] = {
-        "filename": result["filename"],
-        "size_bytes": result["size_bytes"],
-        "size_human": result["size_human"],
-        "format": upload_path.suffix.lstrip("."),
-        "status": "active",
-        "indexed_at": time.time(),
-    }
-    _jorki_save_registry(reg)
-    return result
-
-@app.post("/index/batch")
-async def jorki_index_batch(files: List[UploadFile] = File(...)):
-    """Batch index multiple files in parallel. Supports 1000+ files/min throughput.
-    Uses fast mode (skips DNA/KPI) for speed. Re-index individual files later for full analysis."""
-    import time as _time
-    t0 = _time.time()
-    upload_dir = JORKI_DATA_DIR / "uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write all files to disk first
-    paths = []
-    for f in files:
-        content = await f.read()
-        p = upload_dir / f.filename
-        p.write_bytes(content)
-        paths.append(str(p))
-
-    # Parallel indexing with ThreadPoolExecutor
-    futures = [_INDEX_POOL.submit(_jorki_index_file, p, fast=True) for p in paths]
-    results = []
-    for fut in concurrent.futures.as_completed(futures):
-        try:
-            results.append(fut.result())
-        except Exception as e:
-            results.append({"error": str(e), "filename": "?"})
-
-    # Batch registry update (single write)
-    reg = _jorki_load_registry()
-    for r in results:
-        if "file_id" not in r:
-            continue
-        reg[r["file_id"]] = {
-            "filename": r["filename"],
-            "size_bytes": r["size_bytes"],
-            "size_human": r["size_human"],
-            "format": _Path(r["filename"]).suffix.lstrip("."),
-            "status": "active",
-            "indexed_at": _time.time(),
-        }
-    _jorki_save_registry(reg)
-
-    elapsed = _time.time() - t0
-    ok = sum(1 for r in results if "file_id" in r)
-    failed = len(results) - ok
-    rate = ok / elapsed if elapsed > 0 else 0
-    return {
-        "total": len(files),
-        "indexed": ok,
-        "failed": failed,
-        "elapsed_seconds": round(elapsed, 2),
-        "files_per_second": round(rate, 1),
-        "files_per_minute": round(rate * 60, 0),
-        "results": results,
-    }
-
-@app.post("/index/dir")
-async def jorki_index_dir(body: dict = Body(...)):
-    """Index all files in a directory. Scans recursively, indexes in parallel."""
-    dirpath = body.get("dirpath", "")
-    if not os.path.isdir(dirpath):
-        return {"error": f"Directory not found: {dirpath}"}
-    import time as _time
-    t0 = _time.time()
-
-    # Collect files
-    all_files = []
-    for root, dirs, fnames in os.walk(dirpath):
-        for f in fnames:
-            fp = os.path.join(root, f)
-            if not f.startswith(".") and os.path.getsize(fp) < 10_000_000:  # skip hidden, >10MB
-                all_files.append(fp)
-
-    if not all_files:
-        return {"error": "No files found in directory"}
-
-    # Parallel indexing
-    futures = [_INDEX_POOL.submit(_jorki_index_file, fp, fast=True) for fp in all_files]
-    results = []
-    for fut in concurrent.futures.as_completed(futures):
-        try:
-            results.append(fut.result())
-        except Exception as e:
-            results.append({"error": str(e)})
-
-    # Batch registry update
-    reg = _jorki_load_registry()
-    for r in results:
-        if "file_id" not in r:
-            continue
-        reg[r["file_id"]] = {
-            "filename": r["filename"],
-            "size_bytes": r["size_bytes"],
-            "size_human": r["size_human"],
-            "format": _Path(r["filename"]).suffix.lstrip("."),
-            "status": "active",
-            "indexed_at": _time.time(),
-        }
-    _jorki_save_registry(reg)
-
-    elapsed = _time.time() - t0
-    ok = sum(1 for r in results if "file_id" in r)
-    rate = ok / elapsed if elapsed > 0 else 0
-    return {
-        "total": len(all_files),
-        "indexed": ok,
-        "failed": len(results) - ok,
-        "elapsed_seconds": round(elapsed, 2),
-        "files_per_second": round(rate, 1),
-        "files_per_minute": round(rate * 60, 0),
-        "results": [{"file_id": r.get("file_id"), "filename": r.get("filename"), "error": r.get("error")} for r in results],
-    }
-
-@app.post("/index/path")
-async def jorki_index_path(body: dict = Body(...)):
-    filepath = body.get("filepath", "")
-    if not os.path.exists(filepath):
-        return {"error": f"File not found: {filepath}"}
-    result = _jorki_index_file(filepath)
-    reg = _jorki_load_registry()
-    reg[result["file_id"]] = {
-        "filename": result["filename"],
-        "size_bytes": result["size_bytes"],
-        "size_human": result["size_human"],
-        "format": _Path(filepath).suffix.lstrip("."),
-        "status": "active",
-        "indexed_at": time.time(),
-    }
-    _jorki_save_registry(reg)
-    return result
-
-@app.post("/reindex/{file_id}")
-async def jorki_reindex(file_id: str):
-    """Re-index an already uploaded file. Fixes stale indexes after code updates."""
-    reg = _jorki_load_registry()
-    entry = reg.get(file_id)
-    if not entry:
-        return {"error": f"File {file_id} not in registry"}
-    # Find the uploaded file
-    upload_path = JORKI_DATA_DIR / "uploads" / entry.get("filename", "")
-    if not upload_path.exists():
-        # Try pipeline_uploads
-        upload_path = JORKI_DATA_DIR / "pipeline_uploads" / entry.get("filename", "")
-    if not upload_path.exists():
-        return {"error": f"Source file not found for {file_id}"}
-    # Delete old index
-    old_idx = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if old_idx.exists():
-        old_idx.unlink()
-    # Re-index
-    result = _jorki_index_file(str(upload_path))
-    reg[result["file_id"]] = {
-        "filename": result["filename"],
-        "size_bytes": result["size_bytes"],
-        "size_human": result["size_human"],
-        "format": upload_path.suffix.lstrip("."),
-        "status": "active",
-        "indexed_at": time.time(),
-    }
-    # If file_id changed (content changed), clean up old entry
-    if result["file_id"] != file_id:
-        reg.pop(file_id, None)
-    _jorki_save_registry(reg)
-    return {"status": "reindexed", "old_file_id": file_id, "new_file_id": result["file_id"], **result}
-
-@app.get("/health")
-async def jorki_health():
-    reg = _jorki_load_registry()
-    return {"status": "ok", "service": "jorki", "version": "2.0",
-            "files_registered": len(reg),
-            "persistent_storage": os.path.exists("/data"),
-            "endpoints": ["/health", "/files", "/meta/{id}", "/summary/{id}",
-                          "/capabilities/{id}", "/superpose/state/{id}",
-                          "/search/{id}", "/chunk/{id}/{idx}", "/query/sql/{id}", "/stats/{id}",
-                          "/kpi/{id}", "/kpi/{id}/gif", "/dna/{id}", "/password/{id}", "/password/{id}/verify", "/password/{id}/status",
-                          "/profile/{id}",
-                          "/ml/{id}",
-                          "/valuation/{id}",
-                          "/resume/{id}",
-                          "/video/{id}",
-                          "/formulas",
-                          "/index", "/index/batch", "/index/dir", "/index/path", "/reindex/{id}",
-                          "/pipeline/trigger", "/pipeline/status/{id}", "/pipeline/latest"]}
-
-@app.get("/files")
-async def jorki_files():
-    reg = _jorki_load_registry()
-    files = []
-    for fid, entry in reg.items():
-        files.append({"file_id": fid, "filename": entry.get("filename", "unknown"),
-                       "size": entry.get("size_human", ""), "format": entry.get("format", ""),
-                       "status": entry.get("status", "unknown")})
-    return {"files": files, "total": len(files)}
-
-@app.get("/meta/{file_id}")
-async def jorki_meta(file_id: str):
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    rows = conn.execute("SELECT key, value FROM file_meta").fetchall()
-    caps = conn.execute("SELECT name FROM capabilities").fetchall()
-    conn.close()
-    meta = {r[0]: r[1] for r in rows}
-    return {"file_id": file_id, "meta": meta,
-            "capabilities": [r[0] for r in caps],
-            "endpoints": {"meta": f"/meta/{file_id}", "search": f"/search/{file_id}?q=",
-                          "chunk": f"/chunk/{file_id}/{{idx}}", "sql": f"/query/sql/{file_id}"}}
-
-@app.get("/summary/{file_id}")
-async def jorki_summary(file_id: str):
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    chunks = conn.execute("SELECT idx, boundary_type, line_start, line_end, line_count, preview FROM chunks LIMIT 50").fetchall()
-    symbols = conn.execute("SELECT line, name, type FROM symbols LIMIT 50").fetchall()
-    words = conn.execute("SELECT word, count FROM word_freq ORDER BY count DESC LIMIT 20").fetchall()
-    conn.close()
-    _jorki_track_query(file_id, "summary")
-    return {"file_id": file_id,
-            "semantic_chunks": [{"idx": r[0], "type": r[1], "lines": f"{r[2]}-{r[3]}", "line_count": r[4], "size": len(r[5])} for r in chunks],
-            "functions": [{"line": r[0], "symbol": r[1]} for r in symbols],
-            "top_words": [{"word": r[0], "count": r[1]} for r in words]}
-
-@app.get("/capabilities/{file_id}")
-async def jorki_capabilities(file_id: str):
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    caps = conn.execute("SELECT id, name FROM capabilities").fetchall()
-    conn.close()
-    return {"file_id": file_id, "total": len(caps),
-            "capabilities": [{"id": r[0], "name": r[1], "enabled": True} for r in caps]}
-
-@app.get("/superpose/state/{file_id}")
-async def jorki_state(file_id: str):
-    reg = _jorki_load_registry()
-    entry = reg.get(file_id, {})
-    ql = _jorki_query_log.get(file_id, {"total_queries": 0, "query_breakdown": {}})
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    index_size = idx_path.stat().st_size if idx_path.exists() else 0
-    return {"file_id": file_id,
-            "session_status": "live" if entry.get("status") == "active" else "idle",
-            "uploaded_at": entry.get("indexed_at"),
-            "last_access": ql.get("last_access"),
-            "total_queries": ql.get("total_queries", 0),
-            "query_breakdown": ql.get("query_breakdown", {}),
-            "index_size_bytes": index_size,
-            "original_size": entry.get("size_human", ""),
-            "compression_ratio": f"{round(index_size / max(int(entry.get('size_bytes', 1)), 1) * 100, 1)}%" if entry.get('size_bytes') else ""}
-
-@app.get("/search/{file_id}")
-async def jorki_search(file_id: str, q: str = ""):
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    chunk_results = conn.execute("SELECT idx, line_start, line_end, preview FROM chunks WHERE preview LIKE ?", (f"%{q}%",)).fetchall()
-    sym_results = conn.execute("SELECT line, name, type FROM symbols WHERE name LIKE ?", (f"%{q}%",)).fetchall()
-    conn.close()
-    _jorki_track_query(file_id, "search")
-    return {"file_id": file_id, "query": q,
-            "results": [{"line": r[1], "text": r[3][:200]} for r in chunk_results] +
-                       [{"line": r[0], "text": r[1]} for r in sym_results]}
-
-@app.get("/chunk/{file_id}/{idx}")
-async def jorki_chunk(file_id: str, idx: int):
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    row = conn.execute("SELECT idx, line_start, line_end, boundary_type, preview, line_count FROM chunks WHERE idx = ?", (idx,)).fetchone()
-    conn.close()
-    _jorki_track_query(file_id, "chunk")
-    if not row:
-        return {"error": f"Chunk {idx} not found"}
-    return {"idx": row[0], "line_start": row[1], "line_end": row[2],
-            "boundary_type": row[3], "content": row[4], "line_count": row[5]}
-
-@app.post("/query/sql/{file_id}")
-async def jorki_sql(file_id: str, body: dict = Body(...)):
-    sql = body.get("sql", "")
-    if not sql.strip().upper().startswith("SELECT"):
-        return {"error": "Only SELECT statements allowed"}
-    for kw in ["INSERT", "UPDATE", "DELETE", "DROP", "ATTACH", "PRAGMA", "CREATE", "ALTER"]:
-        if kw in sql.upper():
-            return {"error": f"{kw} not allowed"}
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
+def update_price_on_profile(price: int) -> bool:
     try:
-        cursor = conn.execute(sql)
-        columns = [d[0] for d in cursor.description] if cursor.description else []
-        rows = cursor.fetchmany(1000)
-        conn.close()
-        _jorki_track_query(file_id, "sql")
-        return {"file_id": file_id, "columns": columns, "rows": [list(r) for r in rows], "row_count": len(rows)}
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.chrome.options import Options
+        from rentmasseur_core import login, dismiss_popups
+
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+        driver = webdriver.Chrome(options=options)
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+
+        try:
+            if not login(driver):
+                logger.error("Login failed")
+                return False
+
+            driver.get(PROFILE_RATES_URL)
+            time.sleep(5)
+            dismiss_popups(driver)
+            time.sleep(2)
+
+            price_inputs = driver.find_elements(By.CSS_SELECTOR, "input[name*='rate'], input[name*='price'], input[type='number']")
+            if not price_inputs:
+                logger.error("No price input found on rates page")
+                return False
+
+            price_inputs[0].clear()
+            price_inputs[0].send_keys(str(price))
+            time.sleep(1)
+
+            save_btns = driver.find_elements(By.XPATH, "//*[contains(text(), 'Save') or @type='submit']")
+            if save_btns:
+                driver.execute_script("arguments[0].click();", save_btns[-1])
+                time.sleep(3)
+
+            logger.info("Price updated to $%d", price)
+            return True
+        finally:
+            driver.quit()
     except Exception as e:
-        conn.close()
-        return {"error": str(e)}
+        logger.error("Price update error: %s", e)
+        return False
 
-@app.get("/stats/{file_id}")
-async def jorki_stats(file_id: str):
-    ql = _jorki_query_log.get(file_id, {"total_queries": 0, "query_breakdown": {}})
-    return {"file_id": file_id, "stats": [{"type": k, "count": v} for k, v in ql.get("query_breakdown", {}).items()],
-            "total_queries": ql.get("total_queries", 0)}
 
-# ─── KPI Endpoint ───────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="Price rotator for RentMasseur")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--report", action="store_true")
+    args = parser.parse_args()
 
-@app.get("/kpi/{file_id}")
-async def jorki_kpi(file_id: str):
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    rows = conn.execute("SELECT id, name, value, line, category, confidence FROM kpis ORDER BY confidence DESC, category").fetchall()
-    conn.close()
-    _jorki_track_query(file_id, "kpi")
-    by_category = {}
-    for r in rows:
-        cat = r[4]
-        if cat not in by_category:
-            by_category[cat] = []
-        by_category[cat].append({"id": r[0], "name": r[1], "value": r[2], "line": r[3], "confidence": r[5]})
-    return {"file_id": file_id, "total_kpis": len(rows),
-            "by_category": by_category,
-            "kpis": [{"id": r[0], "name": r[1], "value": r[2], "line": r[3], "category": r[4], "confidence": r[5]} for r in rows]}
+    os.makedirs(CONTENT_DIR, exist_ok=True)
+    now = datetime.now()
+    hour = now.hour
+    dow = now.weekday()
 
-# ─── KPI → Animated GIF ─────────────────────────────────────────────────
+    strategy = pick_strategy(hour, dow)
+    price = calculate_optimal_price(strategy, hour, dow)
 
-def _jorki_kpi_gif(file_id, filename, kpis, by_category):
-    """Render KPIs as an animated GIF with charts, bars, and transitions."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.animation as animation
-    from matplotlib.patches import FancyBboxPatch, Wedge, Circle
-    import numpy as np
-    import re as _re
+    state = {"price": price, "strategy": strategy["name"], "hour": hour, "dow": dow, "timestamp": now.isoformat()}
 
-    BG = "#0a0a0a"
-    ORANGE = "#ff8c00"
-    WHITE = "#e0e0e0"
-    DIM = "#555555"
-    GREEN = "#00ff88"
-    RED = "#ff4444"
-    YELLOW = "#ffcc00"
-    BLUE = "#4488ff"
-    PURPLE = "#aa44ff"
-    CYAN = "#44ddff"
+    if args.report:
+        history = []
+        if os.path.exists(PRICE_STATE_PATH):
+            with open(PRICE_STATE_PATH) as f:
+                try:
+                    hist = json.load(f)
+                    if isinstance(hist, list):
+                        history = hist
+                except Exception:
+                    pass
+        print(f"Price history: {len(history)} entries")
+        for h in history[-10:]:
+            print(f"  {h.get('timestamp', '?')}: ${h.get('price', '?')} ({h.get('strategy', '?')})")
+        return
 
-    CAT_COLORS = {
-        "financial": GREEN,
-        "operational": BLUE,
-        "technical": ORANGE,
-        "config": PURPLE,
-        "temporal": CYAN,
-        "structural": YELLOW,
-        "linguistic": DIM,
+    print(json.dumps(state, indent=2))
+
+    if args.dry_run:
+        logger.info("Dry run — not updating profile")
+        return
+
+    success = update_price_on_profile(price)
+
+    history = []
+    if os.path.exists(PRICE_STATE_PATH):
+        with open(PRICE_STATE_PATH) as f:
+            try:
+                history = json.load(f)
+                if not isinstance(history, list):
+                    history = []
+            except Exception:
+                history = []
+    history.append(state)
+    with open(PRICE_STATE_PATH, "w") as f:
+        json.dump(history[-200:], f, indent=2)
+
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+login_page.html:
+```
+<html lang="en"><head><meta http-equiv="origin-trial" content="3NNj0GXVktLOmVKwWUDendk4Vq2qgMVDBDX+Sni48ATJl9JBj+zF+9W2HGB3pvt6qowOihTbQgTeBm9SKbdTwYAAABfeyJvcmlnaW4iOiJodHRwczovL3JlY2FwdGNoYS5uZXQ6NDQzIiwiZmVhdHVyZSI6IlRwY2QiLCJleHBpcnkiOjE3MzUzNDM5OTksImlzVGhpcmRQYXJ0eSI6dHJ1ZX0="><meta http-equiv="origin-trial" content="A6iYDRdcg1LVww9DNZEU+JUx2g1IJxSxk4P6F+LimR0ElFa38FydBqtz/AmsKdGr11ZooRgDPCInHJfGzwtR+A4AAACXeyJvcmlnaW4iOiJodHRwczovL3d3dy5yZWNhcHRjaGEubmV0OjQ0MyIsImZlYXR1cmUiOiJEaXNhYmxlVGhpcmRQYXJ0eVN0b3JhZ2VQYXJ0aXRpb25pbmczIiwiZXhwaXJ5IjoxNzU3OTgwODAwLCJpc1N1YmRvbWFpbiI6dHJ1ZSwiaXNUaGlyZFBhcnR5Ijp0cnVlfQ==">
+    <title>CrowdSec Captcha</title>
+    <meta content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>/*! tailwindcss v3.2.7 | MIT License | https://tailwindcss.com*/*,:after,:before{border:0 solid #e5e7eb;box-sizing:border-box}:after,:before{--tw-content:""}html{-webkit-text-size-adjust:100%;font-feature-settings:normal;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,Noto Sans,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;line-height:1.5;-moz-tab-size:4;-o-tab-size:4;tab-size:4}body{line-height:inherit;margin:0}hr{border-top-width:1px;color:inherit;height:0}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:initial}sub{bottom:-.25em}sup{top:-.5em}table{border-collapse:collapse;border-color:inherit;text-indent:0}button,input,optgroup,select,textarea{color:inherit;font-family:inherit;font-size:100%;font-weight:inherit;line-height:inherit;margin:0;padding:0}button,select{text-transform:none}[type=button],[type=reset],[type=submit],button{-webkit-appearance:button;background-color:initial;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:initial}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{color:#9ca3af;opacity:1}input::placeholder,textarea::placeholder{color:#9ca3af;opacity:1}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{height:auto;max-width:100%}[hidden]{display:none}*,::backdrop,:after,:before{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:#3b82f680;--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: }.fixed{position:fixed}.right-0{right:0}.top-0{top:0}.flex{display:flex}.h-24{height:6rem}.h-3\/5{height:60%}.h-6{height:1.5rem}.h-full{height:100%}.h-screen{height:100vh}.w-24{width:6rem}.w-6{width:1.5rem}.w-full{width:100%}.w-screen{width:100vw}.flex-col{flex-direction:column}.items-center{align-items:center}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-bottom:calc(.25rem*var(--tw-space-y-reverse));margin-top:calc(.25rem*(1 - var(--tw-space-y-reverse)))}.space-y-4>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-bottom:calc(1rem*var(--tw-space-y-reverse));margin-top:calc(1rem*(1 - var(--tw-space-y-reverse)))}.rounded-xl{border-radius:.75rem}.border-2{border-width:2px}.border-black{--tw-border-opacity:1;border-color:rgb(0 0 0/var(--tw-border-opacity))}.p-4{padding:1rem}.text-2xl{font-size:1.5rem;line-height:2rem}.text-sm{font-size:.875rem;line-height:1.25rem}.text-xl{font-size:1.25rem;line-height:1.75rem}.dark .dark\:border-white{--tw-border-opacity:1;border-color:rgb(255 255 255/var(--tw-border-opacity))}.dark .dark\:bg-slate-900{--tw-bg-opacity:1;background-color:rgb(15 23 42/var(--tw-bg-opacity))}.dark .dark\:text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity))}@media (min-width:640px){.sm\:w-2\/3{width:66.666667%}}@media (min-width:768px){.md\:h-2\/5{height:40%}.md\:flex-row{flex-direction:row}.md\:text-2xl{font-size:1.5rem;line-height:2rem}.md\:text-lg{font-size:1.125rem;line-height:1.75rem}}@media (min-width:1024px){.lg\:w-1\/2{width:50%}.lg\:text-3xl{font-size:1.875rem;line-height:2.25rem}.lg\:text-xl{font-size:1.25rem;line-height:1.75rem}}@media (min-width:1280px){.xl\:text-4xl{font-size:2.25rem;line-height:2.5rem}}</style>
+    <script type="text/javascript" async="" charset="utf-8" src="https://www.gstatic.com/recaptcha/releases/MerVUtRoajKEbP7pLiGXkL28/recaptcha__en.js" crossorigin="anonymous" integrity="sha384-m1PC1ygjfLmGwsDY9jhFKKTk4uAMPEO34ag12kE5Ljsj7EXMzvB24pLZaON7S8Ds"></script><script src="https://www.recaptcha.net/recaptcha/api.js" async="" defer=""></script>
+</head>
+<body class="h-screen w-screen dark">
+  <div class="h-full w-full flex flex-col justify-center items-center dark:bg-slate-900 dark:text-white">
+    <div class="flex flex-col justify-between items-center border-2 border-black dark:border-white rounded-xl p-4 h-3/5 md:h-2/5 w-full sm:w-2/3 lg:w-1/2">
+      <div class="fixed p-4 top-0 right-0 dark-mode-toggle"><svg class="h-6 w-6" viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="M3 12H5M5.00006 19L7.00006 17M12 19V21M17 17L19 19M5 5L7 7M19 12H21M16.9999 7L18.9999 5M12 3V5M15 12C15 13.6569 13.6569 15 12 15C10.3431 15 9 13.6569 9 12C9 10.3431 10.3431 9 12 9C13.6569 9 15 10.3431 15 12Z" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
+      <div class="flex flex-col items-center space-y-4">
+        <svg fill="white" class="h-24 w-24" aria-hidden="true" focusable="false" data-prefix="fas" data-icon="exclamation-triangle" role="img" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512">
+          <path d="M569.517 440.013C587.975 472.007 564.806 512 527.94 512H48.054c-36.937 0-59.999-40.055-41.577-71.987L246.423 23.985c18.467-32.009 64.72-31.951 83.154 0l239.94 416.028zM288 354c-25.405 0-46 20.595-46 46s20.595 46 46 46 46-20.595 46-46-20.595-46-46-46zm-43.673-165.346l7.418 136c.347 6.364 5.609 11.346 11.982 11.346h48.546c6.373 0 11.635-4.982 11.982-11.346l7.418-136c.375-6.874-5.098-12.654-11.982-12.654h-63.383c-6.884 0-12.356 5.78-11.981 12.654z"></path>
+        </svg>
+        <h1 class="text-2xl lg:text-3xl xl:text-4xl">CrowdSec Captcha</h1>
+        <form action="" method="POST" class="flex flex-col space-y-1" id="captcha-form">
+          <div id="captcha" class="g-recaptcha" data-sitekey="6Le2q64qAAAAAJEgw2HU_tXf5dhJtlfKfTUhimF8" data-callback="captchaCallback"><div style="width: 304px; height: 78px;"><div><iframe title="reCAPTCHA" width="304" height="78" role="presentation" name="a-blnui3a8jt5w" frameborder="0" scrolling="no" sandbox="allow-forms allow-popups allow-same-origin allow-scripts allow-top-navigation allow-modals allow-popups-to-escape-sandbox allow-storage-access-by-user-activation" src="https://www.recaptcha.net/recaptcha/api2/anchor?ar=1&amp;k=6Le2q64qAAAAAJEgw2HU_tXf5dhJtlfKfTUhimF8&amp;co=aHR0cHM6Ly9yZW50bWFzc2V1ci5jb206NDQz&amp;hl=en&amp;v=MerVUtRoajKEbP7pLiGXkL28&amp;size=normal&amp;anchor-ms=20000&amp;execute-ms=30000&amp;cb=diwexlvtnhcx"></iframe></div><textarea id="g-recaptcha-response" name="g-recaptcha-response" class="g-recaptcha-response" style="width: 250px; height: 40px; border: 1px solid rgb(193, 193, 193); margin: 10px 25px; padding: 0px; resize: none; display: none;"></textarea></div><iframe style="display: none;"></iframe></div>
+        </form>
+      </div>
+      <div class="flex-col md:flex-row text-sm flex items-center">
+        <p>
+          This security check has been powered by
+        </p>
+        <a href="https://crowdsec.net/" target="_blank" rel="noopener" class="flex flex-col items-center">
+          <svg fill="white" width="33.92" height="33.76" viewBox="0 0 254.4 253.2">
+          <defs>
+            <clipPath id="a">
+              <path d="M0 52h84v201.2H0zm0 0"></path>
+            </clipPath>
+            <clipPath id="b">
+              <path d="M170 52h84.4v201.2H170zm0 0"></path>
+            </clipPath>
+          </defs>
+          <path d="M59.3 128.4c1.4 2.3 2.5 4.6 3.4 7-1-4.1-2.3-8.1-4.3-12-3.1-6-7.8-5.8-10.7 0-2 4-3.2 8-4.3 12.1 1-2.4 2-4.8 3.4-7.1 3.4-5.8 8.8-6 12.5 0M207.8 128.4a42.9 42.9 0 013.4 7c-1-4.1-2.3-8.1-4.3-12-3.2-6-7.8-5.8-10.7 0-2 4-3.3 8-4.3 12.1.9-2.4 2-4.8 3.4-7.1 3.4-5.8 8.8-6 12.5 0M134.6 92.9c2 3.5 3.6 7 4.8 10.7-1.3-5.4-3-10.6-5.6-15.7-4-7.5-9.7-7.2-13.3 0a75.4 75.4 0 00-5.6 16c1.2-3.8 2.7-7.4 4.7-11 4.1-7.2 10.6-7.5 15 0M43.8 136.8c.9 4.6 3.7 8.3 7.3 9.2 0 2.7 0 5.5.2 8.2.3 3.3.4 6.6 1 9.6.3 2.3 1 2.2 1.3 0 .5-3 .6-6.3 1-9.6l.2-8.2c3.5-1 6.4-4.6 7.2-9.2a17.8 17.8 0 01-9 2.4c-3.5 0-6.6-1-9.2-2.4M192.4 136.8c.8 4.6 3.7 8.3 7.2 9.2 0 2.7 0 5.5.3 8.2.3 3.3.4 6.6 1 9.6.3 2.3.9 2.2 1.2 0 .6-3 .7-6.3 1-9.6.2-2.7.3-5.5.2-8.2 3.6-1 6.4-4.6 7.3-9.2a17.8 17.8 0 01-9.1 2.4c-3.4 0-6.6-1-9.1-2.4M138.3 104.6c-3.1 1.9-7 3-11.3 3-4.3 0-8.2-1.1-11.3-3 1 5.8 4.5 10.3 9 11.5 0 3.4 0 6.8.3 10.2.4 4.1.5 8.2 1.2 12 .4 2.9 1.2 2.7 1.6 0 .7-3.8.8-7.9 1.2-12 .3-3.4.3-6.8.3-10.2 4.5-1.2 8-5.7 9-11.5"></path>
+          <path d="M51 146c0 2.7.1 5.5.3 8.2.3 3.3.4 6.6 1 9.6.3 2.3 1 2.2 1.3 0 .5-3 .6-6.3 1-9.6l.2-8.2c3.5-1 6.4-4.6 7.2-9.2a17.8 17.8 0 01-9 2.4c-3.5 0-6.6-1-9.2-2.4.9 4.6 3.7 8.3 7.3 9.2M143.9 105c-1.9-.4-3.5-1.2-4.9-2.3 1.4 5.6 2.5 11.3 4 17 1.2 5 2 10 2.4 15 .6 7.8-4.5 14.5-10.9 14.5h-15c-6.4 0-11.5-6.7-11-14.5.5-5 1.3-10 2.6-15 1.3-5.3 2.3-10.5 3.6-15.7-2.2 1.2-4.8 1.9-7.7 2-4.7.1-9.4-.3-14-1-4-.4-6.7-3-8-6.7-1.3-3.4-2-7-3.3-10.4-.5-1.5-1.6-2.8-2.4-4.2-.4-.6-.8-1.2-.9-1.8v-7.8a77 77 0 0124.5-3c6.1 0 12 1 17.8 3.2 4.7 1.7 9.7 1.8 14.4 0 9-3.4 18.2-3.8 27.5-3 4.9.5 9.8 1.6 14.8 2.4v8.2c0 .6-.3 1.5-.7 1.7-2 .9-2.2 2.7-2.7 4.5-.9 3.2-1.8 6.4-2.9 9.5a11 11 0 01-8.8 7.7 40.6 40.6 0 01-18.4-.2m29.4 80.6c-3.2-26.8-6.4-50-8.9-60.7a14.3 14.3 0 0014.1-14h.4a9 9 0 005.6-16.5 14.3 14.3 0 00-3.7-27.2 9 9 0 00-6.9-14.6c2.4-1.1 4.5-3 5.8-5 3.4-5.3 4-29-8-44.4-5-6.3-9.8-2.5-10 1.8-1 13.2-1.1 23-4.5 34.3a9 9 0 00-16-4.1 14.3 14.3 0 00-28.4 0 9 9 0 00-16 4.1c-3.4-11.2-3.5-21.1-4.4-34.3-.3-4.3-5.2-8-10-1.8-12 15.3-11.5 39-8.1 44.4 1.3 2 3.4 3.9 5.8 5a9 9 0 00-7 14.6 14.3 14.3 0 00-3.6 27.2A9 9 0 0075 111h.5a14.5 14.5 0 0014.3 14c-4 17.2-10 66.3-15 111.3l-1.3 13.4a1656.4 1656.4 0 01106.6 0l-1.4-12.7-5.4-51.3"></path>
+          <g clip-path="url(#a)">
+            <path d="M83.5 136.6l-2.3.7c-5 1-9.8 1-14.8-.2-1.4-.3-2.7-1-3.8-1.9l3.1 13.7c1 4 1.7 8 2 12 .5 6.3-3.6 11.6-8.7 11.6H46.9c-5.1 0-9.2-5.3-8.7-11.6.3-4 1-8 2-12 1-4.2 1.8-8.5 2.9-12.6-1.8 1-3.9 1.5-6.3 1.6a71 71 0 01-11.1-.7 7.7 7.7 0 01-6.5-5.5c-1-2.7-1.6-5.6-2.6-8.3-.4-1.2-1.3-2.3-2-3.4-.2-.4-.6-1-.6-1.4v-6.3c6.4-2 13-2.6 19.6-2.5 4.9.1 9.6 1 14.2 2.6 3.9 1.4 7.9 1.5 11.7 0 1.8-.7 3.6-1.2 5.5-1.6a13 13 0 01-1.6-15.5A18.3 18.3 0 0159 73.1a11.5 11.5 0 00-17.4 8.1 7.2 7.2 0 00-12.9 3.3c-2.7-9-2.8-17-3.6-27.5-.2-3.4-4-6.5-8-1.4C7.5 67.8 7.9 86.9 10.6 91c1.1 1.7 2.8 3.1 4.7 4a7.2 7.2 0 00-5.6 11.7 11.5 11.5 0 00-2.9 21.9 7.2 7.2 0 004.5 13.2h.3c0 .6 0 1.1.2 1.7.9 5.4 5.6 9.5 11.3 9.5A1177.2 1177.2 0 0010 253.2c18.1-1.5 38.1-2.6 59.5-3.4.4-4.6.8-9.3 1.4-14 1.2-11.6 3.3-30.5 5.7-49.7 2.2-18 4.7-36.3 7-49.5"></path>
+          </g>
+          <g clip-path="url(#b)">
+            <path d="M254.4 118.2c0-5.8-4.2-10.5-9.7-11.4a7.2 7.2 0 00-5.6-11.7c2-.9 3.6-2.3 4.7-4 2.7-4.2 3.1-23.3-6.5-35.5-4-5.1-7.8-2-8 1.4-.8 10.5-.9 18.5-3.6 27.5a7.2 7.2 0 00-12.8-3.3 11.5 11.5 0 00-17.8-7.9 18.4 18.4 0 01-4.5 22 13 13 0 01-1.3 15.2c2.4.5 4.8 1 7.1 2 3.8 1.3 7.8 1.4 11.6 0 7.2-2.8 14.6-3 22-2.4 4 .4 7.9 1.2 12 1.9l-.1 6.6c0 .5-.2 1.2-.5 1.3-1.7.7-1.8 2.2-2.2 3.7l-2.3 7.6a8.8 8.8 0 01-7 6.1c-5 1-10 1-14.9-.2-1.5-.3-2.8-1-3.9-1.9 1.2 4.5 2 9.1 3.2 13.7 1 4 1.6 8 2 12 .4 6.3-3.6 11.6-8.8 11.6h-12c-5.2 0-9.3-5.3-8.8-11.6.4-4 1-8 2-12 1-4.2 1.9-8.5 3-12.6-1.8 1-4 1.5-6.3 1.6-3.7 0-7.5-.3-11.2-.7a7.7 7.7 0 01-3.7-1.5c3.1 18.4 7.1 51.2 12.5 100.9l.6 5.3.8 7.9c21.4.7 41.5 1.9 59.7 3.4L243 243l-4.4-41.2a606 606 0 00-7-48.7 11.5 11.5 0 0011.2-11.2h.4a7.2 7.2 0 004.4-13.2c4-1.8 6.8-5.8 6.8-10.5"></path>
+          </g>
+          <path d="M180 249.6h.4a6946 6946 0 00-7.1-63.9l5.4 51.3 1.4 12.6M164.4 125c2.5 10.7 5.7 33.9 8.9 60.7a570.9 570.9 0 00-8.9-60.7M74.8 236.3l-1.4 13.4 1.4-13.4"></path>
+        </svg>
+        <span>
+          CrowdSec
+        </span>
+      </a>
+    </div>
+    </div>
+  </div>
+  <script>
+    const moonSvgString = '<svg fill="black" class="h-6 w-6" viewBox="0 0 35 35" data-name="Layer 2" id="Layer_2" xmlns="http://www.w3.org/2000/svg"><path d="M18.44,34.68a18.22,18.22,0,0,1-2.94-.24,18.18,18.18,0,0,1-15-20.86A18.06,18.06,0,0,1,9.59.63,2.42,2.42,0,0,1,12.2.79a2.39,2.39,0,0,1,1,2.41L11.9,3.1l1.23.22A15.66,15.66,0,0,0,23.34,21h0a15.82,15.82,0,0,0,8.47.53A2.44,2.44,0,0,1,34.47,25,18.18,18.18,0,0,1,18.44,34.68ZM10.67,2.89a15.67,15.67,0,0,0-5,22.77A15.66,15.66,0,0,0,32.18,24a18.49,18.49,0,0,1-9.65-.64A18.18,18.18,0,0,1,10.67,2.89Z"/></svg>'
+    const sunSvgString = '<svg class="h-6 w-6" viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="M3 12H5M5.00006 19L7.00006 17M12 19V21M17 17L19 19M5 5L7 7M19 12H21M16.9999 7L18.9999 5M12 3V5M15 12C15 13.6569 13.6569 15 12 15C10.3431 15 9 13.6569 9 12C9 10.3431 10.3431 9 12 9C13.6569 9 15 10.3431 15 12Z" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    const svg = Array.from(document.querySelectorAll('svg'));
+    const button = document.querySelector('.dark-mode-toggle');
+    window.onload = () => {
+      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        document.body.classList.add('dark');
+        svg.forEach(element => {
+          element.setAttribute('fill', 'white');
+        });
+        button.innerHTML = sunSvgString;
+      } else {
+        button.innerHTML = moonSvgString;
+      }
+      button.addEventListener('click', function() {
+        document.body.classList.toggle('dark');
+        svg.forEach(element => {
+          element.getAttribute('fill') === 'black' ? element.setAttribute('fill', 'white') : element.setAttribute('fill', 'black');
+        });
+        if (document.body.classList.contains('dark')) {
+            button.innerHTML = sunSvgString;
+          } else {
+            button.innerHTML = moonSvgString;
+          }
+      });
+    };
+    function captchaCallback () {
+      setTimeout(() => {
+        document.querySelector('#captcha-form').submit();
+      }, 500);
+    }
+  </script>
+
+
+<div style="background-color: rgb(255, 255, 255); border: 1px solid rgb(204, 204, 204); box-shadow: rgba(0, 0, 0, 0.2) 2px 2px 3px; position: absolute; transition: visibility linear 0.3s, opacity 0.3s linear; opacity: 0; visibility: hidden; z-index: 2000000000; left: 0px; top: -10000px;"><div style="width: 100%; height: 100%; position: fixed; top: 0px; left: 0px; z-index: 2000000000; background-color: rgb(255, 255, 255); opacity: 0.05;"></div><div class="g-recaptcha-bubble-arrow" style="border: 11px solid transparent; width: 0px; height: 0px; position: absolute; pointer-events: none; margin-top: -11px; z-index: 2000000000;"></div><div class="g-recaptcha-bubble-arrow" style="border: 10px solid transparent; width: 0px; height: 0px; position: absolute; pointer-events: none; margin-top: -10px; z-index: 2000000000;"></div><div style="z-index: 2000000000; position: relative;"><iframe title="recaptcha challenge expires in two minutes" name="c-blnui3a8jt5w" frameborder="0" scrolling="no" sandbox="allow-forms allow-popups allow-same-origin allow-scripts allow-top-navigation allow-modals allow-popups-to-escape-sandbox allow-storage-access-by-user-activation" src="https://www.recaptcha.net/recaptcha/api2/bframe?hl=en&amp;v=MerVUtRoajKEbP7pLiGXkL28&amp;k=6Le2q64qAAAAAJEgw2HU_tXf5dhJtlfKfTUhimF8&amp;bft=0dAFcWeA668IQ8UnLyppniTwZ_6Kq9h-UUkRk3Eqw_wdFLMDOX2D-Qz6QkSxRM_9PKtTTp4FDOcKucNiYUuORETPrQsXDQzVQveg" style="width: 100%; height: 100%;"></iframe></div></div></body></html>
+```
+
+start.sh:
+```
+#!/bin/sh
+if [ -f .env ]; then
+    while IFS='=' read -r key value; do
+        case "$key" in
+            ''|\#*) continue ;;
+        esac
+        export "$key=$value"
+    done < .env
+fi
+exec ./cpp_os_server 7860
+
+```
+
+production_control_loop.cpp:
+```
+/*
+ * RentMasseur Production Control Loop — C++17
+ *
+ * Purpose:
+ *   Convert scattered rotators into one deterministic production gate.
+ *   Nothing is uploaded just because it is new. A candidate must pass:
+ *     1) policy/quality validation
+ *     2) booking-link validation
+ *     3) real metric comparison against the active incumbent
+ *     4) cooldown and rollback rules
+ *     5) append-only receipt logging
+ *
+ * No mock data. No simulation. No hardcoded profile values.
+ * Inputs must be produced by real account metrics, approved account exports,
+ * or platform-permitted data collection.
+ *
+ * Build:
+ *   g++ -O3 -std=c++17 -Wall -Wextra -pedantic production_control_loop.cpp -o production_control_loop
+ *
+ * Preflight:
+ *   ./production_control_loop --preflight
+ *
+ * Evaluate:
+ *   ./production_control_loop \
+ *     --evaluate \
+ *     --metrics content/live_metrics.json \
+ *     --candidates content/candidates.tsv \
+ *     --ledger content/experiment_ledger.jsonl \
+ *     --decision content/decisions/latest_decision.json
+ *
+ * candidates.tsv format:
+ *   candidate_id<TAB>asset_type<TAB>booking_url<TAB>source<TAB>body
+ *
+ * live_metrics.json expected keys:
+ *   active_candidate_id, views, profile_clicks, email_clicks, phone_clicks,
+ *   booking_requests, confirmed_bookings, gross_revenue_usd, window_hours
+ */
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <regex>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace rm {
+
+struct Metrics {
+    std::string active_candidate_id;
+    long views = 0;
+    long profile_clicks = 0;
+    long email_clicks = 0;
+    long phone_clicks = 0;
+    long booking_requests = 0;
+    long confirmed_bookings = 0;
+    double gross_revenue_usd = 0.0;
+    double window_hours = 0.0;
+};
+
+struct Candidate {
+    std::string id;
+    std::string asset_type;
+    std::string booking_url;
+    std::string source;
+    std::string body;
+};
+
+struct Score {
+    double reward = 0.0;
+    double phone_rate = 0.0;
+    double booking_rate = 0.0;
+    double revenue_per_view = 0.0;
+};
+
+struct Decision {
+    std::string action;
+    std::string candidate_id;
+    std::string asset_type;
+    double reward = 0.0;
+    std::vector<std::string> reasons;
+    std::vector<std::string> blockers;
+};
+
+static std::string now_iso() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    std::ostringstream os;
+    os << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+    return os.str();
+}
+
+static bool file_exists(const std::string& path) {
+    std::ifstream f(path);
+    return f.good();
+}
+
+static std::string read_file(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("cannot read file: " + path);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static void write_file(const std::string& path, const std::string& body) {
+    std::ofstream f(path);
+    if (!f) throw std::runtime_error("cannot write file: " + path);
+    f << body;
+}
+
+static void append_file(const std::string& path, const std::string& body) {
+    std::ofstream f(path, std::ios::app);
+    if (!f) throw std::runtime_error("cannot append file: " + path);
+    f << body;
+}
+
+static std::string env_or_empty(const std::string& key) {
+    const char* v = std::getenv(key.c_str());
+    return v ? std::string(v) : std::string();
+}
+
+static std::string escape_json(const std::string& s) {
+    std::ostringstream o;
+    for (char c : s) {
+        switch (c) {
+            case '"': o << "\\\""; break;
+            case '\\': o << "\\\\"; break;
+            case '\n': o << "\\n"; break;
+            case '\r': o << "\\r"; break;
+            case '\t': o << "\\t"; break;
+            default: o << c;
+        }
+    }
+    return o.str();
+}
+
+static std::string json_string_value(const std::string& raw, const std::string& key) {
+    std::regex re("\\\"" + key + "\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"");
+    std::smatch m;
+    if (std::regex_search(raw, m, re)) return m[1].str();
+    return "";
+}
+
+static double json_number_value(const std::string& raw, const std::string& key) {
+    std::regex re("\\\"" + key + "\\\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?)");
+    std::smatch m;
+    if (std::regex_search(raw, m, re)) return std::stod(m[1].str());
+    return 0.0;
+}
+
+static Metrics load_metrics(const std::string& path) {
+    std::string raw = read_file(path);
+    Metrics m;
+    m.active_candidate_id = json_string_value(raw, "active_candidate_id");
+    m.views = static_cast<long>(json_number_value(raw, "views"));
+    m.profile_clicks = static_cast<long>(json_number_value(raw, "profile_clicks"));
+    m.email_clicks = static_cast<long>(json_number_value(raw, "email_clicks"));
+    m.phone_clicks = static_cast<long>(json_number_value(raw, "phone_clicks"));
+    m.booking_requests = static_cast<long>(json_number_value(raw, "booking_requests"));
+    m.confirmed_bookings = static_cast<long>(json_number_value(raw, "confirmed_bookings"));
+    m.gross_revenue_usd = json_number_value(raw, "gross_revenue_usd");
+    m.window_hours = json_number_value(raw, "window_hours");
+    return m;
+}
+
+static std::vector<std::string> split_tab(const std::string& line) {
+    std::vector<std::string> parts;
+    std::stringstream ss(line);
+    std::string part;
+    while (std::getline(ss, part, '\t')) parts.push_back(part);
+    return parts;
+}
+
+static std::vector<Candidate> load_candidates(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("cannot read candidates: " + path);
+    std::vector<Candidate> out;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        auto p = split_tab(line);
+        if (p.size() < 5) continue;
+        Candidate c{p[0], p[1], p[2], p[3], p[4]};
+        out.push_back(c);
+    }
+    return out;
+}
+
+static Score score_metrics(const Metrics& m) {
+    Score s;
+    const double views = std::max(1L, m.views);
+    s.phone_rate = static_cast<double>(m.phone_clicks) / views;
+    s.booking_rate = static_cast<double>(m.booking_requests) / views;
+    s.revenue_per_view = m.gross_revenue_usd / views;
+
+    s.reward = 0.0;
+    s.reward += static_cast<double>(m.views) * 0.02;
+    s.reward += static_cast<double>(m.profile_clicks) * 0.20;
+    s.reward += static_cast<double>(m.email_clicks) * 2.00;
+    s.reward += static_cast<double>(m.phone_clicks) * 4.00;
+    s.reward += static_cast<double>(m.booking_requests) * 20.00;
+    s.reward += static_cast<double>(m.confirmed_bookings) * 80.00;
+    s.reward += m.gross_revenue_usd * 0.50;
+
+    // Do not reward high traffic windows too early. Require enough exposure.
+    if (m.window_hours > 0 && m.window_hours < 6) s.reward *= 0.50;
+    if (m.views < 25) s.reward *= 0.40;
+    return s;
+}
+
+static std::vector<std::string> validate_candidate(const Candidate& c, const std::string& required_link) {
+    std::vector<std::string> b;
+    if (c.id.empty()) b.push_back("missing candidate id");
+    if (c.asset_type != "bio" && c.asset_type != "blog" && c.asset_type != "interview" && c.asset_type != "photo" && c.asset_type != "price") {
+        b.push_back("unsupported asset_type");
+    }
+    if (c.body.size() < 80 && c.asset_type == "bio") b.push_back("bio too short to sell");
+    if (c.body.size() > 1800 && c.asset_type == "bio") b.push_back("bio too long for fast conversion");
+    if (required_link.empty()) b.push_back("REBRANDLY_LINK secret missing");
+    if (!required_link.empty() && c.body.find(required_link) == std::string::npos && c.booking_url.find(required_link) == std::string::npos) {
+        b.push_back("required Rebrandly booking link missing");
+    }
+    if (!required_link.empty() && !std::regex_search(required_link, std::regex("^https://rebrand\\.ly/[A-Za-z0-9._/-]+$"))) {
+        b.push_back("REBRANDLY_LINK is not a valid https://rebrand.ly/... URL");
+    }
+    const std::vector<std::string> banned = {
+        "guaranteed", "100%", "cure", "illegal", "underage", "cash only no record"
+    };
+    std::string lower = c.body;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch){ return std::tolower(ch); });
+    for (const auto& term : banned) {
+        if (lower.find(term) != std::string::npos) b.push_back("banned/unsafe term: " + term);
+    }
+    return b;
+}
+
+static double heuristic_candidate_quality(const Candidate& c) {
+    double q = 0.0;
+    const std::string& t = c.body;
+    auto contains = [&](const std::string& s) { return t.find(s) != std::string::npos; };
+    q += std::min<double>(30.0, t.size() / 30.0);
+    if (contains("call") || contains("Call") || contains("CALL")) q += 12.0;
+    if (contains("book") || contains("Book") || contains("BOOK")) q += 10.0;
+    if (contains("today") || contains("Today")) q += 6.0;
+    if (contains("Manhattan") || contains("NYC") || contains("New York")) q += 8.0;
+    if (contains("available") || contains("Available")) q += 5.0;
+    if (contains("professional") || contains("therapeutic") || contains("recovery")) q += 5.0;
+    if (contains("http")) q += 10.0;
+    return q;
+}
+
+static Decision evaluate(const Metrics& m, const std::vector<Candidate>& candidates, const std::string& required_link) {
+    Decision d;
+    Score current = score_metrics(m);
+    d.reward = current.reward;
+
+    if (m.window_hours < 6.0) {
+        d.action = "KEEP_CURRENT";
+        d.candidate_id = m.active_candidate_id;
+        d.reasons.push_back("insufficient live test window; keep incumbent until >=6h");
+        return d;
     }
 
-    scenes = []
+    if (m.views < 25) {
+        d.action = "KEEP_CURRENT";
+        d.candidate_id = m.active_candidate_id;
+        d.reasons.push_back("insufficient exposure; keep incumbent until >=25 views");
+        return d;
+    }
 
-    # Scene 1: Title
-    scenes.append({
-        "type": "title",
-        "title": filename or "unknown",
-        "subtitle": f"{len(kpis)} KPIs EXTRACTED",
-        "info": f"ID: {file_id}",
-    })
+    if (m.phone_clicks > 0 || m.booking_requests > 0 || m.confirmed_bookings > 0) {
+        d.action = "KEEP_CURRENT";
+        d.candidate_id = m.active_candidate_id;
+        d.reasons.push_back("incumbent has live conversion signal; keep and extend test");
+        return d;
+    }
 
-    # Scene 2: Category distribution donut
-    cat_counts = {cat: len(items) for cat, items in by_category.items()}
-    scenes.append({
-        "type": "donut",
-        "title": "KPI DISTRIBUTION",
-        "data": cat_counts,
-        "colors": {cat: CAT_COLORS.get(cat, ORANGE) for cat in cat_counts},
-    })
+    double best_q = -1.0;
+    Candidate best;
+    std::vector<std::string> best_blockers;
 
-    # Scene 3: Confidence distribution
-    conf_buckets = {"0.9+": 0, "0.7-0.9": 0, "0.5-0.7": 0, "<0.5": 0}
-    for k in kpis:
-        c = k["confidence"]
-        if c >= 0.9: conf_buckets["0.9+"] += 1
-        elif c >= 0.7: conf_buckets["0.7-0.9"] += 1
-        elif c >= 0.5: conf_buckets["0.5-0.7"] += 1
-        else: conf_buckets["<0.5"] += 1
-    scenes.append({
-        "type": "bars",
-        "title": "CONFIDENCE LEVELS",
-        "data": conf_buckets,
-        "colors": {"0.9+": GREEN, "0.7-0.9": BLUE, "0.5-0.7": YELLOW, "<0.5": RED},
-    })
+    for (const auto& c : candidates) {
+        auto blockers = validate_candidate(c, required_link);
+        if (!blockers.empty()) continue;
+        double q = heuristic_candidate_quality(c);
+        if (q > best_q) {
+            best_q = q;
+            best = c;
+            best_blockers = blockers;
+        }
+    }
 
-    # Scene 4-6: Top KPIs per category (one scene per major category)
-    for cat, items in by_category.items():
-        if len(items) < 1:
-            continue
-        top_items = sorted(items, key=lambda x: -x["confidence"])[:8]
-        scenes.append({
-            "type": "kpi_list",
-            "title": f"{cat.upper()} KPIs ({len(items)})",
-            "items": top_items,
-            "color": CAT_COLORS.get(cat, ORANGE),
-        })
+    if (best_q < 0) {
+        d.action = "KEEP_CURRENT";
+        d.candidate_id = m.active_candidate_id;
+        d.blockers.push_back("no validated candidate available");
+        return d;
+    }
 
-    # Scene 7: Financial values extracted (if any)
-    fin_kpis = [k for k in kpis if k["category"] == "financial"]
-    if fin_kpis:
-        # Try to parse monetary values
-        monetary = []
-        for k in fin_kpis:
-            val = k["value"]
-            m = _re.search(r'\$?([\d,]+(?:\.\d+)?)', val.replace(",", ""))
-            if m:
-                try:
-                    num = float(m.group(1).replace(",", ""))
-                    monetary.append({"name": k["name"], "value": num, "raw": val, "line": k["line"]})
-                except:
-                    pass
-        if monetary:
-            monetary.sort(key=lambda x: -x["value"])
-            scenes.append({
-                "type": "money_bars",
-                "title": "MONETARY VALUES",
-                "items": monetary[:8],
-            })
+    d.action = "APPLY_CANDIDATE";
+    d.candidate_id = best.id;
+    d.asset_type = best.asset_type;
+    d.reasons.push_back("incumbent has adequate exposure but zero conversion signal");
+    d.reasons.push_back("candidate passed link, policy, length, and CTA checks");
+    d.reasons.push_back("candidate quality score=" + std::to_string(best_q));
+    for (const auto& b : best_blockers) d.blockers.push_back(b);
+    return d;
+}
 
-    # Scene 8: Line distribution (where KPIs appear in the file)
-    if kpis:
-        line_nums = [k["line"] for k in kpis if k["line"] > 0]
-        if line_nums:
-            max_line = max(line_nums)
-            histogram = [0] * min(20, max_line + 1)
-            for ln in line_nums:
-                bucket = min(int(ln / max(max_line, 1) * 19), 19)
-                histogram[bucket] += 1
-            scenes.append({
-                "type": "histogram",
-                "title": "KPI DENSITY BY LINE",
-                "data": histogram,
-                "max_line": max_line,
-            })
+static std::string decision_json(const Decision& d, const Metrics& m) {
+    std::ostringstream os;
+    os << "{\n";
+    os << "  \"timestamp\": \"" << now_iso() << "\",\n";
+    os << "  \"action\": \"" << escape_json(d.action) << "\",\n";
+    os << "  \"candidate_id\": \"" << escape_json(d.candidate_id) << "\",\n";
+    os << "  \"asset_type\": \"" << escape_json(d.asset_type) << "\",\n";
+    os << "  \"reward\": " << std::fixed << std::setprecision(4) << d.reward << ",\n";
+    os << "  \"metric_window\": {\n";
+    os << "    \"active_candidate_id\": \"" << escape_json(m.active_candidate_id) << "\",\n";
+    os << "    \"views\": " << m.views << ",\n";
+    os << "    \"profile_clicks\": " << m.profile_clicks << ",\n";
+    os << "    \"email_clicks\": " << m.email_clicks << ",\n";
+    os << "    \"phone_clicks\": " << m.phone_clicks << ",\n";
+    os << "    \"booking_requests\": " << m.booking_requests << ",\n";
+    os << "    \"confirmed_bookings\": " << m.confirmed_bookings << ",\n";
+    os << "    \"gross_revenue_usd\": " << m.gross_revenue_usd << ",\n";
+    os << "    \"window_hours\": " << m.window_hours << "\n";
+    os << "  },\n";
+    os << "  \"reasons\": [";
+    for (size_t i = 0; i < d.reasons.size(); ++i) {
+        if (i) os << ", ";
+        os << "\"" << escape_json(d.reasons[i]) << "\"";
+    }
+    os << "],\n";
+    os << "  \"blockers\": [";
+    for (size_t i = 0; i < d.blockers.size(); ++i) {
+        if (i) os << ", ";
+        os << "\"" << escape_json(d.blockers[i]) << "\"";
+    }
+    os << "]\n";
+    os << "}\n";
+    return os.str();
+}
 
-    # Scene 9: Confidence heatmap (KPIs as grid)
-    if len(kpis) > 4:
-        grid_size = min(len(kpis), 24)
-        grid_w = 6
-        grid_h = (grid_size + grid_w - 1) // grid_w
-        grid = []
-        for i in range(grid_size):
-            k = kpis[i]
-            grid.append({"name": k["name"][:15], "confidence": k["confidence"], "category": k["category"]})
-        scenes.append({
-            "type": "heatmap",
-            "title": "KPI HEATMAP",
-            "grid": grid,
-            "grid_w": grid_w,
-            "grid_h": grid_h,
-        })
+static int preflight() {
+    std::vector<std::string> missing;
+    if (env_or_empty("RENTMASSEUR_USERNAME").empty()) missing.push_back("RENTMASSEUR_USERNAME");
+    if (env_or_empty("RENTMASSEUR_PASSWORD").empty()) missing.push_back("RENTMASSEUR_PASSWORD");
+    if (env_or_empty("REBRANDLY_LINK").empty()) missing.push_back("REBRANDLY_LINK");
 
-    # Scene 10: Closing
-    scenes.append({
-        "type": "closing",
-        "title": f"{len(kpis)} KPIs",
-        "subtitle": "JORKI KPI SCAN COMPLETE",
-        "info": f"{len(by_category)} categories  ·  {sum(1 for k in kpis if k['confidence'] >= 0.7)} high-confidence",
-    })
+    if (!missing.empty()) {
+        std::cerr << "PRELIGHT_BLOCKED: missing required secrets/env:";
+        for (const auto& m : missing) std::cerr << " " << m;
+        std::cerr << "\n";
+        return 2;
+    }
+    std::cout << "PREFLIGHT_OK: required live credentials/link env vars are present.\n";
+    return 0;
+}
 
-    if not scenes:
-        scenes.append({"type": "closing", "title": "No KPIs", "subtitle": "JORKI", "info": "empty"})
+} // namespace rm
 
-    fig, ax = plt.subplots(figsize=(10, 5.625), facecolor=BG)
-    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+int main(int argc, char** argv) {
+    try {
+        bool run_preflight = false;
+        bool run_evaluate = false;
+        std::string metrics_path = "content/live_metrics.json";
+        std::string candidates_path = "content/candidates.tsv";
+        std::string ledger_path = "content/experiment_ledger.jsonl";
+        std::string decision_path = "content/decisions/latest_decision.json";
 
-    def draw_frame(frame_idx):
-        ax.clear()
-        ax.set_xlim(0, 10)
-        ax.set_ylim(0, 5.625)
-        ax.set_facecolor(BG)
-        ax.axis("off")
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--preflight") run_preflight = true;
+            else if (a == "--evaluate") run_evaluate = true;
+            else if (a == "--metrics" && i + 1 < argc) metrics_path = argv[++i];
+            else if (a == "--candidates" && i + 1 < argc) candidates_path = argv[++i];
+            else if (a == "--ledger" && i + 1 < argc) ledger_path = argv[++i];
+            else if (a == "--decision" && i + 1 < argc) decision_path = argv[++i];
+        }
 
-        frames_per_scene = 18
-        scene_idx = frame_idx // frames_per_scene
-        local_frame = frame_idx % frames_per_scene
+        if (run_preflight) {
+            int rc = rm::preflight();
+            if (!run_evaluate) return rc;
+            if (rc != 0) return rc;
+        }
 
-        if scene_idx >= len(scenes):
-            scene_idx = scene_idx % len(scenes)
+        if (run_evaluate) {
+            if (!rm::file_exists(metrics_path)) {
+                std::cerr << "NO_REAL_METRICS: " << metrics_path << " does not exist. No decision made.\n";
+                return 3;
+            }
+            if (!rm::file_exists(candidates_path)) {
+                std::cerr << "NO_REAL_CANDIDATES: " << candidates_path << " does not exist. No decision made.\n";
+                return 4;
+            }
+            auto metrics = rm::load_metrics(metrics_path);
+            auto candidates = rm::load_candidates(candidates_path);
+            auto decision = rm::evaluate(metrics, candidates, rm::env_or_empty("REBRANDLY_LINK"));
+            auto body = rm::decision_json(decision, metrics);
+            rm::write_file(decision_path, body);
+            rm::append_file(ledger_path, body.substr(0, body.size() - 1) + "\n");
+            std::cout << body;
+            return 0;
+        }
 
-        scene = scenes[scene_idx]
-        stype = scene["type"]
+        std::cout << "usage: production_control_loop --preflight [--evaluate --metrics PATH --candidates PATH]\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "FATAL: " << e.what() << "\n";
+        return 1;
+    }
+}
 
-        if local_frame < 3:
-            alpha = local_frame / 3.0
-        elif local_frame > frames_per_scene - 3:
-            alpha = (frames_per_scene - local_frame) / 3.0
-        else:
-            alpha = 1.0
+```
 
-        if stype == "title":
-            ax.text(5, 3.8, scene["title"], ha="center", va="center",
-                    fontsize=24, color=ORANGE, fontweight="bold", alpha=alpha, fontfamily="monospace")
-            ax.text(5, 2.8, scene["subtitle"], ha="center", va="center",
-                    fontsize=14, color=GREEN, alpha=alpha, fontfamily="monospace")
-            ax.text(5, 2.0, scene["info"], ha="center", va="center",
-                    fontsize=10, color=DIM, alpha=alpha * 0.7, fontfamily="monospace")
-            ax.plot([2, 8], [2.4, 2.4], color=ORANGE, linewidth=0.5, alpha=alpha * 0.3)
+settings_page.png:
+```
+Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
+```
 
-        elif stype == "donut":
-            ax.text(0.5, 5.0, scene["title"], fontsize=14, color=ORANGE,
-                    fontweight="bold", alpha=alpha, fontfamily="monospace")
+docker-compose.yml:
+```
+version: "3.8"
+
+services:
+  optimizer:
+    build:
+      context: .
+      dockerfile: Dockerfile.daemon
+    container_name: rentmasseur-optimizer
+    ports:
+      - "7860:7860"
+    environment:
+      - RM_USERNAME=${RM_USERNAME}
+      - RM_PASSWORD=${RM_PASSWORD}
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - SPACE_NAME=${SPACE_NAME:-rentmasseur-optimizer}
+      - BACKFILL_VIEWS_DAILY=0
+      - DAEMON_INTERVAL=60
+      - TRAFFIC_CYCLE_MINUTES=5
+      - DAILY_PROMOTION_HOUR=6
+    volumes:
+      - ./content:/app/content
+      - ./logs:/app/logs
+      - rm_chrome_profile:/tmp/rm_traffic_chrome
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:7860/api/health', timeout=10)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  rm_chrome_profile:
+
+```
+
+rm_proof.py:
+```
+#!/usr/bin/env python3
+"""
+Zero-Knowledge Screenshot Verification System
+
+Proves that a visit happened at a specific moment by:
+1. Capturing a screenshot at the exact time of visit
+2. Embedding timestamp + URL + session metadata into the image (visible overlay + EXIF)
+3. Computing a SHA-256 hash of (screenshot bytes + metadata + page content hash)
+4. Chaining each screenshot hash to the previous one (tamper-evident chain)
+5. Writing a receipt with: screenshot hash, previous hash, timestamp, URL, page hash, API data
+6. Verification function checks: hash matches file, chain is unbroken, timestamp matches,
+   page hash matches extracted text, API data is present
+
+The screenshot itself is the proof. The hash chain prevents replay or insertion.
+The verifier never needs to see the full screenshot — only the hash + metadata.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import struct
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+
+PROOF_DIR = Path("artifacts/proofs")
+SCREENSHOT_DIR = PROOF_DIR / "screenshots"
+CHAIN_FILE = PROOF_DIR / "chain.jsonl"
+RECEIPT_DIR = Path("receipts")
+
+for d in (PROOF_DIR, SCREENSHOT_DIR, RECEIPT_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def now_compact() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+
+
+def compute_page_hash(page_text: str) -> str:
+    """SHA-256 of the visible page text at time of capture."""
+    return hashlib.sha256(page_text.encode("utf-8")).hexdigest()
+
+
+def compute_screenshot_hash(image_bytes: bytes, metadata: dict) -> str:
+    """SHA-256 of image bytes + canonical metadata. This is the proof hash."""
+    meta_json = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    combined = image_bytes + meta_json.encode("utf-8")
+    return hashlib.sha256(combined).hexdigest()
+
+
+def get_last_chain_hash() -> str:
+    """Read the last hash from the chain file. Returns 'genesis' if empty."""
+    if not CHAIN_FILE.exists():
+        return "genesis"
+    lines = CHAIN_FILE.read_text().strip().split("\n")
+    if not lines or not lines[0]:
+        return "genesis"
+    last = json.loads(lines[-1])
+    return last.get("proof_hash", "genesis")
+
+
+def embed_timestamp_overlay(image_path: Path, metadata: dict) -> bytes:
+    """Overlay timestamp + URL + session onto the image. Return new image bytes."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        img = Image.open(str(image_path))
+        draw = ImageDraw.Draw(img)
+
+        ts = metadata.get("timestamp", "")
+        url = metadata.get("url", "")
+        session = metadata.get("session_id", "")
+        page_hash = metadata.get("page_hash", "")[:16]
+        prev_hash = metadata.get("previous_hash", "")[:16]
+
+        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 18) if Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf").exists() else ImageFont.load_default()
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14) if Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf").exists() else ImageFont.load_default()
+
+        bar_height = 80
+        draw.rectangle([(0, img.height - bar_height), (img.width, img.height)], fill=(0, 0, 0, 220))
+
+        y = img.height - bar_height + 5
+        draw.text((10, y), f"PROOF: {metadata.get('proof_hash', '')[:32]}", fill="#00ff00", font=font_small)
+        y += 16
+        draw.text((10, y), f"TIME: {ts}", fill="#ffffff", font=font_large)
+        y += 20
+        draw.text((10, y), f"URL: {url[:80]}", fill="#00f5ff", font=font_small)
+        y += 16
+        draw.text((10, y), f"SESSION: {session}  PAGE_HASH: {page_hash}  PREV: {prev_hash}", fill="#888888", font=font_small)
+
+        import io as _io

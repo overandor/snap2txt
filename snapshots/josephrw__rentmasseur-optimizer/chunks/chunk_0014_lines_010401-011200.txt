@@ -1,10 +1,234 @@
-            logger.info("Run #%d completed successfully", run_count)
-        else:
-            logger.error("Run #%d failed", run_count)
+    return t
 
-        sleep_seconds = args.interval * 60
-        logger.info("Sleeping for %d minutes...", args.interval)
-        time.sleep(sleep_seconds)
+
+# ---------------------------------------------------------------------------
+# Traffic engine integration
+# ---------------------------------------------------------------------------
+
+def run_traffic_cycle() -> dict:
+    """Run one rm_traffic engine cycle."""
+    if not module_available("rm_traffic.engine"):
+        return {"status": "skipped", "reason": "rm_traffic.engine not installed"}
+    if not Config.username or not Config.password:
+        return {"status": "skipped", "reason": "RM_USERNAME/RM_PASSWORD not set"}
+
+    try:
+        sys.path.insert(0, str(APP_DIR))
+        from rm_traffic.engine import run_cycle
+        result = run_cycle()
+        return {"status": "success", "result": result}
+    except Exception as e:
+        log.error("Traffic cycle failed: %s", e)
+        return {"status": "error", "error": str(e), "trace": traceback.format_exc()}
+
+
+# ---------------------------------------------------------------------------
+# Daily promotion
+# ---------------------------------------------------------------------------
+
+def run_daily_promotion() -> dict:
+    """Generate daily evidence packet and ingest metrics."""
+    script = APP_DIR / "daily_promotion.py"
+    if not script.exists():
+        return {"status": "skipped", "reason": "daily_promotion.py not found"}
+
+    code, out, err = run_subprocess([sys.executable, str(script)])
+    return {
+        "status": "success" if code == 0 else "error",
+        "exit_code": code,
+        "stdout": out[-2000:],
+        "stderr": err[-2000:],
+    }
+
+
+# ---------------------------------------------------------------------------
+# View backfill
+# ---------------------------------------------------------------------------
+
+def run_view_backfill() -> dict:
+    """Backfill missing profile views."""
+    script = APP_DIR / "backfill_views.py"
+    if not script.exists():
+        return {"status": "skipped", "reason": "backfill_views.py not found"}
+
+    code, out, err = run_subprocess([sys.executable, str(script)], timeout=7200)
+    return {
+        "status": "success" if code == 0 else "error",
+        "exit_code": code,
+        "stdout": out[-2000:],
+        "stderr": err[-2000:],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Bio merge / data maintenance
+# ---------------------------------------------------------------------------
+
+def run_bio_merge() -> dict:
+    """Merge bios with views if merge script exists."""
+    script = APP_DIR / "merge_bios.py"
+    if not script.exists():
+        return {"status": "skipped", "reason": "merge_bios.py not found"}
+
+    code, out, err = run_subprocess([sys.executable, str(script)])
+    return {
+        "status": "success" if code == 0 else "error",
+        "exit_code": code,
+        "stdout": out[-2000:],
+        "stderr": err[-2000:],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Health / status
+# ---------------------------------------------------------------------------
+
+def write_daemon_state(state: dict):
+    state_path = APP_DIR / "content" / "daemon_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, indent=2, default=str))
+
+
+def get_health() -> dict:
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "space": Config.hf_space,
+        "subsystems": {
+            "rm_traffic.engine": module_available("rm_traffic.engine"),
+            "rm_revenue_engine.revenue_ops": module_available("rm_revenue_engine.revenue_ops"),
+            "server": True,
+        },
+        "credentials_set": bool(Config.username and Config.password),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+class Scheduler:
+    def __init__(self):
+        self.last_traffic: Optional[float] = None
+        self.last_daily_promotion: Optional[str] = None
+        self.last_view_backfill: Optional[str] = None
+        self.last_bio_merge: Optional[str] = None
+        self.history: list[dict] = []
+
+    def should_run_traffic(self) -> bool:
+        if self.last_traffic is None:
+            return True
+        return (time.time() - self.last_traffic) >= Config.traffic_cycle_minutes * 60
+
+    def should_run_daily_promotion(self) -> bool:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        now_hour = datetime.now(timezone.utc).hour
+        return today != self.last_daily_promotion and now_hour >= Config.daily_promotion_hour
+
+    def should_run_view_backfill(self) -> bool:
+        if not Config.backfill_views_daily:
+            return False
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return today != self.last_view_backfill
+
+    def should_run_bio_merge(self) -> bool:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return today != self.last_bio_merge
+
+    def record(self, name: str, result: dict):
+        entry = {
+            "name": name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "result": result,
+        }
+        self.history.append(entry)
+        if len(self.history) > 1000:
+            self.history = self.history[-1000:]
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def run_once(scheduler: Scheduler) -> dict:
+    results = {}
+
+    if scheduler.should_run_bio_merge():
+        log.info("Running bio merge")
+        results["bio_merge"] = run_bio_merge()
+        if results["bio_merge"]["status"] != "error":
+            scheduler.last_bio_merge = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        scheduler.record("bio_merge", results["bio_merge"])
+
+    if scheduler.should_run_view_backfill():
+        log.info("Running view backfill")
+        results["view_backfill"] = run_view_backfill()
+        if results["view_backfill"]["status"] != "error":
+            scheduler.last_view_backfill = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        scheduler.record("view_backfill", results["view_backfill"])
+
+    if scheduler.should_run_traffic():
+        log.info("Running traffic cycle")
+        results["traffic_cycle"] = run_traffic_cycle()
+        if results["traffic_cycle"]["status"] != "error":
+            scheduler.last_traffic = time.time()
+        scheduler.record("traffic_cycle", results["traffic_cycle"])
+
+    if scheduler.should_run_daily_promotion():
+        log.info("Running daily promotion")
+        results["daily_promotion"] = run_daily_promotion()
+        if results["daily_promotion"]["status"] != "error":
+            scheduler.last_daily_promotion = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        scheduler.record("daily_promotion", results["daily_promotion"])
+
+    state = {
+        "last_run": datetime.now(timezone.utc).isoformat(),
+        "health": get_health(),
+        "scheduler": {
+            "last_traffic": scheduler.last_traffic,
+            "last_daily_promotion": scheduler.last_daily_promotion,
+            "last_view_backfill": scheduler.last_view_backfill,
+            "last_bio_merge": scheduler.last_bio_merge,
+        },
+        "latest_results": results,
+        "history_tail": scheduler.history[-10:],
+    }
+    write_daemon_state(state)
+    return results
+
+
+def main():
+    ap = argparse.ArgumentParser(description="RentMasseur Optimizer Daemon")
+    ap.add_argument("--once", action="store_true", help="Run one cycle and exit")
+    ap.add_argument("--server-only", action="store_true", help="Only run the FastAPI server")
+    ap.add_argument("--host", default="0.0.0.0", help="Server host")
+    ap.add_argument("--port", type=int, default=7860, help="Server port")
+    args = ap.parse_args()
+
+    if args.server_only:
+        run_server(args.host, args.port)
+        return
+
+    log.info("RentMasseur Optimizer Daemon starting")
+    log.info("Health: %s", get_health())
+
+    # Start FastAPI server in background thread
+    server_thread = start_server_thread(args.host, args.port)
+    time.sleep(2)  # give server a moment to bind
+
+    scheduler = Scheduler()
+
+    if args.once:
+        log.info("Running one daemon cycle")
+        run_once(scheduler)
+        return
+
+    log.info("Entering main loop (interval=%ds)", Config.interval)
+    while True:
+        try:
+            run_once(scheduler)
+        except Exception as e:
+            log.error("Main loop error: %s\n%s", e, traceback.format_exc())
+        time.sleep(Config.interval)
 
 
 if __name__ == "__main__":
@@ -12,789 +236,565 @@ if __name__ == "__main__":
 
 ```
 
-profile_page.png:
+test_py.py:
+```
+import sys
+print(f"python {sys.version}")
+with open("/Users/alep/Downloads/02_AI_Agents/rentmasseur-extension/testfile.txt", "w") as f:
+    f.write("hello")
+
+```
+
+ga_rl_optimizer.cpp:
+```
+/*
+ * GA + RL Revenue Optimizer — C++ Native
+ * High-performance genetic algorithm + reinforcement learning for
+ * RentMasseur revenue maximization ($300/day target).
+ *
+ * Build: g++ -O3 -std=c++17 -o ga_rl_optimizer ga_rl_optimizer.cpp
+ * Run:   ./ga_rl_optimizer
+ *        ./ga_rl_optimizer --population 20 --generations 10 --target 300
+ *        ./ga_rl_optimizer --report
+ */
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <algorithm>
+#include <random>
+#include <chrono>
+#include <ctime>
+#include <cmath>
+#include <cstdlib>
+
+struct AccountConfig {
+    std::string id;
+    std::string bio;
+    int price;
+    std::string photo_style;
+    std::string cta;
+    std::string headline;
+    double fitness;
+    double revenue_estimate;
+    double reward;
+    int generation;
+    int uses;
+};
+
+struct GAState {
+    std::vector<AccountConfig> population;
+    int generation;
+    AccountConfig best_config;
+    double best_fitness;
+    double best_revenue;
+    std::vector<std::map<std::string, double>> history;
+};
+
+const double AVG_SESSION_PRICE = 200.0;
+const double CALL_CONVERSION_RATE = 0.20;
+const double VIEW_TO_CLICK_RATE = 0.05;
+const double BOOKING_CLOSE_RATE = 0.40;
+const double REVENUE_TARGET = 300.0;
+
+std::vector<std::string> CTAS = {
+    "Call me now to book your session",
+    "Pick up the phone and call today",
+    "Text or call — I'm available now",
+    "Don't wait — call me right now",
+    "Book now: your body will thank you",
+    "Call today for same-day availability",
+};
+
+std::vector<std::string> HEADLINES = {
+    "Elite Male Masseur in Manhattan",
+    "Your Private Massage Therapist in NYC",
+    "Deep Tissue & Sensory Massage by Request",
+    "Manhattan's Most Sought-After Masseur",
+    "Therapeutic Touch in the Heart of NYC",
+    "Late-Night Relief Available Now",
+    "Premium In-Home Massage Experience",
+    "The Masseur Who Actually Listens",
+};
+
+std::vector<std::string> PHOTO_STYLES = {
+    "professional", "casual", "athletic", "luxury", "mystery", "warm",
+};
+
+std::vector<int> PRICES = {120, 150, 180, 200, 220, 250, 280, 300};
+
+std::mt19937 rng;
+
+static std::string iso_timestamp() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+    return std::string(buf);
+}
+
+static std::string read_file(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return "";
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static void write_file(const std::string& path, const std::string& content) {
+    std::ofstream f(path);
+    if (f) f << content;
+}
+
+static double random_double() {
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    return dist(rng);
+}
+
+static int random_int(int min, int max) {
+    std::uniform_int_distribution<int> dist(min, max);
+    return dist(rng);
+}
+
+static double calculate_revenue_estimate(const std::map<std::string, int>& stats, int price) {
+    double views = stats.count("views") ? stats.at("views") : 0;
+    double phone_clicks = stats.count("phone_clicks") ? stats.at("phone_clicks") : 0;
+    double email_clicks = stats.count("email_clicks") ? stats.at("email_clicks") : 0;
+    double booking_inquiries = stats.count("booking_inquiries") ? stats.at("booking_inquiries") : 0;
+    double messages = stats.count("messages") ? stats.at("messages") : 0;
+
+    double price_factor = 1.0 - ((price - 200) / 1000.0);
+    phone_clicks *= price_factor;
+    booking_inquiries *= price_factor;
+
+    double view_revenue = views * VIEW_TO_CLICK_RATE * AVG_SESSION_PRICE;
+    double call_revenue = phone_clicks * CALL_CONVERSION_RATE * AVG_SESSION_PRICE;
+    double inquiry_revenue = booking_inquiries * BOOKING_CLOSE_RATE * AVG_SESSION_PRICE;
+    double message_revenue = messages * 0.10 * AVG_SESSION_PRICE;
+    double email_revenue = email_clicks * 0.05 * AVG_SESSION_PRICE;
+
+    return view_revenue + call_revenue + inquiry_revenue + message_revenue + email_revenue;
+}
+
+static double calculate_fitness(const std::map<std::string, int>& stats, double revenue, double target) {
+    double reward = 0;
+    reward += (stats.count("views") ? stats.at("views") : 0) * 1;
+    reward += (stats.count("email_clicks") ? stats.at("email_clicks") : 0) * 5;
+    reward += (stats.count("phone_clicks") ? stats.at("phone_clicks") : 0) * 10;
+    reward += (stats.count("booking_inquiries") ? stats.at("booking_inquiries") : 0) * 50;
+    reward += (stats.count("favorites") ? stats.at("favorites") : 0) * 3;
+    reward += (stats.count("messages") ? stats.at("messages") : 0) * 8;
+
+    double target_bonus = std::max(0.0, std::min(100.0, (revenue / target) * 100.0));
+    double target_penalty = std::abs(target - revenue) * 0.1;
+
+    return reward + target_bonus - target_penalty;
+}
+
+static AccountConfig create_random_config(int generation) {
+    AccountConfig c;
+    c.id = "cfg_" + iso_timestamp() + "_" + std::to_string(random_int(1000, 9999));
+    c.bio = "[Generated bio placeholder — C++ version uses static templates; call Python LLM for real bio]";
+    c.price = PRICES[random_int(0, PRICES.size() - 1)];
+    c.photo_style = PHOTO_STYLES[random_int(0, PHOTO_STYLES.size() - 1)];
+    c.cta = CTAS[random_int(0, CTAS.size() - 1)];
+    c.headline = HEADLINES[random_int(0, HEADLINES.size() - 1)];
+    c.fitness = 0;
+    c.revenue_estimate = 0;
+    c.reward = 0;
+    c.generation = generation;
+    c.uses = 0;
+    return c;
+}
+
+static AccountConfig mutate_config(const AccountConfig& parent, int generation) {
+    AccountConfig c = parent;
+    c.id = "cfg_" + iso_timestamp() + "_" + std::to_string(random_int(1000, 9999));
+
+    if (random_double() < 0.5) {
+        c.price = std::max(80, std::min(500, c.price + random_int(-30, 50)));
+    }
+    if (random_double() < 0.3) {
+        c.cta = CTAS[random_int(0, CTAS.size() - 1)];
+    }
+    if (random_double() < 0.3) {
+        c.headline = HEADLINES[random_int(0, HEADLINES.size() - 1)];
+    }
+    if (random_double() < 0.3) {
+        c.photo_style = PHOTO_STYLES[random_int(0, PHOTO_STYLES.size() - 1)];
+    }
+    c.generation = generation;
+    return c;
+}
+
+static AccountConfig crossover(const AccountConfig& p1, const AccountConfig& p2) {
+    AccountConfig c;
+    c.id = "cfg_" + iso_timestamp() + "_" + std::to_string(random_int(1000, 9999));
+    c.bio = random_double() > 0.5 ? p1.bio : p2.bio;
+    c.price = random_double() > 0.5 ? p1.price : p2.price;
+    c.photo_style = random_double() > 0.5 ? p1.photo_style : p2.photo_style;
+    c.cta = random_double() > 0.5 ? p1.cta : p2.cta;
+    c.headline = random_double() > 0.5 ? p1.headline : p2.headline;
+    c.fitness = 0;
+    c.revenue_estimate = 0;
+    c.reward = 0;
+    c.generation = std::max(p1.generation, p2.generation) + 1;
+    c.uses = 0;
+    return c;
+}
+
+static std::map<std::string, int> get_default_stats() {
+    return {
+        {"views", 0}, {"email_clicks", 0}, {"phone_clicks", 0},
+        {"booking_inquiries", 0}, {"messages", 0}, {"favorites", 0},
+    };
+}
+
+static std::vector<AccountConfig> evaluate_population(std::vector<AccountConfig>& pop, const std::map<std::string, int>& stats, double target) {
+    for (auto& c : pop) {
+        c.revenue_estimate = calculate_revenue_estimate(stats, c.price);
+        c.fitness = calculate_fitness(stats, c.revenue_estimate, target);
+    }
+    std::sort(pop.begin(), pop.end(), [](const auto& a, const auto& b) { return a.fitness > b.fitness; });
+    return pop;
+}
+
+static void print_report(const GAState& state) {
+    std::cout << "=" << std::string(60, '=') << "\n";
+    std::cout << "GA + RL C++ REVENUE OPTIMIZER REPORT\n";
+    std::cout << "=" << std::string(60, '=') << "\n";
+    std::cout << "Generation: " << state.generation << "\n";
+    std::cout << "Best fitness: " << state.best_fitness << "\n";
+    std::cout << "Best revenue: $" << state.best_revenue << "\n";
+    std::cout << "Target: $" << REVENUE_TARGET << "\n";
+    if (!state.best_config.id.empty()) {
+        std::cout << "\nBest config:\n";
+        std::cout << "  ID: " << state.best_config.id << "\n";
+        std::cout << "  Price: $" << state.best_config.price << "\n";
+        std::cout << "  CTA: " << state.best_config.cta << "\n";
+        std::cout << "  Headline: " << state.best_config.headline << "\n";
+        std::cout << "  Photo: " << state.best_config.photo_style << "\n";
+    }
+}
+
+static GAState evolve(int population_size, int generations, double target) {
+    GAState state;
+    state.generation = 0;
+    state.best_fitness = 0;
+    state.best_revenue = 0;
+
+    std::map<std::string, int> stats = get_default_stats();
+
+    // Initialize population
+    for (int i = 0; i < population_size; i++) {
+        state.population.push_back(create_random_config(0));
+    }
+
+    for (int gen = 1; gen <= generations; gen++) {
+        std::cout << "=== Generation " << gen << " ===\n";
+        evaluate_population(state.population, stats, target);
+
+        std::cout << "Best fitness: " << state.population[0].fitness
+                  << ", revenue: $" << state.population[0].revenue_estimate << "\n";
+
+        if (state.population[0].fitness > state.best_fitness) {
+            state.best_fitness = state.population[0].fitness;
+            state.best_revenue = state.population[0].revenue_estimate;
+            state.best_config = state.population[0];
+        }
+
+        state.generation = gen;
+
+        std::map<std::string, double> h;
+        h["generation"] = gen;
+        h["best_fitness"] = state.population[0].fitness;
+        h["best_revenue"] = state.population[0].revenue_estimate;
+        state.history.push_back(h);
+
+        // Selection + crossover + mutation
+        std::vector<AccountConfig> new_pop;
+        new_pop.push_back(state.population[0]);  // Elitism
+        new_pop.push_back(state.population[1]);
+
+        while ((int)new_pop.size() < population_size) {
+            const auto& p1 = state.population[random_int(0, state.population.size() / 2)];
+            const auto& p2 = state.population[random_int(0, state.population.size() / 2)];
+            auto child = crossover(p1, p2);
+            child = mutate_config(child, gen);
+            new_pop.push_back(child);
+        }
+
+        state.population = new_pop;
+    }
+
+    return state;
+}
+
+int main(int argc, char* argv[]) {
+    rng.seed(std::random_device()());
+
+    int population_size = 12;
+    int generations = 5;
+    double target = REVENUE_TARGET;
+    bool report = false;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--population" && i + 1 < argc) population_size = std::atoi(argv[++i]);
+        else if (arg == "--generations" && i + 1 < argc) generations = std::atoi(argv[++i]);
+        else if (arg == "--target" && i + 1 < argc) target = std::atof(argv[++i]);
+        else if (arg == "--report") report = true;
+        else if (arg == "--help") {
+            std::cout << "Usage: ga_rl_optimizer [options]\n"
+                      << "  --population N    Population size\n"
+                      << "  --generations N   Number of generations\n"
+                      << "  --target X        Revenue target\n"
+                      << "  --report          Show report\n";
+            return 0;
+        }
+    }
+
+    if (report) {
+        GAState state;
+        print_report(state);
+        return 0;
+    }
+
+    auto state = evolve(population_size, generations, target);
+    print_report(state);
+
+    if (state.best_revenue >= target * 0.5) {
+        std::cout << "\nWinning config reaches target. Apply with Python ga_rl_optimizer.py --apply-winner\n";
+    } else {
+        std::cout << "\nNo config reached target threshold. Continue evolving.\n";
+    }
+
+    return 0;
+}
+
+```
+
+profile_debug.png:
 ```
 Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
 ```
 
-rotator_engine:
+deploy_bio_experiment.py:
 ```
-version https://git-lfs.github.com/spec/v1
-oid sha256:87fc4144612bbb9dbc3cf92c9fdd558f701d0a29bc4a2e9b713ec9c2554b15b1
-size 106448
+#!/usr/bin/env python3
+"""One-time manual bio deployment for controlled experiment 001.
+
+Usage:
+    python3 deploy_bio_experiment.py --bio controlled_wolf_v1 --dry-run
+    python3 deploy_bio_experiment.py --bio controlled_wolf_v1
+
+This is NOT a scheduled automation. It is a one-time manual deployment
+of an approved candidate bio for a controlled experiment.
+"""
+import argparse
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+BIOS_DIR = os.path.join(CONTENT_DIR, "bios")
+EXPERIMENTS_DIR = os.path.join(CONTENT_DIR, "experiments")
+RECEIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
+
+
+def load_bio(bio_id: str) -> str:
+    path = os.path.join(BIOS_DIR, f"{bio_id}.md")
+    if not os.path.exists(path):
+        logger.error(f"Bio file not found: {path}")
+        sys.exit(1)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def load_experiment(exp_id: str) -> dict:
+    path = os.path.join(EXPERIMENTS_DIR, f"{exp_id}.json")
+    if not os.path.exists(path):
+        logger.error(f"Experiment file not found: {path}")
+        sys.exit(1)
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def write_receipt(bio_id: str, experiment_id: str, success: bool, notes: str = ""):
+    os.makedirs(RECEIPTS_DIR, exist_ok=True)
+    ts = datetime.now(timezone.utc).isoformat()
+    receipt = {
+        "action": "bio_deploy",
+        "bio_id": bio_id,
+        "experiment_id": experiment_id,
+        "success": success,
+        "timestamp": ts,
+        "notes": notes,
+    }
+    path = os.path.join(RECEIPTS_DIR, f"deploy_{bio_id}_{ts.replace(':', '-')}.json")
+    with open(path, "w") as f:
+        json.dump(receipt, f, indent=2)
+    logger.info(f"Receipt written: {path}")
+    return path
+
+
+def deploy_bio(bio_text: str, headless: bool = False) -> bool:
+    """Log in and update the profile bio on RentMasseur via Selenium."""
+    from rentmasseur_core import setup_driver, login, update_bio, save_bio_field
+
+    driver = setup_driver(headless=headless)
+    try:
+        if not login(driver):
+            logger.error("Login failed - cannot deploy bio")
+            return False
+
+        logger.info("Login successful, locating bio field...")
+        result = update_bio(driver, "")
+        if result is None or (isinstance(result, dict) and result.get("error")):
+            logger.error("Could not find bio field on profile settings")
+            return False
+
+        field_info, current_bio = result
+        logger.info(f"Current bio preview: {current_bio[:80]}...")
+
+        saved = save_bio_field(driver, field_info, bio_text)
+        if saved:
+            logger.info("Bio deployed successfully!")
+            return True
+        else:
+            logger.error("Failed to save bio")
+            return False
+    finally:
+        driver.quit()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="One-time manual bio deployment for controlled experiment")
+    parser.add_argument("--bio", required=True, help="Bio ID (e.g. controlled_wolf_v1)")
+    parser.add_argument("--experiment", default="exp_001_targeted_wolf", help="Experiment ID")
+    parser.add_argument("--dry-run", action="store_true", help="Show bio without updating profile")
+    parser.add_argument("--headless", default="false", help="Run headless (true/false)")
+    args = parser.parse_args()
+
+    bio_text = load_bio(args.bio)
+    exp = load_experiment(args.experiment)
+
+    print(f"\n{'='*60}")
+    print(f"EXPERIMENT: {exp['experiment_id']}")
+    print(f"BIO ID: {args.bio}")
+    print(f"VARIABLE: {exp['variable']}")
+    print(f"FROZEN: photos={exp['photos_frozen']} price={exp['price_frozen']} services={exp['services_frozen']} availability={exp['availability_frozen']}")
+    print(f"BIO LENGTH: {len(bio_text)} chars")
+    print(f"{'='*60}")
+    print(bio_text)
+    print(f"{'='*60}\n")
+
+    if args.dry_run:
+        logger.info("Dry run - not updating profile")
+        write_receipt(args.bio, args.experiment, False, "dry_run_only")
+        return
+
+    headless = args.headless.lower() == "true"
+    success = deploy_bio(bio_text, headless=headless)
+    write_receipt(args.bio, args.experiment, success, "manual_deploy" if success else "deploy_failed")
+
+    if success:
+        print("\nBio deployed. Now:")
+        print("1. Freeze all other profile variables (photos, prices, services)")
+        print("2. Wait 24-48 hours or 100+ new profile views")
+        print("3. Capture after-snapshot metrics")
+        print("4. POST to /api/metrics/ingest with after data")
+        print("5. Check /api/decision/latest for verdict")
+    else:
+        print("\nDeploy failed. Check logs above.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
 
 ```
 
-hf_space_app.py:
+price_rotator.py:
 ```
-"""SystemLake Underwriter — Privacy-Preserving Code Evaluation Gateway.
+#!/usr/bin/env python3
+"""Price rotator — dynamically changes prices on RentMasseur profile.
 
-The actual product: User uploads files → system crawls + hashes + redacts →
-sends only a metadata cognition packet to GPT → GPT evaluates →
-returns verdict + receipt. Raw files never leave the user's control.
+Rotates prices based on time of day, day of week, demand signals, and RL feedback.
+Prices are liquid — they change constantly to maximize bookings and revenue.
 
-Pipeline:
-    Upload → Extract → Crawl → Hash → Merkle Root → Detect Systems →
-    Score Collateral → Redact (strip source, keep metadata) →
-    Build Cognition Packet → Send to LLM → Get Evaluation →
-    Write Receipt → Return Verdict
-
-What goes to GPT (cognition packet):
-    - File hashes (SHA-256), sizes, extensions, categories
-    - Merkle root
-    - System detection results (has_git, has_tests, has_endpoints)
-    - Collateral scores (10 dimensions)
-    - Risk register with classifications
-    - Verification results
-    - Capabilities summary
-
-What does NOT go to GPT:
-    - Source code content
-    - File names containing secrets
-    - .env, .ssh, keys, wallets, credentials
-    - Binary file contents
-    - Any file content at all — only metadata
-
-Endpoints:
-    GET  /              — Upload UI
-    POST /upload        — Upload a zip/tar of your repo
-    GET  /result/{id}   — Get evaluation result + receipt
-    GET  /result/{id}/packet — Get cognition packet only
-    GET  /result/{id}/evaluation — Get LLM evaluation only
-    GET  /result/{id}/receipt — Get receipt only
-    GET  /health        — Health check
-    GET  /telemetry     — Pre-baked telemetry (existing audit)
+Usage:
+    python3 price_rotator.py                    # rotate to optimal price now
+    python3 price_rotator.py --dry-run          # show calculated price without updating
+    python3 price_rotator.py --report           # show price history
 """
 
-import os
+import argparse
 import json
-import hashlib
-import zipfile
-import tarfile
-import shutil
-import threading
-import uuid
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-from pathlib import Path as _Path
+import os
+import sys
+import time
+import random
+import logging
+from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Body
-from fastapi.responses import HTMLResponse, PlainTextResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
 
-# ─── Configuration ──────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 
-# Auto-load .env if present (local dev)
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-if os.path.exists(_env_path):
-    with open(_env_path) as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _k, _v = _line.split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip())
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
 
-DATA_DIR = os.environ.get("SYSTEMLAKE_DATA_DIR", "/app/audit_data")
-UPLOAD_DIR = os.environ.get("SYSTEMLAKE_UPLOAD_DIR", "/tmp/systemlake_uploads")
-RESULTS_DIR = os.environ.get("SYSTEMLAKE_RESULTS_DIR", "/tmp/systemlake_results")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-PORT = int(os.environ.get("PORT", 7860))
+RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+RENTMASSEUR_PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+PRICE_STATE_PATH = os.path.join(CONTENT_DIR, "price_state.json")
+PROFILE_RATES_URL = "https://rentmasseur.com/settings/rates"
 
-# ─── Denied file patterns (never hashed, never indexed, never sent) ─────
-
-DENIED_PATTERNS = [
-    '.env', '.env.', '.ssh', '.aws', '.npmrc', '.pypirc',
-    'id_rsa', 'id_ed25519', 'id_ecdsa',
-    '.key', '.pem', '.crt', '.pfx', '.p12',
-    'credentials', 'secrets', 'wallet', 'keystore',
-    '.keystore', '.keychain', 'Keychains',
-    '.gnupg', '.gpg',
+PRICE_STRATEGIES = [
+    {"name": "premium_peak", "desc": "High price peak hours", "base": 250, "variance": 30},
+    {"name": "off_peak_deal", "desc": "Off-peak discount", "base": 180, "variance": 20},
+    {"name": "new_client_special", "desc": "First-time client", "base": 150, "variance": 15},
+    {"name": "loyalty_rate", "desc": "Returning client", "base": 200, "variance": 10},
+    {"name": "late_night_premium", "desc": "After-hours premium", "base": 300, "variance": 50},
+    {"name": "lunch_express", "desc": "Quick lunch special", "base": 120, "variance": 10},
+    {"name": "weekend_warrior", "desc": "Weekend athletic recovery", "base": 220, "variance": 25},
+    {"name": "holiday_special", "desc": "Seasonal rate", "base": 200, "variance": 40},
+    {"name": "last_minute", "desc": "Same-day booking discount", "base": 170, "variance": 15},
+    {"name": "package_deal", "desc": "Multi-session package", "base": 190, "variance": 20},
 ]
 
-DENIED_EXTENSIONS = {
-    '.env', '.key', '.pem', '.crt', '.pfx', '.p12', '.keystore',
-    '.jks', '.gpg', '.pgp',
-}
 
-EXCLUDE_DIRS = {
-    '__pycache__', '.git', 'node_modules', '.venv', 'venv',
-    '.pytest_cache', '.mypy_cache', '.cache', '.npm',
-    'dist', 'build', 'target', '.next', '.nuxt',
-    '.gradle', '.m2', '.cargo', '.rustup',
-    '.vscode', '.cursor', '.windsurf', '.idea',
-}
-
-# ─── Data Loading (for pre-baked telemetry) ─────────────────────────────
-
-def _load_json(filename: str) -> Optional[dict]:
-    path = os.path.join(DATA_DIR, filename)
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
-    return None
-
-def _load_text(filename: str) -> Optional[str]:
-    path = os.path.join(DATA_DIR, filename)
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return f.read()
-    return None
-
-def _load_all() -> dict:
-    return {
-        "systems": _load_json("systems.json"),
-        "scores": _load_json("underwriting_scores.json"),
-        "risks": _load_json("risk_register.json"),
-        "borrowing": _load_json("borrowing_base.json"),
-        "verification": _load_json("verification_results.json"),
-        "merkle": _load_json("merkle_root.json"),
-        "manifest": _load_json("machine_manifest.json"),
-        "receipt": _load_json("receipt.json"),
-        "focus": _load_json("focus_packet.json"),
-        "memo": _load_text("underwriting_memo.md"),
-    }
-
-# ─── Redaction Layer ────────────────────────────────────────────────────
-
-def _is_denied(filename: str) -> bool:
-    lower = filename.lower()
-    for ext in DENIED_EXTENSIONS:
-        if lower.endswith(ext):
-            return True
-    for pattern in DENIED_PATTERNS:
-        if pattern in lower:
-            return True
-    return False
-
-def _compute_merkle_root(hashes: List[str]) -> str:
-    if not hashes:
-        return None
-    leaves = [hashlib.sha256(h.encode()).hexdigest() for h in hashes]
-    while len(leaves) > 1:
-        if len(leaves) % 2 != 0:
-            leaves.append(leaves[-1])
-        leaves = [hashlib.sha256((leaves[i] + leaves[i+1]).encode()).hexdigest()
-                  for i in range(0, len(leaves), 2)]
-    return leaves[0]
-
-def _build_cognition_packet(extracted_dir: str) -> dict:
-    """Crawl extracted files and build a REDACTED cognition packet.
-    Contains NO source code, NO file content. Only hashes, sizes, structure.
-    """
-    packet = {
-        "schema": "membra.systemlake.cognition_packet.v1",
-        "created_at": datetime.now().isoformat(),
-        "files": [],
-        "systems": [],
-        "stats": {
-            "total_files": 0, "total_bytes": 0,
-            "denied_files": 0, "by_extension": {}, "by_category": {},
-        },
-    }
-    file_hashes = []
-
-    for dirpath, dirnames, filenames in os.walk(extracted_dir):
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
-        for fname in filenames:
-            full_path = os.path.join(dirpath, fname)
-            rel_path = os.path.relpath(full_path, extracted_dir)
-            if _is_denied(fname) or _is_denied(rel_path):
-                packet["stats"]["denied_files"] += 1
-                continue
-            try:
-                st = os.stat(full_path)
-            except Exception:
-                continue
-            try:
-                h = hashlib.sha256()
-                with open(full_path, "rb") as f:
-                    while True:
-                        chunk = f.read(8192)
-                        if not chunk:
-                            break
-                        h.update(chunk)
-                sha = h.hexdigest()
-            except Exception:
-                sha = "unreadable"
-            ext = os.path.splitext(fname)[1].lower()
-            size = st.st_size
-            if ext in ('.py',): category = 'python'
-            elif ext in ('.js', '.ts', '.jsx', '.tsx'): category = 'javascript'
-            elif ext in ('.go',): category = 'go'
-            elif ext in ('.rs',): category = 'rust'
-            elif ext in ('.java',): category = 'java'
-            elif ext in ('.md', '.rst', '.txt'): category = 'documentation'
-            elif ext in ('.json', '.yaml', '.yml', '.toml', '.ini', '.cfg'): category = 'config'
-            elif ext in ('.html', '.css', '.vue', '.svelte'): category = 'frontend'
-            elif ext in ('.sql',): category = 'database'
-            elif ext in ('.sh', '.bash'): category = 'script'
-            elif ext in ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico'): category = 'asset'
-            else: category = 'other'
-            packet["files"].append({"path": rel_path, "sha256": sha, "size": size, "extension": ext, "category": category})
-            packet["stats"]["total_files"] += 1
-            packet["stats"]["total_bytes"] += size
-            packet["stats"]["by_extension"][ext] = packet["stats"]["by_extension"].get(ext, 0) + 1
-            packet["stats"]["by_category"][category] = packet["stats"]["by_category"].get(category, 0) + 1
-            file_hashes.append(sha)
-
-    packet["merkle_root"] = _compute_merkle_root(file_hashes) if file_hashes else None
-    packet["systems"] = _detect_systems_metadata(extracted_dir)
-    packet["collateral_scores"] = _score_collateral_metadata(packet)
-    packet["risks"] = _build_risk_register(packet)
-    return packet
-
-def _detect_systems_metadata(root: str) -> list:
-    markers = {'requirements.txt', 'package.json', 'setup.py', 'Makefile',
-               'Dockerfile', '.git', 'README.md', 'pyproject.toml'}
-    systems = []
-    seen = set()
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
-        has_git_dir = '.git' in dirnames
-        dir_files = set(filenames + dirnames)
-        if has_git_dir: dir_files.add('.git')
-        markers_found = markers & dir_files
-        if not markers_found: continue
-        dirname = os.path.basename(dirpath) or 'root'
-        if dirname in seen: continue
-        has_code = any(f.endswith(('.py', '.js', '.ts', '.go', '.rs', '.java')) for f in filenames)
-        strong = markers_found & {'requirements.txt', 'setup.py', 'Dockerfile', 'Makefile', '.git'}
-        if len(markers_found) < 2 and not strong and not (has_git_dir and has_code): continue
-        systems.append({
-            "name": dirname, "root_path": os.path.relpath(dirpath, root),
-            "markers": sorted(list(markers_found)), "has_git": has_git_dir,
-            "has_tests": any('test' in f.lower() for f in filenames),
-            "has_endpoints": bool({'app.py', 'server.py', 'main.py', 'server.js', 'index.js'} & set(filenames)),
-            "has_receipts": any('receipt' in f.lower() for f in filenames),
-            "file_count": len(filenames),
-            "has_dockerfile": 'Dockerfile' in markers_found,
-            "has_requirements": 'requirements.txt' in markers_found,
-            "has_readme": 'README.md' in markers_found,
-        })
-        seen.add(dirname)
-    return systems
-
-def _score_collateral_metadata(packet: dict) -> dict:
-    stats = packet["stats"]
-    systems = packet["systems"]
-    by_cat = stats["by_category"]
-    code_files = sum(by_cat.get(c, 0) for c in ("python", "javascript", "go", "rust", "java"))
-    doc_files = by_cat.get("documentation", 0)
-    config_files = by_cat.get("config", 0)
-    has_git = any(s["has_git"] for s in systems)
-    has_tests = any(s["has_tests"] for s in systems)
-    has_ep = any(s["has_endpoints"] for s in systems)
-    has_docker = any(s["has_dockerfile"] for s in systems)
-    has_receipts = any(s["has_receipts"] for s in systems)
-    has_readme = any(s["has_readme"] for s in systems)
-
-    dims = {
-        "functionality": min(100, 20 + code_files * 2 + (15 if has_ep else 0)),
-        "reproducibility": min(100, 25 + (20 if has_git else 0) + (15 if has_docker else 0) + (10 if config_files > 0 else 0)),
-        "receipt_strength": min(100, 20 + (40 if has_receipts else 0) + (20 if has_git else 0)),
-        "deployability": min(100, 20 + (25 if has_docker else 0) + (15 if has_ep else 0) + (10 if config_files > 2 else 0)),
-        "test_strength": min(100, 15 + (50 if has_tests else 0)),
-        "documentation": min(100, 20 + doc_files * 5 + (20 if has_readme else 0)),
-        "security_cleanliness": min(100, 40 + (20 if stats["denied_files"] == 0 else 0) + (20 if stats["total_files"] < 1000 else 0)),
-        "provenance": min(100, 20 + (50 if has_git else 0) + (15 if has_receipts else 0)),
-        "economic_evidence": min(100, 15 + (10 if has_ep else 0) + (5 if has_receipts else 0)),
-        "marketability": min(100, 20 + (15 if doc_files > 0 else 0) + (10 if has_ep else 0) + (10 if len(systems) > 1 else 0)),
-    }
-    dims = {k: round(v, 1) for k, v in dims.items()}
-    weights = {"functionality": 0.18, "reproducibility": 0.14, "receipt_strength": 0.14,
-               "deployability": 0.12, "test_strength": 0.10, "documentation": 0.10,
-               "security_cleanliness": 0.10, "provenance": 0.08,
-               "economic_evidence": 0.08, "marketability": 0.06}
-    raw = sum(dims[k] * weights[k] for k in dims)
-    haircuts = {}
-    if not has_tests: haircuts["no_tests"] = 10.0
-    if not has_receipts: haircuts["no_receipts"] = 8.0
-    if not has_git: haircuts["no_provenance"] = 15.0
-    if stats["denied_files"] > 0: haircuts["secret_exposure"] = 20.0
-    if not has_readme: haircuts["no_documentation"] = 5.0
-    total_hc = sum(haircuts.values())
-    final = max(0, raw - total_hc)
-    grade = "A" if final >= 80 else "B" if final >= 65 else "C" if final >= 50 else "D" if final >= 35 else "F"
-    return {
-        "dimensions": dims, "raw_score": round(raw, 1), "haircuts": haircuts,
-        "total_haircut": round(total_hc, 1), "final_score": round(final, 1),
-        "grade": grade,
-        "borrowing_base_estimate_usd": {"low": round(final*5,2), "mid": round(final*15,2), "high": round(final*25,2)},
-        "systems_count": len(systems),
-        "capabilities": {"has_git": has_git, "has_tests": has_tests, "has_endpoints": has_ep,
-                         "has_dockerfile": has_docker, "has_receipts": has_receipts},
-    }
-
-def _build_risk_register(packet: dict) -> list:
-    risks = []
-    haircuts = packet.get("collateral_scores", {}).get("haircuts", {})
-    risk_map = {
-        "no_tests": ("missing_evidence", "No test coverage", "Add test files"),
-        "no_receipts": ("missing_evidence", "No execution receipts", "Generate receipts"),
-        "no_provenance": ("missing_evidence", "No git history", "Initialize git repo"),
-        "secret_exposure": ("real", "Exposed secrets detected", "Remove .env and secrets"),
-        "no_documentation": ("missing_evidence", "No README", "Add README.md"),
-    }
-    for hname, val in haircuts.items():
-        cls, desc, rem = risk_map.get(hname, ("real", hname, "Review"))
-        risks.append({"risk_type": hname, "severity": "high" if val >= 15 else "medium" if val >= 8 else "low",
-                      "haircut": val, "classification": cls, "description": desc, "remediation": rem})
-    return risks
-
-# ─── LLM Evaluation Gateway ─────────────────────────────────────────────
-
-def _build_llm_prompt(packet: dict) -> str:
-    scores = packet.get("collateral_scores", {})
-    stats = packet["stats"]
-    systems = packet["systems"]
-    sys_summary = "\n".join([
-        f"  - {s['name']}: {s['file_count']} files, markers={s['markers']}, "
-        f"git={s['has_git']}, tests={s['has_tests']}, endpoints={s['has_endpoints']}"
-        for s in systems]) or "  (none detected)"
-    return f"""You are a software collateral underwriter. Evaluate the following software asset metadata.
-
-IMPORTANT: You receive ONLY metadata — hashes, sizes, extensions, structure. NO source code. NO file contents. NO proprietary information.
-
-## Asset Summary
-- Files: {stats['total_files']}, Size: {stats['total_bytes']:,} bytes
-- Denied (secrets filtered): {stats['denied_files']}
-- Merkle root: {packet.get('merkle_root', 'N/A')[:16]}...
-- Systems: {len(systems)}
-
-## Systems
-{sys_summary}
-
-## Categories
-{json.dumps(stats.get('by_category', {}), indent=2)}
-
-## Extensions
-{json.dumps(stats.get('by_extension', {}), indent=2)}
-
-## Scores
-- Final: {scores.get('final_score', 0)}/100, Grade: {scores.get('grade', 'F')}
-- Dimensions: {json.dumps(scores.get('dimensions', {}))}
-- Haircuts: {json.dumps(scores.get('haircuts', {}))}
-
-## Risks
-{json.dumps(packet.get('risks', []), indent=2)}
-
-## Borrowing Base
-{json.dumps(scores.get('borrowing_base_estimate_usd', {}))}
-
-## Capabilities
-{json.dumps(scores.get('capabilities', {}))}
-
-## Task
-Provide:
-1. VERDICT: underwritable / underwritable_after_remediation / not_underwritable
-2. GRADE JUSTIFICATION
-3. KEY STRENGTHS
-4. KEY RISKS
-5. REMEDIATION PATH
-6. BORROWING BASE OPINION
-7. CONFIDENCE (high/medium/low)
-
-Be honest and conservative. Missing evidence = missing evidence, not positive evidence."""
-
-async def _call_llm(prompt: str) -> str:
-    if OPENAI_API_KEY:
-        import httpx
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post("https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-                    json={"model": "gpt-4o-mini", "messages": [
-                        {"role": "system", "content": "You are a software collateral underwriter. Be precise, honest, and conservative."},
-                        {"role": "user", "content": prompt}],
-                        "max_tokens": 2000, "temperature": 0.3})
-                resp.raise_for_status()
-                return resp.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            return f"[LLM call failed: {e}]\n\n" + _local_evaluation(prompt)
-    if HF_TOKEN:
-        import httpx
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post("https://api-inference.huggingface.co/models/meta-llama/Meta-Llama-3-8B-Instruct",
-                    headers={"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"},
-                    json={"inputs": prompt, "parameters": {"max_new_tokens": 1000, "temperature": 0.3}})
-                resp.raise_for_status()
-                data = resp.json()
-                return data[0].get("generated_text", str(data)) if isinstance(data, list) else str(data)
-        except Exception as e:
-            return f"[HF inference failed: {e}]\n\n" + _local_evaluation(prompt)
-    return _local_evaluation(prompt)
-
-def _local_evaluation(prompt: str) -> str:
-    final_score = 0; grade = "F"
-    for line in prompt.split('\n'):
-        if "Final:" in line:
-            try: final_score = float(line.split(":")[1].split("/")[0].split(",")[0].strip())
-            except: pass
-        if "Grade:" in line:
-            try: grade = line.split("Grade:")[1].strip().split(",")[0].strip()
-            except: pass
-    if final_score >= 65: verdict = "underwritable"; conf = "medium"
-    elif final_score >= 35: verdict = "underwritable_after_remediation"; conf = "medium"
-    else: verdict = "not_underwritable"; conf = "low"
-    return f"""## 1. VERDICT
-{verdict}
-
-## 2. GRADE JUSTIFICATION
-Grade {grade} (score: {final_score}/100). Metadata-only analysis. Higher grade requires passing tests, execution receipts, and external validation.
-
-## 3. KEY STRENGTHS
-- Software structure is detectable and measurable
-- Merkle root provides tamper-evident state proof
-- Systems detected with project markers
-
-## 4. KEY RISKS
-- Source code quality NOT evaluated (metadata only)
-- Tests may exist but not pass
-- No external validation of economic claims
-
-## 5. REMEDIATION PATH
-- Add tests and ensure they pass
-- Generate execution receipts
-- Add LICENSE file and lockfile
-- Document usage and deployment
-
-## 6. BORROWING BASE OPINION
-Conservative estimate based on structural metadata. Adjusts upward with: passing tests, receipts, usage logs, market validation. Adjusts downward with: failing tests, secret exposure, license conflicts.
-
-## 7. CONFIDENCE
-{conf} — Metadata-only evaluation. Full confidence requires source code review, test execution, and external audit.
-
----
-Note: Local evaluation (no LLM API configured). Set OPENAI_API_KEY or HF_TOKEN for LLM-powered evaluation."""
-
-# ─── Evaluation Pipeline ────────────────────────────────────────────────
-
-_evaluations = {}
-
-async def _run_evaluation(eval_id: str, extracted_dir: str, filename: str):
-    result = {"id": eval_id, "status": "crawling", "filename": filename,
-              "started_at": datetime.now().isoformat(), "steps": []}
-    _evaluations[eval_id] = result
-    try:
-        result["status"] = "building_cognition_packet"
-        result["steps"].append({"step": "crawl_hash_redact", "status": "running", "timestamp": datetime.now().isoformat()})
-        packet = _build_cognition_packet(extracted_dir)
-        result["steps"][-1].update({"status": "complete", "files_indexed": packet["stats"]["total_files"],
-                                     "files_denied": packet["stats"]["denied_files"],
-                                     "merkle_root": (packet.get("merkle_root") or "")[:16] + "...",
-                                     "systems_detected": len(packet["systems"])})
-        result["status"] = "building_llm_prompt"
-        result["steps"].append({"step": "build_prompt", "status": "running", "timestamp": datetime.now().isoformat()})
-        prompt = _build_llm_prompt(packet)
-        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
-        result["steps"][-1].update({"status": "complete", "prompt_hash": prompt_hash[:16] + "...", "prompt_size": len(prompt)})
-        result["status"] = "evaluating_with_llm"
-        result["steps"].append({"step": "llm_evaluation", "status": "running", "timestamp": datetime.now().isoformat()})
-        llm_response = await _call_llm(prompt)
-        result["steps"][-1].update({"status": "complete", "response_length": len(llm_response)})
-        result["status"] = "writing_receipt"
-        receipt = {
-            "schema": "membra.systemlake.evaluation_receipt.v1",
-            "receipt_id": eval_id, "timestamp": datetime.now().isoformat(), "filename": filename,
-            "merkle_root": packet.get("merkle_root"), "files_indexed": packet["stats"]["total_files"],
-            "files_denied": packet["stats"]["denied_files"], "systems_detected": len(packet["systems"]),
-            "collateral_score": packet["collateral_scores"]["final_score"], "grade": packet["collateral_scores"]["grade"],
-            "prompt_hash": prompt_hash, "llm_used": bool(OPENAI_API_KEY or HF_TOKEN),
-            "cognition_packet_schema": packet["schema"],
-            "safety_guarantees": {"source_code_sent_to_llm": False, "file_contents_sent_to_llm": False,
-                                  "secrets_sent_to_llm": False, "only_metadata_hashes_structure": True},
-        }
-        receipt["receipt_hash"] = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
-        result["steps"].append({"step": "write_receipt", "status": "complete", "timestamp": datetime.now().isoformat()})
-        result["status"] = "complete"
-        result["completed_at"] = datetime.now().isoformat()
-        result["packet"] = packet
-        result["llm_evaluation"] = llm_response
-        result["receipt"] = receipt
-        result_path = os.path.join(RESULTS_DIR, f"{eval_id}.json")
-        with open(result_path, "w") as f:
-            json.dump(result, f, indent=2, default=str)
-        shutil.rmtree(extracted_dir, ignore_errors=True)
-    except Exception as e:
-        result["status"] = "error"
-        result["error"] = str(e)
-        shutil.rmtree(extracted_dir, ignore_errors=True)
-
-def _run_evaluation_sync(eval_id: str, extract_dir: str, filename: str):
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try: loop.run_until_complete(_run_evaluation(eval_id, extract_dir, filename))
-    finally: loop.close()
-
-# ─── FastAPI App ────────────────────────────────────────────────────────
-
-app = FastAPI(title="Jorki File Gateway", version="2.0.0")
-
-@app.get("/telemetry")
-async def telemetry():
-    data = _load_all()
-    if not data["systems"]: raise HTTPException(404, "No pre-baked audit data found.")
-    systems = data["systems"].get("systems", [])
-    grades = {}
-    for s in systems:
-        g = s.get("grade", "F"); grades[g] = grades.get(g, 0) + 1
-    bb = data["borrowing"] or {}
-    risks = data["risks"] or {}
-    return {"schema": "membra.systemlake.telemetry.v1", "timestamp": datetime.now().isoformat(),
-            "audit": {"systems_total": len(systems), "grade_distribution": dict(sorted(grades.items())),
-                      "borrowing_base": {"low": bb.get("total_low",0), "mid": bb.get("total_mid",0), "high": bb.get("total_high",0)},
-                      "risks": {"total": risks.get("total_risks",0), "high": risks.get("high_severity",0),
-                                "medium": risks.get("medium_severity",0), "low": risks.get("low_severity",0)},
-                      "merkle_root": data["merkle"].get("root","") if data["merkle"] else "",
-                      "receipt_id": data["receipt"].get("receipt_id","") if data["receipt"] else ""},
-            "evaluations": list(_evaluations.keys())}
-
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    """Upload a zip/tar of your repo. Source code is NEVER sent to any LLM.
-    Only metadata (hashes, sizes, extensions, structure) is sent for evaluation.
-    Secrets, keys, and credentials are filtered out entirely."""
-    eval_id = str(uuid.uuid4())
-    upload_path = os.path.join(UPLOAD_DIR, f"{eval_id}_{file.filename}")
-    with open(upload_path, "wb") as f:
-        content = await file.read(); f.write(content)
-    extract_dir = os.path.join(UPLOAD_DIR, f"{eval_id}_extracted")
-    os.makedirs(extract_dir, exist_ok=True)
-    if file.filename.endswith('.zip'):
-        with zipfile.ZipFile(upload_path, 'r') as z: z.extractall(extract_dir)
-    elif file.filename.endswith(('.tar.gz', '.tgz', '.tar')):
-        with tarfile.open(upload_path, 'r:*') as t: t.extractall(extract_dir)
-    else:
-        shutil.copy(upload_path, os.path.join(extract_dir, file.filename))
-    os.unlink(upload_path)
-    entries = os.listdir(extract_dir)
-    if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
-        extract_dir = os.path.join(extract_dir, entries[0])
-    threading.Thread(target=lambda: _run_evaluation_sync(eval_id, extract_dir, file.filename), daemon=True).start()
-    return {"eval_id": eval_id, "filename": file.filename, "status": "started",
-            "message": "File uploaded. Poll GET /result/{eval_id} for results.", "result_url": f"/result/{eval_id}"}
-
-@app.get("/result/{eval_id}")
-async def get_result(eval_id: str):
-    if eval_id in _evaluations: return _evaluations[eval_id]
-    result_path = os.path.join(RESULTS_DIR, f"{eval_id}.json")
-    if os.path.exists(result_path):
-        with open(result_path, "r") as f: return json.load(f)
-    raise HTTPException(404, f"Evaluation '{eval_id}' not found")
-
-@app.get("/result/{eval_id}/packet")
-async def get_packet(eval_id: str):
-    result = _evaluations.get(eval_id)
-    if not result:
-        rp = os.path.join(RESULTS_DIR, f"{eval_id}.json")
-        if os.path.exists(rp):
-            with open(rp, "r") as f: result = json.load(f)
-    if not result: raise HTTPException(404, f"Evaluation '{eval_id}' not found")
-    return result.get("packet", {})
-
-@app.get("/result/{eval_id}/evaluation")
-async def get_evaluation(eval_id: str):
-    result = _evaluations.get(eval_id)
-    if not result:
-        rp = os.path.join(RESULTS_DIR, f"{eval_id}.json")
-        if os.path.exists(rp):
-            with open(rp, "r") as f: result = json.load(f)
-    if not result: raise HTTPException(404, f"Evaluation '{eval_id}' not found")
-    return PlainTextResponse(result.get("llm_evaluation", "No evaluation available"))
-
-@app.get("/result/{eval_id}/receipt")
-async def get_receipt(eval_id: str):
-    result = _evaluations.get(eval_id)
-    if not result:
-        rp = os.path.join(RESULTS_DIR, f"{eval_id}.json")
-        if os.path.exists(rp):
-            with open(rp, "r") as f: result = json.load(f)
-    if not result: raise HTTPException(404, f"Evaluation '{eval_id}' not found")
-    return result.get("receipt", {})
-
-# ─── Legacy telemetry endpoints ─────────────────────────────────────────
-
-@app.get("/systems")
-async def list_systems():
-    data = _load_all()
-    if not data["systems"]: raise HTTPException(404, "No audit data found.")
-    return data["systems"]
-
-@app.get("/risks")
-async def risks():
-    data = _load_all()
-    if not data["risks"]: raise HTTPException(404, "No audit data found.")
-    return data["risks"]
-
-@app.get("/borrowing")
-async def borrowing():
-    data = _load_all()
-    if not data["borrowing"]: raise HTTPException(404, "No audit data found.")
-    return data["borrowing"]
-
-@app.get("/scores")
-async def scores():
-    data = _load_all()
-    if not data["scores"]: raise HTTPException(404, "No audit data found.")
-    return data["scores"]
-
-@app.get("/merkle")
-async def merkle():
-    data = _load_all()
-    if not data["merkle"]: raise HTTPException(404, "No audit data found.")
-    return data["merkle"]
-
-@app.get("/receipt")
-async def receipt_legacy():
-    data = _load_all()
-    if not data["receipt"]: raise HTTPException(404, "No audit data found.")
-    return data["receipt"]
-
-@app.get("/scope")
-async def scope():
-    data = _load_all()
-    if not data["focus"]: raise HTTPException(404, "No audit data found.")
-    return data["focus"].get("scope", {})
-
-@app.get("/memo")
-async def memo():
-    data = _load_all()
-    if not data["memo"]: raise HTTPException(404, "No audit data found.")
-    return HTMLResponse(f"<pre>{data['memo']}</pre>")
-
-@app.get("/verification")
-async def verification():
-    data = _load_all()
-    if not data["verification"]: raise HTTPException(404, "No audit data found.")
-    return data["verification"]
-
-# ─── Dashboard / Upload UI ──────────────────────────────────────────────
-
-@app.get("/")
-async def root():
-    rm_avail = _rm_state.get("available", False)
-    rm_hidden = _rm_state.get("is_hidden")
-    rm_cycles = _rm_state.get("cycles", 0)
-    rm_refreshes = _rm_state.get("refreshes", 0)
-    rm_err = _rm_state.get("last_error", "")
-    creds = "set" if (RM_USER or RM_TOKEN) else "missing"
-    jit_on = _rm_state.get("jitter_enabled", True)
-    jit_bursts = _rm_state.get("jitter_bursts", 0)
-    jit_dur = _rm_state.get("last_burst_duration", 0)
-    jit_next = _rm_state.get("next_burst_in", 0)
-
-    avail_c = "#00ffa3" if rm_avail else "#ff3b6b"
-    avail_t = "AVAILABLE" if rm_avail else "OFFLINE"
-    vis_c = "#00ffa3" if rm_hidden is False else ("#ff3b6b" if rm_hidden else "#6b7280")
-    vis_t = "VISIBLE" if rm_hidden is False else ("HIDDEN" if rm_hidden else "UNKNOWN")
-    jit_c = "#b14dff" if jit_on else "#6b7280"
-    jit_t = f"ON · {jit_bursts} bursts" if jit_on else "OFF"
-    jit_pct = min(100, max(0, 100 - jit_next / 18)) if jit_on and jit_next > 0 else (100 if jit_on else 0)
-
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RM 24/7</title>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-:root{{--g:#00ffa3;--r:#ff3b6b;--p:#b14dff;--bg:#050510}}
-body{{font-family:'SF Mono',-apple-system,monospace;background:radial-gradient(ellipse at 30% 0%,#0a0a1a 0%,#050510 60%);color:#c8c8e0;min-height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden}}
-body::before{{content:'';position:fixed;inset:0;background:radial-gradient(circle at 80% 90%,rgba(177,77,255,.06) 0%,transparent 50%),radial-gradient(circle at 10% 50%,rgba(0,255,163,.04) 0%,transparent 50%);pointer-events:none}}
-.glass{{background:rgba(12,12,24,.55);backdrop-filter:blur(24px) saturate(1.4);-webkit-backdrop-filter:blur(24px) saturate(1.4);border:1px solid rgba(255,255,255,.06);border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.05);padding:40px;max-width:580px;width:92%;position:relative}}
-.glass::before{{content:'';position:absolute;inset:0;border-radius:20px;padding:1px;background:linear-gradient(135deg,rgba(0,255,163,.15),transparent 40%,rgba(177,77,255,.12));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}}
-h1{{font-size:1.3rem;font-weight:300;letter-spacing:.02em;color:#f0f0ff;margin-bottom:2px}}
-.sub{{color:#5a5a7a;font-size:.75rem;margin-bottom:28px;letter-spacing:.03em}}
-.row{{display:flex;align-items:center;gap:14px;padding:14px 0;border-bottom:1px solid rgba(255,255,255,.04)}}
-.dot{{width:8px;height:8px;border-radius:50%;flex-shrink:0;box-shadow:0 0 12px currentColor}}
-.lbl{{font-size:.75rem;color:#7878a0;flex:1;letter-spacing:.02em}}
-.val{{font-size:.75rem;font-weight:500;font-variant-numeric:tabular-nums;letter-spacing:.04em}}
-.sec{{font-size:.625rem;text-transform:uppercase;letter-spacing:.12em;color:#3a3a5a;margin:20px 0 6px}}
-.grid{{display:grid;grid-template-columns:1fr 1fr;gap:6px 24px}}
-.k{{color:#4a4a6a;font-size:.6875rem}}
-.v{{color:#a8a8c8;font-size:.6875rem;font-variant-numeric:tabular-nums;text-align:right}}
-.err{{color:var(--r);font-size:.625rem;margin-top:10px;word-break:break-word;opacity:.8}}
-.bar{{height:3px;background:rgba(255,255,255,.04);border-radius:2px;margin:6px 0 14px;overflow:hidden}}
-.bar-fill{{height:100%;background:linear-gradient(90deg,var(--p),var(--g));border-radius:2px;transition:width .8s ease;box-shadow:0 0 8px var(--p)}}
-.btn{{display:inline-block;padding:7px 14px;border-radius:8px;font-size:.6875rem;font-weight:500;border:1px solid rgba(255,255,255,.08);cursor:pointer;margin:3px 4px 0 0;text-decoration:none;background:rgba(255,255,255,.03);color:#c8c8e0;transition:all .2s;letter-spacing:.03em}}
-.btn:hover{{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.12)}}
-.btn-a{{border-color:rgba(177,77,255,.3);color:var(--p)}}
-.btn-a:hover{{background:rgba(177,77,255,.08);box-shadow:0 0 16px rgba(177,77,255,.15)}}
-.btn-g{{border-color:rgba(0,255,163,.25);color:var(--g)}}
-.btn-g:hover{{background:rgba(0,255,163,.06);box-shadow:0 0 16px rgba(0,255,163,.1)}}
-.api{{margin-top:18px;padding-top:18px;border-top:1px solid rgba(255,255,255,.04)}}
-.api a{{color:#4a6a9a;text-decoration:none;font-size:.625rem;display:inline-block;padding:2px 8px;letter-spacing:.02em}}
-.api a:hover{{color:#6a8aba}}
-.pulse{{animation:p 2s ease-in-out infinite}}
-@keyframes p{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
-</style>
-</head>
-<body>
-<div class="glass">
-<h1>RentMasseur 24/7</h1>
-<p class="sub">autonomous availability · visibility guard · jitter bursts</p>
-
-<div class="row"><div class="dot pulse" style="background:{avail_c};color:{avail_c}"></div><span class="lbl">Availability</span><span class="val" style="color:{avail_c}">{avail_t}</span></div>
-<div class="row"><div class="dot" style="background:{vis_c};color:{vis_c}"></div><span class="lbl">Visibility</span><span class="val" style="color:{vis_c}">{vis_t}</span></div>
-<div class="row"><div class="dot pulse" style="background:{jit_c};color:{jit_c}"></div><span class="lbl">Jitter Bursts</span><span class="val" style="color:{jit_c}">{jit_t}</span></div>
-
-<div class="sec">Metrics</div>
-<div class="grid">
-<div><span class="k">cycles</span></div><div><span class="v">{rm_cycles}</span></div>
-<div><span class="k">refreshes</span></div><div><span class="v">{rm_refreshes}</span></div>
-<div><span class="k">burst count</span></div><div><span class="v">{jit_bursts}</span></div>
-<div><span class="k">last offline</span></div><div><span class="v">{jit_dur}s</span></div>
-<div><span class="k">next burst</span></div><div><span class="v">{jit_next}s</span></div>
-<div><span class="k">credentials</span></div><div><span class="v">{creds}</span></div>
-</div>
-<div class="bar"><div class="bar-fill" style="width:{jit_pct}%"></div></div>
-
-{"<div class='err'>⚠ " + rm_err + "</div>" if rm_err else ""}
-
-<div class="sec">Controls</div>
-<a class="btn btn-a" href="#" onclick="fetch('/api/jitter/burst',{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),1000));return false">Burst Now</a>
-<a class="btn {'btn-g' if not jit_on else 'btn'}" href="#" onclick="fetch('/api/jitter/toggle',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}}).then(()=>setTimeout(()=>location.reload(),500));return false">{'Disable' if jit_on else 'Enable'} Jitter</a>
-<a class="btn btn-g" href="#" onclick="fetch('/api/availability/refresh',{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),1000));return false">Refresh Now</a>
-
-<div class="api">
-<a href="/api/automation/status">status</a> ·
-<a href="/api/availability/history">history</a> ·
-<a href="/api/jitter/history">bursts</a> ·
-<a href="/api/visibility/guard">visibility</a> ·
-<a href="/api/visit-back">visits</a> ·
-<a href="/api/bio/post">bio</a> ·
-<a href="/health">health</a> ·
-<a href="/api/kpis">kpis</a>
-</div>
-</div>
-<script>setTimeout(()=>location.reload(),15000)</script>
-</body></html>""")
-
-@app.get("/systemlake", response_class=HTMLResponse)
-@app.get("/systemlake", response_class=HTMLResponse)
-async def dashboard():
-    return HTMLResponse("<meta http-equiv=refresh content=0 url=/>")
-
-# ─── JORKI API Endpoints ─────────────────────────────────────────────────
-
-import sqlite3
-import re
-import time
-
-JORKI_DATA_DIR = _Path(os.environ.get("SYSTEMLAKE_DATA_DIR", "/tmp/systemlake_v4b")) / "jorki"
-JORKI_DATA_DIR.mkdir(parents=True, exist_ok=True)
-JORKI_INDEX_DIR = JORKI_DATA_DIR / "indexes"
-JORKI_INDEX_DIR.mkdir(parents=True, exist_ok=True)
-JORKI_REGISTRY_PATH = JORKI_DATA_DIR / "registry.json"
-
-def _jorki_load_registry():
+def calculate_optimal_price(strategy: dict, hour: int, day_of_week: int) -> int:
+    price = strategy["base"]
+    if 18 <= hour <= 23:
+        price += int(strategy["variance"] * 0.5)
+    if 0 <= hour <= 4:
+        price += int(strategy["variance"] * 0.8)
+    if day_of_week in (0, 6):
+        price += int(strategy["variance"] * 0.3)
+    price += round(random.uniform(-0.1, 0.1) * strategy["variance"])
+    return max(80, price)
+
+
+def pick_strategy(hour: int, day_of_week: int) -> dict:
+    if 0 <= hour <= 4:
+        return next(s for s in PRICE_STRATEGIES if s["name"] == "late_night_premium")
+    elif 11 <= hour <= 14:
+        return next(s for s in PRICE_STRATEGIES if s["name"] == "lunch_express")
+    elif 18 <= hour <= 23:

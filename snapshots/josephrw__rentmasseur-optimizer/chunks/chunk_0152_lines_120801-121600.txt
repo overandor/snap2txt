@@ -1,0 +1,800 @@
+  GET /meta        — File metadata + Merkle root + endpoint map
+  GET /summary     — First/last 4KB + line count + structure hints
+  GET /head?n=N    — First N lines (default 100)
+  GET /tail?n=N    — Last N lines (default 100)
+  GET /chunk/{i}   — Chunk i (64KB default), with Merkle proof header
+  GET /range?s=X&e=Y — Arbitrary byte range [X, Y)
+  GET /search?q=...&context=N — Server-side grep, returns matching lines + context
+  GET /merkle      — Full Merkle tree (just hashes, small)
+  GET /stream      — Full file stream (only if explicitly requested)
+  GET /health      — Health check
+
+Usage:
+  python3 llm_proxy.py /path/to/file [--port 8765] [--chunk-size 65536]
+"""
+
+import argparse
+import hashlib
+import json
+import mimetypes
+import os
+import re
+import sys
+import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+# ---------------------------------------------------------------------------
+# Merkle Tree (lazy computation, memory-efficient)
+# ---------------------------------------------------------------------------
+
+class MerkleTree:
+    """Lazy Merkle tree over file chunks. Hashes computed on demand."""
+
+    def __init__(self, filepath: str, chunk_size: int = 65536):
+        self.filepath = filepath
+        self.chunk_size = chunk_size
+        self.file_size = os.path.getsize(filepath)
+        self.num_chunks = (self.file_size + chunk_size - 1) // chunk_size
+        self._leaf_hashes: list[str | None] = [None] * self.num_chunks
+        self._lock = threading.Lock()
+        self._root: str | None = None
+
+    def _compute_leaf(self, index: int) -> str:
+        if self._leaf_hashes[index] is not None:
+            return self._leaf_hashes[index]
+        with open(self.filepath, "rb") as f:
+            f.seek(index * self.chunk_size)
+            data = f.read(self.chunk_size)
+        h = hashlib.sha256(data).hexdigest()
+        self._leaf_hashes[index] = h
+        return h
+
+    def get_chunk_hash(self, index: int) -> str:
+        return self._compute_leaf(index)
+
+    def get_root(self) -> str:
+        if self._root:
+            return self._root
+        with self._lock:
+            if self._root:
+                return self._root
+            # Compute all leaves
+            for i in range(self.num_chunks):
+                self._compute_leaf(i)
+            # Build tree
+            level = [h for h in self._leaf_hashes if h is not None]
+            while len(level) > 1:
+                next_level = []
+                for i in range(0, len(level), 2):
+                    left = level[i]
+                    right = level[i + 1] if i + 1 < len(level) else left
+                    next_level.append(hashlib.sha256(
+                        (left + right).encode()
+                    ).hexdigest())
+                level = next_level
+            self._root = level[0] if level else hashlib.sha256(b"").hexdigest()
+            return self._root
+
+    def get_proof(self, index: int) -> list[dict]:
+        """Return Merkle proof for chunk at index."""
+        self.get_root()  # ensure all leaves computed
+        level = [h for h in self._leaf_hashes if h is not None]
+        proof = []
+        idx = index
+        while len(level) > 1:
+            if idx % 2 == 0:
+                sibling_idx = idx + 1 if idx + 1 < len(level) else idx
+                proof.append({"position": "right", "hash": level[sibling_idx]})
+            else:
+                sibling_idx = idx - 1
+                proof.append({"position": "left", "hash": level[sibling_idx]})
+            # Build next level
+            next_level = []
+            for i in range(0, len(level), 2):
+                left = level[i]
+                right = level[i + 1] if i + 1 < len(level) else left
+                next_level.append(hashlib.sha256(
+                    (left + right).encode()
+                ).hexdigest())
+            level = next_level
+            idx //= 2
+        return proof
+
+    def get_all_leaves(self) -> list[str]:
+        self.get_root()
+        return [h for h in self._leaf_hashes if h is not None]
+
+
+# ---------------------------------------------------------------------------
+# File Profiler (structure hints)
+# ---------------------------------------------------------------------------
+
+def detect_file_type(filepath: str) -> dict:
+    """Detect file type and structure hints without loading full file."""
+    size = os.path.getsize(filepath)
+    name = os.path.basename(filepath)
+    mime, _ = mimetypes.guess_type(name)
+
+    hints = {
+        "filename": name,
+        "size_bytes": size,
+        "size_human": _human_size(size),
+        "mime_type": mime or "application/octet-stream",
+        "extension": os.path.splitext(name)[1],
+    }
+
+    # Sample first 4KB for structure detection
+    with open(filepath, "rb") as f:
+        sample = f.read(4096)
+
+    sample_text = sample.decode("utf-8", errors="replace")
+
+    # Detect format
+    stripped = sample_text.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        hints["format"] = "json"
+    elif stripped.startswith("<?xml") or stripped.startswith("<"):
+        hints["format"] = "xml"
+    elif stripped.startswith("#!"):
+        hints["format"] = "script"
+    elif re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*\s*=', sample_text):
+        hints["format"] = "config"
+    elif "," in sample_text and "\n" in sample_text:
+        # CSV heuristic
+        first_line = sample_text.split("\n")[0]
+        if first_line.count(",") > 2:
+            hints["format"] = "csv"
+    elif sample_text.startswith("PK"):
+        hints["format"] = "zip"
+    else:
+        hints["format"] = "text"
+
+    # Count lines in sample for estimate
+    sample_lines = sample_text.count("\n")
+    if len(sample) > 0:
+        avg_line_len = len(sample) / max(sample_lines, 1)
+        hints["estimated_lines"] = int(size / max(avg_line_len, 1))
+    else:
+        hints["estimated_lines"] = 0
+
+    # Check if binary
+    try:
+        sample.decode("utf-8")
+        hints["encoding"] = "utf-8"
+        hints["is_binary"] = False
+    except UnicodeDecodeError:
+        hints["encoding"] = "binary"
+        hints["is_binary"] = True
+
+    return hints
+
+
+def _human_size(n: int) -> str:
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+# ---------------------------------------------------------------------------
+# HTTP Handler
+# ---------------------------------------------------------------------------
+
+class CAPDHandler(BaseHTTPRequestHandler):
+    """Content-Addressed Progressive Disclosure handler."""
+
+    # Class-level config set by main()
+    filepath: str = ""
+    chunk_size: int = 65536
+    merkle: MerkleTree | None = None
+    file_info: dict = {}
+    start_time: float = 0
+
+    def log_message(self, format, *args):
+        # Minimal logging
+        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {args[0]}\n")
+
+    def _send_json(self, data: dict, status: int = 200):
+        body = json.dumps(data, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, text: str, status: int = 200, content_type: str = "text/plain"):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_bytes(self, data: bytes, status: int = 200,
+                    content_type: str = "application/octet-stream",
+                    extra_headers: dict | None = None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _wants_json(self) -> bool:
+        accept = self.headers.get("Accept", "")
+        return "application/json" in accept or "json" in accept
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
+        try:
+            if path == "/" or path == "/meta":
+                self.handle_meta()
+            elif path == "/summary":
+                self.handle_summary()
+            elif path == "/head":
+                n = int(qs.get("n", ["100"])[0])
+                self.handle_head(n)
+            elif path == "/tail":
+                n = int(qs.get("n", ["100"])[0])
+                self.handle_tail(n)
+            elif path.startswith("/chunk/"):
+                idx = int(path.split("/chunk/")[1])
+                self.handle_chunk(idx)
+            elif path == "/range":
+                start = int(qs.get("s", ["0"])[0])
+                end = int(qs.get("e", [str(self.chunk_size)])[0])
+                self.handle_range(start, end)
+            elif path == "/search":
+                q = qs.get("q", [""])[0]
+                context = int(qs.get("context", ["2"])[0])
+                max_results = int(qs.get("max", ["50"])[0])
+                self.handle_search(q, context, max_results)
+            elif path == "/merkle":
+                self.handle_merkle()
+            elif path == "/stream":
+                self.handle_stream()
+            elif path == "/health":
+                self._send_json({"status": "ok", "uptime_s": time.time() - self.start_time})
+            else:
+                self._send_json({"error": "not found", "path": path}, 404)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, Range")
+        self.end_headers()
+
+    # --- Endpoint handlers ---
+
+    def handle_meta(self):
+        """File metadata + Merkle root + endpoint map."""
+        root = self.merkle.get_root()
+        meta = {
+            "protocol": "CAPD/1.0",
+            "description": "Content-Addressed Progressive Disclosure — navigate this file without downloading it",
+            "file": self.file_info,
+            "merkle_root": root,
+            "chunk_size": self.chunk_size,
+            "num_chunks": self.merkle.num_chunks,
+            "endpoints": {
+                "GET /meta": "This response — file metadata + Merkle root",
+                "GET /summary": "First/last 4KB + structure hints (start here)",
+                "GET /head?n=100": "First N lines",
+                "GET /tail?n=100": "Last N lines",
+                "GET /chunk/{i}": "Chunk i (64KB) with Merkle proof header",
+                "GET /range?s=0&e=65536": "Arbitrary byte range [s, e)",
+                "GET /search?q=pattern&context=2": "Server-side grep, returns matching lines + context",
+                "GET /merkle": "Full Merkle tree (all chunk hashes)",
+                "GET /stream": "Full file stream (downloads entire file — use sparingly)",
+                "GET /health": "Health check",
+            },
+            "usage_hint": (
+                "1. Read /meta to understand the file. "
+                "2. Read /summary to see structure. "
+                "3. Use /search?q=... to find relevant sections. "
+                "4. Pull specific /chunk/{i} or /range?s=X&e=Y for detail. "
+                "Never download /stream unless you truly need every byte."
+            ),
+        }
+        if self._wants_json():
+            self._send_json(meta)
+        else:
+            # Human-readable landing page
+            html = self._render_landing(meta)
+            self._send_text(html, content_type="text/html")
+
+    def _render_landing(self, meta: dict) -> str:
+        f = meta["file"]
+        return f"""<!DOCTYPE html>
+<html>
+<head><title>LLM File Proxy — {f['filename']}</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; color: #333; }}
+  h1 {{ color: #2563eb; }}
+  .meta {{ background: #f8fafc; padding: 16px; border-radius: 8px; margin: 16px 0; }}
+  .endpoint {{ font-family: monospace; background: #1e293b; color: #93c5fd; padding: 2px 8px; border-radius: 4px; }}
+  .hint {{ background: #fef3c7; padding: 12px; border-radius: 8px; margin: 16px 0; }}
+  code {{ background: #f1f5f9; padding: 2px 6px; border-radius: 3px; }}
+</style>
+</head>
+<body>
+<h1>LLM File Proxy</h1>
+<p><strong>{f['filename']}</strong> — {f['size_human']} ({f['mime_type']})</p>
+<div class="meta">
+  <p><strong>Protocol:</strong> CAPD/1.0 — Content-Addressed Progressive Disclosure</p>
+  <p><strong>Merkle Root:</strong> <code>{meta['merkle_root']}</code></p>
+  <p><strong>Chunks:</strong> {meta['num_chunks']} × {self.chunk_size // 1024}KB</p>
+  <p><strong>Format:</strong> {f.get('format', 'unknown')}</p>
+</div>
+<div class="hint">
+  <strong>For LLMs:</strong> Send the base URL to your LLM. It can navigate this file
+  using the endpoints below without downloading the full {f['size_human']}.
+</div>
+<h2>Endpoints</h2>
+<ul>
+  <li><span class="endpoint">GET /meta</span> — File metadata + Merkle root</li>
+  <li><span class="endpoint">GET /summary</span> — First/last 4KB + structure</li>
+  <li><span class="endpoint">GET /head?n=100</span> — First N lines</li>
+  <li><span class="endpoint">GET /tail?n=100</span> — Last N lines</li>
+  <li><span class="endpoint">GET /chunk/&#123;i&#125;</span> — Chunk i (64KB) with Merkle proof</li>
+  <li><span class="endpoint">GET /range?s=0&e=65536</span> — Byte range</li>
+  <li><span class="endpoint">GET /search?q=pattern</span> — Server-side grep + context</li>
+  <li><span class="endpoint">GET /merkle</span> — Full Merkle tree</li>
+  <li><span class="endpoint">GET /stream</span> — Full file (use sparingly)</li>
+</ul>
+</body>
+</html>"""
+
+    def handle_summary(self):
+        """First/last 4KB + line count + structure."""
+        size = self.file_info["size_bytes"]
+        head_bytes = min(4096, size)
+        tail_start = max(0, size - 4096)
+        tail_bytes = size - tail_start
+
+        with open(self.filepath, "rb") as f:
+            head = f.read(head_bytes)
+            f.seek(tail_start)
+            tail = f.read(tail_bytes)
+
+        # Count total lines (streaming, no full load)
+        line_count = 0
+        with open(self.filepath, "rb") as f:
+            for _ in f:
+                line_count += 1
+
+        summary = {
+            "file": self.file_info["filename"],
+            "size_bytes": size,
+            "total_lines": line_count,
+            "head_4kb": head.decode("utf-8", errors="replace"),
+            "tail_4kb": tail.decode("utf-8", errors="replace"),
+            "head_bytes": head_bytes,
+            "tail_start_byte": tail_start,
+            "tail_bytes": tail_bytes,
+            "format": self.file_info.get("format", "text"),
+            "is_binary": self.file_info.get("is_binary", False),
+        }
+        self._send_json(summary)
+
+    def handle_head(self, n: int):
+        """First N lines."""
+        lines = []
+        with open(self.filepath, "r", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= n:
+                    break
+                lines.append(line.rstrip("\n"))
+        self._send_json({
+            "lines": lines,
+            "count": len(lines),
+            "requested": n,
+        })
+
+    def handle_tail(self, n: int):
+        """Last N lines (efficient via seek from end)."""
+        # Read last 64KB chunk, split into lines, take last N
+        size = self.file_info["size_bytes"]
+        read_size = min(size, n * 512 + 4096)  # generous estimate
+        with open(self.filepath, "rb") as f:
+            f.seek(max(0, size - read_size))
+            data = f.read()
+        all_lines = data.decode("utf-8", errors="replace").splitlines()
+        lines = all_lines[-n:] if len(all_lines) >= n else all_lines
+        self._send_json({
+            "lines": lines,
+            "count": len(lines),
+            "requested": n,
+        })
+
+    def handle_chunk(self, index: int):
+        """Chunk i with Merkle proof in headers."""
+        if index < 0 or index >= self.merkle.num_chunks:
+            self._send_json({"error": f"chunk index out of range [0, {self.merkle.num_chunks})"}, 400)
+            return
+
+        with open(self.filepath, "rb") as f:
+            f.seek(index * self.chunk_size)
+            data = f.read(self.chunk_size)
+
+        chunk_hash = self.merkle.get_chunk_hash(index)
+        proof = self.merkle.get_proof(index)
+
+        self._send_bytes(
+            data,
+            content_type=self.file_info.get("mime_type", "application/octet-stream"),
+            extra_headers={
+                "X-Merkle-Root": self.merkle.get_root(),
+                "X-Chunk-Index": str(index),
+                "X-Chunk-Hash": chunk_hash,
+                "X-Chunk-Proof": json.dumps(proof),
+                "X-Total-Chunks": str(self.merkle.num_chunks),
+                "X-Chunk-Size": str(len(data)),
+            }
+        )
+
+    def handle_range(self, start: int, end: int):
+        """Arbitrary byte range [start, end)."""
+        size = self.file_info["size_bytes"]
+        start = max(0, start)
+        end = min(size, end)
+        if start >= end:
+            self._send_json({"error": "invalid range", "start": start, "end": end}, 400)
+            return
+
+        with open(self.filepath, "rb") as f:
+            f.seek(start)
+            data = f.read(end - start)
+
+        range_hash = hashlib.sha256(data).hexdigest()
+        self._send_bytes(
+            data,
+            content_type=self.file_info.get("mime_type", "application/octet-stream"),
+            extra_headers={
+                "Content-Range": f"bytes {start}-{end-1}/{size}",
+                "X-Range-Hash": range_hash,
+                "X-Range-Start": str(start),
+                "X-Range-End": str(end),
+            }
+        )
+
+    def handle_search(self, query: str, context: int, max_results: int):
+        """Server-side grep — stream file, return matching lines + context."""
+        if not query:
+            self._send_json({"error": "missing q parameter", "usage": "/search?q=pattern&context=2&max=50"}, 400)
+            return
+
+        results = []
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
+        buffer: list[tuple[int, str]] = []  # (line_num, line_text) for context
+        match_count = 0
+
+        with open(self.filepath, "r", errors="replace") as f:
+            for line_num, line in enumerate(f):
+                line_text = line.rstrip("\n")
+                buffer.append((line_num, line_text))
+                if len(buffer) > context + 1:
+                    buffer.pop(0)
+
+                if pattern.search(line_text):
+                    # Include context lines
+                    ctx_start = max(0, len(buffer) - context - 1)
+                    ctx_lines = buffer[ctx_start:]
+                    results.append({
+                        "line": line_num,
+                        "match": line_text,
+                        "context_before": [l for n, l in ctx_lines[:-1]],
+                        "context_after": [],  # filled below
+                    })
+                    match_count += 1
+
+                    # Read context after
+                    if context > 0:
+                        after = []
+                        for _ in range(context):
+                            try:
+                                next_line = next(f)
+                                after.append(next_line.rstrip("\n"))
+                            except StopIteration:
+                                break
+                        results[-1]["context_after"] = after
+
+                    if match_count >= max_results:
+                        break
+
+        self._send_json({
+            "query": query,
+            "matches": match_count,
+            "truncated": match_count >= max_results,
+            "max_results": max_results,
+            "results": results,
+        })
+
+    def handle_merkle(self):
+        """Full Merkle tree — all leaf hashes + root."""
+        leaves = self.merkle.get_all_leaves()
+        self._send_json({
+            "root": self.merkle.get_root(),
+            "chunk_size": self.chunk_size,
+            "num_chunks": self.merkle.num_chunks,
+            "leaves": leaves,
+        })
+
+    def handle_stream(self):
+        """Full file stream — only if explicitly requested."""
+        size = self.file_info["size_bytes"]
+        self.send_response(200)
+        self.send_header("Content-Type", self.file_info.get("mime_type", "application/octet-stream"))
+        self.send_header("Content-Length", str(size))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Merkle-Root", self.merkle.get_root())
+        self.end_headers()
+        with open(self.filepath, "rb") as f:
+            while True:
+                chunk = f.read(self.chunk_size)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="LLM File Proxy — Content-Addressed Progressive Disclosure"
+    )
+    parser.add_argument("file", help="Path to file to serve")
+    parser.add_argument("--port", type=int, default=8765, help="Port (default 8765)")
+    parser.add_argument("--chunk-size", type=int, default=65536, help="Chunk size in bytes (default 65536 = 64KB)")
+    args = parser.parse_args()
+
+    filepath = os.path.abspath(args.file)
+    if not os.path.isfile(filepath):
+        print(f"Error: {filepath} is not a file", file=sys.stderr)
+        sys.exit(1)
+
+    file_info = detect_file_type(filepath)
+    merkle = MerkleTree(filepath, args.chunk_size)
+
+    # Inject config into handler class
+    CAPDHandler.filepath = filepath
+    CAPDHandler.chunk_size = args.chunk_size
+    CAPDHandler.merkle = merkle
+    CAPDHandler.file_info = file_info
+    CAPDHandler.start_time = time.time()
+
+    server = HTTPServer(("127.0.0.1", args.port), CAPDHandler)
+    print(f"LLM File Proxy serving: {file_info['filename']} ({file_info['size_human']})", file=sys.stderr)
+    print(f"Listening on http://127.0.0.1:{args.port}", file=sys.stderr)
+    print(f"Chunks: {merkle.num_chunks} × {args.chunk_size // 1024}KB", file=sys.stderr)
+    print(f"Endpoints: /meta /summary /head /tail /chunk/{{i}} /range /search /merkle /stream", file=sys.stderr)
+    print(f"READY", file=sys.stderr)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+README.md:
+```
+---
+title: Jorki
+emoji: ⚡
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
+# Jorki — The Operating System for AI File Access
+
+**Files don't move. Context does.**
+
+Jorki turns any local file into a live AI-readable session URL. Instead of uploading gigabytes into every chat, create one secure session and let AI tools query exactly what they need.
+
+## How it works
+
+1. Select a file (Finder right-click → Jorki → Copy AI URL)
+2. Local C++ engine indexes any file (1GB+) in <3 seconds
+3. Compact SQLite index (KB) is uploaded to this Space
+4. AI queries the index via SQL, search, chunk retrieval, or MCP
+5. The original file never leaves your machine
+6. Revoke access at any time
+
+## API
+
+- `POST /upload` — Upload .idx index (auth required)
+- `GET /meta/{id}` — File metadata
+- `GET /summary/{id}` — Structure + samples
+- `GET /chunk/{id}/{idx}` — Chunk content
+- `GET /chunks/{id}` — List all chunks
+- `GET /search/{id}?q=` — Full-text search
+- `POST /query/sql/{id}` — SQL query
+- `POST /query/nosql/{id}` — NoSQL query
+- `GET /stats/{id}` — Query statistics
+- `DELETE /revoke/{id}` — Revoke session (auth required)
+- `GET /mcp` — MCP manifest
+- `POST /mcp/query` — MCP unified query
+- `GET /health` — Health check
+
+## Persistent Storage
+
+To survive Space restarts, enable persistent storage in HF Space settings:
+1. Go to Space Settings → Persistent Storage
+2. Attach a small (20GB) persistent volume
+3. It mounts at `/data` — Jorki auto-detects and uses it
+
+Without persistent storage, sessions are lost on restart. The `/health` endpoint shows storage status.
+
+```
+
+requirements.txt:
+```
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+
+```
+
+JorkiBar:
+```
+Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
+```
+
+hf_space.py:
+```
+"""
+JORKI — AI File Gateway
+HF Space server v2.0: persistent storage, auth, chunk retrieval, MCP, compression.
+
+Fixes:
+1. Persistent storage (/data mount) + SQLite registry — survives restarts
+2. Bearer token auth on upload
+3. GET /chunk/{file_id}/{idx} — returns semantic chunk content
+4. GET /mcp — MCP-compatible endpoint for AI tools
+5. Index compression (gzip) on upload, decompress on query
+"""
+
+import os
+import json
+import sqlite3
+import shutil
+import gzip
+import time
+import hashlib
+import struct
+import base64
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Query, Body
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+# Google OAuth client ID (set as HF Space secret, no credentials.json needed)
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+
+app = FastAPI(title="JORKI — AI File Gateway", version="2.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Fix 1: Persistent storage ---
+# HF Space mounts /data as persistent volume. Fallback to /tmp if not available.
+DATA_DIR = Path(os.environ.get("JORKI_DATA_DIR", "/data" if Path("/data").exists() else "/tmp/jorki"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+STORAGE_DIR = DATA_DIR / "indexes"
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+REGISTRY_DB = DATA_DIR / "registry.sqlite3"
+
+# Auth token (set as HF Space secret)
+AUTH_TOKEN = os.environ.get("JORKI_AUTH_TOKEN", "")
+
+def init_registry_db():
+    """SQLite-backed registry — survives restarts."""
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.execute("""CREATE TABLE IF NOT EXISTS files (
+        file_id TEXT PRIMARY KEY,
+        filename TEXT,
+        path TEXT,
+        size_human TEXT,
+        merkle_root TEXT,
+        format TEXT,
+        total_lines TEXT,
+        uploaded_at REAL,
+        meta_json TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS query_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id TEXT,
+        query_type TEXT,
+        query_text TEXT,
+        timestamp REAL,
+        client_ip TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        file_id TEXT,
+        user_email TEXT,
+        created_at REAL,
+        status TEXT DEFAULT 'active'
+    )""")
+    conn.commit()
+    conn.close()
+
+init_registry_db()
+
+def load_registry() -> dict:
+    """Load registry from SQLite into memory."""
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.row_factory = sqlite3.Row
+    reg = {}
+    for row in conn.execute("SELECT * FROM files"):
+        reg[row["file_id"]] = {
+            "path": row["path"],
+            "filename": row["filename"],
+            "meta": json.loads(row["meta_json"]) if row["meta_json"] else {},
+            "uploaded_at": row["uploaded_at"],
+        }
+    conn.close()
+    return reg
+
+def save_file_entry(file_id: str, meta: dict, path: str):
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.execute(
+        "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?,?,?)",
+        (file_id, meta.get("filename", "unknown"), path,
+         meta.get("size_human", "?"), meta.get("merkle_root", "?"),
+         meta.get("format", "?"), meta.get("total_lines", "?"),
+         time.time(), json.dumps(meta))
+    )
+    conn.commit()
+    conn.close()
+
+def log_query(file_id: str, query_type: str, query_text: str, client_ip: str = ""):
+    try:
+        conn = sqlite3.connect(str(REGISTRY_DB))
+        conn.execute(
+            "INSERT INTO query_log (file_id, query_type, query_text, timestamp, client_ip) VALUES (?,?,?,?,?)",
+            (file_id, query_type, query_text[:500], time.time(), client_ip)
+        )
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
+def get_file_path(file_id: str) -> str:
+    """Resolve file_id to index path, checking DB."""
+    reg = load_registry()
+    if file_id not in reg:
+        raise HTTPException(404, {
+            "status": "session_not_found",
+            "file_id": file_id,
+            "message": "This Jorki session is expired, revoked, or unavailable.",
+            "possible_causes": ["session expired", "session revoked", "Space restarted and local disk was lost", "index was never uploaded", "persistent storage not attached"],
+            "next": "Create a new Jorki session."
+        })
+    path = reg[file_id]["path"]
+    if not Path(path).exists():
+        raise HTTPException(410, {

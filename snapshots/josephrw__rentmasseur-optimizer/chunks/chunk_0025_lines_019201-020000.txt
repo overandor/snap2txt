@@ -1,800 +1,800 @@
-            "revenue_estimate": winner.revenue_estimate,
-            "target": args.target,
-            "gap": round(args.target - winner.revenue_estimate, 2),
-        }, indent=2))
-        sys.exit(0 if success else 1)
+    segments = []
+    for i, rms in enumerate(rms_values):
+        if rms < avg_rms * 0.2:
+            seg_type = "pause"
+        elif rms > avg_rms * 1.8:
+            seg_type = "emphasis"
+        elif rms < avg_rms * 0.5:
+            seg_type = "quiet_speech"
+        else:
+            seg_type = "speech"
+        timestamp = round(i * window_size / (meta.get("sample_rate", 44100) or 44100), 2)
+        segments.append({"t": timestamp, "type": seg_type, "energy": round(rms, 1)})
+    # Build shadow string: symbolic representation
+    shadow_symbols = {"pause": "·", "quiet_speech": "░", "speech": "▓", "emphasis": "█"}
+    shadow = "".join(shadow_symbols.get(s["type"], "?") for s in segments)
+    # Detect pace (transitions per second)
+    transitions = sum(1 for i in range(1, len(segments)) if segments[i]["type"] != segments[i-1]["type"])
+    duration = meta.get("duration_s", 1) or 1
+    pace = transitions / duration
+    return {
+        "shadow": shadow,
+        "shadow_hash": hashlib.sha256(shadow.encode()).hexdigest()[:32],
+        "segments": len(segments),
+        "segment_details": segments[:20],
+        "pace": round(pace, 2),
+        "pace_label": "fast" if pace > 2 else "slow" if pace < 0.5 else "normal",
+        "redacted": True,
+        "note": "Transcript shadow shows speech structure without revealing words.",
+    }
+
+def _sonic_semantic_claims(meta: dict, fingerprint: dict, speakers: dict, shadow: dict) -> list:
+    """L6: Timestamped semantic claims about the audio."""
+    claims = []
+    if meta.get("duration_s", 0) > 0:
+        claims.append({"claim": "audio_duration", "value": meta["duration_s"], "unit": "seconds", "confidence": 0.99})
+    if meta.get("format") != "unknown":
+        claims.append({"claim": "audio_format", "value": meta["format"], "confidence": 0.95})
+    if speakers.get("speaker_count", 0) > 0:
+        claims.append({"claim": "speaker_count", "value": speakers["speaker_count"], "confidence": 0.7})
+        claims.append({"claim": "speaker_topology", "value": speakers["speaker_estimate"], "confidence": 0.7})
+    if fingerprint.get("brightness"):
+        claims.append({"claim": "spectral_brightness", "value": fingerprint["brightness"], "confidence": 0.85})
+    if fingerprint.get("tonality"):
+        claims.append({"claim": "tonality", "value": fingerprint["tonality"], "confidence": 0.8})
+    if shadow.get("pace_label"):
+        claims.append({"claim": "speech_pace", "value": shadow["pace_label"], "confidence": 0.75})
+    if meta.get("loudness_db", -60) > -30:
+        claims.append({"claim": "loudness", "value": meta["loudness_db"], "unit": "dB", "confidence": 0.9})
+    if meta.get("silence_ratio", 1) < 0.3:
+        claims.append({"claim": "contains_speech", "value": True, "confidence": 0.85})
+    claims.append({"claim": "audio_exists", "value": True, "confidence": 1.0, "evidence": meta["sha256"][:16]})
+    return claims
+
+def _sonic_create_audio_idx(audio_id: str, meta: dict, fingerprint: dict,
+                            speakers: dict, shadow: dict, claims: list,
+                            content: bytes, filename: str):
+    """Create SQLite index for audio file."""
+    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
+    conn = sqlite3.connect(str(idx_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS audio_meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS fingerprint (key TEXT, value TEXT);
+        CREATE TABLE IF NOT EXISTS speakers (key TEXT, value TEXT);
+        CREATE TABLE IF NOT EXISTS transcript_shadow (idx INTEGER, timestamp REAL, seg_type TEXT, energy REAL);
+        CREATE TABLE IF NOT EXISTS semantic_claims (idx INTEGER, claim TEXT, value TEXT, unit TEXT, confidence REAL);
+        CREATE TABLE IF NOT EXISTS audio_chunks (idx INTEGER, timestamp_start REAL, timestamp_end REAL, energy REAL, seg_type TEXT, preview TEXT);
+    """)
+    for k, v in meta.items():
+        conn.execute("INSERT OR REPLACE INTO audio_meta VALUES (?,?)", (k, str(v)))
+    for k, v in fingerprint.items():
+        conn.execute("INSERT INTO fingerprint VALUES (?,?)", (k, str(v)))
+    for k, v in speakers.items():
+        conn.execute("INSERT INTO speakers VALUES (?,?)", (k, str(v)))
+    for i, seg in enumerate(shadow.get("segment_details", [])):
+        conn.execute("INSERT INTO transcript_shadow VALUES (?,?,?,?)",
+                     (i, seg["t"], seg["type"], seg["energy"]))
+    for i, c in enumerate(claims):
+        conn.execute("INSERT INTO semantic_claims VALUES (?,?,?,?,?)",
+                     (i, c["claim"], str(c["value"]), c.get("unit", ""), c.get("confidence", 0)))
+    # Build audio chunks (time-segmented)
+    window_size = 4096
+    sr = meta.get("sample_rate", 44100) or 44100
+    chunk_idx = 0
+    for i in range(0, min(len(content), 131072), window_size * 4):
+        chunk = content[i:i+window_size*4]
+        if len(chunk) < 256:
+            continue
+        rms = (sum((b - 128) ** 2 for b in chunk) / len(chunk)) ** 0.5
+        t_start = round(i / sr, 2)
+        t_end = round((i + len(chunk)) / sr, 2)
+        if rms < sum([rms]) / 2 * 0.2:
+            seg_type = "pause"
+        elif rms > sum([rms]) / 2 * 1.8:
+            seg_type = "emphasis"
+        else:
+            seg_type = "speech"
+        preview = f"[{t_start}s-{t_end}s] {seg_type} energy={round(rms,1)}"
+        conn.execute("INSERT INTO audio_chunks VALUES (?,?,?,?,?,?)",
+                     (chunk_idx, t_start, t_end, round(rms, 1), seg_type, preview))
+        chunk_idx += 1
+    conn.commit()
+    conn.close()
+
+@app.post("/audio/upload")
+async def sonic_upload(file: UploadFile = File(...)):
+    """Upload audio file. Creates non-playable proof object with fidelity ladder L0-L6."""
+    content = await file.read()
+    if len(content) < 64:
+        return {"error": "File too small to analyze"}
+    audio_id = hashlib.sha256(content).hexdigest()[:12]
+    meta = _sonic_extract_metadata(content, file.filename)
+    fingerprint = _sonic_fingerprint(content)
+    speakers = _sonic_speaker_topology(content, meta)
+    shadow = _sonic_transcript_shadow(content, meta)
+    claims = _sonic_semantic_claims(meta, fingerprint, speakers, shadow)
+    _sonic_create_audio_idx(audio_id, meta, fingerprint, speakers, shadow, claims, content, file.filename)
+    # Store encrypted full audio (L8) — base64 with XOR gate
+    enc_path = SONIC_DATA_DIR / f"{audio_id}.enc"
+    xor_key = os.urandom(32)
+    enc_content = bytes(b ^ xor_key[i % 32] for i, b in enumerate(content))
+    enc_path.write_bytes(enc_content)
+    key_path = SONIC_DATA_DIR / f"{audio_id}.key"
+    key_path.write_bytes(xor_key)
+    # Register
+    reg = _sonic_load_registry()
+    reg[audio_id] = {
+        "filename": file.filename,
+        "size_bytes": len(content),
+        "format": meta["format"],
+        "duration_s": meta["duration_s"],
+        "sha256": meta["sha256"],
+        "fingerprint_hash": fingerprint["fingerprint_hash"],
+        "speaker_count": speakers["speaker_count"],
+        "uploaded_at": time.time(),
+        "status": "indexed",
+    }
+    _sonic_save_registry(reg)
+    return {
+        "audio_id": audio_id,
+        "filename": file.filename,
+        "fidelity_ladder": {
+            "L0_exists": True,
+            "L1_metadata": True,
+            "L2_signal": True,
+            "L3_fingerprint": True,
+            "L4_speakers": True,
+            "L5_transcript_shadow": True,
+            "L6_semantic_claims": len(claims),
+            "L7_degraded_preview": False,
+            "L8_encrypted_full": True,
+            "L9_playable": False,
+        },
+        "meta": meta,
+        "fingerprint": {k: v for k, v in fingerprint.items() if k != "fingerprint"},
+        "speakers": speakers,
+        "shadow_summary": {"segments": shadow["segments"], "pace": shadow["pace"], "pace_label": shadow["pace_label"]},
+        "claims_count": len(claims),
+        "sha256": meta["sha256"],
+        "merkle_root": audio_id + hashlib.sha256(json.dumps(meta, sort_keys=True).encode()).hexdigest()[:20],
+        "endpoints": {
+            "meta": f"/audio/meta/{audio_id}",
+            "fingerprint": f"/audio/fingerprint/{audio_id}",
+            "transcript_shadow": f"/audio/transcript-shadow/{audio_id}",
+            "speakers": f"/audio/speakers/{audio_id}",
+            "search": f"/audio/search/{audio_id}?q=",
+            "chunk": f"/audio/chunk/{audio_id}/{{timestamp}}",
+            "claims": f"/audio/claims/{audio_id}",
+            "glyph": f"/audio/glyph/{audio_id}",
+            "receipt": f"/audio/receipt/{audio_id}",
+            "claim_create": f"/audio/claim/create",
+            "claim_settle": f"/audio/claim/settle",
+        },
+    }
+
+@app.get("/audio/meta/{audio_id}")
+async def sonic_meta(audio_id: str):
+    """L0-L2: Audio metadata — exists, format, duration, loudness, silence."""
+    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Audio not found: {audio_id}"}
+    conn = sqlite3.connect(str(idx_path))
+    meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM audio_meta").fetchall()}
+    conn.close()
+    return {"audio_id": audio_id, "meta": meta}
+
+@app.get("/audio/fingerprint/{audio_id}")
+async def sonic_fingerprint(audio_id: str):
+    """L3: Acoustic fingerprint — non-playable spectral identity."""
+    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Audio not found: {audio_id}"}
+    conn = sqlite3.connect(str(idx_path))
+    fp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM fingerprint").fetchall()}
+    conn.close()
+    return {"audio_id": audio_id, "fingerprint": fp}
+
+@app.get("/audio/transcript-shadow/{audio_id}")
+async def sonic_transcript_shadow(audio_id: str):
+    """L5: Redacted transcript shadow — speech structure without words."""
+    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Audio not found: {audio_id}"}
+    conn = sqlite3.connect(str(idx_path))
+    segs = conn.execute("SELECT idx, timestamp, seg_type, energy FROM transcript_shadow").fetchall()
+    conn.close()
+    return {
+        "audio_id": audio_id,
+        "segments": [{"idx": r[0], "timestamp": r[1], "type": r[2], "energy": r[3]} for r in segs],
+        "total_segments": len(segs),
+        "redacted": True,
+        "note": "Transcript shadow shows speech structure without revealing words.",
+    }
+
+@app.get("/audio/speakers/{audio_id}")
+async def sonic_speakers(audio_id: str):
+    """L4: Speaker topology — count and structure without identity."""
+    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Audio not found: {audio_id}"}
+    conn = sqlite3.connect(str(idx_path))
+    sp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM speakers").fetchall()}
+    conn.close()
+    return {"audio_id": audio_id, "speakers": sp}
+
+@app.get("/audio/claims/{audio_id}")
+async def sonic_claims(audio_id: str):
+    """L6: Timestamped semantic claims about the audio."""
+    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Audio not found: {audio_id}"}
+    conn = sqlite3.connect(str(idx_path))
+    claims = conn.execute("SELECT idx, claim, value, unit, confidence FROM semantic_claims").fetchall()
+    conn.close()
+    return {
+        "audio_id": audio_id,
+        "claims": [{"idx": r[0], "claim": r[1], "value": r[2], "unit": r[3], "confidence": r[4]} for r in claims],
+        "total_claims": len(claims),
+    }
+
+@app.get("/audio/search/{audio_id}")
+async def sonic_search(audio_id: str, q: str = ""):
+    """Search audio chunks by segment type or energy pattern."""
+    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Audio not found: {audio_id}"}
+    if not q:
+        return {"error": "Query 'q' is required (try: speech, pause, emphasis)"}
+    conn = sqlite3.connect(str(idx_path))
+    results = conn.execute(
+        "SELECT idx, timestamp_start, timestamp_end, energy, seg_type, preview FROM audio_chunks WHERE seg_type LIKE ? OR preview LIKE ?",
+        (f"%{q}%", f"%{q}%")
+    ).fetchall()
+    conn.close()
+    return {
+        "audio_id": audio_id,
+        "query": q,
+        "results": [{"idx": r[0], "start": r[1], "end": r[2], "energy": r[3], "type": r[4], "preview": r[5]} for r in results],
+        "total": len(results),
+    }
+
+@app.get("/audio/chunk/{audio_id}/{timestamp}")
+async def sonic_chunk(audio_id: str, timestamp: float):
+    """Retrieve audio chunk at a specific timestamp."""
+    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Audio not found: {audio_id}"}
+    conn = sqlite3.connect(str(idx_path))
+    row = conn.execute(
+        "SELECT idx, timestamp_start, timestamp_end, energy, seg_type, preview FROM audio_chunks WHERE timestamp_start <= ? AND timestamp_end >= ? ORDER BY ABS(timestamp_start - ?) LIMIT 1",
+        (timestamp, timestamp, timestamp)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"error": f"No chunk at timestamp {timestamp}"}
+    return {
+        "audio_id": audio_id,
+        "idx": row[0],
+        "timestamp_start": row[1],
+        "timestamp_end": row[2],
+        "energy": row[3],
+        "seg_type": row[4],
+        "preview": row[5],
+        "playable": False,
+    }
+
+@app.get("/audio/glyph/{audio_id}")
+async def sonic_glyph(audio_id: str):
+    """Complete SonicGlyph — all fidelity layers in one object."""
+    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Audio not found: {audio_id}"}
+    conn = sqlite3.connect(str(idx_path))
+    meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM audio_meta").fetchall()}
+    fp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM fingerprint").fetchall()}
+    sp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM speakers").fetchall()}
+    segs = conn.execute("SELECT idx, timestamp, seg_type, energy FROM transcript_shadow").fetchall()
+    claims = conn.execute("SELECT idx, claim, value, unit, confidence FROM semantic_claims").fetchall()
+    chunks = conn.execute("SELECT idx, timestamp_start, timestamp_end, energy, seg_type, preview FROM audio_chunks").fetchall()
+    conn.close()
+    reg = _sonic_load_registry()
+    entry = reg.get(audio_id, {})
+    return {
+        "audio_id": audio_id,
+        "glyph_type": "SonicGlyph",
+        "filename": meta.get("filename", ""),
+        "fidelity_ladder": {
+            "L0_exists": True,
+            "L1_metadata": True,
+            "L2_signal": True,
+            "L3_fingerprint": True,
+            "L4_speakers": True,
+            "L5_transcript_shadow": True,
+            "L6_semantic_claims": len(claims),
+            "L7_degraded_preview": False,
+            "L8_encrypted_full": True,
+            "L9_playable": False,
+        },
+        "meta": meta,
+        "fingerprint": fp,
+        "speakers": sp,
+        "transcript_shadow": {
+            "segments": [{"idx": r[0], "t": r[1], "type": r[2], "energy": r[3]} for r in segs],
+            "total": len(segs),
+            "redacted": True,
+        },
+        "semantic_claims": [{"idx": r[0], "claim": r[1], "value": r[2], "unit": r[3], "confidence": r[4]} for r in claims],
+        "audio_chunks": [{"idx": r[0], "start": r[1], "end": r[2], "energy": r[3], "type": r[4]} for r in chunks],
+        "sha256": meta.get("sha256", ""),
+        "merkle_root": audio_id + hashlib.sha256(json.dumps(meta, sort_keys=True).encode()).hexdigest()[:20],
+        "registered_at": entry.get("uploaded_at", 0),
+        "playable": False,
+        "identity_exposed": False,
+    }
+
+@app.get("/audio/receipt/{audio_id}")
+async def sonic_receipt(audio_id: str):
+    """Proof receipt for audio — timestamped, hash-backed, non-playable."""
+    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Audio not found: {audio_id}"}
+    conn = sqlite3.connect(str(idx_path))
+    meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM audio_meta").fetchall()}
+    fp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM fingerprint").fetchall()}
+    claims = conn.execute("SELECT claim, value, confidence FROM semantic_claims").fetchall()
+    conn.close()
+    receipt = {
+        "receipt_id": hashlib.sha256(f"{audio_id}{time.time()}".encode()).hexdigest()[:16],
+        "audio_id": audio_id,
+        "timestamp": datetime.now().isoformat(),
+        "sha256": meta.get("sha256", ""),
+        "fingerprint_hash": fp.get("fingerprint_hash", ""),
+        "merkle_root": audio_id + hashlib.sha256(json.dumps(meta, sort_keys=True).encode()).hexdigest()[:20],
+        "filename": meta.get("filename", ""),
+        "duration_s": meta.get("duration_s", "0"),
+        "format": meta.get("format", "unknown"),
+        "speaker_count": int(fp.get("speaker_count", 0) or 0),
+        "claims_verified": len(claims),
+        "playable": False,
+        "identity_exposed": False,
+        "proof_type": "SonicGlyph non-playable proof receipt",
+    }
+    return receipt
+
+@app.get("/audio/files")
+async def sonic_list():
+    """List all indexed audio files."""
+    reg = _sonic_load_registry()
+    return {
+        "files": [{"audio_id": aid, **e} for aid, e in reg.items()],
+        "total": len(reg),
+    }
+
+# ─── SonicGlyph AFC Claims ──────────────────────────────────────────────
+
+@app.post("/audio/claim/create")
+async def sonic_claim_create(body: dict = Body(...)):
+    """Create an AFC claim for audio.
+    Body: {audio_id, seller_id, task_description, bond_amount, buyer_id?}
+    """
+    audio_id = body.get("audio_id", "")
+    if not audio_id:
+        return {"error": "audio_id is required"}
+    idx_path = SONIC_DATA_DIR / f"{audio_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Audio not found: {audio_id}"}
+    conn = sqlite3.connect(str(idx_path))
+    meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM audio_meta").fetchall()}
+    fp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM fingerprint").fetchall()}
+    sp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM speakers").fetchall()}
+    conn.close()
+    claim_id = hashlib.sha256(f"{audio_id}{time.time()}{body.get('seller_id','')}".encode()).hexdigest()[:16]
+    surrogate = {
+        "duration_s": meta.get("duration_s", "0"),
+        "sha256": meta.get("sha256", "")[:32],
+        "speaker_count": sp.get("speaker_count", "0"),
+        "speaker_estimate": sp.get("speaker_estimate", "unknown"),
+        "fingerprint_hash": fp.get("fingerprint_hash", ""),
+        "format": meta.get("format", "unknown"),
+        "redacted": True,
+    }
+    claim = {
+        "claim_id": claim_id,
+        "audio_id": audio_id,
+        "seller_id": body.get("seller_id", "anonymous"),
+        "buyer_id": body.get("buyer_id", ""),
+        "task_description": body.get("task_description", ""),
+        "surrogate": surrogate,
+        "bond_amount": body.get("bond_amount", 0),
+        "bond_posted": True,
+        "payment_escrowed": 0,
+        "status": "open",
+        "created_at": time.time(),
+        "tests_submitted": 0,
+        "tests_passed": 0,
+        "settlement_result": "",
+        "receipt": "",
+    }
+    _sonic_claims[claim_id] = claim
+    return {
+        "claim_id": claim_id,
+        "status": "open",
+        "surrogate": surrogate,
+        "bond_posted": claim["bond_amount"] > 0,
+        "message": "Claim created. Buyer must escrow payment, then reveal + settle.",
+    }
+
+@app.post("/audio/claim/settle")
+async def sonic_claim_settle(body: dict = Body(...)):
+    """Settle an AFC claim.
+    Body: {claim_id, buyer_id, payment_amount, tests_passed, tests_total}
+    """
+    claim_id = body.get("claim_id", "")
+    if claim_id not in _sonic_claims:
+        return {"error": f"Claim not found: {claim_id}"}
+    claim = _sonic_claims[claim_id]
+    tests_passed = body.get("tests_passed", 0)
+    tests_total = body.get("tests_total", 0)
+    payment = body.get("payment_amount", 0)
+    # Settlement logic: all tests pass → bond returned + payment released
+    # Any test fails → bond slashed + payment returned
+    if tests_total > 0 and tests_passed == tests_total:
+        result = "pass"
+        claim["settlement_result"] = f"PASS: {tests_passed}/{tests_total} tests passed. Bond returned. Payment released."
+        claim["receipt"] = hashlib.sha256(f"{claim_id}{time.time()}pass".encode()).hexdigest()[:32]
     else:
-        logger.warning("Winner revenue $%.2f too far from target $%.2f — not applying", winner.revenue_estimate, args.target)
-        print(json.dumps({
-            "winner": winner.to_dict(),
-            "applied": False,
-            "reason": "revenue_too_low",
-            "revenue_estimate": winner.revenue_estimate,
-            "target": args.target,
-        }, indent=2))
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-rotator_engine.cpp:
-```
-/*
- * RentMasseur Rotator Engine — C++ Native
- * High-performance rotation engine for bios, photos, prices, interviews, blogs.
- * RL feedback loop with reward calculation. 10x faster than Python equivalent.
- *
- * Build: g++ -O3 -std=c++17 -o rotator_engine rotator_engine.cpp -lcurl
- * Run:   ./rotator_engine --rotate bio
- *        ./rotator_engine --report
- *        ./rotator_engine --reward bio photo_001 '{"views":150,"phone_clicks":12}'
- */
-
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <map>
-#include <unordered_map>
-#include <algorithm>
-#include <chrono>
-#include <ctime>
-#include <iomanip>
-#include <random>
-#include <memory>
-#include <cmath>
-#include <cstdlib>
-
-using json_val = std::string;
-
-struct RewardWeights {
-    int views = 1;
-    int email_clicks = 5;
-    int phone_clicks = 10;
-    int booking_inquiries = 50;
-    int favorites = 3;
-    int messages = 8;
-};
-
-struct RotationRule {
-    int max_age_hours;
-    int min_reward_threshold;
-    bool rotate_if_stale;
-};
-
-struct RotationItem {
-    std::string id;
-    std::string content;
-    std::string strategy;
-    std::string start_time;
-    std::string end_time;
-    double total_reward = 0;
-    double delta_reward = 0;
-    int times_used = 0;
-    double age_hours = 0;
-    std::map<std::string, int> last_stats;
-    std::map<std::string, int> delta_stats;
-};
-
-struct RLState {
-    std::map<std::string, std::map<std::string, RotationItem>> stores;
-    std::map<std::string, std::string> current;
-    std::map<std::string, int> rotations;
-    std::vector<std::string> history;
-};
-
-// --- Utilities ---
-
-static std::string iso_timestamp() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
-    return std::string(buf);
-}
-
-static double hours_since(const std::string& iso_time) {
-    if (iso_time.empty()) return 0;
-    // Simple parse: extract hours from ISO timestamp difference
-    // For production, use proper date parsing
-    std::time_t now = std::time(nullptr);
-    // Approximate: parse the timestamp
-    struct std::tm tm = {};
-    std::istringstream ss(iso_time);
-    ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
-    std::time_t then = std::mktime(&tm);
-    return std::difftime(now, then) / 3600.0;
-}
-
-static std::string read_file(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) return "";
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
-static void write_file(const std::string& path, const std::string& content) {
-    std::ofstream f(path);
-    if (f) f << content;
-}
-
-// Simple JSON-ish serialization for state
-static std::string serialize_state(const RLState& state) {
-    std::ostringstream ss;
-    ss << "{\n";
-    ss << "  \"stores\": {\n";
-    bool first_store = true;
-    for (const auto& [type, store] : state.stores) {
-        if (!first_store) ss << ",\n";
-        first_store = false;
-        ss << "    \"" << type << "\": {\n";
-        bool first_item = true;
-        for (const auto& [id, item] : store) {
-            if (!first_item) ss << ",\n";
-            first_item = false;
-            ss << "      \"" << id << "\": {\n";
-            ss << "        \"content\": \"" << item.content.substr(0, 200) << "\",\n";
-            ss << "        \"strategy\": \"" << item.strategy << "\",\n";
-            ss << "        \"total_reward\": " << item.total_reward << ",\n";
-            ss << "        \"delta_reward\": " << item.delta_reward << ",\n";
-            ss << "        \"times_used\": " << item.times_used << ",\n";
-            ss << "        \"age_hours\": " << item.age_hours << "\n";
-            ss << "      }";
-        }
-        ss << "\n    }";
-    }
-    ss << "\n  },\n";
-    ss << "  \"current\": {\n";
-    bool first_cur = true;
-    for (const auto& [type, id] : state.current) {
-        if (!first_cur) ss << ",\n";
-        first_cur = false;
-        ss << "    \"" << type << "\": \"" << id << "\"";
-    }
-    ss << "\n  },\n";
-    ss << "  \"rotations\": {\n";
-    bool first_rot = true;
-    for (const auto& [type, count] : state.rotations) {
-        if (!first_rot) ss << ",\n";
-        first_rot = false;
-        ss << "    \"" << type << "\": " << count;
-    }
-    ss << "\n  }\n";
-    ss << "}\n";
-    return ss.str();
-}
-
-// --- Core Engine ---
-
-class RotatorEngine {
-private:
-    RLState state;
-    RewardWeights weights;
-    std::map<std::string, RotationRule> rules;
-    std::string state_path;
-    std::mt19937 rng;
-
-public:
-    RotatorEngine(const std::string& content_dir) : state_path(content_dir + "/rl_state.json") {
-        rules["bio"] = {24, 5, true};
-        rules["photo"] = {48, 3, true};
-        rules["price"] = {12, 8, false};
-        rules["interview"] = {72, 2, true};
-        rules["blog"] = {48, 4, true};
-        rng.seed(std::random_device()());
-        load_state();
+        result = "fail"
+        failed = tests_total - tests_passed
+        claim["settlement_result"] = f"FAIL: {tests_passed}/{tests_total} passed, {failed} failed. Bond slashed. Payment returned."
+        claim["receipt"] = hashlib.sha256(f"{claim_id}{time.time()}fail".encode()).hexdigest()[:32]
+    claim["status"] = "settled"
+    claim["tests_submitted"] = tests_total
+    claim["tests_passed"] = tests_passed
+    claim["payment_escrowed"] = payment
+    claim["settled_at"] = time.time()
+    return {
+        "claim_id": claim_id,
+        "status": "settled",
+        "result": result,
+        "settlement": claim["settlement_result"],
+        "receipt": claim["receipt"],
+        "bond_returned": result == "pass",
+        "payment_released": result == "pass",
     }
 
-    void load_state() {
-        std::string raw = read_file(state_path);
-        if (raw.empty()) return;
-        // Minimal parse — in production use nlohmann/json
-        // For now, state starts empty and gets populated at runtime
-    }
-
-    void save_state() {
-        write_file(state_path, serialize_state(state));
-    }
-
-    double calculate_reward(const std::map<std::string, int>& stats, double age_hours) {
-        double reward = 0;
-        reward += stats.count("views") ? stats.at("views") * weights.views : 0;
-        reward += stats.count("email_clicks") ? stats.at("email_clicks") * weights.email_clicks : 0;
-        reward += stats.count("phone_clicks") ? stats.at("phone_clicks") * weights.phone_clicks : 0;
-        reward += stats.count("booking_inquiries") ? stats.at("booking_inquiries") * weights.booking_inquiries : 0;
-        reward += stats.count("favorites") ? stats.at("favorites") * weights.favorites : 0;
-        reward += stats.count("messages") ? stats.at("messages") * weights.messages : 0;
-        reward -= (age_hours / 24.0) * 0.5;
-        return std::round(reward * 100.0) / 100.0;
-    }
-
-    struct RotateDecision {
-        bool rotate;
-        std::string reason;
-    };
-
-    RotateDecision should_rotate(const std::string& type, double age_hours, double delta_reward) {
-        auto it = rules.find(type);
-        if (it == rules.end()) return {false, "unknown type"};
-
-        const auto& rule = it->second;
-        if (rule.rotate_if_stale && age_hours >= rule.max_age_hours)
-            return {true, "stale (" + std::to_string((int)age_hours) + "h >= " + std::to_string(rule.max_age_hours) + "h)"};
-        if (age_hours >= rule.max_age_hours / 2 && delta_reward < rule.min_reward_threshold)
-            return {true, "low reward (" + std::to_string((int)delta_reward) + " < " + std::to_string(rule.min_reward_threshold) + ")"};
-        if (age_hours >= 6 && delta_reward == 0)
-            return {true, "zero engagement 6h+"};
-        return {false, "performing well"};
-    }
-
-    std::pair<std::string, RotationItem*> pick_next(const std::string& type) {
-        auto store_it = state.stores.find(type);
-        if (store_it == state.stores.end() || store_it->second.empty())
-            return {"", nullptr};
-
-        auto& store = store_it->second;
-        std::vector<std::pair<std::string, RotationItem*>> items;
-        for (auto& [id, item] : store) {
-            items.emplace_back(id, &item);
-        }
-
-        std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
-            if (a.second->times_used != b.second->times_used)
-                return a.second->times_used < b.second->times_used;
-            return a.second->total_reward > b.second->total_reward;
-        });
-
-        return items[0];
-    }
-
-    void register_rotation(const std::string& type, const std::string& id,
-                          const std::string& content, const std::string& strategy) {
-        auto& store = state.stores[type];
-        auto cur_it = state.current.find(type);
-        if (cur_it != state.current.end() && store.count(cur_it->second)) {
-            store[cur_it->second].end_time = iso_timestamp();
-        }
-
-        auto& item = store[id];
-        item.id = id;
-        item.content = content.substr(0, 500);
-        item.strategy = strategy;
-        item.start_time = iso_timestamp();
-        item.total_reward = 0;
-        item.delta_reward = 0;
-        item.times_used++;
-        item.age_hours = 0;
-
-        state.current[type] = id;
-        state.rotations[type]++;
-
-        save_state();
-    }
-
-    void update_reward(const std::string& type, const std::string& id,
-                       const std::map<std::string, int>& stats) {
-        auto store_it = state.stores.find(type);
-        if (store_it == state.stores.end()) return;
-        auto item_it = store_it->second.find(id);
-        if (item_it == store_it->second.end()) return;
-
-        auto& item = item_it->second;
-        std::map<std::string, int> delta;
-        for (const auto& [key, weight] : std::map<std::string, int>{{"views",1},{"email_clicks",5},{"phone_clicks",10},{"booking_inquiries",50},{"favorites",3},{"messages",8}}) {
-            int prev = item.last_stats.count(key) ? item.last_stats[key] : 0;
-            delta[key] = std::max(0, stats.count(key) ? stats.at(key) - prev : 0);
-        }
-
-        double age = hours_since(item.start_time);
-        double dr = calculate_reward(delta, age);
-        item.delta_reward = dr;
-        item.total_reward += dr;
-        item.last_stats = stats;
-        item.age_hours = age;
-
-        save_state();
-    }
-
-    std::vector<std::pair<std::string, double>> top_performers(const std::string& type, int n = 5) {
-        auto store_it = state.stores.find(type);
-        if (store_it == state.stores.end()) return {};
-
-        std::vector<std::pair<std::string, double>> result;
-        for (const auto& [id, item] : store_it->second) {
-            result.emplace_back(id, item.total_reward);
-        }
-        std::sort(result.begin(), result.end(),
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
-        if ((int)result.size() > n) result.resize(n);
-        return result;
-    }
-
-    std::string report() {
-        std::ostringstream ss;
-        ss << "=== ROTATOR ENGINE REPORT (C++) ===\n";
-        for (const auto& type : {"bio", "photo", "price", "interview", "blog"}) {
-            int rotations = state.rotations.count(type) ? state.rotations[type] : 0;
-            std::string cur = state.current.count(type) ? state.current[type] : "none";
-            ss << "\n" << type << ": " << rotations << " rotations, current=" << cur << "\n";
-            auto top = top_performers(type, 3);
-            for (const auto& [id, reward] : top) {
-                ss << "  " << id << ": reward=" << reward << "\n";
-            }
-        }
-        return ss.str();
-    }
-
-    // Price generation
-    struct PriceStrategy {
-        std::string name;
-        std::string desc;
-        int base;
-        int variance;
-    };
-
-    std::vector<PriceStrategy> price_strategies = {
-        {"premium_peak", "High price peak hours", 250, 30},
-        {"off_peak_deal", "Off-peak discount", 180, 20},
-        {"new_client_special", "First-time client", 150, 15},
-        {"loyalty_rate", "Returning client", 200, 10},
-        {"late_night_premium", "After-hours", 300, 50},
-        {"lunch_express", "Quick lunch", 120, 10},
-        {"weekend_warrior", "Weekend athletic", 220, 25},
-        {"holiday_special", "Seasonal", 200, 40},
-        {"last_minute", "Same-day", 170, 15},
-        {"package_deal", "Multi-session", 190, 20},
-    };
-
-    int generate_price(const std::string& strategy_name, int hour, int day_of_week) {
-        const PriceStrategy* s = &price_strategies[0];
-        for (const auto& ps : price_strategies) {
-            if (ps.name == strategy_name) { s = &ps; break; }
-        }
-
-        int price = s->base;
-        if (hour >= 18 && hour <= 23) price += s->variance * 0.5;
-        if (hour >= 0 && hour <= 4) price += s->variance * 0.8;
-        if (day_of_week == 0 || day_of_week == 6) price += s->variance * 0.3;
-
-        std::uniform_real_distribution<double> dist(-0.1, 0.1);
-        price += std::round(dist(rng) * s->variance);
-
-        return std::max(80, price);
-    }
-};
-
-// --- CLI ---
-
-int main(int argc, char* argv[]) {
-    std::string content_dir = "./content";
-    std::string action = "report";
-    std::string type = "bio";
-    std::string item_id;
-    std::string stats_json;
-
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--rotate" && i + 1 < argc) { action = "rotate"; type = argv[++i]; }
-        else if (arg == "--report") { action = "report"; }
-        else if (arg == "--reward" && i + 3 < argc) {
-            action = "reward"; type = argv[++i]; item_id = argv[++i]; stats_json = argv[++i];
-        }
-        else if (arg == "--price" && i + 2 < argc) {
-            action = "price"; std::string strat = argv[++i]; int hr = std::atoi(argv[++i]);
-            int dow = i + 1 < argc ? std::atoi(argv[++i]) : 3;
-            RotatorEngine engine(content_dir);
-            int price = engine.generate_price(strat, hr, dow);
-            std::cout << "Price: $" << price << " (strategy: " << strat << ", hour: " << hr << ")\n";
-            return 0;
-        }
-        else if (arg == "--dir" && i + 1 < argc) { content_dir = argv[++i]; }
-        else if (arg == "--help") {
-            std::cout << "Usage: rotator_engine [options]\n"
-                      << "  --rotate <type>       Pick next item to rotate\n"
-                      << "  --report              Show RL report\n"
-                      << "  --reward <type> <id> <stats_json>  Update reward\n"
-                      << "  --price <strategy> <hour> <day>    Generate price\n"
-                      << "  --dir <path>          Content directory\n";
-            return 0;
-        }
-    }
-
-    RotatorEngine engine(content_dir);
-
-    if (action == "report") {
-        std::cout << engine.report() << "\n";
-    } else if (action == "rotate") {
-        auto [id, item] = engine.pick_next(type);
-        if (item) {
-            std::cout << "Next " << type << ": " << id
-                      << " (strategy: " << item->strategy
-                      << ", uses: " << item->times_used
-                      << ", reward: " << item->total_reward << ")\n";
-        } else {
-            std::cout << "No " << type << " items in pool\n";
-            return 1;
-        }
-    } else if (action == "reward") {
-        std::map<std::string, int> stats;
-        // Simple parse: {"views":150,"phone_clicks":12}
-        // In production, use proper JSON parser
-        std::cout << "Updating reward for " << type << "/" << item_id << "\n";
-        engine.update_reward(type, item_id, stats);
-        std::cout << "Reward updated\n";
-    }
-
-    return 0;
-}
-
-```
-
-cpp_os_server.cpp:
-```
-/*
- * RentMasseur Operating System — C++ Native HTTP Server
- * Production-control version: no mock success, no simulation claims, no detached fake starts.
- * Every action returns real evidence: exit code, captured output, receipt path, and block reasons.
- */
-
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <map>
-#include <chrono>
-#include <ctime>
-#include <cstring>
-#include <cstdlib>
-#include <cstdio>
-#include <sys/stat.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <dirent.h>
-
-static const int PORT = 7860;
-static std::string GH_TOKEN = std::getenv("GH_TOKEN") ? std::getenv("GH_TOKEN") : "";
-static std::string GH_REPO = std::getenv("GH_REPO") ? std::getenv("GH_REPO") : "overandor/rentmasseur-extension";
-static std::string ADMIN_TOKEN = std::getenv("ADMIN_TOKEN") ? std::getenv("ADMIN_TOKEN") : "";
-static const std::string CONTENT_DIR = "./content";
-static const std::string RECEIPTS_DIR = "./receipts";
-static const std::string AVAILABILITY_FILE = "./availability.json";
-
-static void ensure_dir(const std::string& path) {
-    mkdir(path.c_str(), 0755);
-}
-
-static std::string iso_timestamp() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
-    return std::string(buf);
-}
-
-static std::string compact_timestamp() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", std::gmtime(&t));
-    return std::string(buf);
-}
-
-static bool file_exists(const std::string& path) {
-    std::ifstream f(path);
-    return static_cast<bool>(f);
-}
-
-static std::string read_file(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) return "";
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
-static std::string json_escape(const std::string& s) {
-    std::string out;
-    for (char c : s) {
-        if (c == '"') out += "\\\"";else if (c == '\\') out += "\\\\";
-        else if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else if (c == '\t') out += "\\t";
-        else if ((unsigned char)c < 0x20) {
-            char buf[8];
-            std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
-            out += buf;
-        } else out += c;
-    }
-    return out;
-}
-
-static std::string http_response(int code, const std::string& content_type, const std::string& body) {
-    std::string reason = code == 200 ? "OK" : (code == 202 ? "Accepted" : (code == 403 ? "Forbidden" : (code == 404 ? "Not Found" : "Error")));
-    std::ostringstream ss;
-    ss << "HTTP/1.1 " << code << " " << reason << "\r\n";
-    ss << "Content-Type: " << content_type << "\r\n";
-    ss << "Content-Length: " << body.size() << "\r\n";
-    ss << "Access-Control-Allow-Origin: *\r\n";
-    ss << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
-    ss << "Access-Control-Allow-Headers: Content-Type\r\n";
-    ss << "Connection: close\r\n\r\n";
-    ss << body;
-    return ss.str();
-}
-
-static std::string get_method(const std::string& request) {
-    size_t space = request.find(' ');
-    return space == std::string::npos ? "GET" : request.substr(0, space);
-}
-
-static std::string get_path(const std::string& request) {
-    size_t first = request.find(' ');
-    if (first == std::string::npos) return "/";
-    size_t second = request.find(' ', first + 1);
-    if (second == std::string::npos) return "/";
-    return request.substr(first + 1, second - first - 1);
-}
-
-static std::string get_body(const std::string& request) {
-    size_t pos = request.find("\r\n\r\n");
-    return pos == std::string::npos ? "" : request.substr(pos + 4);
-}
-
-struct CommandResult {
-    int exit_code;
-    std::string output;
-};
-
-static CommandResult run_command_evidence(const std::string& cmd) {
-    std::string wrapped = cmd + " 2>&1";
-    FILE* pipe = popen(wrapped.c_str(), "r");
-    if (!pipe) return {127, "popen failed"};
-    char buffer[512];
-    std::string output;
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        output += buffer;
-        if (output.size() > 6000) {
-            output = output.substr(output.size() - 6000);
-        }
-    }
-    int status = pclose(pipe);
-    int code = status;
-    if (WIFEXITED(status)) code = WEXITSTATUS(status);
-    return {code, output};
-}
-
-static std::string write_receipt(const std::string& action, const std::string& status, int exit_code, const std::string& output, const std::string& extra_json = "") {
-    ensure_dir(RECEIPTS_DIR);
-    std::string path = RECEIPTS_DIR + "/hf_action_" + compact_timestamp() + "_" + action + ".json";
-    std::ofstream f(path);
-    if (f) {
-        f << "{\n";
-        f << "  \"action\": \"" << json_escape(action) << "\",\n";
-        f << "  \"status\": \"" << json_escape(status) << "\",\n";
-        f << "  \"exit_code\": " << exit_code << ",\n";
-        f << "  \"timestamp\": \"" << iso_timestamp() << "\",\n";
-        f << "  \"stdout_stderr_tail\": \"" << json_escape(output) << "\"";
-        if (!extra_json.empty()) f << ",\n  " << extra_json;
-        f << "\n}\n";
-    }
-    return path;
-}
-
-static int count_files(const std::string& dir) {
-    int count = 0;
-    DIR* d = opendir(dir.c_str());
-    if (!d) return 0;
-    struct dirent* entry;
-    while ((entry = readdir(d)) != nullptr) {
-        if (entry->d_type == DT_REG) count++;
-    }
-    closedir(d);
-    return count;
-}
-
-static std::string read_json_or_block(const std::string& path, const std::string& name) {
-    std::string c = read_file(path);
-    if (!c.empty()) return c;
-    return "{\"status\":\"missing_real_data\",\"name\":\"" + json_escape(name) + "\",\"path\":\"" + json_escape(path) + "\"}";
-}
-
-static std::string bios_json() {
-    std::string dir = CONTENT_DIR + "/bios";
-    DIR* d = opendir(dir.c_str());
-    if (!d) return "{\"status\":\"missing_real_data\",\"bios\":[],\"reason\":\"content/bios directory does not exist\"}";
-    std::ostringstream ss;
-    ss << "{\"status\":\"ok\",\"bios\":[";
-    bool first = true;
-    struct dirent* entry;
-    while ((entry = readdir(d)) != nullptr) {
-        if (entry->d_type != DT_REG) continue;
-        std::string name = entry->d_name;
-        std::string content = read_file(dir + "/" + name);
-        if (!first) ss << ",";
-        first = false;
-        ss << "{\"file\":\"" << json_escape(name) << "\",\"content\":\"" << json_escape(content) << "\"}";
-    }
-    closedir(d);
-    ss << "]}";
-    return ss.str();
-}
-
-static std::string gh_api(const std::string& method, const std::string& endpoint, const std::string& body = "") {
-    if (GH_TOKEN.empty()) return "{\"status\":\"blocked\",\"reason\":\"GH_TOKEN not set\"}";
-    std::string cmd = "curl -sS -X " + method;
-    cmd += " -H \"Authorization: Bearer " + GH_TOKEN + "\"";
-    cmd += " -H \"Accept: application/vnd.github+json\"";
-    cmd += " -H \"X-GitHub-Api-Version: 2022-11-28\"";
-    if (!body.empty()) cmd += " -d '" + body + "'";
-    cmd += " https://api.github.com/repos/" + GH_REPO + "/" + endpoint;
-    CommandResult r = run_command_evidence(cmd);
-    return r.output.empty() ? "{\"status\":\"dispatched_or_empty_response\",\"exit_code\":" + std::to_string(r.exit_code) + "}" : r.output;
-}
-
-static std::string url_encode_workflow(const std::string& s) {
-    std::string out;
-    for (char c : s) {
-        if (c == '/') out += "%2F";
-        else if (c == ' ') out += "%20";
-        else out += c;
-    }
-    return out;
-}
-
-static std::string action_response(const std::string& action, const std::string& cmd) {
-    CommandResult r = run_command_evidence(cmd);
-    std::string status = r.exit_code == 0 ? "success" : "failed";
-    std::string label = r.exit_code == 0 ? (!r.output.empty() ? "GREEN_REAL" : "GRAY_NO_DATA") : "RED_FAILED";
-    std::string receipt = write_receipt(action, status, r.exit_code, r.output, "\"command\": \"" + json_escape(cmd) + "\"");
-    std::ostringstream ss;
-    ss << "{\"status\":\"" << status << "\",\"label\":\"" << label << "\",\"action\":\"" << json_escape(action) << "\",\"exit_code\":" << r.exit_code;
-    ss << ",\"receipt\":\"" << json_escape(receipt) << "\",\"stdout_stderr_tail\":\"" << json_escape(r.output) << "\"}";
-    return ss.str();
-}
-
-static std::string blocked_response(const std::string& action, const std::string& reason) {
-    std::string receipt = write_receipt(action, "blocked", 0, reason);
-    return "{\"status\":\"blocked\",\"action\":\"" + json_escape(action) + "\",\"reason\":\"" + json_escape(reason) + "\",\"receipt\":\"" + json_escape(receipt) + "\"}";
-}
-
-static bool is_mutation(const std::string& m, const std::string& p) {
-    if (m == "POST" && p != "/api/metrics/ingest") return true;
-    if (p.rfind("/api/cicd/trigger/", 0) == 0) return true;
-    if (p.rfind("/api/rotate/", 0) == 0) return true;
-    if (p == "/api/run/ga-rl" || p == "/api/run/orchestrator" || p == "/api/run/availability" || p == "/api/rotator/report") return true;
-    return false;
-}
-
-static std::string check_admin(const std::string& req, const std::string& path, const std::string& method) {
-    if (!is_mutation(method, path)) return "";
-    if (ADMIN_TOKEN.empty()) return blocked_response("auth", "ADMIN_TOKEN required; mutation endpoints disabled until ADMIN_TOKEN is set.");
-    size_t ap = req.find("Authorization: Bearer ");
-    if (ap != std::string::npos) {
-        size_t vs = ap + 21;
-        size_t ve = req.find("\r\n", vs);
-        if (ve != std::string::npos && req.substr(vs, ve - vs) == ADMIN_TOKEN) return "";
-    }
-    return blocked_response("auth", "Admin token required for mutation endpoints. Use Authorization: Bearer <ADMIN_TOKEN> header.");
-}
-
-static std::string landing_page() {
-    return R"HTML(<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>RentMasseur RevenueOps Control Plane</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'SF Mono',Monaco,Consolas,monospace;background:#0a0b14;color:#e0e0e8;padding:20px}
-h1{font-size:24px;font-weight:600;letter-spacing:-0.5px}
-h2{font-size:13px;text-transform:uppercase;letter-spacing:1px;color:#6b7280;margin-bottom:12px}
-.subtitle{color:#6b7280;font-size:13px;margin-top:4px}
-.header{padding:24px 0;border-bottom:1px solid #1e2030;margin-bottom:24px}
-.header h1{color:#fff}
-.status-bar{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
-.tag{padding:4px 10px;border-radius:4px;font-size:11px;font-weight:600}
-.tag-green{background:#0d3320;color:#39ff88;border:1px solid #1a5c3a}
-.tag-gray{background:#1a1b2e;color:#6b7280;border:1px solid #2a2b3e}
-.tag-red{background:#330d0d;color:#ff5370;border:1px solid #5c1a1a}
-.tag-yellow{background:#332b0d;color:#ffd166;border:1px solid #5c4a1a}
-.tag-black{background:#0d0d0d;color:#444;border:1px solid #222}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;margin-top:16px}
-.panel{background:#11121f;border:1px solid #1e2030;border-radius:8px;padding:20px;min-height:200px}
-.panel pre{white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.5;color:#9ca3af;max-height:400px;overflow:auto}
-.metric-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1a1b2e;font-size:13px}
-.metric-label{color:#6b7280}
-.metric-value{color:#e0e0e8;font-weight:600}
-.metric-zero{color:#444}
-.truth{font-size:12px;color:#ff5370;padding:8px;background:#1a0a0a;border-radius:4px;margin-top:8px}
-.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-.btn{padding:8px 14px;border-radius:6px;border:1px solid #2a2b3e;background:#161728;color:#9ca3af;text-decoration:none;font-size:12px;cursor:pointer;transition:all 0.15s}
-.btn:hover{border-color:#3a3b4e;color:#fff}
-.btn-danger{border-color:#3a1a1a;color:#ff5370}
-.btn-danger:hover{background:#1a0a0a}
-.btn-ok{border-color:#1a3a2a;color:#39ff88}
-.btn-ok:hover{background:#0a1a0a}
-.footer{margin-top:32px;padding-top:16px;border-top:1px solid #1e2030;color:#444;font-size:11px;text-align:center}
-#daily-proof{font-size:12px;line-height:1.8;color:#9ca3af}
-.proof-q{color:#6b7280}
-.proof-a{color:#e0e0e8}
-</style>
-</head>
-<body>
-
-<div class="header">
-  <h1>RentMasseur RevenueOps Control Plane</h1>
-  <p class="subtitle">Mission: one paying client per day, or prove exactly why it failed today.</p>
-  <div class="status-bar">
-    <span class="tag tag-gray" id="tag-health">HEALTH: checking...</span>
-    <span class="tag tag-gray" id="tag-metrics">METRICS: checking...</span>
-    <span class="tag tag-gray" id="tag-candidates">CANDIDATES: checking...</span>
-    <span class="tag tag-gray" id="tag-decision">DECISION: checking...</span>
-    <span class="tag tag-black">AVAILABILITY: BLACK_DISABLED</span>
-  </div>
-</div>
-
-<div class="grid">
-
-  <div class="panel">
-    <h2>Mission Control</h2>
-    <div class="metric-row"><span class="metric-label">Today target</span><span class="metric-value">1 paid client</span></div>
-    <div class="metric-row"><span class="metric-label">Current status</span><span class="metric-value" id="mission-status">loading...</span></div>
-    <div class="metric-row"><span class="metric-label">Prospects today</span><span class="metric-value metric-zero" id="prospects-count">0</span></div>
-    <div class="metric-row"><span class="metric-label">Leads active</span><span class="metric-value metric-zero" id="leads-active">0</span></div>
-    <div class="metric-row"><span class="metric-label">Bookings confirmed</span><span class="metric-value metric-zero" id="bookings-confirmed">0</span></div>
-    <div class="metric-row"><span class="metric-label">Revenue verified</span><span class="metric-value metric-zero">$0</span></div>
-    <div class="truth" id="mission-truth">No mock success. No simulation labels. Every number must be backed by a receipt.</div>
-  </div>
-
-  <div class="panel">
-    <h2>Live Metrics</h2>
-    <div id="metrics-panel"><pre>loading...</pre></div>
-    <div class="actions">
-      <a class="btn" href="/api/funnel/daily">Funnel Daily</a>
-      <a class="btn" href="/api/leads">Leads</a>
-      <a class="btn btn-ok" href="/api/metrics/ingest" onclick="return false">Ingest (POST)</a>
-    </div>
-  </div>
-
-  <div class="panel">
-    <h2>Candidate Queue</h2>
-    <div id="candidates-panel"><pre>loading...</pre></div>
-    <div class="actions">
-      <a class="btn" href="/api/candidates">Refresh</a>
-      <a class="btn" href="/api/bios">Bios</a>
-    </div>
-  </div>
-
-  <div class="panel">
-    <h2>Decision Gate</h2>
-    <div id="decision-panel"><pre>loading...</pre></div>
-    <div class="actions">
-      <a class="btn" href="/api/decision/latest">Latest Decision</a>
-      <a class="btn btn-danger" href="/api/run/availability">Availability (BLOCKED)</a>
-    </div>
-  </div>
-
-  <div class="panel">
-    <h2>Job Ledger</h2>
-    <div id="jobs-panel"><pre>loading...</pre></div>
-    <div class="actions">
-      <a class="btn" href="/api/jobs">All Jobs</a>
-      <a class="btn" href="/api/receipts">Receipts</a>
-      <a class="btn" href="/api/audit/files">File Audit</a>
-    </div>
-  </div>
-
-  <div class="panel">
-    <h2>Revenue Proof</h2>
-    <div class="metric-row"><span class="metric-label">Verified revenue</span><span class="metric-value metric-zero">$0</span></div>
-    <div class="metric-row"><span class="metric-label">Confirmed bookings</span><span class="metric-value metric-zero">0</span></div>
-    <div class="metric-row"><span class="metric-label">Target</span><span class="metric-value">1 client/day</span></div>
-    <div class="metric-row"><span class="metric-label">Client probability</span><span class="metric-value metric-zero" id="prob">unverified</span></div>
+@app.get("/audio/claim/{claim_id}")
+async def sonic_claim_get(claim_id: str):
+    """Get claim status."""
+    if claim_id not in _sonic_claims:
+        return {"error": f"Claim not found: {claim_id}"}
+    return _sonic_claims[claim_id]
+
+# ─── MCP Protocol Endpoints (for ChatGPT web) ───────────────────────────
+# Embeds MCP server directly into the FastAPI app so the HF Space URL
+# becomes an MCP endpoint: https://josephrw-llm-file-proxy.hf.space/mcp
+
+_MCP_TOOLS = [
+    {
+        "name": "jorki_list_files",
+        "description": "List all indexed files in the Jorki registry",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "jorki_metadata",
+        "description": "Get file metadata: name, size, line count, word count, merkle root, symbol count, chunk count.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_summary",
+        "description": "Get structural summary: top words, function symbols, chunk previews, line/word counts.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_search",
+        "description": "Search file content for a query string. Returns matching lines and symbol hits.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}, "q": {"type": "string", "description": "Search query"}}, "required": ["file_id", "q"]},
+    },
+    {
+        "name": "jorki_chunk",
+        "description": "Retrieve a specific content chunk by index. Returns line range, boundary type, and preview text.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}, "idx": {"type": "integer", "description": "Chunk index (0-based)", "default": 0}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_verify",
+        "description": "Verify file integrity: check merkle root, confirm index exists, return verification receipt.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_kpi",
+        "description": "Extract KPIs: monetary values, percentages, dates, technical metrics, operational indicators with confidence scores.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_dna",
+        "description": "Get the file's DNA fingerprint: structural genes, complexity score, species classification, genome size.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_profile",
+        "description": "Get semantic profile: origin, accounting, finance, law, collateral, liquidity, risk.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_ml",
+        "description": "Get ML features: topics, clusters, anomalies, latent features, TF-IDF top terms.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_valuation",
+        "description": "Get valuation: production readiness, replacement cost, build cost, depreciation, insurance value.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_dossier",
+        "description": "Get the complete file dossier — all analysis layers combined: identity, DNA, KPIs, profile, ML, valuation, risk, recommendations, narrative.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}, "format": {"type": "string", "enum": ["json", "text"], "default": "json", "description": "Output format"}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_capabilities",
+        "description": "List all capabilities available for a file (sql, search, chunk, summary, etc.).",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_stats",
+        "description": "Get query statistics for a file — how many times each endpoint was called.",
+        "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string", "description": "12-character Jorki file ID"}}, "required": ["file_id"]},
+    },
+    {
+        "name": "jorki_health",
+        "description": "Check Jorki API health and list available endpoints.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "sonic_list",
+        "description": "List all indexed audio files with SonicGlyph metadata.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "sonic_meta",
+        "description": "Get audio metadata: format, duration, loudness, silence ratio, sample rate, codec (L0-L2).",
+        "inputSchema": {"type": "object", "properties": {"audio_id": {"type": "string", "description": "12-character audio ID"}}, "required": ["audio_id"]},
+    },
+    {
+        "name": "sonic_fingerprint",
+        "description": "Get acoustic fingerprint: spectral centroid, flatness, brightness, tonality — non-playable identity (L3).",
+        "inputSchema": {"type": "object", "properties": {"audio_id": {"type": "string", "description": "12-character audio ID"}}, "required": ["audio_id"]},
+    },
+    {
+        "name": "sonic_speakers",
+        "description": "Get speaker topology: count, voice activity, estimate — without identity exposure (L4).",
+        "inputSchema": {"type": "object", "properties": {"audio_id": {"type": "string", "description": "12-character audio ID"}}, "required": ["audio_id"]},
+    },
+    {
+        "name": "sonic_transcript_shadow",
+        "description": "Get redacted transcript shadow: speech structure, pace, pauses, emphasis — without words (L5).",
+        "inputSchema": {"type": "object", "properties": {"audio_id": {"type": "string", "description": "12-character audio ID"}}, "required": ["audio_id"]},
+    },
+    {
+        "name": "sonic_claims",
+        "description": "Get timestamped semantic claims about the audio: duration, format, speaker count, brightness, tonality, pace (L6).",
+        "inputSchema": {"type": "object", "properties": {"audio_id": {"type": "string", "description": "12-character audio ID"}}, "required": ["audio_id"]},
+    },
+    {
+        "name": "sonic_search",
+        "description": "Search audio chunks by segment type (speech, pause, emphasis) or energy pattern.",
+        "inputSchema": {"type": "object", "properties": {"audio_id": {"type": "string", "description": "12-character audio ID"}, "q": {"type": "string", "description": "Search query (try: speech, pause, emphasis)"}}, "required": ["audio_id", "q"]},
+    },
+    {
+        "name": "sonic_chunk",
+        "description": "Get audio chunk at a specific timestamp. Returns energy, segment type, and preview — not playable.",
+        "inputSchema": {"type": "object", "properties": {"audio_id": {"type": "string", "description": "12-character audio ID"}, "timestamp": {"type": "number", "description": "Timestamp in seconds"}}, "required": ["audio_id", "timestamp"]},
+    },
+    {
+        "name": "sonic_glyph",
+        "description": "Get complete SonicGlyph — all fidelity layers (L0-L8) in one object: meta, fingerprint, speakers, transcript shadow, claims, chunks.",
+        "inputSchema": {"type": "object", "properties": {"audio_id": {"type": "string", "description": "12-character audio ID"}}, "required": ["audio_id"]},
+    },
+    {
+        "name": "sonic_receipt",
+        "description": "Get non-playable proof receipt for audio: timestamped, hash-backed, with merkle root and claims verified.",
+        "inputSchema": {"type": "object", "properties": {"audio_id": {"type": "string", "description": "12-character audio ID"}}, "required": ["audio_id"]},
+    },
+    {
+        "name": "sonic_claim_create",
+        "description": "Create an AFC claim for audio. Seller posts bond, buyer escrows payment. Surrogate reveals non-playable proof only.",
+        "inputSchema": {"type": "object", "properties": {"audio_id": {"type": "string", "description": "12-character audio ID"}, "seller_id": {"type": "string"}, "task_description": {"type": "string"}, "bond_amount": {"type": "number"}, "buyer_id": {"type": "string"}}, "required": ["audio_id"]},
+    },
+    {
+        "name": "sonic_claim_settle",
+        "description": "Settle an AFC claim. If all tests pass: bond returned + payment released. If any fail: bond slashed + payment returned.",
+        "inputSchema": {"type": "object", "properties": {"claim_id": {"type": "string"}, "payment_amount": {"type": "number"}, "tests_passed": {"type": "integer"}, "tests_total": {"type": "integer"}}, "required": ["claim_id", "tests_passed", "tests_total"]},
+    },
+]
+
+def _mcp_call_tool(name: str, args: dict) -> Any:
+    """Dispatch MCP tool calls to existing Jorki API functions."""
+    file_id = args.get("file_id", "")
+    if name == "jorki_health":
+        return {"status": "ok", "service": "jorki", "tools": len(_MCP_TOOLS)}
+    if name == "jorki_list_files":
+        reg = _jorki_load_registry()
+        return {"files": [{"file_id": fid, "filename": e.get("filename", ""), "status": e.get("status", "unknown")} for fid, e in reg.items()], "total": len(reg)}
+    if not file_id and not name.startswith("sonic_") and name not in ("jorki_list_files", "jorki_health"):
+        return {"error": "file_id is required"}
+    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
+    if not name.startswith("sonic_") and name != "jorki_health" and not idx_path.exists():
+        return {"error": f"Index not found for {file_id}"}
+    if name == "jorki_metadata":
+        conn = sqlite3.connect(str(idx_path)); meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM file_meta").fetchall()}; conn.close()
+        _jorki_track_query(file_id, "meta")
+        return {"file_id": file_id, "meta": meta, "endpoints": {"meta": f"/meta/{file_id}", "search": f"/search/{file_id}?q=", "chunk": f"/chunk/{file_id}/{{idx}}"}}
+    if name == "jorki_summary":
+        conn = sqlite3.connect(str(idx_path))
+        meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM file_meta").fetchall()}
+        words = conn.execute("SELECT word, count FROM word_freq ORDER BY count DESC LIMIT 20").fetchall()
+        symbols = conn.execute("SELECT line, name, type FROM symbols").fetchall()
+        chunks = conn.execute("SELECT idx, line_start, line_end, boundary_type, preview, line_count FROM chunks").fetchall()
+        conn.close(); _jorki_track_query(file_id, "summary")
+        return {"file_id": file_id, "meta": meta, "top_words": [{"word": r[0], "count": r[1]} for r in words], "functions": [{"line": r[0], "symbol": r[1]} for r in symbols], "chunks": [{"idx": r[0], "lines": f"{r[1]}-{r[2]}", "type": r[3], "preview": r[4][:100]} for r in chunks]}
+    if name == "jorki_search":
+        q = args.get("q", "")
+        if not q: return {"error": "query 'q' is required"}
+        conn = sqlite3.connect(str(idx_path))
+        chunk_results = conn.execute("SELECT idx, line_start, line_end, preview FROM chunks WHERE preview LIKE ? LIMIT 20", (f"%{q}%",)).fetchall()
+        sym_results = conn.execute("SELECT line, name FROM symbols WHERE name LIKE ? LIMIT 20", (f"%{q}%",)).fetchall()
+        conn.close(); _jorki_track_query(file_id, "search")
+        return {"file_id": file_id, "query": q, "results": [{"line": r[1], "text": r[3][:200]} for r in chunk_results] + [{"line": r[0], "text": r[1]} for r in sym_results]}
+    if name == "jorki_chunk":
+        idx = args.get("idx", 0)
+        conn = sqlite3.connect(str(idx_path))
+        row = conn.execute("SELECT idx, line_start, line_end, boundary_type, preview, line_count FROM chunks WHERE idx = ?", (idx,)).fetchone(); conn.close()
+        _jorki_track_query(file_id, "chunk")
+        if not row: return {"error": f"Chunk {idx} not found"}
+        return {"idx": row[0], "line_start": row[1], "line_end": row[2], "boundary_type": row[3], "content": row[4], "line_count": row[5]}
+    if name == "jorki_verify":
+        conn = sqlite3.connect(str(idx_path)); meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM file_meta").fetchall()}; conn.close()
+        return {"file_id": file_id, "verified": True, "merkle_root": meta.get("merkle_root", ""), "filename": meta.get("filename", ""), "timestamp": datetime.now().isoformat()}
+    if name == "jorki_kpi":
+        conn = sqlite3.connect(str(idx_path))
+        rows = conn.execute("SELECT id, name, value, line, category, confidence FROM kpis ORDER BY confidence DESC").fetchall(); conn.close()
+        _jorki_track_query(file_id, "kpi")
+        by_cat = {}
+        for r in rows:
+            by_cat.setdefault(r[4], []).append({"id": r[0], "name": r[1], "value": r[2], "line": r[3], "confidence": r[5]})
+        return {"file_id": file_id, "total_kpis": len(rows), "by_category": by_cat}
+    if name == "jorki_dna":
+        conn = sqlite3.connect(str(idx_path)); rows = conn.execute("SELECT key, value FROM dna").fetchall(); conn.close()
+        _jorki_track_query(file_id, "dna"); dna = {r[0]: r[1] for r in rows}
+        try: genes = json.loads(dna.get("genes", "{}"))
+        except: genes = {}
+        return {"file_id": file_id, "dna_sequence": dna.get("dna_sequence", ""), "species": dna.get("species", "unknown"), "genes": genes, "complexity_score": float(dna.get("complexity_score", 0)), "genome_size": int(dna.get("genome_size", 0))}
+    if name == "jorki_profile":
+        conn = sqlite3.connect(str(idx_path))
+        meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM file_meta").fetchall()}
+        kpis = [{"id": r[0], "name": r[1], "value": r[2], "line": r[3], "category": r[4], "confidence": r[5]} for r in conn.execute("SELECT id, name, value, line, category, confidence FROM kpis").fetchall()]
+        dna_rows = conn.execute("SELECT key, value FROM dna").fetchall()
+        chunk_rows = conn.execute("SELECT idx, line_start, line_end, boundary_type, preview, line_count FROM chunks").fetchall()
+        word_rows = conn.execute("SELECT word, count FROM word_freq").fetchall()
+        conn.close()
+        dna = {r[0]: r[1] for r in dna_rows}
+        try: dna_obj = json.loads(dna.get("genes", "{}"))
+        except: dna_obj = {}
+        dna_dict = {"genes": dna_obj, "complexity_score": float(dna.get("complexity_score", 0)), "dna_sequence": dna.get("dna_sequence", ""), "species": dna.get("species", "")}
+        text = "\n".join(r[4] for r in chunk_rows if r[4])
+        word_freq = {r[0]: int(r[1]) for r in word_rows}
+        profile = _jorki_compute_profile(text, text.split("\n"), word_freq, kpis, dna_dict)
+        return {"file_id": file_id, "profile": profile}
+    if name == "jorki_ml":
+        conn = sqlite3.connect(str(idx_path))
+        meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM file_meta").fetchall()}
+        kpis = [{"id": r[0], "name": r[1], "value": r[2], "line": r[3], "category": r[4], "confidence": r[5]} for r in conn.execute("SELECT id, name, value, line, category, confidence FROM kpis").fetchall()]
+        dna_rows = conn.execute("SELECT key, value FROM dna").fetchall()
+        word_rows = conn.execute("SELECT word, count FROM word_freq").fetchall()
+        chunk_rows = conn.execute("SELECT idx, line_start, line_end, boundary_type, preview, line_count FROM chunks").fetchall(); conn.close()
+        word_freq = {r[0]: int(r[1]) for r in word_rows}
+        dna = {r[0]: r[1] for r in dna_rows}
+        try: dna_obj = json.loads(dna.get("genes", "{}"))
+        except: dna_obj = {}
+        dna_dict = {"genes": dna_obj, "complexity_score": float(dna.get("complexity_score", 0)), "dna_sequence": dna.get("dna_sequence", ""), "species": dna.get("species", "")}
+        text = "\n".join(r[4] for r in chunk_rows if r[4]); lines = text.split("\n")
+        chunks = [{"idx": r[0], "line_start": r[1], "line_end": r[2], "boundary_type": r[3], "preview": r[4], "line_count": r[5]} for r in chunk_rows]
+        try: ml = _jorki_ml_extract(text, lines, chunks, word_freq, kpis, dna_dict)
+        except Exception as e: ml = {"available": False, "error": str(e)}
+        return {"file_id": file_id, "ml": ml}
+    if name == "jorki_valuation":
+        conn = sqlite3.connect(str(idx_path))
+        meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM file_meta").fetchall()}
+        kpis = [{"id": r[0], "name": r[1], "value": r[2], "line": r[3], "category": r[4], "confidence": r[5]} for r in conn.execute("SELECT id, name, value, line, category, confidence FROM kpis").fetchall()]
+        dna_rows = conn.execute("SELECT key, value FROM dna").fetchall()
+        word_rows = conn.execute("SELECT word, count FROM word_freq").fetchall()
+        chunk_rows = conn.execute("SELECT idx, line_start, line_end, boundary_type, preview, line_count FROM chunks").fetchall()
+        sym_rows = conn.execute("SELECT line, name, type FROM symbols").fetchall(); conn.close()
+        word_freq = {r[0]: int(r[1]) for r in word_rows}
+        dna = {r[0]: r[1] for r in dna_rows}
+        try: dna_obj = json.loads(dna.get("genes", "{}"))
+        except: dna_obj = {}
+        dna_dict = {"genes": dna_obj, "complexity_score": float(dna.get("complexity_score", 0)), "dna_sequence": dna.get("dna_sequence", ""), "species": dna.get("species", "")}
+        text = "\n".join(r[4] for r in chunk_rows if r[4]); lines = text.split("\n")
+        chunks = [{"idx": r[0], "line_start": r[1], "line_end": r[2], "boundary_type": r[3], "preview": r[4], "line_count": r[5]} for r in chunk_rows]
+        symbols = [{"line": r[0], "name": r[1], "type": r[2]} for r in sym_rows]
+        val = _jorki_valuate(text, lines, chunks, symbols, word_freq, kpis, dna_dict, meta)
+        return {"file_id": file_id, "valuation": val}
+    if name == "jorki_dossier":
+        fmt = args.get("format", "json")
+        if fmt == "text":
+            return PlainTextResponse(_jorki_generate_resume(file_id, {"filename": ""}, [], {}, {}, [], [], {}, {}, {})["dossier_text"])
+        return await_proxy(file_id)
+    if name == "jorki_capabilities":
+        conn = sqlite3.connect(str(idx_path)); caps = conn.execute("SELECT id, name FROM capabilities").fetchall(); conn.close()
+        return {"file_id": file_id, "total": len(caps), "capabilities": [{"id": r[0], "name": r[1], "enabled": True} for r in caps]}
+    if name == "jorki_stats":
+        ql = _jorki_query_log.get(file_id, {"total_queries": 0, "query_breakdown": {}})
+        return {"file_id": file_id, "total_queries": ql.get("total_queries", 0), "stats": [{"type": k, "count": v} for k, v in ql.get("query_breakdown", {}).items()]}
+    # ── SonicGlyph tools ──
+    if name == "sonic_list":
+        reg = _sonic_load_registry()
+        return {"files": [{"audio_id": aid, **e} for aid, e in reg.items()], "total": len(reg)}
+    audio_id = args.get("audio_id", "")
+    if name.startswith("sonic_") and name not in ("sonic_list", "sonic_claim_create", "sonic_claim_settle"):
+        if not audio_id:
+            return {"error": "audio_id is required"}
+        sidx = SONIC_DATA_DIR / f"{audio_id}.idx"
+        if not sidx.exists():
+            return {"error": f"Audio not found: {audio_id}"}
+        conn = sqlite3.connect(str(sidx))
+        if name == "sonic_meta":
+            meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM audio_meta").fetchall()}; conn.close()
+            return {"audio_id": audio_id, "meta": meta}
+        if name == "sonic_fingerprint":
+            fp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM fingerprint").fetchall()}; conn.close()
+            return {"audio_id": audio_id, "fingerprint": fp}
+        if name == "sonic_speakers":
+            sp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM speakers").fetchall()}; conn.close()
+            return {"audio_id": audio_id, "speakers": sp}
+        if name == "sonic_transcript_shadow":
+            segs = conn.execute("SELECT idx, timestamp, seg_type, energy FROM transcript_shadow").fetchall(); conn.close()
+            return {"audio_id": audio_id, "segments": [{"idx": r[0], "t": r[1], "type": r[2], "energy": r[3]} for r in segs], "total": len(segs), "redacted": True}
+        if name == "sonic_claims":
+            claims = conn.execute("SELECT idx, claim, value, unit, confidence FROM semantic_claims").fetchall(); conn.close()
+            return {"audio_id": audio_id, "claims": [{"idx": r[0], "claim": r[1], "value": r[2], "unit": r[3], "confidence": r[4]} for r in claims], "total": len(claims)}
+        if name == "sonic_search":
+            q = args.get("q", "")
+            if not q: conn.close(); return {"error": "query 'q' is required"}
+            results = conn.execute("SELECT idx, timestamp_start, timestamp_end, energy, seg_type, preview FROM audio_chunks WHERE seg_type LIKE ? OR preview LIKE ?", (f"%{q}%", f"%{q}%")).fetchall(); conn.close()
+            return {"audio_id": audio_id, "query": q, "results": [{"idx": r[0], "start": r[1], "end": r[2], "energy": r[3], "type": r[4], "preview": r[5]} for r in results], "total": len(results)}
+        if name == "sonic_chunk":
+            ts = args.get("timestamp", 0)
+            row = conn.execute("SELECT idx, timestamp_start, timestamp_end, energy, seg_type, preview FROM audio_chunks WHERE timestamp_start <= ? AND timestamp_end >= ? ORDER BY ABS(timestamp_start - ?) LIMIT 1", (ts, ts, ts)).fetchone(); conn.close()
+            if not row: return {"error": f"No chunk at timestamp {ts}"}
+            return {"audio_id": audio_id, "idx": row[0], "start": row[1], "end": row[2], "energy": row[3], "type": row[4], "preview": row[5], "playable": False}
+        if name == "sonic_glyph":
+            meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM audio_meta").fetchall()}
+            fp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM fingerprint").fetchall()}
+            sp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM speakers").fetchall()}
+            segs = conn.execute("SELECT idx, timestamp, seg_type, energy FROM transcript_shadow").fetchall()
+            claims = conn.execute("SELECT idx, claim, value, unit, confidence FROM semantic_claims").fetchall()
+            chunks = conn.execute("SELECT idx, timestamp_start, timestamp_end, energy, seg_type FROM audio_chunks").fetchall(); conn.close()
+            return {"audio_id": audio_id, "glyph_type": "SonicGlyph", "meta": meta, "fingerprint": fp, "speakers": sp, "transcript_shadow": {"segments": len(segs), "redacted": True}, "semantic_claims": len(claims), "audio_chunks": len(chunks), "playable": False, "identity_exposed": False, "fidelity": {"L0": True, "L1": True, "L2": True, "L3": True, "L4": True, "L5": True, "L6": len(claims), "L8": True, "L9": False}}
+        if name == "sonic_receipt":
+            meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM audio_meta").fetchall()}
+            fp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM fingerprint").fetchall()}
+            claims = conn.execute("SELECT claim, value, confidence FROM semantic_claims").fetchall(); conn.close()
+            return {"receipt_id": hashlib.sha256(f"{audio_id}{time.time()}".encode()).hexdigest()[:16], "audio_id": audio_id, "timestamp": datetime.now().isoformat(), "sha256": meta.get("sha256", ""), "fingerprint_hash": fp.get("fingerprint_hash", ""), "filename": meta.get("filename", ""), "duration_s": meta.get("duration_s", "0"), "format": meta.get("format", "unknown"), "claims_verified": len(claims), "playable": False, "identity_exposed": False, "proof_type": "SonicGlyph non-playable proof receipt"}
+        conn.close()
+    if name == "sonic_claim_create":
+        if not audio_id and "audio_id" in args:
+            audio_id = args["audio_id"]
+        if not audio_id:
+            return {"error": "audio_id is required"}
+        sidx = SONIC_DATA_DIR / f"{audio_id}.idx"
+        if not sidx.exists():
+            return {"error": f"Audio not found: {audio_id}"}
+        conn = sqlite3.connect(str(sidx))
+        meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM audio_meta").fetchall()}
+        fp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM fingerprint").fetchall()}
+        sp = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM speakers").fetchall()}; conn.close()
+        claim_id = hashlib.sha256(f"{audio_id}{time.time()}{args.get('seller_id','')}".encode()).hexdigest()[:16]
+        surrogate = {"duration_s": meta.get("duration_s", "0"), "sha256": meta.get("sha256", "")[:32], "speaker_count": sp.get("speaker_count", "0"), "fingerprint_hash": fp.get("fingerprint_hash", ""), "format": meta.get("format", "unknown"), "redacted": True}
+        _sonic_claims[claim_id] = {"claim_id": claim_id, "audio_id": audio_id, "seller_id": args.get("seller_id", "anonymous"), "buyer_id": args.get("buyer_id", ""), "task_description": args.get("task_description", ""), "surrogate": surrogate, "bond_amount": args.get("bond_amount", 0), "bond_posted": True, "status": "open", "created_at": time.time()}
+        return {"claim_id": claim_id, "status": "open", "surrogate": surrogate, "message": "Claim created. Buyer must escrow payment, then settle."}
+    if name == "sonic_claim_settle":

@@ -1,0 +1,477 @@
+        # No experiment running — check if we have baseline data
+        baseline = conn.execute(
+            "SELECT profile_views, contact_clicks FROM daily_profile_metrics "
+            "WHERE bio_id = ? ORDER BY id DESC LIMIT 1", (bio_id,)
+        ).fetchone()
+        if not baseline:
+            return {"status": "BLOCK_NO_BASELINE_EXPERIMENT",
+                    "reason": "Real traffic exists, but no completed experiment exists yet. "
+                              "Start one controlled bio-only experiment.",
+                    "next_action": "start_experiment",
+                    "baseline": {"profile_views": profile_views, "contact_clicks": contact_clicks,
+                                 "contact_click_rate": round(contact_clicks / profile_views, 5) if profile_views > 0 else 0},
+                    "next_candidate": {"bio_id": "targeted_wolf_v1", "change_scope": "headline_and_bio_only",
+                                       "minimum_views": MIN_VIEWS_FOR_DECISION, "minimum_hours": MIN_HOURS_FOR_DECISION}}
+        return {"status": "READY_TO_TEST",
+                "reason": "Baseline established. No active experiment. Ready to start next test.",
+                "next_action": "start_experiment",
+                "baseline": {"profile_views": baseline[0], "contact_clicks": baseline[1],
+                             "contact_click_rate": round(baseline[1] / baseline[0], 5) if baseline[0] > 0 else 0}}
+
+    # Experiment is running — check exposure
+    exp_id, exp_bio_id, _, started_at, _, _, before_views, before_clicks, before_emails = exp[:9]
+
+    # Parse started_at
+    try:
+        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        elapsed_hours = (datetime.now(timezone.utc) - start).total_seconds() / 3600
+    except Exception:
+        elapsed_hours = 0
+
+    delta_views = profile_views - (before_views or 0)
+    delta_clicks = contact_clicks - (before_clicks or 0)
+
+    min_views_met = delta_views >= MIN_VIEWS_FOR_DECISION
+    min_hours_met = elapsed_hours >= MIN_HOURS_FOR_DECISION
+
+    if not min_views_met and not min_hours_met:
+        return {"status": "BLOCK_LOW_EXPOSURE",
+                "reason": f"Only {delta_views} views in {elapsed_hours:.1f}h. "
+                          f"Need {MIN_VIEWS_FOR_DECISION} views or {MIN_HOURS_FOR_DECISION}h.",
+                "next_action": "wait",
+                "experiment_id": exp_id,
+                "elapsed_hours": round(elapsed_hours, 1),
+                "current_delta_views": delta_views}
+
+    # We have enough exposure — compute lift
+    before_ctr = before_clicks / before_views if before_views and before_views > 0 else 0
+    after_ctr = contact_clicks / profile_views if profile_views > 0 else 0
+    lift = after_ctr - before_ctr
+
+    # Severe drop check (can trigger before full window if CTR collapses)
+    if before_ctr > 0 and after_ctr < before_ctr * (1 - SEVERE_DROP_THRESHOLD):
+        return {"status": "REVERT_TO_BASELINE",
+                "reason": f"CTR dropped {abs(lift)*100:.1f}pp. Severe drop threshold exceeded.",
+                "next_action": "rollback",
+                "experiment_id": exp_id,
+                "before_ctr": round(before_ctr, 4),
+                "after_ctr": round(after_ctr, 4),
+                "lift": round(lift, 4)}
+
+    if not min_views_met or not min_hours_met:
+        return {"status": "TEST_RUNNING",
+                "reason": f"Experiment running: delta_views={delta_views}/{MIN_VIEWS_FOR_DECISION}, "
+                          f"hours={elapsed_hours:.1f}/{MIN_HOURS_FOR_DECISION}",
+                "next_action": "wait",
+                "experiment_id": exp_id}
+
+    # Enough exposure — decide
+    if lift > 0.01:
+        return {"status": "WINNER_FOUND",
+                "reason": f"CTR improved by {lift*100:.1f}pp.",
+                "next_action": "close_experiment_winner",
+                "experiment_id": exp_id,
+                "before_ctr": round(before_ctr, 4),
+                "after_ctr": round(after_ctr, 4),
+                "lift": round(lift, 4)}
+    elif lift < -0.01:
+        return {"status": "REVERT_TO_BASELINE",
+                "reason": f"CTR decreased by {abs(lift)*100:.1f}pp.",
+                "next_action": "rollback",
+                "experiment_id": exp_id,
+                "before_ctr": round(before_ctr, 4),
+                "after_ctr": round(after_ctr, 4),
+                "lift": round(lift, 4)}
+    else:
+        return {"status": "KEEP_CURRENT",
+                "reason": f"CTR flat ({lift*100:.1f}pp). No significant change.",
+                "next_action": "test_next_bio",
+                "experiment_id": exp_id,
+                "before_ctr": round(before_ctr, 4),
+                "after_ctr": round(after_ctr, 4),
+                "lift": round(lift, 4)}
+
+
+def start_experiment(bio_id: str, variant_class: str, before_views: int,
+                     before_contact_clicks: int, before_emails: int,
+                     db_path: Path = DB_PATH) -> dict:
+    conn = get_conn(db_path)
+    exp_id = f"exp_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{variant_class}"
+    ts = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO experiments
+           (experiment_id, bio_id, variant_class, started_at, baseline_bio_id,
+            before_views, before_contact_clicks, before_emails, status)
+           VALUES (?, ?, ?, ?, 'current_live', ?, ?, ?, 'running')""",
+        (exp_id, bio_id, variant_class, ts, before_views, before_contact_clicks, before_emails),
+    )
+    conn.commit()
+    conn.close()
+    write_receipt("experiment_start", {
+        "experiment_id": exp_id, "bio_id": bio_id, "variant_class": variant_class,
+        "before_views": before_views, "before_contact_clicks": before_contact_clicks,
+    }, db_path)
+    return {"experiment_id": exp_id, "status": "running", "bio_id": bio_id}
+
+
+def close_experiment(experiment_id: str, after_views: int, after_contact_clicks: int,
+                     after_emails: int, db_path: Path = DB_PATH) -> dict:
+    conn = get_conn(db_path)
+    exp = conn.execute("SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)).fetchone()
+    if not exp:
+        conn.close()
+        return {"error": "experiment not found"}
+    before_views = exp[6] or 0
+    before_clicks = exp[7] or 0
+    before_ctr = before_clicks / before_views if before_views > 0 else 0
+    after_ctr = after_contact_clicks / after_views if after_views > 0 else 0
+    lift = after_ctr - before_ctr
+    winner = "test_bio" if lift > 0.01 else ("baseline" if lift < -0.01 else "no_significant_change")
+    ts = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """UPDATE experiments SET ended_at=?, after_views=?, after_contact_clicks=?,
+           after_emails=?, actual_lift=?, winner=?, status='closed' WHERE experiment_id=?""",
+        (ts, after_views, after_contact_clicks, after_emails, lift, winner, experiment_id),
+    )
+    conn.commit()
+    conn.close()
+    write_receipt("experiment_close", {
+        "experiment_id": experiment_id, "winner": winner, "lift": lift,
+        "before_ctr": before_ctr, "after_ctr": after_ctr,
+    }, db_path)
+    return {"experiment_id": experiment_id, "winner": winner, "lift": round(lift, 4),
+            "before_ctr": round(before_ctr, 4), "after_ctr": round(after_ctr, 4)}
+
+
+def generate_daily_evidence_packet(rm_traffic_db: str, bio_id: str = "karpathian_wolf_live",
+                                    db_path: Path = DB_PATH) -> dict:
+    """Generate daily_evidence_packet.json from rm_traffic profileops.db."""
+    traffic_conn = sqlite3.connect(rm_traffic_db)
+    snap = traffic_conn.execute(
+        "SELECT profile_views, contact_clicks, new_visits, new_emails, "
+        "is_hidden, is_available, headline, description_len "
+        "FROM traffic_snapshots ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    traffic_conn.close()
+
+    if not snap:
+        return {"error": "no traffic snapshot found"}
+
+    views, clicks, visits, emails, hidden, available, headline, desc_len = snap
+    visible = not hidden
+    avail = bool(available)
+    ctr = clicks / views if views > 0 else 0
+    email_rate = emails / views if views > 0 else 0
+
+    # Get current experiment
+    conn = get_conn(db_path)
+    exp = conn.execute(
+        "SELECT experiment_id, bio_id, status, started_at FROM experiments "
+        "WHERE status='running' ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    date_str = datetime.now(timezone.utc).date().isoformat()
+    packet_id = f"rmep_{date_str.replace('-', '_')}_{datetime.now(timezone.utc).strftime('%H%M')}"
+
+    bio_text = headline or ""
+    bio_hash = "sha256:" + sha256_of(bio_text)
+
+    decision = compute_decision(bio_id, views, clicks, emails,
+                                1 if avail else 0, 1 if visible else 0,
+                                get_conn(db_path))
+
+    packet = {
+        "packet_id": packet_id,
+        "date": date_str,
+        "account": {
+            "profile_visible": visible,
+            "is_available": avail,
+            "gold_status": True,
+        },
+        "bio": {
+            "bio_id": bio_id,
+            "headline": bio_text,
+            "bio_hash": bio_hash,
+            "variant_class": "current_live",
+        },
+        "metrics": {
+            "profile_views": views,
+            "contact_clicks": clicks,
+            "new_visits": visits,
+            "new_emails": emails,
+            "booking_requests": None,
+            "confirmed_clients": None,
+            "revenue": None,
+        },
+        "derived": {
+            "contact_click_rate": round(ctr, 4),
+            "email_rate": round(email_rate, 4),
+            "contact_clicks_per_100_views": round(ctr * 100, 2),
+        },
+        "experiment": {
+            "experiment_id": exp[0] if exp else None,
+            "state": exp[2] if exp else "none",
+            "baseline_bio_id": "current_live",
+            "test_bio_id": exp[1] if exp else None,
+            "minimum_views_required": MIN_VIEWS_FOR_DECISION,
+            "minimum_hours_required": MIN_HOURS_FOR_DECISION,
+        },
+        "decision": decision,
+        "receipt": {
+            "source": "rm_traffic",
+            "created_by": "daily_promotion_script",
+            "source_db": rm_traffic_db,
+            "packet_hash": "sha256:" + sha256_of(packet_id + str(views) + str(clicks)),
+        },
+    }
+    return packet
+
+
+def get_latest_decision(db_path: Path = DB_PATH) -> dict:
+    conn = get_conn(db_path)
+    row = conn.execute(
+        "SELECT experiment_id, bio_id, decision, reason, profile_views, "
+        "contact_clicks, contact_click_rate, created_at "
+        "FROM experiment_decisions ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"status": "BLOCK_NO_SIGNAL", "reason": "No decisions yet."}
+    return {
+        "experiment_id": row[0], "bio_id": row[1], "decision": row[2],
+        "reason": row[3], "profile_views": row[4], "contact_clicks": row[5],
+        "contact_click_rate": row[6], "created_at": row[7],
+    }
+
+
+def get_metrics_history(limit: int = 30, db_path: Path = DB_PATH) -> list:
+    conn = get_conn(db_path)
+    rows = conn.execute(
+        "SELECT date, bio_id, profile_views, contact_clicks, new_visits, "
+        "new_emails, availability_state, profile_visible, created_at "
+        "FROM daily_profile_metrics ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [{"date": r[0], "bio_id": r[1], "profile_views": r[2], "contact_clicks": r[3],
+             "new_visits": r[4], "new_emails": r[5], "available": bool(r[6]),
+             "visible": bool(r[7]), "created_at": r[8]} for r in rows]
+
+
+def get_experiments(db_path: Path = DB_PATH) -> list:
+    conn = get_conn(db_path)
+    rows = conn.execute(
+        "SELECT experiment_id, bio_id, variant_class, started_at, ended_at, "
+        "status, winner, actual_lift FROM experiments ORDER BY started_at DESC"
+    ).fetchall()
+    conn.close()
+    return [{"experiment_id": r[0], "bio_id": r[1], "variant_class": r[2],
+             "started_at": r[3], "ended_at": r[4], "status": r[5],
+             "winner": r[6], "actual_lift": r[7]} for r in rows]
+
+```
+
+__init__.py:
+```
+"""
+RM Revenue Engine — RentMasseur API Revenue Engine.
+
+Not AGI. Not a toy. An execution-and-measurement engine.
+
+Architecture:
+    API Client → State DB → Market Scanner → C++ Engine → Approval Gate → Experiment Runner
+
+Every action produces:
+    - SQLite log entry
+    - JSON receipt
+    - Before/after snapshot (for mutations)
+    - Exit code + captured output
+
+Priority order:
+    1. Visibility ON
+    2. Availability truthful and refreshed
+    3. Dashboard stats logging
+    4. Search-rank tracking
+    5. Competitor corpus enrichment with visits/day
+    6. C++ predictor
+    7. Approved profile experiments
+    8. Retraining from real dashboard lift
+"""
+
+from .state_db import StateDB
+from .market_scan import MarketScanner
+from .experiment_runner import ExperimentRunner
+
+```
+
+PROVIDER_GROWTH_CRM.md:
+```
+# Provider Growth CRM
+
+Provider Growth CRM turns the availability script into a local operator console for account-owned growth workflows.
+
+It is manual-first, receipt-backed, and policy-gated. It stores engagement records, profile content versions, draft suggestions, outbox state, iMac/Mac handoff files, conversion snapshots, revenue events, and receipts. It does not bypass access controls, collect hidden data, or transmit outbound content without human approval.
+
+## Modules
+
+- `provider_growth/db.py` — SQLite schema, default policy seed, indexes.
+- `provider_growth/receipts.py` — JSONL + SQLite audit receipts.
+- `provider_growth/engagement.py` — manual engagement records and scoring.
+- `provider_growth/drafts.py` — reviewable draft queue.
+- `provider_growth/policy.py` — approval, quiet-hour, and do-not-contact policy gate.
+- `provider_growth/outbox.py` — manual outbox state machine: queued, ready, blocked, exported, completed.
+- `provider_growth/kpi.py` — revenue events and funnel liquidity summary.
+- `provider_growth/profile_content.py` — bio, blog, interview, headline, and availability-note versions.
+- `provider_growth/experiments.py` — daily conversion snapshots and version summaries.
+- `provider_growth/imac_relay.py` — local manual handoff files for Mac review workflows.
+- `provider_growth_cli.py` — command-line console.
+
+## Production-shaped workflow
+
+```bash
+python provider_growth_cli.py init-db
+python provider_growth_cli.py policy
+python provider_growth_cli.py add-record "manual-client-handle" --name "Client"
+python provider_growth_cli.py priority-records
+python provider_growth_cli.py draft <record_key> --template same_day --name "Client" --channel imessage
+python provider_growth_cli.py evaluate-draft <draft_id>
+python provider_growth_cli.py approve-draft <draft_id>
+python provider_growth_cli.py enqueue <draft_id>
+python provider_growth_cli.py outbox --state ready
+python provider_growth_cli.py export-outbox <outbox_id>
+python provider_growth_cli.py complete-outbox <outbox_id> --outcome manual_completed
+python provider_growth_cli.py add-version bio bio_v1 "Profile text here" --reason "trust-focused version"
+python provider_growth_cli.py activate-version <version_id>
+python provider_growth_cli.py snapshot --version bio_v1 --views 50 --repeat 6 --contacts 4 --inbound 3 --bookings 1
+python provider_growth_cli.py revenue-event confirmed_booking --amount-cents 20000 --record-key <record_key>
+python provider_growth_cli.py revenue-summary
+```
+
+## State model
+
+Draft states:
+
+```text
+draft -> approved -> queued/outbox -> exported -> manual_completed
+                  \-> blocked
+                  \-> skipped
+                  \-> failed
+```
+
+Policy decisions:
+
+```text
+needs_approval
+allowed
+blocked
+defer
+```
+
+Revenue events:
+
+```text
+inquiry
+quote
+booking_request
+confirmed_booking
+completed_booking
+cancelled
+```
+
+## Compliance boundary
+
+Allowed:
+
+- account-owner records
+- manual imports
+- human-reviewed drafts
+- opt-out / do-not-contact handling
+- local receipts
+- content versioning
+- conversion measurement
+- approved local handoff files
+- manually logged revenue events
+
+Not allowed:
+
+- automated spam
+- hidden data collection
+- account access without authorization
+- challenge/captcha bypass
+- sending without explicit human approval
+- fake availability
+
+## Revenue loop
+
+Availability keeps the profile open for demand. Engagement records identify warm demand. Drafts keep conversations organized. Policy gates prevent sloppy action. Outbox creates an operator queue. iMac handoff turns an approved draft into a local review file. Profile versions test positioning. Metrics show which content creates contact actions and bookings. Revenue events turn conversations into pipeline. Receipts prove what happened.
+
+```
+
+PROVIDER_GROWTH_CRM_PRODUCTION_NOTES.md:
+```
+# Provider Growth CRM Production Notes
+
+This branch is no longer just a toy CRM scaffold. It now has a production-shaped local operator model:
+
+1. Local SQLite ledger.
+2. Default policy seed.
+3. Manual approval gate.
+4. Quiet-hour gate.
+5. Do-not-contact gates.
+6. Manual outbox state machine.
+7. Approved local handoff export.
+8. Conversation event receipts.
+9. Profile content versioning.
+10. Funnel and revenue liquidity KPIs.
+
+## Non-negotiable constraints
+
+The system is not an auto-sender. It is a local operator queue. The operator remains responsible for reviewing and performing any outbound action.
+
+The system is not a hidden-data collector. Records must come from sources the operator owns, controls, or is authorized to manage.
+
+The system is not a challenge/captcha bypass tool.
+
+## Real operating loop
+
+```text
+record demand signal
+→ score record
+→ create draft
+→ approve draft
+→ evaluate policy
+→ enqueue outbox item
+→ export manual handoff
+→ operator reviews on Mac/iMac
+→ operator completes/skips/fails item
+→ log conversation note
+→ update metrics snapshot
+→ log revenue event
+→ inspect revenue summary
+```
+
+## Why this is more serious
+
+The previous version stored records and drafts. This version adds operational control:
+
+- policy decisions are explicit
+- handoff has a state machine
+- revenue events are separate from vanity metrics
+- every important action can create a receipt
+- tests exercise the full approved outbox path
+
+## Next production layer
+
+To become production-grade, add:
+
+- migration files instead of schema-in-code only
+- encrypted local storage for sensitive aliases
+- desktop UI or menu bar wrapper
+- signed receipt chain
+- calendar availability integration
+- explicit consent/authorization intake for any managed account
+- test fixtures with synthetic data
+- macOS notification-only adapter
+- backup/export command
+
+```

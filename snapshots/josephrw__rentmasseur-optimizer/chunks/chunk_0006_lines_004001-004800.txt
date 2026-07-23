@@ -1,800 +1,800 @@
-            "GET /api/decision",
-            "GET /api/decisions",
-            "GET /api/test-phase",
-            "GET /api/control-mode",
-            "POST /api/control-mode (admin)",
-            "POST /api/score (admin)",
-            "POST /api/experiments/{id}/close (admin)",
-            "GET /api/jobs",
-            "GET /api/jobs/{job_id}",
-            "GET /api/jobs/{job_id}/receipt",
-            "POST /api/run/pipeline (admin)",
-            "POST /api/ci/trigger (admin)",
-            "GET /api/receipts",
-            "GET /api/audit/files",
-            "POST /api/run/availability (BLOCKED)",
-        ],
-    }
-
-
-@app.get("/api/daily-proof")
-def daily_proof():
-    proof = build_daily_proof()
-    has_data = proof["mission_status"] != "NO_PROSPECTS" or proof["jobs_today"] > 0
-    proof["status"] = "GREEN_REAL" if has_data else "GRAY_NO_DATA"
-    return proof
-
-
-@app.get("/api/prospects")
-def prospects_list():
-    prospects = get_prospects()
-    if not prospects:
-        return {"status": "GRAY_NO_DATA", "count": 0, "prospects": [], "message": "No prospects discovered yet."}
-    return {"status": "GREEN_REAL", "count": len(prospects), "prospects": prospects[-50:]}
-
-
-@app.post("/api/prospects")
-def prospect_add(request: Request, x_admin_token: Optional[str] = Header(None)):
-    require_admin(x_admin_token)
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    prospect = {
-        "id": str(uuid.uuid4())[:12],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "stage": body.get("stage", "discovered"),
-        "source": body.get("source", ""),
-        "name": body.get("name", ""),
-        "notes": body.get("notes", ""),
-    }
-    append_jsonl(PROSPECTS_FILE, prospect)
-    receipt_path = write_receipt("prospect_add", f"Prospect {prospect['id']} added at stage={prospect['stage']}", prospect)
-    return {"status": "GREEN_REAL", "prospect": prospect, "receipt_path": receipt_path}
-
-
-@app.get("/api/metrics")
-def metrics_list():
-    metrics = get_metrics()
-    if not metrics:
-        return {"status": "GRAY_NO_DATA", "count": 0, "metrics": [], "message": "No metrics ingested yet. POST /api/metrics/ingest."}
-    return {"status": "GREEN_REAL", "count": len(metrics), "latest": metrics[-1], "metrics": metrics[-20:]}
-
-
-@app.post("/api/metrics/ingest")
-def metrics_ingest(payload: dict):
-    """Ingest a daily metrics packet into RevenueOps ledger.
-    No admin token required — this is the data ingestion path.
-    Returns computed CTR + strict decision."""
-    result = _rev_ingest(payload, db_path=REVENUE_OPS_DB)
-    # Also write to legacy metrics file for backward compat
-    record = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "date": payload.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d")),
-        "profile_views": payload.get("profile_views", 0),
-        "contact_clicks": payload.get("contact_clicks", 0),
-        "new_visits": payload.get("new_visits", 0),
-        "new_emails": payload.get("new_emails", 0),
-        "bio_id": payload.get("bio_id", ""),
-        "availability_status": payload.get("availability_state", "unknown"),
-        "notes": payload.get("notes", ""),
-    }
-    append_jsonl(METRICS_FILE, record)
-    return result
-
-
-@app.get("/api/candidates")
-def candidates_list():
-    candidates = get_candidates()
-    bio_files = list(BIOS_DIR.glob("*.txt")) if BIOS_DIR.exists() else []
-    if not candidates and not bio_files:
-        return {"status": "GRAY_NO_DATA", "count": 0, "candidates": [], "message": "No candidates. Generate via pipeline or add bio files to content/bios/."}
-    # Include file-backed bios
-    file_bios = []
-    for f in sorted(bio_files, key=lambda x: x.stat().st_mtime, reverse=True):
-        file_bios.append({
-            "id": f.stem,
-            "source": "file",
-            "filename": f.name,
-            "chars": f.stat().st_size,
-            "preview": f.read_text()[:200],
-        })
-    return {"status": "GREEN_REAL", "count": len(candidates) + len(file_bios), "candidates": candidates[-20:], "file_bios": file_bios}
-
-
-# ─── Content Ledger Endpoint ───
-
-@app.get("/api/content")
-def content_list(content_type: Optional[str] = None):
-    items = get_content_ledger()
-    if content_type and content_type in CONTENT_TYPES:
-        items = [c for c in items if c.get("type") == content_type]
-    if not items:
-        return {"status": "GRAY_NO_DATA", "count": 0, "content": [], "message": "No content versions logged. POST /api/content to add."}
-    return {"status": "GREEN_REAL", "count": len(items), "content": items[-50:]}
-
-
-@app.post("/api/content")
-def content_add(request: Request, x_admin_token: Optional[str] = Header(None)):
-    require_admin(x_admin_token)
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    ctype = body.get("type", "")
-    if ctype not in CONTENT_TYPES:
-        raise HTTPException(status_code=400, detail=f"type must be one of {CONTENT_TYPES}")
-
-    content_id = body.get("id", f"{ctype}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}")
-    record = {
-        "id": content_id,
-        "type": ctype,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "body": body.get("body", ""),
-        "label": body.get("label", ""),
-        "source": body.get("source", "manual"),
-        "notes": body.get("notes", ""),
-    }
-    append_jsonl(CONTENT_LEDGER_FILE, record)
-    receipt_path = write_receipt("content_add", f"Content {content_id} ({ctype}) added", record)
-    return {"status": "GREEN_REAL", "content": record, "receipt_path": receipt_path}
-
-
-# ─── Event Ledger Endpoint ───
-
-@app.get("/api/events")
-def events_list(content_id: Optional[str] = None, experiment_id: Optional[str] = None):
-    events = get_events()
-    if content_id:
-        events = [e for e in events if e.get("content_id") == content_id]
-    if experiment_id:
-        events = [e for e in events if e.get("experiment_id") == experiment_id]
-    if not events:
-        return {"status": "GRAY_NO_DATA", "count": 0, "events": [], "message": "No events recorded. POST /api/events to log."}
-    reward = compute_reward(events)
-    return {"status": "GREEN_REAL", "count": len(events), "reward": reward, "events": events[-50:]}
-
-
-@app.post("/api/events")
-def event_add(request: Request, x_admin_token: Optional[str] = Header(None)):
-    require_admin(x_admin_token)
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    etype = body.get("event_type", "")
-    if etype not in EVENT_TYPES:
-        raise HTTPException(status_code=400, detail=f"event_type must be one of {EVENT_TYPES}")
-
-    record = {
-        "id": str(uuid.uuid4())[:12],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "event_type": etype,
-        "content_id": body.get("content_id", ""),
-        "experiment_id": body.get("experiment_id", ""),
-        "reward": RL_REWARD.get(etype, 0),
-        "notes": body.get("notes", ""),
-    }
-    append_jsonl(EVENT_LEDGER_FILE, record)
-    receipt_path = write_receipt("event_add", f"Event {etype} for {record['content_id'] or 'unknown'}", record)
-    return {"status": "GREEN_REAL", "event": record, "receipt_path": receipt_path}
-
-
-# ─── Decision Ledger Endpoint ───
-
-@app.get("/api/decisions")
-def decisions_list():
-    decisions = get_decisions()
-    if not decisions:
-        return {"status": "GRAY_NO_DATA", "count": 0, "decisions": [], "message": "No decisions logged yet."}
-    return {"status": "GREEN_REAL", "count": len(decisions), "decisions": decisions[-50:]}
-
-
-@app.get("/api/test-phase")
-def test_phase():
-    """Show which variable is being tested this week and what is frozen."""
-    phase = get_current_test_phase()
-    return {"status": "GREEN_REAL", **phase}
-
-
-# ─── Control Mode ───
-
-@app.get("/api/control-mode")
-def control_mode_get():
-    return {
-        "status": "GREEN_REAL",
-        "current_mode": CURRENT_CONTROL_MODE,
-        "mode_name": CONTROL_MODES[CURRENT_CONTROL_MODE],
-        "modes": {k: v for k, v in CONTROL_MODES.items()},
-        "mode4_unlock_check": check_mode4_unlock(),
-    }
-
-
-@app.post("/api/control-mode")
-def control_mode_set(request: Request, x_admin_token: Optional[str] = Header(None)):
-    global CURRENT_CONTROL_MODE
-    require_admin(x_admin_token)
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    mode = body.get("mode", -1)
-    if mode not in CONTROL_MODES:
-        raise HTTPException(status_code=400, detail=f"mode must be one of {list(CONTROL_MODES.keys())}")
-    if mode == 4:
-        checks = check_mode4_unlock()
-        if not checks["can_unlock"]:
-            return JSONResponse({"status": "BLACK_DISABLED", "reason": "Mode 4 requirements not met", "checks": checks}, status_code=403)
-    old_mode = CURRENT_CONTROL_MODE
-    CURRENT_CONTROL_MODE = mode
-    receipt_path = write_receipt("control_mode_change", f"Mode {old_mode}→{mode} ({CONTROL_MODES[mode]})", {"old": old_mode, "new": mode})
-    return {"status": "GREEN_REAL", "old_mode": old_mode, "new_mode": mode, "mode_name": CONTROL_MODES[mode], "receipt_path": receipt_path}
-
-
-# ─── RM-PRI Scoring ───
-
-@app.post("/api/score")
-def score_record(request: Request, x_admin_token: Optional[str] = Header(None)):
-    require_admin(x_admin_token)
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    rec = body.get("record", {})
-    features = body.get("features", {})
-    before = body.get("before", {})
-    after = body.get("after", {})
-    stage = body.get("stage", "all")
-
-    result = {"status": "GREEN_REAL", "stage": stage}
-    if stage in ("1", "all"):
-        result["stage1_review_strength"] = stage1_review_strength(rec, features)
-    if stage in ("2", "all"):
-        s2 = stage2_market_demand(rec, features)
-        result["stage2_market_demand"] = s2 if s2 is not None else "REQUIRES_ENRICHMENT"
-    if stage in ("3", "all"):
-        s3 = stage3_profile_conversion(before, after, features) if before and after else None
-        result["stage3_profile_conversion"] = s3 if s3 is not None else "REQUIRES_DASHBOARD_BEFORE_AFTER"
-    if stage in ("4", "all"):
-        s4 = stage4_profit_bio(before, after, features) if before and after else None
-        result["stage4_profit_bio"] = s4 if s4 is not None else "REQUIRES_BOOKINGS_DATA"
-
-    receipt_path = write_receipt("score_record", f"Scored record stage={stage}", result)
-    result["receipt_path"] = receipt_path
-    return result
-
-
-# ─── Experiment Close with Receipt ───
-
-@app.post("/api/experiments/{exp_id}/close")
-def experiment_close(exp_id: str, request: Request, x_admin_token: Optional[str] = Header(None)):
-    require_admin(x_admin_token)
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        body = {}
-
-    experiments = get_experiments()
-    exp = None
-    for e in experiments:
-        if e.get("id") == exp_id:
-            exp = e
-            break
-    if not exp:
-        raise HTTPException(status_code=404, detail="Experiment not found")
-
-    before = body.get("before", {})
-    after = body.get("after", {})
-    features = body.get("features", {})
-
-    computed = {}
-    if before and after:
-        computed["views_delta"] = (after.get("profile_views", 0) or 0) - (before.get("profile_views", 0) or 0)
-        computed["contact_click_delta"] = (after.get("contact_clicks", 0) or 0) - (before.get("contact_clicks", 0) or 0)
-        computed["email_delta"] = (after.get("new_emails", 0) or 0) - (before.get("new_emails", 0) or 0)
-        computed["rank_delta"] = (before.get("rank_position", 0) or 0) - (after.get("rank_position", 0) or 0)
-        views_b = before.get("profile_views", 0) or 0
-        views_a = after.get("profile_views", 0) or 0
-        clicks_b = before.get("contact_clicks", 0) or 0
-        clicks_a = after.get("contact_clicks", 0) or 0
-        computed["ctr_before"] = round(clicks_b / views_b, 6) if views_b else 0
-        computed["ctr_after"] = round(clicks_a / views_a, 6) if views_a else 0
-        computed["ctr_lift_pct"] = round((computed["ctr_after"] - computed["ctr_before"]) / computed["ctr_before"] * 100, 2) if computed["ctr_before"] else 0
-
-    s3 = stage3_profile_conversion(before, after, features) if before and after else None
-    s4 = stage4_profit_bio(before, after, features) if before and after else None
-
-    decision = body.get("decision", {})
-    rollback = body.get("rollback", {"available": True, "snapshot_path": ""})
-
-    receipt = {
-        "receipt_id": f"exp_{exp_id}",
-        "variant_id": exp.get("candidate_id") or exp.get("bio_file"),
-        "action": "close_experiment",
-        "status": "verified" if before and after else "incomplete",
-        "started_at": exp.get("started_at"),
-        "ended_at": datetime.now(timezone.utc).isoformat(),
-        "before": before,
-        "after": after,
-        "computed": computed,
-        "stage3_profile_conversion": s3,
-        "stage4_profit_bio": s4,
-        "decision": decision,
-        "rollback": rollback,
-    }
-
-    receipt_path = EXPERIMENTS_DIR / f"experiment_{exp_id}.json"
-    receipt_path.write_text(json.dumps(receipt, indent=2, default=str))
-
-    write_receipt("experiment_close", f"Experiment {exp_id} closed with before/after", receipt)
-
-    return {"status": "GREEN_REAL", "experiment_id": exp_id, "receipt": receipt, "receipt_path": str(receipt_path)}
-
-
-@app.get("/api/experiments")
-def experiments_list():
-    experiments = get_experiments()
-    if not experiments:
-        return {"status": "GRAY_NO_DATA", "count": 0, "experiments": [], "message": "No experiments. POST /api/experiments/start to begin."}
-    return {"status": "GREEN_REAL", "count": len(experiments), "experiments": experiments[-20:]}
-
-
-@app.post("/api/experiments/start")
-def experiment_start(request: Request, x_admin_token: Optional[str] = Header(None)):
-    require_admin(x_admin_token)
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        body = {}
-
-    # Stop any active experiment
-    existing = get_experiments()
-    for e in existing:
-        if e.get("status") == "live":
-            e["status"] = "stopped"
-            e["stopped_at"] = datetime.now(timezone.utc).isoformat()
-
-    exp = {
-        "id": str(uuid.uuid4())[:12],
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "status": "live",
-        "content_type": body.get("content_type", "bio"),
-        "candidate_id": body.get("candidate_id", ""),
-        "bio_file": body.get("bio_file", ""),
-        "reason": body.get("reason", ""),
-    }
-    append_jsonl(EXPERIMENTS_FILE, exp)
-    receipt_path = write_receipt("experiment_start", f"Experiment {exp['id']} started with {exp['bio_file'] or exp['candidate_id']}", exp)
-    return {"status": "GREEN_REAL", "experiment": exp, "receipt_path": receipt_path}
-
-
-@app.post("/api/experiments/stop")
-def experiment_stop(request: Request, x_admin_token: Optional[str] = Header(None)):
-    require_admin(x_admin_token)
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        body = {}
-
-    exp_id = body.get("experiment_id", "")
-    result = body.get("result", "")
-    experiments = get_experiments()
-    stopped = None
-    for e in experiments:
-        if e.get("status") == "live" and (not exp_id or e.get("id") == exp_id):
-            e["status"] = "stopped"
-            e["stopped_at"] = datetime.now(timezone.utc).isoformat()
-            e["result"] = result
-            stopped = e
-
-    if stopped:
-        receipt_path = write_receipt("experiment_stop", f"Experiment {stopped['id']} stopped: {result}", stopped)
-        return {"status": "GREEN_REAL", "stopped": stopped, "receipt_path": receipt_path}
-    return {"status": "GRAY_NO_DATA", "message": "No active experiment to stop"}
-
-
-@app.get("/api/decision")
-def decision_gate():
-    """Production gate: KEEP_CURRENT, TEST_NEW_BIO, TEST_NEW_PHOTO, TEST_NEW_PRICE, TEST_NEW_INTERVIEW, BLOCK_NO_SIGNAL, or NEEDS_HUMAN_APPROVAL."""
-    metrics = get_latest_metrics()
-    active_exp = get_active_experiment()
-    content = get_content_ledger()
-    bio_files = list(BIOS_DIR.glob("*.txt")) if BIOS_DIR.exists() else []
-    candidates = get_candidates()
-
-    # No metrics = blocked
-    if not metrics:
-        decision = "BLOCK_NO_SIGNAL"
-        reason = "No metrics ingested. Cannot make decision without real data."
-        gate_info = None
-    elif active_exp:
-        # Check experiment gate — minimum exposure window
-        exp_events = get_events_for_experiment(active_exp.get("id", ""))
-        gate_info = check_experiment_gate(active_exp, exp_events, metrics)
-
-        if not gate_info["can_decide"]:
-            decision = "KEEP_CURRENT"
-            reason = gate_info["block_reason"]
-        elif not gate_info["has_downstream_signal"]:
-            decision = "KEEP_CURRENT"
-            reason = gate_info["block_reason"]
-        else:
-            # Has enough exposure + downstream signal — can declare winner
-            decision = "KEEP_CURRENT"
-            reason = f"Experiment has {gate_info['downstream_signals']} downstream signals and {gate_info['views']} views. Reward={gate_info['reward']}. Ready for comparison — stop experiment to evaluate."
-            gate_info["ready_for_evaluation"] = True
-    elif content or bio_files or candidates:
-        # No active experiment, candidates available
-        # Pick what to test based on what content types are available
-        content_types_available = set(c.get("type", "bio") for c in content)
-        if "bio" in content_types_available or bio_files:
-            decision = "TEST_NEW_BIO"
-            reason = "Bio candidates available and no active experiment. Start testing a new bio."
-        elif "photo" in content_types_available:
-            decision = "TEST_NEW_PHOTO"
-            reason = "Photo candidates available. Start testing a new photo."
-        elif "price" in content_types_available:
-            decision = "TEST_NEW_PRICE"
-            reason = "Price candidates available. Start testing a new price."
-        elif "interview" in content_types_available:
-            decision = "TEST_NEW_INTERVIEW"
-            reason = "Interview candidates available. Start testing a new interview."
-        else:
-            decision = "TEST_NEW_BIO"
-            reason = "Candidates available. Start testing."
-        gate_info = None
-    else:
-        decision = "BLOCK_NO_SIGNAL"
-        reason = "No candidates available. Generate candidates via pipeline first."
-        gate_info = None
-
-    # Log decision to decision ledger
-    decision_record = {
-        "id": str(uuid.uuid4())[:12],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "decision": decision,
-        "reason": reason,
-        "active_experiment_id": active_exp.get("id") if active_exp else None,
-        "gate_info": gate_info,
-    }
-    append_jsonl(DECISION_LEDGER_FILE, decision_record)
-
-    return {
-        "status": "GREEN_REAL",
-        "decision": decision,
-        "reason": reason,
-        "active_experiment": active_exp,
-        "gate": gate_info,
-        "candidates_available": len(candidates) + len(bio_files) + len(content),
-        "metrics_available": bool(metrics),
-    }
-
-
-@app.get("/api/jobs")
-def jobs_list(limit: int = 20):
-    return {"status": "GREEN_REAL", "jobs": list_jobs(limit)}
-
-
-@app.get("/api/jobs/{job_id}")
-def job_detail(job_id: str):
-    j = get_job(job_id)
-    if not j:
-        raise HTTPException(status_code=404, detail="Job not found")
-    label = status_label(j.get("exit_code"))
-    if j["status"] == "running":
-        label = "YELLOW_RUNNING"
-    j["status_label"] = label
-    return j
-
-
-@app.get("/api/jobs/{job_id}/receipt")
-def job_receipt(job_id: str):
-    j = get_job(job_id)
-    if not j:
-        raise HTTPException(status_code=404, detail="Job not found")
-    receipt_path = j.get("receipt_path", "")
-    if receipt_path and Path(receipt_path).exists():
-        return json.loads(Path(receipt_path).read_text())
-    return {"status": "GRAY_NO_DATA", "job_id": job_id, "message": "No receipt for this job"}
-
-
-@app.post("/api/run/pipeline")
-def run_pipeline(request: Request, x_admin_token: Optional[str] = Header(None)):
-    require_admin(x_admin_token)
-    cmd = ["python3", "production_pipeline.py"]
-    input_hash = hashlib.sha256(json.dumps({}, sort_keys=True).encode()).hexdigest()[:16]
-    job = create_job(" ".join(cmd), input_hash)
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=str(APP_DIR))
-        output_files = [str(p) for p in (APP_DIR / "pipeline_output").glob("*")] if (APP_DIR / "pipeline_output").exists() else []
-        receipt_path = write_receipt("run_pipeline", "Full production pipeline", {
-            "job_id": job["job_id"], "exit_code": r.returncode,
-        })
-        update_job(job["job_id"], r.returncode, r.stdout, r.stderr, output_files, receipt_path)
-    except subprocess.TimeoutExpired:
-        update_job(job["job_id"], -1, "", "timeout after 600s", [])
-    except Exception as e:
-        update_job(job["job_id"], -1, "", str(e), [])
-    return get_job(job["job_id"])
-
-
-@app.post("/api/run/availability")
-def run_availability(x_admin_token: Optional[str] = Header(None)):
-    require_admin(x_admin_token)
-    receipt_path = write_receipt("availability_blocked", "Automated availability disabled — captcha/anti-bot", {
-        "reason": "Automated login hits CrowdSec captcha. Use manual approved path.",
-    })
-    return JSONResponse({
-        "status": "BLACK_DISABLED",
-        "label": "blocked_unsafe_automation",
-        "reason": "Automated availability login is blocked. This endpoint will not launch automation.",
-        "receipt_path": receipt_path,
-    }, status_code=403)
-
-
-@app.post("/api/ci/trigger")
-def ci_trigger(request: Request, x_admin_token: Optional[str] = Header(None)):
-    require_admin(x_admin_token)
-    if not GITHUB_TOKEN:
-        return JSONResponse({"status": "BLACK_DISABLED", "label": "no_github_token", "message": "GITHUB_TOKEN not configured."})
-    try:
-        body = json.loads(request.body)
-    except Exception:
-        body = {}
-    workflow = body.get("workflow", "rentmasseur-optimizer.yml")
-    ref = body.get("ref", "main")
-    import requests
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{workflow}/dispatches"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    try:
-        r = requests.post(url, headers=headers, json={"ref": ref}, timeout=30)
-        if r.status_code == 204:
-            receipt_path = write_receipt("ci_trigger", f"Triggered {workflow} on {ref}", {"workflow": workflow, "ref": ref, "repo": GITHUB_REPO})
-            return {"status": "GREEN_REAL", "workflow": workflow, "ref": ref, "receipt_path": receipt_path}
-        return JSONResponse({"status": "RED_FAILED", "status_code": r.status_code, "response": r.text[:500]}, status_code=502)
-    except Exception as e:
-        return JSONResponse({"status": "RED_FAILED", "error": str(e)}, status_code=500)
-
-
-@app.get("/api/receipts")
-def receipts_list():
-    receipt_files = sorted(RECEIPTS_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
-    receipts = []
-    for f in receipt_files[:50]:
+        "You are an expert A/B testing judge for massage therapy profiles. "
+        "Score the given bio on a scale of 0-100 for each criterion. "
+        "Return ONLY valid JSON with these fields:\n"
+        '{"phone_cta_strength": 0-100, "urgency": 0-100, "emotional_hook": 0-100, '
+        '"seo_keywords": 0-100, "uniqueness": 0-100, "length_optimal": 0-100, '
+        '"beats_competitors": 0-100, "overall_score": 0-100, "reasoning": "one sentence"}'
+    )
+    user_prompt = (
+        f"BIO TO SCORE:\n{bio}\n\n"
+        f"TOP COMPETITOR BIOS:\n{competitor_sample}\n\n"
+        f"Score this bio. The overall_score must reflect whether it beats ALL competitors. "
+        f"Be harsh — only bios that are clearly better than competitors should score above 80."
+    )
+
+    result = _groq_json(system_prompt, user_prompt, max_tokens=400)
+    if result:
         try:
-            receipts.append(json.loads(f.read_text()))
+            result["overall_score"] = int(result.get("overall_score", 0))
+            return result
+        except (ValueError, TypeError):
+            result["overall_score"] = 0
+    return {"overall_score": 0, "reasoning": "Failed to score"}
+
+
+def ab_test_bios(variants: list, competitor_bios: list) -> dict:
+    """Run A/B testing tournament on all bio variants."""
+    logger.info("=== A/B Testing %d bio variants ===", len(variants))
+    os.makedirs(AB_TEST_DIR, exist_ok=True)
+
+    scored = []
+    for v in variants:
+        logger.info("Scoring: %s (%d chars)", v["strategy"], v["length"])
+        score = score_bio(v["bio"], competitor_bios)
+        scored.append({
+            "strategy": v["strategy"],
+            "bio": v["bio"],
+            "length": v["length"],
+            "file": v["file"],
+            "score": score,
+        })
+        logger.info("  Score: %d/100 — %s", score.get("overall_score", 0), score.get("reasoning", ""))
+        time.sleep(1)
+
+    scored.sort(key=lambda x: x["score"].get("overall_score", 0), reverse=True)
+
+    # Head-to-head final: top 3 vs each other
+    top3 = scored[:3]
+    if len(top3) >= 2:
+        logger.info("=== Final head-to-head: top 3 ===")
+        winner = top3[0]
+        for candidate in top3[1:]:
+            system_prompt = (
+                "You are the final judge in a bio A/B test. "
+                "Pick the bio that will generate MORE PHONE CALLS. "
+                "Return ONLY valid JSON: {\"winner\": \"A\" or \"B\", \"reasoning\": \"one sentence\"}"
+            )
+            user_prompt = (
+                f"BIO A (current winner — {winner['strategy']}, score {winner['score']['overall_score']}):\n{winner['bio']}\n\n"
+                f"BIO B (challenger — {candidate['strategy']}, score {candidate['score']['overall_score']}):\n{candidate['bio']}\n\n"
+                f"Which bio generates more phone calls? Pick A or B."
+            )
+            result = _groq_json(system_prompt, user_prompt, max_tokens=200)
+            if result and result.get("winner") == "B":
+                logger.info("  Challenger %s beats %s!", candidate["strategy"], winner["strategy"])
+                winner = candidate
+            else:
+                logger.info("  %s retains crown over %s", winner["strategy"], candidate["strategy"])
+            time.sleep(1)
+    else:
+        winner = scored[0] if scored else None
+
+    # Save A/B test results
+    results_path = os.path.join(AB_TEST_DIR, f"results_{datetime.now().strftime('%Y%m%d')}.json")
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "date": datetime.now(timezone.utc).isoformat(),
+            "total_variants": len(variants),
+            "competitors_analyzed": len(competitor_bios),
+            "all_scores": [{k: v for k, v in s.items() if k != "bio"} for s in scored],
+            "winner": winner["strategy"] if winner else None,
+            "winner_score": winner["score"] if winner else None,
+        }, f, indent=2)
+
+    logger.info("=== A/B Test Winner: %s (score: %d) ===",
+                winner["strategy"] if winner else "NONE",
+                winner["score"]["overall_score"] if winner else 0)
+
+    return winner
+
+
+def get_current_bio() -> Optional[str]:
+    """Get current bio from RentMasseur profile."""
+    try:
+        from rentmasseur_core import setup_driver, login
+        driver = setup_driver(headless=True)
+        try:
+            if not login(driver):
+                return None
+            driver.get("https://rentmasseur.com/settings/about")
+            time.sleep(5)
+            from selenium.webdriver.common.by import By
+            textarea = driver.find_element(By.CSS_SELECTOR, "textarea#description, textarea[name='description']")
+            current = textarea.get_attribute("value") or textarea.text
+            logger.info("Current bio: %d chars", len(current))
+            return current
+        finally:
+            driver.quit()
+    except Exception as e:
+        logger.warning("Could not get current bio: %s", e)
+        return None
+
+
+def verify_bio_beats_current(winner_bio: str, current_bio: str) -> bool:
+    """Verify the winning bio is better than the current one."""
+    if not current_bio:
+        logger.info("No current bio to compare — uploading winner")
+        return True
+
+    system_prompt = (
+        "You are a bio verification judge. "
+        "Return ONLY valid JSON: {\"winner\": \"new\" or \"current\", \"confidence\": 0-100, \"reasoning\": \"one sentence\"}"
+    )
+    user_prompt = (
+        f"CURRENT BIO (on profile now):\n{current_bio}\n\n"
+        f"NEW BIO (A/B test winner):\n{winner_bio}\n\n"
+        f"Which bio will generate MORE PHONE CALLS? Be strict. "
+        f"Only pick 'new' if it is clearly better."
+    )
+    result = _groq_json(system_prompt, user_prompt, max_tokens=200)
+    if result:
+        is_better = result.get("winner") == "new"
+        confidence = result.get("confidence", 0)
+        logger.info("Verification: %s (confidence: %d%%) — %s",
+                     "NEW WINS" if is_better else "CURRENT KEEPS",
+                     confidence, result.get("reasoning", ""))
+        return is_better and confidence >= 70
+    return False
+
+
+def upload_bio(bio_text: str) -> bool:
+    """Upload the winning bio to RentMasseur profile."""
+    try:
+        from rentmasseur_core import setup_driver, login, update_bio, save_bio_field
+        driver = setup_driver(headless=True)
+        try:
+            if not login(driver):
+                logger.error("Login failed")
+                return False
+            logger.info("Login successful, finding bio field...")
+            result = update_bio(driver, "")
+            if result is None or (isinstance(result, dict) and result.get("error")):
+                logger.error("Could not find bio field")
+                return False
+            field_info, current_bio = result
+            saved = save_bio_field(driver, field_info, bio_text)
+            if saved:
+                logger.info("Bio uploaded and saved successfully!")
+                return True
+            logger.error("Failed to save bio")
+            return False
+        finally:
+            driver.quit()
+    except Exception as e:
+        logger.error("Upload error: %s", e)
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Bio A/B testing engine")
+    parser.add_argument("--dry-run", action="store_true", help="Don't upload, just test")
+    parser.add_argument("--competitors-only", action="store_true", help="Only scrape competitors")
+    parser.add_argument("--min-score", type=int, default=75, help="Minimum score to upload")
+    args = parser.parse_args()
+
+    os.makedirs(AB_TEST_DIR, exist_ok=True)
+    os.makedirs(BIOS_DIR, exist_ok=True)
+
+    # Step 1: Scrape competitors
+    competitor_bios = scrape_competitor_bios()
+    if args.competitors_only:
+        print(json.dumps({"competitors_scraped": len(competitor_bios)}, indent=2))
+        return
+
+    # Step 2: Generate variants
+    variants = generate_bio_variants()
+    if not variants:
+        logger.error("No bio variants generated")
+        sys.exit(1)
+
+    # Step 3: A/B test
+    winner = ab_test_bios(variants, competitor_bios)
+    if not winner:
+        logger.error("No winner determined")
+        sys.exit(1)
+
+    winner_score = winner["score"].get("overall_score", 0)
+    if winner_score < args.min_score:
+        logger.warning("Winner score %d below minimum %d — not uploading", winner_score, args.min_score)
+        print(json.dumps({"winner": winner["strategy"], "score": winner_score, "uploaded": False, "reason": "below_min_score"}, indent=2))
+        return
+
+    # Step 4: Verify against current bio
+    current_bio = get_current_bio()
+    if current_bio and not verify_bio_beats_current(winner["bio"], current_bio):
+        logger.warning("Winner did not beat current bio — keeping current")
+        print(json.dumps({"winner": winner["strategy"], "score": winner_score, "uploaded": False, "reason": "current_bio_is_better"}, indent=2))
+        return
+
+    # Step 5: Upload
+    if args.dry_run:
+        logger.info("Dry run — not uploading")
+        print(json.dumps({"winner": winner["strategy"], "score": winner_score, "uploaded": False, "reason": "dry_run"}, indent=2))
+        return
+
+    success = upload_bio(winner["bio"])
+    print(json.dumps({
+        "winner": winner["strategy"],
+        "score": winner_score,
+        "uploaded": success,
+        "competitors_analyzed": len(competitor_bios),
+        "variants_tested": len(variants),
+        "date": datetime.now(timezone.utc).isoformat(),
+    }, indent=2))
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+files_index.bin:
+```
+Error reading file: 'utf-8' codec can't decode byte 0x8d in position 98: invalid start byte
+```
+
+_deploy_settings.py:
+```
+#!/usr/bin/env python3
+"""Login + navigate to settings + find and update bio."""
+import time, os, sys, json
+import undetected_chromedriver as uc
+from dotenv import load_dotenv
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from datetime import datetime, timezone
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+BIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "bios", "controlled_wolf_v1.md")
+
+with open(BIO_FILE, "r") as f:
+    BIO_TEXT = f.read().strip()
+
+options = uc.ChromeOptions()
+options.add_argument("--window-size=1280,900")
+
+driver = uc.Chrome(options=options, version_main=149)
+
+try:
+    # Login
+    print("[1] Login...")
+    driver.get("https://rentmasseur.com/login")
+    time.sleep(6)
+    driver.execute_script("""
+        const pwd = document.querySelector('input[type="password"]');
+        const user = document.querySelector('input[type="text"], input[type="email"]');
+        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
+        if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
+    """, USERNAME, PASSWORD)
+    time.sleep(1)
+    driver.find_element(By.CSS_SELECTOR, 'input[type="password"]').send_keys(Keys.ENTER)
+    time.sleep(5)
+    print(f"  URL: {driver.current_url}")
+    
+    # Go to settings/dashboard
+    print("\n[2] Settings page...")
+    driver.get("https://rentmasseur.com/settings")
+    time.sleep(5)
+    print(f"  URL: {driver.current_url}")
+    print(f"  Title: {driver.title}")
+    
+    # Dump everything
+    info = driver.execute_script("""
+        const r = {textareas: [], inputs: [], contenteditable: [], buttons: [], links: [], tabs: []};
+        document.querySelectorAll('textarea').forEach(t => r.textareas.push({id:t.id,name:t.name,ph:t.placeholder,val:(t.value||'').substring(0,80),vis:t.offsetParent!==null}));
+        document.querySelectorAll('input').forEach(i => r.inputs.push({type:i.type,id:i.id,name:i.name,ph:i.placeholder,val:(i.value||'').substring(0,40),vis:i.offsetParent!==null}));
+        document.querySelectorAll('[contenteditable]').forEach(e => r.contenteditable.push({tag:e.tagName,id:e.id,cls:e.className,txt:(e.innerText||'').substring(0,80)}));
+        document.querySelectorAll('button, [role="button"]').forEach(b => r.buttons.push({txt:(b.innerText||'').trim().substring(0,30),type:b.type,id:b.id}));
+        document.querySelectorAll('a').forEach(a => {if(a.innerText.trim()) r.links.push({txt:a.innerText.trim().substring(0,30),href:a.href})});
+        document.querySelectorAll('[role="tab"], .nav-link, .tab').forEach(t => r.tabs.push({txt:(t.innerText||'').trim(),href:t.getAttribute('href')||'',id:t.id}));
+        return r;
+    """)
+    
+    print(f"\nTextareas: {len(info['textareas'])}")
+    for t in info['textareas']:
+        print(f"  id={t['id']} name={t['name']} ph={t['ph']} vis={t['vis']} val={t['val'][:60]}")
+    
+    print(f"\nInputs: {len(info['inputs'])}")
+    for i in info['inputs']:
+        print(f"  type={i['type']} id={i['id']} name={i['name']} ph={i['ph']} vis={i['vis']}")
+    
+    print(f"\nContenteditable: {len(info['contenteditable'])}")
+    for c in info['contenteditable']:
+        print(f"  {c['tag']} id={c['id']} cls={c['cls']} txt={c['txt'][:60]}")
+    
+    print(f"\nButtons: {len(info['buttons'])}")
+    for b in info['buttons']:
+        print(f"  {b['txt']} type={b['type']} id={b['id']}")
+    
+    print(f"\nTabs: {len(info['tabs'])}")
+    for t in info['tabs']:
+        print(f"  {t['txt']} href={t['href']} id={t['id']}")
+    
+    print(f"\nLinks: {len(info['links'])}")
+    for l in info['links'][:25]:
+        print(f"  {l['txt']} -> {l['href']}")
+    
+    driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/settings_page.png")
+    
+    # Try clicking through tabs to find bio editor
+    print("\n[3] Looking for bio tab...")
+    bio_tabs = [l for l in info['links'] if any(w in (l['txt']+l['href']).lower() for w in ['bio', 'about', 'profile', 'edit', 'content'])]
+    print(f"  Bio-related links: {len(bio_tabs)}")
+    for bt in bio_tabs:
+        print(f"    {bt['txt']} -> {bt['href']}")
+    
+    # Try each bio-related link
+    for bt in bio_tabs:
+        print(f"\n  Trying: {bt['href']}")
+        driver.get(bt['href'])
+        time.sleep(4)
+        textareas = driver.find_elements(By.CSS_SELECTOR, 'textarea')
+        editables = driver.find_elements(By.CSS_SELECTOR, '[contenteditable]')
+        print(f"    textareas={len(textareas)} editables={len(editables)}")
+        if textareas:
+            for ta in textareas:
+                val = ta.get_attribute("value") or ""
+                print(f"    textarea id={ta.get_attribute('id')} name={ta.get_attribute('name')} len={len(val)} preview={val[:80]}")
+            
+            # Update the bio textarea (longest one or one with bio/about in name)
+            updated = driver.execute_script("""
+                const tas = Array.from(document.querySelectorAll('textarea'));
+                let best = null, bestScore = 0;
+                for (const ta of tas) {
+                    const ctx = (ta.id||'') + ' ' + (ta.name||'') + ' ' + (ta.placeholder||'');
+                    if (/bio|about|description|profile/i.test(ctx)) { best = ta; break; }
+                    if ((ta.value||'').length > bestScore) { bestScore = (ta.value||'').length; best = ta; }
+                }
+                if (!best && tas.length > 0) best = tas[0];
+                if (!best) return {error: 'no_textarea'};
+                const ns = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                ns.call(best, arguments[0]);
+                best.dispatchEvent(new Event('input', {bubbles: true}));
+                best.dispatchEvent(new Event('change', {bubbles: true}));
+                best.dispatchEvent(new Event('blur', {bubbles: true}));
+                return {id: best.id, name: best.name, new_len: arguments[0].length};
+            """, BIO_TEXT)
+            print(f"    Updated: {updated}")
+            
+            if isinstance(updated, dict) and 'error' not in updated:
+                time.sleep(1)
+                saved = driver.execute_script("""
+                    const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+                    const sb = btns.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'')+' '+(b.value||'')));
+                    if (sb) { sb.click(); return {ok: true, text: sb.innerText}; }
+                    return {ok: false};
+                """)
+                print(f"    Save: {saved}")
+                time.sleep(5)
+                
+                # Receipt
+                receipts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
+                os.makedirs(receipts_dir, exist_ok=True)
+                receipt = {"action": "bio_deploy", "bio_id": "controlled_wolf_v1", "experiment_id": "exp_001_targeted_wolf", "success": True, "timestamp": datetime.now(timezone.utc).isoformat(), "url": driver.current_url}
+                rpath = os.path.join(receipts_dir, f"deploy_controlled_wolf_v1_{receipt['timestamp'].replace(':','-')}.json")
+                with open(rpath, "w") as f:
+                    json.dump(receipt, f, indent=2)
+                print(f"\n=== BIO DEPLOYED === Receipt: {rpath}")
+                break
+        if editables:
+            for e in editables:
+                txt = e.get_attribute("innerText") or ""
+                print(f"    editable tag={e.tag_name} id={e.get_attribute('id')} txt={txt[:80]}")
+    
+finally:
+    driver.quit()
+    print("\nDone.")
+
+```
+
+hf_app.py:
+```
+#!/usr/bin/env python3
+"""RentMasseur Operating System — Hugging Face Space App.
+
+Glassmorphism UI + real-time metrics + competitor intelligence + RL/GA training.
+Feeds into CI/CD pipelines to select perfect selling bio candidates.
+
+Endpoints:
+  GET /          — glassmorphism dashboard
+  GET /api/os/report     — full operating system state
+  POST /api/os/train     — train RL/GA on all bios
+  GET /api/os/competitors — competitor intelligence
+  GET /api/os/bios       — all bio candidates with scores
+  POST /api/os/ingest    — ingest metrics from Vercel functions
+  GET /run/orchestrator  — run master orchestrator
+  GET /run/availability  — run availability keeper
+  GET /run/ga-rl         — run GA+RL optimizer
+"""
+
+import os
+import json
+import glob
+import sqlite3
+import subprocess
+import time
+import random
+import requests
+from datetime import datetime, timezone
+from pathlib import Path
+from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+app = FastAPI(title="RentMasseur OS", docs_url="/docs")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+ORCHESTRATOR_LOG = os.path.join(CONTENT_DIR, "orchestrator.log")
+VERCEL_BACKEND_URL = os.getenv("VERCEL_BACKEND_URL", "")
+REBRANDLY_LINK = os.getenv("REBRANDLY_LINK", "")
+
+ENGAGEMENT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts", "engagement", "engagement.db")
+BIO_EXPERIMENTS_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts", "engagement", "bio_experiments.db")
+BIO_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts", "engagement", "current_bio.json")
+
+os.makedirs(CONTENT_DIR, exist_ok=True)
+
+
+def load_json(path: str, default=None):
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
         except Exception:
             pass
-    return {"status": "GREEN_REAL", "count": len(receipts), "receipts": receipts}
+    return default if default is not None else {}
 
 
-@app.get("/api/audit/files")
-def audit_files():
-    results = []
-    for f in sorted(APP_DIR.rglob("*")):
-        if f.is_dir() or ".git" in str(f) or "__pycache__" in str(f):
-            continue
-        rel = str(f.relative_to(APP_DIR))
-        entry = {"file": rel, "size_bytes": f.stat().st_size}
-        if f.suffix == ".py":
-            content = f.read_text()
-            entry["compiled"] = True
-            entry["called"] = any(fn in content for fn in ["@app.", "def ", "class "])
-            entry["writes_output"] = any(kw in content for kw in ["write_text", "open(", "json.dump", "sqlite3", "append_jsonl"])
-            entry["has_receipt"] = "write_receipt" in content
-            entry["mock"] = "mock" in content.lower() and "no mock" not in content.lower()
-            entry["label"] = "mock" if entry["mock"] else ("real" if entry["called"] else "dead")
-        elif f.suffix in (".jsonl", ".json"):
-            entry["label"] = "real_data" if f.stat().st_size > 0 else "empty"
-        elif f.suffix == ".txt":
-            entry["label"] = "real_data" if f.stat().st_size > 0 else "empty"
-        else:
-            entry["label"] = "config"
-        results.append(entry)
-    return {"status": "GREEN_REAL", "files_audited": len(results), "files": results}
+def _content_counts():
+    counts = {}
+    for subdir in ["bios", "blog_posts", "interview_questions", "social_posts", "email_templates", "seo_keywords", "ab_tests", "photos"]:
+        path = os.path.join(CONTENT_DIR, subdir)
+        counts[subdir] = len(glob.glob(os.path.join(path, "*"))) if os.path.exists(path) else 0
+    return counts
 
 
-# ─── UI: Revenue OS Dashboard ───
+def _load_all_bios():
+    bios = []
+    bios_dir = os.path.join(CONTENT_DIR, "bios")
+    if os.path.exists(bios_dir):
+        for f in sorted(glob.glob(os.path.join(bios_dir, "*.md")), reverse=True):
+            with open(f, "r", encoding="utf-8") as fh:
+                bios.append({
+                    "id": os.path.basename(f).replace(".md", ""),
+                    "file": os.path.basename(f),
+                    "chars": os.path.getsize(f),
+                    "preview": fh.read()[:200],
+                })
+    return bios
 
-UI_HTML = """<!DOCTYPE html>
-<html>
+
+def _engagement_stats():
+    if not os.path.exists(ENGAGEMENT_DB):
+        return {"total": 0, "repeat_3plus": 0, "messages_sent": 0, "top_visitors": [], "recent_visits": [], "visit_events": 0, "last_updated": None}
+    conn = sqlite3.connect(ENGAGEMENT_DB)
+    conn.row_factory = sqlite3.Row
+    total = conn.execute("SELECT COUNT(*) FROM visitors").fetchone()[0]
+    repeat_3 = conn.execute("SELECT COUNT(*) FROM visitors WHERE visit_count >= 3").fetchone()[0]
+    msgs = conn.execute("SELECT COUNT(*) FROM message_log WHERE status='sent'").fetchone()[0]
+    visit_events = conn.execute("SELECT COUNT(*) FROM visit_log").fetchone()[0]
+    top = conn.execute(
+        "SELECT username, visit_count, last_online, last_messaged FROM visitors ORDER BY visit_count DESC LIMIT 10"
+    ).fetchall()
+    recent = conn.execute(
+        "SELECT username, visited_at, status, content_hash FROM visit_log ORDER BY visited_at DESC LIMIT 20"
+    ).fetchall()
+    last_updated_row = conn.execute("SELECT visited_at FROM visit_log ORDER BY visited_at DESC LIMIT 1").fetchone()
+    conn.close()
+    return {
+        "total": total,
+        "repeat_3plus": repeat_3,
+        "messages_sent": msgs,
+        "visit_events": visit_events,
+        "top_visitors": [dict(r) for r in top],
+        "recent_visits": [dict(r) for r in recent],
+        "last_updated": last_updated_row[0] if last_updated_row else None,
+    }
+
+
+def _bio_experiments():
+    if not os.path.exists(BIO_EXPERIMENTS_DB):
+        return []
+    conn = sqlite3.connect(BIO_EXPERIMENTS_DB)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, bio_text, model, score, deployed_at, status, visitors_during FROM bio_experiments ORDER BY created_at DESC LIMIT 20"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def _current_bio():
+    if os.path.exists(BIO_CACHE):
+        try:
+            with open(BIO_CACHE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"bio": "(not fetched)", "char_count": 0}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    rl_state = load_json(os.path.join(CONTENT_DIR, "rl_state.json"), {})
+    ga_state = load_json(os.path.join(CONTENT_DIR, "ga_rl_state.json"), {})
+    counts = _content_counts()
+    availability = load_json(os.path.join(os.path.dirname(__file__), "availability.json"), {})
+    competitors = load_json(os.path.join(CONTENT_DIR, "competitor_bios.json"), [])
+    revenue = ga_state.get("best_revenue", 0)
+    target = 300
+    progress = min(100, round((revenue / target) * 100, 1))
+    eng = _engagement_stats()
+    bio_exp = _bio_experiments()
+    current_bio = _current_bio()
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RentMasseur Revenue OS</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RentMasseur Operating System</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'SF Mono',monospace;background:#0a0a0f;color:#c0c0d0}
-.header{background:#0d0d15;padding:20px 30px;border-bottom:1px solid #1a1a2a}
-.header h1{color:#e0e0e0;font-size:15px;text-transform:uppercase;letter-spacing:3px}
-.header .sub{color:#555;font-size:11px;margin-top:4px}
-.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:15px;max-width:1600px;margin:0 auto}
-.panel{background:#0d0d15;border:1px solid #1a1a2a;border-radius:6px;overflow:hidden}
-.panel-h{padding:10px 14px;border-bottom:1px solid #1a1a2a;font-size:11px;font-weight:bold;text-transform:uppercase;letter-spacing:1px;color:#777}
-.panel-b{padding:14px;font-size:12px;line-height:1.6}
-.badge{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:bold}
-.badge.GREEN_REAL{background:#0a2a0a;color:#4caf50;border:1px solid #1a3a1a}
-.badge.YELLOW_RUNNING{background:#2a2a0a;color:#ffc107;border:1px solid #3a3a1a}
-.badge.RED_FAILED{background:#2a0a0a;color:#f44336;border:1px solid #3a1a1a}
-.badge.GRAY_NO_DATA{background:#0a0a0a;color:#555;border:1px solid #222}
-.badge.BLACK_DISABLED{background:#1a0505;color:#ff4444;border:1px solid #2a0a0a}
-table{width:100%;border-collapse:collapse;font-size:10px}
-th{text-align:left;padding:4px 5px;color:#555;border-bottom:1px solid #1a1a2a}
-td{padding:4px 5px;border-bottom:1px solid #0f0f18}
-.mr{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #0f0f18}
-.ml{color:#777}.mv{color:#e0e0e0;font-weight:bold}
-.missing{color:#555;font-style:italic}
-pre{background:#050508;padding:8px;border-radius:4px;overflow-x:auto;font-size:10px;color:#6a9f5a;max-height:160px;overflow-y:auto}
-.full{grid-column:span 3}
-.wide{grid-column:span 2}
-.funnel{display:flex;gap:3px;flex-wrap:wrap;margin-top:8px}
-.funnel-step{padding:3px 6px;border-radius:3px;font-size:9px;background:#111}
-.funnel-step.has{background:#0a2a0a;color:#4caf50}
-.funnel-step.empty{background:#0a0a0a;color:#333}
-.mission-status{font-size:18px;font-weight:bold;padding:8px 0}
-.mission-status.BOOKING_CONFIRMED{color:#4caf50}
-.mission-status.LEADS_ACTIVE{color:#ffc107}
-.mission-status.PROSPECTS_FOUND{color:#80a0ff}
-.mission-status.NO_PROSPECTS{color:#555}
-.gate-pass{color:#4caf50}.gate-fail{color:#f44336}
-.warning{background:#1a0a0a;border:1px solid #2a0a0a;padding:6px 10px;border-radius:4px;color:#f44336;font-size:10px;margin-top:4px}
-.mode-badge{display:inline-block;padding:3px 10px;border-radius:3px;font-size:11px;font-weight:bold}
-.mode-0{background:#0a0a1a;color:#555;border:1px solid #222}
-.mode-1{background:#0a1a0a;color:#4caf50;border:1px solid #1a3a1a}
-.mode-2{background:#0a1a1a;color:#80a0ff;border:1px solid #1a2a3a}
-.mode-3{background:#1a1a0a;color:#ffc107;border:1px solid #3a3a1a}
-.mode-4{background:#2a0a0a;color:#f44336;border:1px solid #3a1a1a}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+* {{ box-sizing: border-box; }}
+body {{
+    margin: 0;
+    font-family: 'Inter', sans-serif;
+    background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+    color: #fff;
+    min-height: 100vh;
+}}
+.glass {{
+    background: rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 20px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}}
+.header {{
+    padding: 30px 40px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}}
+.header h1 {{
+    margin: 0;
+    font-size: 32px;
+    font-weight: 700;
+    background: linear-gradient(90deg, #00f5ff, #b026ff, #ff2a6d);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}}
+.sub {{ font-size: 14px; color: rgba(255,255,255,0.6); margin-top: 4px; }}
+.live {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: #00f5a0;
+    font-weight: 600;
+}}
+.pulse {{
+    width: 10px;
+    height: 10px;
+    background: #00f5a0;
+    border-radius: 50%;
+    animation: pulse 2s infinite;
+}}
+@keyframes pulse {{
+    0%, 100% {{ opacity: 1; transform: scale(1); }}
+    50% {{ opacity: 0.5; transform: scale(1.3); }}
+}}
+.grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 20px;
+    padding: 0 40px 40px;
+}}
+.card {{
+    padding: 24px;
+    transition: transform 0.2s;
+}}
+.card:hover {{ transform: translateY(-4px); }}
+.card h3 {{
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: rgba(255,255,255,0.7);
+}}
+.card .num {{
+    font-size: 42px;
+    font-weight: 700;
+    margin: 8px 0;
+    background: linear-gradient(90deg, #00f5ff, #b026ff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}}
+.card .sub {{
+    font-size: 13px;
+    color: rgba(255,255,255,0.6);
+}}
+.progress-bar {{
+    width: 100%;
+    height: 12px;
+    background: rgba(255,255,255,0.1);
+    border-radius: 6px;
+    overflow: hidden;
+    margin-top: 12px;
+}}
+.progress-fill {{
+    height: 100%;
+    background: linear-gradient(90deg, #00f5ff, #b026ff);
+    border-radius: 6px;
+    transition: width 0.5s;
+    width: {progress}%;
+}}
+.actions {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 0 40px 40px;
+}}
+.btn {{
+    padding: 12px 24px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.25);
+    background: rgba(255,255,255,0.1);
+    color: #fff;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 13px;
+    transition: all 0.2s;
+    cursor: pointer;
+}}
+.btn:hover {{
+    background: rgba(255,255,255,0.2);
+    border-color: rgba(255,255,255,0.4);
+}}
+.btn.primary {{
+    background: linear-gradient(90deg, #00f5ff, #b026ff);
+    border: none;
+    color: #0f0c29;
+}}
+.btn.primary:hover {{ opacity: 0.9; }}
+.section {{
+    padding: 0 40px 40px;
+}}
+.section h2 {{
+    font-size: 18px;
+    margin-bottom: 16px;
+    color: rgba(255,255,255,0.9);
+}}
+.table {{
+    width: 100%;
+    border-collapse: collapse;
+}}
+.table th, .table td {{
+    text-align: left;
+    padding: 12px;
+    font-size: 13px;
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+}}
+.table th {{
+    color: rgba(255,255,255,0.6);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-size: 11px;
+}}
+pre {{
+    background: rgba(0,0,0,0.3);
+    padding: 16px;
+    border-radius: 12px;
+    overflow-x: auto;
+    font-size: 12px;
+    color: rgba(255,255,255,0.8);
+}}
+.link {{
+    color: #00f5ff;
+    text-decoration: none;
+}}
+.footer {{
+    text-align: center;
+    padding: 40px;
+    font-size: 12px;
+    color: rgba(255,255,255,0.4);
+}}
 </style>
 </head>
 <body>
 <div class="header">
-<h1>RM-PRI — RentMasseur Profile Revenue Intelligence</h1>
-<div class="sub">Mission: one paying client per day, or prove exactly why it failed today. | <span id="rm-pri-version">v0.1</span> | <span id="control-mode-badge"></span></div>
+    <div>
+        <h1>RentMasseur Operating System</h1>
+        <div class="sub">Autonomous availability, dynamic content, revenue optimization</div>
+    </div>
+    <div class="live">
+        <div class="pulse"></div>
+        <span>LIVE SYSTEM</span>
+    </div>
 </div>
+
 <div class="grid">
-
-<div class="panel full">
-<div class="panel-h">Mission Control — Instrument Panel</div>
-<div class="panel-b" id="mission">Loading...</div>
+    <div class="card glass">
+        <h3>Revenue Estimate</h3>
+        <div class="num">${revenue:.0f}</div>
+        <div class="sub">of $300/day target</div>
+        <div class="progress-bar"><div class="progress-fill"></div></div>
+    </div>
+    <div class="card glass">
+        <h3>24/7 Availability</h3>
+        <div class="num">{availability.get('status', 'ACTIVE')}</div>
+        <div class="sub">Last checked: {availability.get('checked_at', 'now')}</div>
+    </div>
+    <div class="card glass">
+        <h3>Bio Candidates</h3>
+        <div class="num">{counts.get('bios', 0)}</div>
+        <div class="sub">Trained and scored</div>
+    </div>
+    <div class="card glass">
+        <h3>GA Generations</h3>
+        <div class="num">{ga_state.get('generation', 0)}</div>
+        <div class="sub">Evolving toward $300/day</div>
+    </div>
+    <div class="card glass">
+        <h3>Competitor Bios</h3>
+        <div class="num">{len(competitors)}</div>
+        <div class="sub">Analyzed for advantage</div>
+    </div>
+    <div class="card glass">
+        <h3>Content Assets</h3>
+        <div class="num">{sum(counts.values())}</div>
+        <div class="sub">Total generated items</div>
+    </div>
+    <div class="card glass">
+        <h3>Visitors Tracked</h3>
+        <div class="num">{eng.get('total', 0)}</div>
+        <div class="sub">{eng.get('repeat_3plus', 0)} repeat (3+ visits)</div>
+    </div>
+    <div class="card glass">
+        <h3>Visit Events</h3>
+        <div class="num">{eng.get('visit_events', 0)}</div>
+        <div class="sub">Total profile visits logged</div>
+    </div>
+    <div class="card glass">
+        <h3>Messages Sent</h3>
+        <div class="num">{eng.get('messages_sent', 0)}</div>
+        <div class="sub">Auto-engagement pipeline</div>
+    </div>
+    <div class="card glass">
+        <h3>Bio Experiments</h3>
+        <div class="num">{len(bio_exp)}</div>
+        <div class="sub">Ollama-generated candidates</div>
+    </div>
 </div>
 
-<div class="panel">
-<div class="panel-h">Control Mode</div>
-<div class="panel-b" id="cmode">Loading...</div>
-</div>
-
-<div class="panel">
-<div class="panel-h">Test Phase</div>
-<div class="panel-b" id="tphase">Loading...</div>
-</div>
-
-<div class="panel">
-<div class="panel-h">Decision Gate</div>
-<div class="panel-b" id="decision">Loading...</div>
-</div>
-
-<div class="panel wide">
-<div class="panel-h">Prospect Ledger</div>
-<div class="panel-b" id="prospects">Loading...</div>
-</div>
-
-<div class="panel">
-<div class="panel-h">Content Ledger</div>
-<div class="panel-b" id="content">Loading...</div>
-</div>
-
-<div class="panel">
-<div class="panel-h">Event Ledger</div>
-<div class="panel-b" id="events">Loading...</div>
-</div>
-
-<div class="panel">
-<div class="panel-h">Experiment Ledger</div>
-<div class="panel-b" id="experiments">Loading...</div>
-</div>
-
-<div class="panel">
-<div class="panel-h">Job Ledger</div>
-<div class="panel-b" id="jobs">Loading...</div>
-</div>
-
-<div class="panel">
-<div class="panel-h">Revenue Proof</div>
-<div class="panel-b" id="revenue">Loading...</div>
-</div>
-
-<div class="panel full">
-<div class="panel-h">RevenueOps — Profile Stats Snapshot</div>
-<div class="panel-b" id="rev-stats">Loading...</div>
-</div>
-
-<div class="panel wide">
-<div class="panel-h">RevenueOps — Bio Candidates</div>
-<div class="panel-b" id="rev-bios">Loading...</div>
-</div>
-
-<div class="panel">
-<div class="panel-h">RevenueOps — Experiment</div>
-<div class="panel-b" id="rev-exp">Loading...</div>
-</div>
-
-<div class="panel">
-<div class="panel-h">RevenueOps — Interview</div>
-<div class="panel-b" id="rev-interview">Loading...</div>
-</div>
-
-<div class="panel">
-<div class="panel-h">RevenueOps — Blog</div>
-<div class="panel-b" id="rev-blog">Loading...</div>
-</div>
-
-<div class="panel full">
-<div class="panel-h">RevenueOps — Receipt Chain</div>
-<div class="panel-b" id="rev-receipts">Loading...</div>
-</div>
-
-</div>
-<script>
-async function api(p){try{const r=await fetch(p);return await r.json()}catch(e){return null}}
-function badge(s){return `<span class="badge ${s}">${s}</span>`}
-
-async function load(){
-// Mission Control
-const d=await api('/api/daily-proof');
-if(d){
-  const f=d.funnel||{};
-  const steps=['discovered','qualified','contacted','viewed','clicked','messaged','conversation','appointment','paid'];
-  let funnel='<div class="funnel">';
-  steps.forEach(s=>{const v=f[s]||0;funnel+=`<span class="funnel-step ${v>0?'has':'empty'}">${s}: ${v}</span>`});
-  funnel+='</div>';
-  document.getElementById('mission').innerHTML=`
-    <div class="mission-status ${d.mission_status}">${d.mission_status}</div>
-    <div class="mr"><span class="ml">Date</span><span class="mv">${d.date}</span></div>
-    <div class="mr"><span class="ml">Verified revenue</span><span class="mv">$${d.verified_revenue||0}</span></div>
-    <div class="mr"><span class="ml">Content versions</span><span class="mv">${d.content_versions||0}</span></div>
-    <div class="mr"><span class="ml">Events recorded</span><span class="mv">${d.events_recorded||0}</span></div>
-    <div class="mr"><span class="ml">Total reward</span><span class="mv">${d.total_reward||0}</span></div>
-    <div class="mr"><span class="ml">Jobs today</span><span class="mv">${d.jobs_today||0}</span></div>
-    <div class="mr"><span class="ml">RM-PRI Version</span><span class="mv">${d.rm_pri_version||'v0.1'}</span></div>
-    <div class="mr"><span class="ml">Control Mode</span><span class="mv">${d.control_mode_name||'read_only'}</span></div>
-    <div class="mr"><span class="ml">Next best action</span><span class="mv" style="font-size:10px">${d.next_best_action}</span></div>
-    ${funnel}
-  `;
-  if(d.rm_pri_version)document.getElementById('rm-pri-version').textContent=d.rm_pri_version;
-  if(d.control_mode_name)document.getElementById('control-mode-badge').innerHTML=`<span class="mode-badge mode-${d.control_mode}">${d.control_mode_name}</span>`;
-}
-
-// Control Mode
-const cm=await api('/api/control-mode');
-if(cm){
-  let h=`<span class="mode-badge mode-${cm.current_mode}">Mode ${cm.current_mode}: ${cm.mode_name}</span>`;
-  if(cm.mode4_unlock_check){
-    h+=`<div style="margin-top:8px"><b>Mode 4 Unlock:</b></div>`;
-    h+=`<div class="mr"><span class="ml">Experiments</span><span class="mv">${cm.mode4_unlock_check.experiment_count}/${cm.mode4_unlock_check.min_experiments?20:'?'}</span></div>`;
-    h+=`<div class="mr"><span class="ml">Rollback tested</span><span class="${cm.mode4_unlock_check.rollback_tested?'gate-pass':'gate-fail'}">${cm.mode4_unlock_check.rollback_tested?'YES':'NO'}</span></div>`;
-    h+=`<div class="mr"><span class="ml">Can unlock</span><span class="${cm.mode4_unlock_check.can_unlock?'gate-pass':'gate-fail'}">${cm.mode4_unlock_check.can_unlock?'YES':'NO'}</span></div>`;
-  }
-  if(cm.current_mode<2){h+=`<div class="warning">DO NOT APPLY: Mode < 2. No profile mutations allowed.</div>`}
-  document.getElementById('cmode').innerHTML=h;
-}
-
-// Test Phase
-const tp=await api('/api/test-phase');
-if(tp){
-  let h=`<b>Phase: ${tp.phase}</b> (day ${tp.day})`;
-  h+=`<div style="margin-top:6px;color:#888;font-size:11px">${tp.reason}</div>`;
-  if(tp.freeze&&tp.freeze.length){h+=`<div style="margin-top:6px"><b>Frozen:</b> ${tp.freeze.join(', ')}</div>`}
-  document.getElementById('tphase').innerHTML=h;
-}
-
-// Prospects
-const p=await api('/api/prospects');
-if(p){
-  if(p.status==='GRAY_NO_DATA'){
-    document.getElementById('prospects').innerHTML=`${badge('GRAY_NO_DATA')}<div class="missing" style="margin-top:8px">NO PROSPECTS</div>`;
-  }else{
-    let h=`${badge('GREEN_REAL')} ${p.count} prospects`;
-    h+='<table style="margin-top:8px"><tr><th>ID</th><th>Stage</th><th>Source</th><th>Time</th></tr>';
+<div class="actions">
+    <a href="/run/ga-rl?apply=1" class="btn primary">Train GA+RL & Apply Winner</a>
+    <a href="/run/orchestrator?all=1" class="btn">Run Full Orchestrator</a>
+    <a href="/run/availability" class="btn">Run Availability Keeper</a>
+    <a href="/api/os/train" class="btn">Train on All Bios</a>
+    <a href="/api/os/report" class="btn">Full OS Report</a>

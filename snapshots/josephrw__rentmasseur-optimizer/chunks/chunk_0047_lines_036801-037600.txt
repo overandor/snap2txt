@@ -1,204 +1,260 @@
-            try:
-                api.set_availability(option=1, duration=1)
-                state.available = True
-                self.pulse_start = time.time()
-                state.refreshes_executed += 1
-                _record(state, self.name, "pulse_on", f"hour={hour} after {self.PULSE_OFF}s")
-                return {"algo": self.name, "action": "pulse_on", "hour": hour}
-            except Exception as e:
-                return {"algo": self.name, "action": "error", "error": str(e)}
-        return {"algo": self.name, "action": "noop"}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Algo 7: GeoRotation — rotate timing for multiple timezone waves
-# ═══════════════════════════════════════════════════════════════════
-
-class GeoRotation:
-    """Stagger availability to catch ET, CT, PT traffic waves."""
-
-    name = "geo_rotation"
-    # ET peak: 8-11, 19-23 | CT peak: 9-12, 20-00 | PT peak: 11-14, 22-02
-    # Combined: ensure availability 8-14 and 19-02
-    GEO_PEAKS = [(8, 14), (19, 24), (0, 2)]
-
-    def should_fire(self, state: AlgoState) -> bool:
-        hour = state.current_hour
-        in_peak = any(start <= hour < end for start, end in self.GEO_PEAKS)
-        return in_peak and not state.available
-
-    def execute(self, api, state: AlgoState) -> Dict:
-        hour = state.current_hour
-        # Calculate duration until peak window ends
-        duration = 2
-        for start, end in self.GEO_PEAKS:
-            if start <= hour < end:
-                duration = min(6, end - hour)
-                break
-        try:
-            api.set_availability(option=1, duration=duration)
-            state.available = True
-            state.refreshes_executed += 1
-            _record(state, self.name, "geo_sync", f"hour={hour} dur={duration}h")
-            return {"algo": self.name, "action": "geo_sync", "hour": hour, "duration": duration}
-        except Exception as e:
-            _record(state, self.name, "error", str(e))
-            return {"algo": self.name, "action": "error", "error": str(e)}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Algo 8: EngagementTrigger — refresh after visit/message
-# ═══════════════════════════════════════════════════════════════════
-
-class EngagementTrigger:
-    """Immediately refresh availability after receiving a visit or message."""
-
-    name = "engagement_trigger"
-    COOLDOWN = 300  # 5 min between triggers
-
-    def __init__(self):
-        self.last_trigger = 0
-
-    def should_fire(self, state: AlgoState) -> bool:
-        now = time.time()
-        if (now - self.last_trigger) < self.COOLDOWN:
-            return False
-        # Fire if recent visit or message within last 2 min
-        recent_visit = (now - state.last_visit) < 120
-        recent_msg = (now - state.last_message) < 120
-        return recent_visit or recent_msg
-
-    def execute(self, api, state: AlgoState) -> Dict:
-        try:
-            api.set_availability(option=1, duration=5)
-            state.available = True
-            state.refreshes_executed += 1
-            self.last_trigger = time.time()
-            trigger = "visit" if (time.time() - state.last_visit) < 120 else "message"
-            _record(state, self.name, "engagement_refresh", f"trigger={trigger}")
-            return {"algo": self.name, "action": "engagement_refresh", "trigger": trigger}
-        except Exception as e:
-            _record(state, self.name, "error", str(e))
-            return {"algo": self.name, "action": "error", "error": str(e)}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Algo 9: BackoffRecovery — exponential backoff on API failure
-# ═══════════════════════════════════════════════════════════════════
-
-class BackoffRecovery:
-    """Never lose presence: retry with exponential backoff on API failures."""
-
-    name = "backoff_recovery"
-    MAX_RETRIES = 5
-    BASE_DELAY = 2.0
-    MAX_DELAY = 120.0
-
-    def should_fire(self, state: AlgoState) -> bool:
-        return state.api_failures > 0 and not state.available
-
-    def execute(self, api, state: AlgoState) -> Dict:
-        for attempt in range(self.MAX_RETRIES):
-            delay = min(self.MAX_DELAY, self.BASE_DELAY * (2 ** attempt))
-            try:
-                time.sleep(delay)
-                api.set_availability(option=1, duration=5)
-                state.available = True
-                state.api_failures = 0
-                _record(state, self.name, "recovered", f"attempt={attempt+1} delay={delay:.0f}s")
-                return {"algo": self.name, "action": "recovered", "attempts": attempt + 1, "delay": delay}
-            except Exception as e:
-                state.api_failures += 1
-                state.last_api_error = str(e)
-                _record(state, self.name, "retry", f"attempt={attempt+1} delay={delay:.0f}s err={str(e)[:80]}")
-        _record(state, self.name, "exhausted", f"failures={state.api_failures}")
-        return {"algo": self.name, "action": "exhausted", "failures": state.api_failures}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Orchestrator — runs all 9 algos in priority order
-# ═══════════════════════════════════════════════════════════════════
-
-ALL_ALGOS = [
-    BackoffRecovery(),    # 9: recover first if broken
-    RefreshCascade(),     # 4: don't let availability lapse
-    EngagementTrigger(),  # 8: capitalize on engagement
-    CompetitorGap(),      # 3: fill competitor gaps
-    PeakHourSync(),       # 2: sync to peaks
-    GeoRotation(),       # 7: timezone coverage
-    DemandPulse(),       # 6: low-traffic pulsing
-    JitterBurst(),       # 1: traffic attraction bursts
-    SearchRankBoost(),   # 5: search rank freshness
-]
-
-ALGO_NAMES = [a.name for a in ALL_ALGOS]
-
-
-def run_algos(api, state: AlgoState) -> List[Dict]:
-    """Run all algos that should fire. Returns list of results."""
-    results = []
-    for algo in ALL_ALGOS:
-        try:
-            if algo.should_fire(state):
-                result = algo.execute(api, state)
-                results.append(result)
-        except Exception as e:
-            log.error(f"algo {algo.name} crashed: {e}")
-            results.append({"algo": algo.name, "action": "crash", "error": str(e)})
-    return results
-
-
-def algo_status(state: AlgoState) -> Dict[str, Any]:
-    """Get status of all algos for API response."""
-    return {
-        "available": state.available,
-        "bursts": state.bursts_executed,
-        "refreshes": state.refreshes_executed,
-        "toggles": state.toggles_executed,
-        "api_failures": state.api_failures,
-        "last_error": state.last_api_error,
-        "algos": ALGO_NAMES,
-        "recent": state.algo_history[-10:],
+        }
+        std::vector<double> a2(output_size);
+        for (int j = 0; j < output_size; j++) a2[j] = sigmoid(z2[j]);
+        return a2;
     }
 
+    void backward(const std::vector<double>& x, const std::vector<double>& y, const std::vector<double>& y_pred,
+                  const std::vector<double>& z1, const std::vector<double>& a1, const std::vector<double>& mask,
+                  double lr, double beta1 = 0.9, double beta2 = 0.999, double eps = 1e-8) {
+        t++;
+        int m = 1;
+        std::vector<double> dz2(output_size);
+        for (int j = 0; j < output_size; j++) dz2[j] = (y_pred[j] - y[j]) / m;
+        std::vector<std::vector<double>> dW2(hidden_size, std::vector<double>(output_size, 0.0));
+        std::vector<double> db2(output_size, 0.0);
+        for (int j = 0; j < output_size; j++) {
+            for (int i = 0; i < hidden_size; i++) dW2[i][j] += a1[i] * dz2[j];
+            db2[j] += dz2[j];
+        }
+        std::vector<double> da1(hidden_size, 0.0);
+        for (int i = 0; i < hidden_size; i++) {
+            for (int j = 0; j < output_size; j++) da1[i] += dz2[j] * W2[i][j];
+            da1[i] *= mask[i];
+        }
+        std::vector<std::vector<double>> dW1(input_size, std::vector<double>(hidden_size, 0.0));
+        std::vector<double> db1(hidden_size, 0.0);
+        for (int j = 0; j < hidden_size; j++) {
+            double dz1 = da1[j] * (z1[j] > 0 ? 1.0 : 0.0);
+            for (int i = 0; i < input_size; i++) dW1[i][j] += x[i] * dz1;
+            db1[j] += dz1;
+        }
+
+        auto adam = [&](double& W, double& mW, double& vW, double dW) {
+            mW = beta1 * mW + (1 - beta1) * dW;
+            vW = beta2 * vW + (1 - beta2) * dW * dW;
+            double m_hat = mW / (1 - std::pow(beta1, t));
+            double v_hat = vW / (1 - std::pow(beta2, t));
+            W -= lr * m_hat / (std::sqrt(v_hat) + eps);
+        };
+        for (int i = 0; i < input_size; i++)
+            for (int j = 0; j < hidden_size; j++)
+                adam(W1[i][j], mW1[i][j], vW1[i][j], dW1[i][j]);
+        for (int j = 0; j < hidden_size; j++) adam(b1[j], mb1[j], vb1[j], db1[j]);
+        for (int i = 0; i < hidden_size; i++)
+            for (int j = 0; j < output_size; j++)
+                adam(W2[i][j], mW2[i][j], vW2[i][j], dW2[i][j]);
+        for (int j = 0; j < output_size; j++) adam(b2[j], mb2[j], vb2[j], db2[j]);
+    }
+
+    void train_epoch(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& y,
+                     double lr, int batch_size, std::mt19937& rng) {
+        int n = X.size();
+        std::vector<int> idx(n);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::shuffle(idx.begin(), idx.end(), rng);
+        for (int i = 0; i < n; i += batch_size) {
+            for (int k = i; k < std::min(n, i + batch_size); k++) {
+                int ii = idx[k];
+                std::vector<double> z1, a1, mask;
+                auto pred = forward(X[ii], true, z1, a1, mask);
+                backward(X[ii], y[ii], pred, z1, a1, mask, lr);
+            }
+        }
+    }
+
+    std::vector<double> predict(const std::vector<double>& x) {
+        std::vector<double> z1, a1, mask;
+        return forward(x, false, z1, a1, mask);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+struct Metrics {
+    double mae, rmse, r2;
+};
+
+Metrics evaluate(MLP& model, const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& y) {
+    int n = X.size();
+    double mae = 0, mse = 0;
+    std::vector<double> y_mean(3, 0);
+    for (const auto& row : y) for (int j = 0; j < 3; j++) y_mean[j] += row[j];
+    for (double& v : y_mean) v /= n;
+    double ss_tot = 0;
+    for (int i = 0; i < n; i++) {
+        auto pred = model.predict(X[i]);
+        for (int j = 0; j < 3; j++) {
+            double diff = pred[j] - y[i][j];
+            mae += std::abs(diff);
+            mse += diff * diff;
+            ss_tot += (y[i][j] - y_mean[j]) * (y[i][j] - y_mean[j]);
+        }
+    }
+    mae /= (n * 3);
+    mse /= (n * 3);
+    return {mae, std::sqrt(mse), 1 - mse * (n * 3) / ss_tot};
+}
+
+// ---------------------------------------------------------------------------
+// Data loading
+// ---------------------------------------------------------------------------
+
+struct Bio {
+    std::string headline, description;
+    std::vector<double> features;
+    std::vector<double> labels;
+};
+
+std::vector<Bio> load_bios(const std::string& path, int limit = 0) {
+    std::vector<Bio> bios;
+    std::ifstream f(path);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        Bio b;
+        b.headline = extract_json_string(line, "headline");
+        b.description = extract_json_string(line, "description");
+        b.features = extract_features(b.headline, b.description);
+        b.labels = heuristic_score(b.headline, b.description);
+        bios.push_back(b);
+        if (limit > 0 && (int)bios.size() >= limit) break;
+    }
+    return bios;
+}
+
+// ---------------------------------------------------------------------------
+// k-fold cross-validation
+// ---------------------------------------------------------------------------
+
+void k_fold_cv(std::vector<Bio>& bios, int k, int epochs, double lr, int batch_size) {
+    int n = bios.size();
+    int fold_size = n / k;
+    std::vector<Metrics> metrics;
+    for (int fold = 0; fold < k; fold++) {
+        int val_start = fold * fold_size;
+        int val_end = val_start + fold_size;
+        std::vector<std::vector<double>> X_train, y_train, X_val, y_val;
+        for (int i = 0; i < n; i++) {
+            if (i >= val_start && i < val_end) {
+                X_val.push_back(bios[i].features);
+                y_val.push_back(bios[i].labels);
+            } else {
+                X_train.push_back(bios[i].features);
+                y_train.push_back(bios[i].labels);
+            }
+        }
+        MLP model(feature_count(), 32, 3, fold + 1);
+        std::mt19937 rng(fold + 1);
+        for (int e = 0; e < epochs; e++) model.train_epoch(X_train, y_train, lr, batch_size, rng);
+        Metrics m = evaluate(model, X_val, y_val);
+        metrics.push_back(m);
+        std::cout << "Fold " << fold << " — MAE=" << m.mae << " RMSE=" << m.rmse << " R2=" << m.r2 << std::endl;
+    }
+    double mae = 0, rmse = 0, r2 = 0;
+    for (const auto& m : metrics) { mae += m.mae; rmse += m.rmse; r2 += m.r2; }
+    std::cout << "CV mean — MAE=" << mae / k << " RMSE=" << rmse / k << " R2=" << r2 / k << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Walk-forward validation
+// ---------------------------------------------------------------------------
+
+void walk_forward(std::vector<Bio>& bios, double train_ratio, int epochs, double lr, int batch_size) {
+    int n = bios.size();
+    int split = (int)(train_ratio * n);
+    std::vector<std::vector<double>> X_train, y_train, X_val, y_val;
+    for (int i = 0; i < n; i++) {
+        if (i < split) { X_train.push_back(bios[i].features); y_train.push_back(bios[i].labels); }
+        else { X_val.push_back(bios[i].features); y_val.push_back(bios[i].labels); }
+    }
+    MLP model(feature_count(), 32, 3, 42);
+    std::mt19937 rng(42);
+    for (int e = 0; e < epochs; e++) {
+        model.train_epoch(X_train, y_train, lr, batch_size, rng);
+        if (e % 20 == 0) {
+            Metrics m = evaluate(model, X_train, y_train);
+            std::cout << "Epoch " << e << " train_loss=" << m.mae << std::endl;
+        }
+    }
+    Metrics m = evaluate(model, X_val, y_val);
+    std::cout << "Walk-forward — MAE=" << m.mae << " RMSE=" << m.rmse << " R2=" << m.r2 << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cout << "Usage: bio_ml <bios.jsonl> [cv|walk|train] [limit] [epochs] [lr] [batch_size]" << std::endl;
+        return 1;
+    }
+    std::string path = argv[1];
+    std::string mode = argc > 2 ? argv[2] : "cv";
+    int limit = argc > 3 ? std::stoi(argv[3]) : 10000;
+    int epochs = argc > 4 ? std::stoi(argv[4]) : 100;
+    double lr = argc > 5 ? std::stod(argv[5]) : 0.01;
+    int batch_size = argc > 6 ? std::stoi(argv[6]) : 64;
+
+    auto start = std::chrono::high_resolution_clock::now();
+    std::cout << "Loading bios..." << std::endl;
+    auto bios = load_bios(path, limit);
+    std::cout << "Loaded " << bios.size() << " bios" << std::endl;
+
+    if (mode == "cv") k_fold_cv(bios, 5, epochs, lr, batch_size);
+    else if (mode == "walk") walk_forward(bios, 0.8, epochs, lr, batch_size);
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    std::cout << "Total time: " << ms << " ms" << std::endl;
+    return 0;
+}
+
 ```
 
-service.py:
+money_daemon.py:
 ```
 """
-RM Traffic Service — unified multi-tenant optimization pipeline.
+Money-Making 24/7 Daemon — continuous revenue optimization loop.
 
-Consolidates 5 overlapping systems into one service:
-  - profileops.py  (visibility, availability, stats)
-  - fortress.py    (hardened login, identity rotation, rate limiting)
-  - traffic_loop.py (30-function optimization loop)
-  - money_loop.py   (revenue funnel + LLM optimizer)
-  - engagement_engine.py (Selenium visits + messaging)
+Combines:
+  1. Profile visibility guard (unhide if hidden → clients find you)
+  2. Availability auto-refresh (stay "Available" → appear in search)
+  3. Stats collection (views, contacts, emails → track conversion)
+  4. Search rank monitoring (know your position in Manhattan)
+  5. ML training loop (retrain money model every 6h → better bio predictions)
+  6. Bio A/B testing (rotate bio every 24h → higher CTR → more bookings)
+  7. Selenium verification (verify search visibility every 30min)
+  8. Live dashboard (print revenue metrics to terminal)
 
-Single API client. Single DB for ROI. Per-tenant credentials.
-Orchestrated cycle: collect → prioritize → execute → measure → report.
+The loop never stops. It handles crashes, re-auths, and writes receipts.
 
 Usage:
-    python3 -m rm_traffic.service --once --tenant <tenant_id>
-    python3 -m rm_traffic.service --daemon
-    python3 -m rm_traffic.service --register --username <rm_username> --display-name "John Doe"
-    python3 -m rm_traffic.service --report --tenant <tenant_id>
-    python3 -m rm_traffic.service --list-tenants
+    python3 -m rm_traffic.money_daemon
+
+Credentials read from .env file or environment variables.
 """
 
-import argparse
-import hashlib
 import json
 import logging
 import os
-import sqlite3
+import signal
 import sys
+import threading
 import time
-from datetime import datetime, timezone, timedelta
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, Optional
 
-# .env loading
+import numpy as np
+
+CYCLE_TIMEOUT = 120  # max seconds per cycle before watchdog kills it
+
+# Load .env
 ENV_PATH = Path(__file__).parent.parent / ".env"
 if ENV_PATH.exists():
     for line in open(ENV_PATH):
@@ -207,594 +263,538 @@ if ENV_PATH.exists():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
+os.environ.setdefault("RM_USER", os.environ.get("RENTMASSEUR_USER", ""))
+os.environ.setdefault("RM_PASS", os.environ.get("RENTMASSEUR_PASS", ""))
+
 from .api_client import RentMasseurAPI
 from .auth import AuthSession
-from .llm_client import generate_with_fallback
-from . import roi_algorithm as roi
+from .db import init_db, write_receipt, write_traffic_snapshot, get_latest_traffic_snapshot
+from .visibility_guard import ensure_visible
+from .availability_guard import check_availability, refresh_availability
+from .stats_collector import collect_snapshot
+from .search_rank import check_search_rank
+from .content_optimizer import run_daily_draft_cycle
+from .bio_ml_trainer import MLP
+from .bio_appraiser import load_bios
+from .money_training_selenium import build_money_dataset, predict_top_bios, selenium_verify_search
 
-log = logging.getLogger("rm_service")
+log = logging.getLogger("money.daemon")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(Path(__file__).parent / "data" / "money_daemon.log"),
+    ],
 )
 
-SERVICE_DB = Path(__file__).parent / "service.db"
-NY_CITIES = [
-    "manhattan-ny", "brooklyn-ny", "queens-ny",
-    "bronx-ny", "staten-island-ny", "long-island-ny", "westchester-ny",
-]
+# Intervals (seconds)
+CYCLE_INTERVAL = 5 * 60           # 5 min — main loop
+AVAIL_REFRESH_THRESHOLD = 45 * 60 # refresh if < 45 min left
+STATS_INTERVAL = 15 * 60          # 15 min
+SEARCH_RANK_INTERVAL = 60 * 60    # 60 min
+ML_RETRAIN_INTERVAL = 6 * 60 * 60 # 6 hours
+BIO_TEST_INTERVAL = 24 * 60 * 60  # 24 hours
+SELENIUM_INTERVAL = 30 * 60       # 30 min
 
-# Valid actions the orchestrator can execute
-VALID_ACTIONS = {
-    "refresh_availability", "ensure_visible", "send_messages",
-    "visit_profiles", "update_bio", "check_search_rank",
-    "multi_city_rank", "engagement_stats", "sms_alerts",
-    "track_actions", "adjust_rates",
-}
-
-
-def _sdb():
-    conn = sqlite3.connect(str(SERVICE_DB))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+BIOS_PATH = Path(__file__).parent / "data" / "real_bios_with_views.jsonl"
+MODEL_PATH = Path(__file__).parent / "data" / "models" / "money_mlp.pkl"
+DASHBOARD_PATH = Path(__file__).parent / "data" / "money_dashboard.json"
 
 
-def init_db():
-    conn = _sdb()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS service_cycles (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        ts TEXT NOT NULL,
-        cycle_num INTEGER,
-        actions_executed INTEGER,
-        actions_passed INTEGER,
-        llm_calls INTEGER,
-        views_before INTEGER,
-        views_after INTEGER,
-        contacts_before INTEGER,
-        contacts_after INTEGER,
-        emails_before INTEGER,
-        emails_after INTEGER,
-        search_rank_before INTEGER,
-        search_rank_after INTEGER,
-        receipt_hash TEXT
-    );
-    CREATE TABLE IF NOT EXISTS tenant_credentials (
-        tenant_id TEXT PRIMARY KEY,
-        rm_username TEXT NOT NULL,
-        rm_password_encrypted TEXT NOT NULL,
-        session_json TEXT,
-        updated_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_cycles_tenant ON service_cycles(tenant_id, ts);
-    """)
-    conn.commit()
-    conn.close()
-    roi.init_db()
+class MoneyDaemon:
+    def __init__(self):
+        self.api = RentMasseurAPI(min_request_interval=2.0)
+        self.auth = AuthSession(self.api, session_file="rm_traffic/session.json")
+        self.running = True
+        self.cycle_count = 0
+        self.start_time = time.time()
 
+        # Timers
+        self.last_stats = 0
+        self.last_search_rank = 0
+        self.last_ml_retrain = 0
+        self.last_bio_test = 0
+        self.last_selenium = 0
+        self.last_avail_check = 0
 
-# ---------------------------------------------------------------------------
-# Credential Storage (simple obfuscation — not plaintext at rest)
-# ---------------------------------------------------------------------------
+        # State
+        self.current_stats = {}
+        self.search_position = None
+        self.ml_model = None
+        self.ml_summary = {}
+        self.top_bios = []
+        self.selenium_status = "pending"
+        self.total_revenue_signals = 0
+        self.total_actions = 0
+        self.total_receipts = 0
+        self.errors = 0
+        self.last_error = ""
 
-_OBF_KEY = os.environ.get("RM_SERVICE_KEY", "rm_traffic_service_v1")
+        signal.signal(signal.SIGINT, self._shutdown)
+        signal.signal(signal.SIGTERM, self._shutdown)
 
+    def _shutdown(self, signum, frame):
+        log.info("Shutdown signal %d received. Finishing cycle...", signum)
+        self.running = False
 
-def _obfuscate(text: str) -> str:
-    return hashlib.sha256((_OBF_KEY + text).encode()).hexdigest()[:8] + "|" + text[::-1]
-
-
-def _deobfuscate(stored: str) -> str:
-    parts = stored.split("|", 1)
-    if len(parts) != 2:
-        return ""
-    return parts[1][::-1]
-
-
-def store_credentials(tenant_id: str, rm_username: str, rm_password: str):
-    ts = datetime.now(timezone.utc).isoformat()
-    conn = _sdb()
-    conn.execute(
-        "INSERT OR REPLACE INTO tenant_credentials (tenant_id, rm_username, rm_password_encrypted, updated_at) VALUES (?, ?, ?, ?)",
-        (tenant_id, rm_username, _obfuscate(rm_password), ts)
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_credentials(tenant_id: str) -> Optional[Dict]:
-    conn = _sdb()
-    row = conn.execute("SELECT * FROM tenant_credentials WHERE tenant_id = ?", (tenant_id,)).fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {"username": row["rm_username"], "password": _deobfuscate(row["rm_password_encrypted"])}
-
-
-# ---------------------------------------------------------------------------
-# API Session Per Tenant
-# ---------------------------------------------------------------------------
-
-def get_api_for_tenant(tenant_id: str) -> Optional[RentMasseurAPI]:
-    """Create an authenticated API session for a specific tenant."""
-    creds = get_credentials(tenant_id)
-    if not creds:
-        log.error("No credentials for tenant %s", tenant_id)
-        return None
-
-    tenant = roi.get_tenant(tenant_id)
-    if not tenant:
-        log.error("Tenant %s not found", tenant_id)
-        return None
-
-    api = RentMasseurAPI(min_request_interval=2.0)
-    session_file = str(Path(__file__).parent / f"session_{tenant_id}.json")
-    auth = AuthSession(api, session_file=session_file)
-
-    if not auth.login(creds["username"], creds["password"]):
-        log.error("Login failed for tenant %s (%s)", tenant_id, creds["username"])
-        return None
-
-    return api
-
-
-# ---------------------------------------------------------------------------
-# Metric Collection (unified — replaces 5 duplicate implementations)
-# ---------------------------------------------------------------------------
-
-def collect_metrics(api: RentMasseurAPI, tenant_id: str) -> Dict:
-    """Collect all traffic metrics in one pass. Replaces duplicate code in 5 files."""
-    metrics: Dict = {"ts": datetime.now(timezone.utc).isoformat()}
-
-    try:
-        stats = api.get_ad_statistics()
-        prof = stats.get("profileStatistics", {}) or {}
-        visits = prof.get("visits", []) or []
-        metrics["views"] = prof.get("totalPageViews", 0)
-        metrics["contact_clicks"] = prof.get("totalContactClicks", 0)
-    except Exception as e:
-        log.warning("Stats collection failed: %s", e)
-        metrics["views"] = 0
-        metrics["contact_clicks"] = 0
-
-    try:
-        mb = api.get_mailbox(page=1, folder=1, sort=1)
-        emails = mb.get("emails", []) or []
-        metrics["emails_count"] = len(emails)
-        metrics["unread_emails"] = sum(1 for e in emails if e.get("unread"))
-        metrics["premium_senders"] = sum(
-            1 for e in emails
-            if e.get("userCard", {}).get("isGold") or e.get("userCard", {}).get("isPremium")
-        )
-        # Classify emails
-        booking = 0
-        inquiry = 0
-        for e in emails:
-            preview = (e.get("lastMessage", "") or "").lower()
-            if any(w in preview for w in ["book", "appointment", "session", "today", "tomorrow", "available", "schedule"]):
-                booking += 1
-            elif any(w in preview for w in ["price", "rate", "how much", "where", "location", "incall", "outcall"]):
-                inquiry += 1
-        metrics["booking_emails"] = booking
-        metrics["inquiry_emails"] = inquiry
-    except Exception as e:
-        log.warning("Mailbox collection failed: %s", e)
-        metrics["emails_count"] = 0
-        metrics["unread_emails"] = 0
-        metrics["booking_emails"] = 0
-        metrics["inquiry_emails"] = 0
-        metrics["premium_senders"] = 0
-
-    try:
-        about = api.get_about()
-        assets = about.get("userProps", {}).get("assets", {})
-        metrics["headline"] = assets.get("headline", "")
-    except Exception:
-        metrics["headline"] = ""
-
-    try:
-        avail = api.get_availability()
-        metrics["availability_option"] = avail.get("option", 0)
-    except Exception:
-        metrics["availability_option"] = 0
-
-    try:
-        keep = api.get_keeponline()
-        metrics["is_hidden"] = int(bool(keep.get("isAdHidden", 0)))
-    except Exception:
-        metrics["is_hidden"] = 0
-
-    try:
-        tenant = roi.get_tenant(tenant_id)
-        city = tenant.get("city", "manhattan-ny") if tenant else "manhattan-ny"
-        search = api.search(city=city, available_only=False, page=1)
-        results = search.get("results", []) or search.get("data", []) or search.get("users", []) or []
-        metrics["search_rank"] = _find_rank(results, creds_username=None, tenant=tenant)
-        metrics["search_total"] = len(results)
-    except Exception:
-        metrics["search_rank"] = 0
-        metrics["search_total"] = 0
-
-    try:
-        avail_search = api.search(city=city, available_only=True, page=1)
-        a_results = avail_search.get("results", []) or avail_search.get("data", []) or []
-        metrics["available_rank"] = _find_rank(a_results, creds_username=None, tenant=tenant)
-        metrics["available_total"] = len(a_results)
-    except Exception:
-        metrics["available_rank"] = 0
-        metrics["available_total"] = 0
-
-    # Record into ROI daily metrics
-    roi.record_daily_metrics(tenant_id, metrics)
-
-    return metrics
-
-
-def _find_rank(results: List, creds_username: str = None, tenant: Dict = None) -> int:
-    username = (creds_username or "").lower()
-    if tenant:
-        username = tenant.get("username", "").lower()
-    if not username:
-        return 0
-    for i, r in enumerate(results):
-        name = (r.get("username") or r.get("name") or "").lower()
-        if username in name or name in username:
-            return i + 1
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# Action Executors (unified — one implementation per action)
-# ---------------------------------------------------------------------------
-
-def exec_refresh_availability(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    avail = api.get_availability()
-    option = avail.get("option", 0)
-    if option != 1:
-        api.set_availability(option=1, duration=5)
-        roi.log_action(tenant_id, cycle, "refresh_availability", "visibility", True,
-                       "set to Available", before, {"availability": 1})
-        return {"executed": True, "detail": "set to Available"}
-    roi.log_action(tenant_id, cycle, "refresh_availability", "visibility", False,
-                   "already available", before, {"availability": 1})
-    return {"executed": False, "detail": "already available"}
-
-
-def exec_ensure_visible(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    if before.get("is_hidden", 0):
-        api.set_visibility(True)
-        roi.log_action(tenant_id, cycle, "ensure_visible", "visibility", True,
-                       "unhidden profile", before, {"is_hidden": 0})
-        return {"executed": True, "detail": "profile unhidden"}
-    roi.log_action(tenant_id, cycle, "ensure_visible", "visibility", False,
-                   "already visible", before, {"is_hidden": 0})
-    return {"executed": False, "detail": "already visible"}
-
-
-def exec_send_messages(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        from .engagement_engine import get_visitors_to_message, mark_messaged, generate_message_for_visitor, EngagementBrowser
-        visitors = get_visitors_to_message(limit=3)
-        if not visitors:
-            roi.log_action(tenant_id, cycle, "send_messages", "engagement", False,
-                           "no visitors to message", before, before)
-            return {"executed": False, "detail": "no visitors to message"}
-        browser = EngagementBrowser()
-        browser.start()
+    def login(self) -> bool:
         try:
-            browser.login()
-            sent = 0
-            for v in visitors:
-                uname = v["username"]
-                subject, body, provider, model = generate_message_for_visitor(uname)
-                ok, status_code, detail, screenshot = browser.send_message(uname, subject, body)
-                mark_messaged(uname, subject, body, provider, model, ok, status_code, detail, screenshot_path=screenshot)
-                if ok:
-                    sent += 1
-                time.sleep(3)
-            roi.log_action(tenant_id, cycle, "send_messages", "engagement", sent > 0,
-                           f"sent {sent}/{len(visitors)}", before, {"messages_sent": sent})
-            return {"executed": sent > 0, "detail": f"sent {sent}/{len(visitors)} messages"}
-        finally:
-            browser.stop()
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "send_messages", "engagement", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
+            ok = self.auth.login()
+            if ok:
+                log.info("Authenticated as %s", self.auth.username or "karpathianwolf")
+            else:
+                log.warning("Auth failed — running in offline mode (ML + Selenium only)")
+            return ok
+        except Exception as e:
+            log.warning("Auth error: %s — offline mode", e)
+            return False
 
+    def run(self):
+        log.info("=" * 60)
+        log.info("MONEY-MAKING DAEMON — 24/7 REVENUE OPTIMIZATION")
+        log.info("=" * 60)
 
-def exec_visit_profiles(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        from .engagement_engine import get_profiles_to_visit, mark_visited_back, EngagementBrowser
-        profiles = get_profiles_to_visit(limit=5)
-        if not profiles:
-            roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", False,
-                           "no profiles to visit", before, before)
-            return {"executed": False, "detail": "no profiles to visit"}
-        browser = EngagementBrowser()
-        browser.start()
+        init_db()
+        self.login()
+
+        # Initial ML training
+        self._retrain_ml()
+
+        while self.running:
+            cycle_done = threading.Event()
+            cycle_error = [None]
+
+            def _run_cycle():
+                try:
+                    self._cycle()
+                except Exception as e:
+                    cycle_error[0] = e
+                finally:
+                    cycle_done.set()
+
+            t = threading.Thread(target=_run_cycle, daemon=True)
+            t.start()
+            t.join(timeout=CYCLE_TIMEOUT)
+
+            if not cycle_done.is_set():
+                log.error("⚠ Cycle %d TIMED OUT after %ds — killing thread", self.cycle_count, CYCLE_TIMEOUT)
+                self.errors += 1
+                self.last_error = f"cycle_timeout_{CYCLE_TIMEOUT}s"
+                # Thread is daemon, will be abandoned. Continue.
+            elif cycle_error[0]:
+                self.errors += 1
+                self.last_error = str(cycle_error[0])
+                log.error("Cycle %d error: %s", self.cycle_count, cycle_error[0])
+                traceback.print_exc()
+                write_receipt("daemon_error_v1", "cycle_error", {},
+                              {"error": str(cycle_error[0]), "cycle": self.cycle_count}, verified=False)
+
+            # Sleep between cycles — flush stdout so logs appear in nohup file
+            for _ in range(CYCLE_INTERVAL):
+                if not self.running:
+                    break
+                time.sleep(1)
+            sys.stdout.flush()
+            sys.stderr.flush()
+
+        self._print_final_report()
+        log.info("Daemon stopped after %d cycles, %d actions, %d receipts",
+                 self.cycle_count, self.total_actions, self.total_receipts)
+
+    def _cycle(self):
+        self.cycle_count += 1
+        now = time.time()
+        log.info("")
+        log.info("━" * 50)
+        log.info("Cycle %d | Uptime: %s | Actions: %d | Receipts: %d",
+                 self.cycle_count, self._uptime(), self.total_actions, self.total_receipts)
+        log.info("━" * 50)
+
+        # Re-auth if needed (with timeout)
         try:
-            browser.login()
-            visited = 0
-            for p in profiles:
-                uname = p["username"]
-                status, bytes_recv, ok, screenshot = browser.visit_profile(uname)
-                mark_visited_back(uname, status, bytes_recv, ok, screenshot_path=screenshot)
-                if ok:
-                    visited += 1
-                time.sleep(2)
-            roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", visited > 0,
-                           f"visited {visited}/{len(profiles)}", before, {"profiles_visited": visited})
-            return {"executed": visited > 0, "detail": f"visited {visited}/{len(profiles)}"}
-        finally:
-            browser.stop()
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "visit_profiles", "engagement", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_update_bio(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        about = api.get_about()
-        assets = about.get("userProps", {}).get("assets", {})
-        current_h = assets.get("headline", "")
-        current_d = assets.get("description", "")
-        ctr = (before.get("contact_clicks", 0) / max(before.get("views", 1), 1)) * 100
-        prompt = f"""Current headline: "{current_h}"
-CTR: {ctr:.1f}% (benchmark: 5-8%)
-Views: {before.get('views', 0)}, Contacts: {before.get('contact_clicks', 0)}
-Generate a new headline that would increase CTR. Reply with ONLY the headline (max 80 chars)."""
-        new_h = generate_with_fallback(prompt, max_tokens=100)
-        if new_h:
-            new_h = new_h.strip().strip('"').strip("'")[:80]
-            if new_h and new_h != current_h:
-                api.set_about(new_h, current_d)
-                roi.log_action(tenant_id, cycle, "update_bio", "bio", True,
-                               f"headline: {current_h[:30]} → {new_h[:30]}", before, {"headline": new_h})
-                return {"executed": True, "detail": f"headline updated to: {new_h[:40]}"}
-        roi.log_action(tenant_id, cycle, "update_bio", "bio", False,
-                       "no change needed", before, before)
-        return {"executed": False, "detail": "no change needed"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "update_bio", "bio", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_check_search_rank(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        tenant = roi.get_tenant(tenant_id)
-        city = tenant.get("city", "manhattan-ny") if tenant else "manhattan-ny"
-        search = api.search(city=city, available_only=False, page=1)
-        results = search.get("results", []) or search.get("data", []) or []
-        rank = _find_rank(results, tenant=tenant)
-        roi.log_action(tenant_id, cycle, "check_search_rank", "search", True,
-                       f"rank #{rank}/{len(results)}", before, {"search_rank": rank})
-        return {"executed": True, "detail": f"rank #{rank}/{len(results)}"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "check_search_rank", "search", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_multi_city_rank(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        tenant = roi.get_tenant(tenant_id)
-        positions = {}
-        for city in NY_CITIES:
-            try:
-                r = api.search(city=city, page=1)
-                results = r.get("results", []) or r.get("data", []) or []
-                positions[city] = {"rank": _find_rank(results, tenant=tenant), "total": len(results)}
-            except Exception:
-                positions[city] = {"error": True}
-            time.sleep(1)
-        roi.log_action(tenant_id, cycle, "multi_city_rank", "search", True,
-                       json.dumps(positions)[:100], before, {"positions": positions})
-        return {"executed": True, "detail": f"scanned {len(NY_CITIES)} cities"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "multi_city_rank", "search", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_sms_alerts(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        dash = api.get_dashboard()
-        sms_on = int(dash.get("userSetting", {}).get("sms", 0)) != 0
-        if not sms_on:
-            api.set_sms_alerts(True)
-            roi.log_action(tenant_id, cycle, "sms_alerts", "visibility", True,
-                           "enabled SMS alerts", before, {"sms": 1})
-            return {"executed": True, "detail": "SMS alerts enabled"}
-        roi.log_action(tenant_id, cycle, "sms_alerts", "visibility", False,
-                       "SMS already on", before, before)
-        return {"executed": False, "detail": "SMS already on"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "sms_alerts", "visibility", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_track_actions(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        dash = api.get_dashboard()
-        track_on = int(dash.get("userSetting", {}).get("trackActions", 0)) != 0
-        if not track_on:
-            api.set_track_actions(True)
-            roi.log_action(tenant_id, cycle, "track_actions", "visibility", True,
-                           "enabled tracking", before, {"trackActions": 1})
-            return {"executed": True, "detail": "tracking enabled"}
-        roi.log_action(tenant_id, cycle, "track_actions", "visibility", False,
-                       "tracking already on", before, before)
-        return {"executed": False, "detail": "tracking already on"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "track_actions", "visibility", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_engagement_stats(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        from .engagement_engine import init_db as eng_init
-        eng_init()
-        eng_db = Path(__file__).parent / "engagement.db"
-        conn = sqlite3.connect(str(eng_db))
-        conn.row_factory = sqlite3.Row
-        total_v = conn.execute("SELECT COUNT(*) FROM visitors").fetchone()[0]
-        visited = conn.execute("SELECT COUNT(*) FROM visitors WHERE visited_back=1").fetchone()[0]
-        messaged = conn.execute("SELECT COUNT(*) FROM visitors WHERE messaged=1").fetchone()[0]
-        conn.close()
-        stats = {"total_visitors": total_v, "visited_back": visited, "messaged": messaged}
-        roi.log_action(tenant_id, cycle, "engagement_stats", "analytics", True,
-                       json.dumps(stats), before, stats)
-        return {"executed": True, "detail": f"visitors={total_v} visited={visited} messaged={messaged}"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "engagement_stats", "analytics", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-def exec_adjust_rates(api: RentMasseurAPI, tenant_id: str, cycle: int, before: Dict) -> Dict:
-    try:
-        dash = api.get_dashboard()
-        services = dash.get("service", {})
-        rates = []
-        for key, svc in services.items():
-            if isinstance(svc, dict) and svc.get("activated"):
-                p = svc.get("price", {})
-                incall = p.get("incall")
-                outcall = p.get("outcall")
-                if isinstance(incall, int) and isinstance(outcall, int):
-                    rates.append({"service": key, "incall": incall, "outcall": outcall})
-        if not rates:
-            roi.log_action(tenant_id, cycle, "adjust_rates", "revenue", False, "no rates", before, before)
-            return {"executed": False, "detail": "no rates found"}
-        ctr = (before.get("contact_clicks", 0) / max(before.get("views", 1), 1)) * 100
-        bookings = before.get("booking_emails", 0)
-        prompt = f"""Current rates: {json.dumps(rates)[:300]}
-CTR: {ctr:.1f}%, Booking inquiries: {bookings}
-Views: {before.get('views', 0)}, Contacts: {before.get('contact_clicks', 0)}
-Should I raise rates (high demand) or lower rates (low demand)? Reply with JSON: {{"adjust": "raise/lower/keep", "amount": 10}}"""
-        response = generate_with_fallback(prompt, max_tokens=100)
-        roi.log_action(tenant_id, cycle, "adjust_rates", "revenue", True,
-                       f"LLM analysis: {(response or 'unavailable')[:80]}", before, {"rates": len(rates)})
-        return {"executed": True, "detail": f"LLM rate analysis for {len(rates)} services"}
-    except Exception as e:
-        roi.log_action(tenant_id, cycle, "adjust_rates", "revenue", False, str(e)[:100], before, before)
-        return {"executed": False, "detail": f"error: {e}"}
-
-
-# Action registry
-ACTION_EXECUTORS = {
-    "refresh_availability": exec_refresh_availability,
-    "ensure_visible": exec_ensure_visible,
-    "send_messages": exec_send_messages,
-    "visit_profiles": exec_visit_profiles,
-    "update_bio": exec_update_bio,
-    "check_search_rank": exec_check_search_rank,
-    "multi_city_rank": exec_multi_city_rank,
-    "engagement_stats": exec_engagement_stats,
-    "sms_alerts": exec_sms_alerts,
-    "track_actions": exec_track_actions,
-    "adjust_rates": exec_adjust_rates,
-}
-
-
-# ---------------------------------------------------------------------------
-# LLM Action Prioritization
-# ---------------------------------------------------------------------------
-
-def llm_prioritize_actions(tenant_id: str, metrics: Dict, baseline: Dict) -> List[Dict]:
-    """Use LLM + historical attribution to rank actions by expected impact."""
-
-    # Get historical attribution scores
-    historical = roi.prioritize_actions(tenant_id)
-    hist_str = json.dumps(historical[:4], default=str)[:300]
-
-    baseline_str = json.dumps({k: round(v, 1) for k, v in baseline.items()}, default=str)[:200] if baseline else "no baseline yet"
-
-    prompt = f"""You are a traffic optimization engine for a massage therapist on RentMasseur.com.
-
-CURRENT METRICS:
-  Views: {metrics.get('views', 0)}
-  Contact clicks: {metrics.get('contact_clicks', 0)}
-  Emails: {metrics.get('emails_count', 0)} ({metrics.get('unread_emails', 0)} unread, {metrics.get('booking_emails', 0)} bookings)
-  Search rank: #{metrics.get('search_rank', 0)}
-  Availability: {metrics.get('availability_option', 0)} (1=Available)
-  Hidden: {metrics.get('is_hidden', 0)}
-
-BASELINE: {baseline_str}
-
-HISTORICAL ATTRIBUTION (actions that worked before):
-{hist_str}
-
-AVAILABLE ACTIONS (rank top 4 by expected impact):
-  1. refresh_availability — stay in "Available Now" filter
-  2. ensure_visible — fix if profile hidden
-  3. send_messages — message visitors
-  4. visit_profiles — reciprocal visits
-  5. update_bio — change headline to improve CTR
-  6. check_search_rank — track position
-  7. multi_city_rank — scan 7 NY cities
-  8. engagement_stats — check engagement
-  9. sms_alerts — ensure SMS on
-  10. track_actions — ensure tracking on
-  11. adjust_rates — raise/lower based on demand
-
-Reply in JSON: {{"ranked": [{{"action": "name", "reason": "why", "priority": 1}}]}}
-
-Pick top 4. Action must be one of: {', '.join(sorted(VALID_ACTIONS))}"""
-
-    response = generate_with_fallback(prompt, max_tokens=400)
-    ranked: List[Dict] = []
-
-    if response:
-        try:
-            import re
-            json_match = re.search(r'\{[^{}]*"ranked"[^{}]*\[.*?\][^{}]*\}', response, re.DOTALL)
-            if json_match:
-                parsed = json.loads(json_match.group())
-                ranked = parsed.get("ranked", [])
+            authed = self.auth.is_authenticated()
         except Exception:
-            pass
-        ranked = [a for a in ranked if a.get("action", "") in VALID_ACTIONS]
+            authed = False
+        if not authed:
+            log.info("Session expired. Re-authenticating...")
+            self.login()
 
-    if not ranked:
-        # Fallback: use historical priority + always-on actions
-        ranked = [
-            {"action": "ensure_visible", "reason": "safety check", "priority": 1},
-            {"action": "refresh_availability", "reason": "maintain visibility", "priority": 2},
-        ]
-        if metrics.get("unread_emails", 0) > 0:
-            ranked.append({"action": "send_messages", "reason": f"{metrics['unread_emails']} unread", "priority": 3})
-        if metrics.get("search_rank", 0) == 0:
-            ranked.append({"action": "check_search_rank", "reason": "rank unknown", "priority": 4})
-        else:
-            ranked.append({"action": "update_bio", "reason": "improve CTR", "priority": 4})
+        # 1. Visibility guard (every cycle)
+        if self.auth.api.logged_in:
+            try:
+                visible_ok = ensure_visible(self.api)
+                self.total_actions += 1
+                self.total_receipts += 1
+                if visible_ok:
+                    log.info("◉ Visibility: OK")
+                else:
+                    log.warning("⟁ Visibility: REPAIRING")
+            except Exception as e:
+                log.warning("Visibility check failed: %s", e)
 
-    return ranked[:4]
+        # 2. Availability guard (every cycle)
+        if self.auth.api.logged_in and (now - self.last_avail_check >= 5 * 60):
+            self.last_avail_check = now
+            try:
+                avail = check_availability(self.api)
+                self.total_receipts += 1
+                if avail.get("needs_refresh"):
+                    log.info("⌁ Refreshing availability...")
+                    refresh_availability(self.api)
+                    self.total_actions += 1
+                    self.total_receipts += 1
+                    log.info("◆ Availability refreshed")
+                else:
+                    remaining = avail.get("remaining_seconds", 0)
+                    log.info("◉ Availability: %s (%d min left)",
+                             avail.get("selected"), remaining // 60)
+            except Exception as e:
+                log.warning("Availability check failed: %s", e)
+
+        # 3. Stats collection (every 15 min)
+        if self.auth.api.logged_in and (now - self.last_stats >= STATS_INTERVAL):
+            self.last_stats = now
+            try:
+                snapshot = collect_snapshot(self.api)
+                self.current_stats = snapshot
+                self.total_receipts += 1
+                views = snapshot.get("profile_views", 0)
+                clicks = snapshot.get("contact_clicks", 0)
+                visits = snapshot.get("new_visits", 0)
+                emails = snapshot.get("new_emails", 0)
+                ctr = (clicks / views * 100) if views else 0
+                log.info("◍ Stats: views=%s contacts=%s visits=%s emails=%s ctr=%.2f%%",
+                         views, clicks, visits, emails, ctr)
+                if visits or emails:
+                    self.total_revenue_signals += visits + emails
+                    log.info("▲ Revenue signals: +%d (total: %d)",
+                             visits + emails, self.total_revenue_signals)
+            except Exception as e:
+                log.warning("Stats collection failed: %s", e)
+
+        # 4. Search rank (every 60 min)
+        if self.auth.api.logged_in and (now - self.last_search_rank >= SEARCH_RANK_INTERVAL):
+            self.last_search_rank = now
+            try:
+                rank = check_search_rank(self.api, "karpathianwolf", city="manhattan-ny")
+                self.search_position = rank.get("position")
+                self.total_receipts += 1
+                if rank.get("found"):
+                    log.info("◆ Search rank: #%d/%d in Manhattan",
+                             rank["position"], rank.get("total", 0))
+                else:
+                    log.warning("⟁ Not found in search results")
+            except Exception as e:
+                log.warning("Search rank check failed: %s", e)
+
+        # 5. ML retraining (every 6 hours)
+        if now - self.last_ml_retrain >= ML_RETRAIN_INTERVAL:
+            self._retrain_ml()
+
+        # 6. Bio A/B test (every 24 hours)
+        if self.auth.api.logged_in and (now - self.last_bio_test >= BIO_TEST_INTERVAL):
+            self.last_bio_test = now
+            try:
+                log.info("⌁ Running daily bio A/B test cycle...")
+                result = run_daily_draft_cycle(self.api)
+                self.total_actions += 1
+                self.total_receipts += 1
+                draft = result.get("bio_draft")
+                if draft:
+                    log.info("◆ Bio draft created: %s (score: %s)",
+                             draft.get("variant_id"),
+                             draft.get("hypothesis", "")[:60])
+                else:
+                    log.info("No bio change needed (too soon or no better variant)")
+            except Exception as e:
+                log.warning("Bio A/B test failed: %s", e)
+
+        # 7. Selenium verification (every 30 min)
+        if now - self.last_selenium >= SELENIUM_INTERVAL:
+            self.last_selenium = now
+            try:
+                log.info("◉ Selenium verification...")
+                sel = selenium_verify_search()
+                self.selenium_status = sel.get("selenium_status", "unknown")
+                cards = sel.get("total_found", 0)
+                links = sel.get("total_profile_links", 0)
+                log.info("◆ Selenium: %s (%d cards, %d links, %.1fs)",
+                         self.selenium_status, cards, links,
+                         sel.get("page_load_time", 0))
+            except Exception as e:
+                log.warning("Selenium verification failed: %s", e)
+                self.selenium_status = "fail"
+
+        # 8. Update dashboard
+        self._update_dashboard()
+
+        # Print mini dashboard
+        self._print_mini_dashboard()
+
+    def _retrain_ml(self):
+        self.last_ml_retrain = time.time()
+        try:
+            log.info("⟡ ML retraining: 30 epochs on bio dataset...")
+            from .money_training_selenium import train_money_model
+            bios = load_bios(BIOS_PATH, limit=5000)
+            if bios:
+                model, summary = train_money_model(bios, epochs=30)
+                self.ml_model = model
+                self.ml_summary = summary
+                self.top_bios = predict_top_bios(model, bios, top_n=10)
+                self.total_receipts += 1
+                log.info("◆ ML retrained: R²=%.4f MAE=%.6f reward=%.2f",
+                         summary["final_r2"], summary["final_mae"],
+                         summary["money_reward_final"])
+                if self.top_bios:
+                    log.info("  Top bio: %s (ctr=%.4f score=%.2f)",
+                             self.top_bios[0]["username"],
+                             self.top_bios[0]["predicted_ctr"],
+                             self.top_bios[0]["money_score"])
+        except Exception as e:
+            log.warning("ML retraining failed: %s", e)
+
+    def _uptime(self) -> str:
+        secs = int(time.time() - self.start_time)
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        s = secs % 60
+        return f"{h}h{m}m{s}s"
+
+    def _update_dashboard(self):
+        dashboard = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "uptime_seconds": int(time.time() - self.start_time),
+            "cycle_count": self.cycle_count,
+            "authenticated": self.auth.api.logged_in,
+            "current_stats": self.current_stats,
+            "search_position": self.search_position,
+            "selenium_status": self.selenium_status,
+            "ml_summary": {
+                "r2": self.ml_summary.get("final_r2"),
+                "mae": self.ml_summary.get("final_mae"),
+                "money_reward": self.ml_summary.get("money_reward_final"),
+            } if self.ml_summary else None,
+            "top_bios": self.top_bios[:3],
+            "total_revenue_signals": self.total_revenue_signals,
+            "total_actions": self.total_actions,
+            "total_receipts": self.total_receipts,
+            "errors": self.errors,
+            "last_error": self.last_error,
+        }
+        DASHBOARD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(DASHBOARD_PATH, "w") as f:
+            json.dump(dashboard, f, indent=2, default=str)
+
+    def _print_mini_dashboard(self):
+        views = self.current_stats.get("profile_views", "—")
+        clicks = self.current_stats.get("contact_clicks", "—")
+        visits = self.current_stats.get("new_visits", "—")
+        emails = self.current_stats.get("new_emails", "—")
+        pos = self.search_position or "—"
+        r2 = self.ml_summary.get("final_r2", "—") if self.ml_summary else "—"
+
+        log.info("")
+        log.info("┌─────────────────────────────────────────────┐")
+        log.info("│  ◉◆⌁  MONEY DASHBOARD — Cycle %d  │", self.cycle_count)
+        log.info("├─────────────────────────────────────────────┤")
+        log.info("│  Uptime:     %s", self._uptime())
+        log.info("│  Auth:       %s", "◉ logged in" if self.auth.api.logged_in else "◌ offline")
+        log.info("│  Views:      %s", views)
+        log.info("│  Contacts:   %s", clicks)
+        log.info("│  New visits: %s", visits)
+        log.info("│  New emails: %s", emails)
+        log.info("│  Search pos: #%s in Manhattan", pos)
+        log.info("│  Selenium:   %s", self.selenium_status)
+        log.info("│  ML R²:      %s", f"{r2:.4f}" if isinstance(r2, float) else r2)
+        log.info("│  Rev signals: %d", self.total_revenue_signals)
+        log.info("│  Actions:    %d | Receipts: %d | Errors: %d",
+                 self.total_actions, self.total_receipts, self.errors)
+        log.info("└─────────────────────────────────────────────┘")
+
+    def _print_final_report(self):
+        log.info("")
+        log.info("=" * 60)
+        log.info("FINAL REPORT")
+        log.info("=" * 60)
+        log.info("Uptime:          %s", self._uptime())
+        log.info("Cycles:          %d", self.cycle_count)
+        log.info("Total actions:   %d", self.total_actions)
+        log.info("Total receipts:  %d", self.total_receipts)
+        log.info("Revenue signals: %d", self.total_revenue_signals)
+        log.info("Errors:          %d", self.errors)
+        log.info("ML R²:           %s", self.ml_summary.get("final_r2", "—"))
+        log.info("Dashboard:       %s", DASHBOARD_PATH)
+        log.info("=" * 60)
 
 
-# ---------------------------------------------------------------------------
-# Orchestration Cycle
-# ---------------------------------------------------------------------------
+def main():
+    daemon = MoneyDaemon()
+    daemon.run()
 
-def run_cycle(tenant_id: str, cycle_num: int = 0) -> Dict:
-    """Run one complete optimization cycle for a tenant."""
-    ts = datetime.now(timezone.utc).isoformat()
-    log.info("  ═══ SERVICE CYCLE %d for %s ═══", cycle_num, tenant_id)
 
-    api = get_api_for_tenant(tenant_id)
-    if not api:
-        return {"error": "api auth failed", "tenant_id": tenant_id}
+if __name__ == "__main__":
+    main()
 
-    # 1. Collect before metrics
-    log.info("  ⌁ Collecting metrics...")
-    before = collect_metrics(api, tenant_id)
-    log.info("  ◉ Before: views=%s contacts=%s emails=%s rank=%s",
-             before.get("views", 0), before.get("contact_clicks", 0),
-             before.get("emails_count", 0), before.get("search_rank", 0))
+```
 
-    # 2. Get baseline for comparison
-    baseline = roi.get_baseline_metrics(tenant_id)
+overclock_ir.py:
+```
+#!/usr/bin/env python3
+"""
+TrafficOverclockIR — Canonical state for RM Traffic Overclock.
 
-    # 3. LLM prioritization
-    log.info("  ⌁ LLM action prioritization...")
-    ranked = llm_prioritize_actions(tenant_id, before, baseline)
+The product is not traffic. The product is conversion.
+
+Optimize: time-to-booking and qualified-client yield.
+Not: more scripts, more cron jobs, more visits, more scraping.
+
+Client Quantity = HighIntentSources × CaptureRate × QualificationRate
+Conversion Speed = DetectionLatency + DraftLatency + ApprovalLatency + ReplyLatency
+Revenue = ConfirmedBookings × AverageSessionValue × ShowRate × RepeatRate
+"""
+
+import hashlib
+import json
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+
+
+# ─── Urgency tiers ─────────────────────────────────────────────────
+
+URGENCY_NOW = "NOW"          # booking language + today/tomorrow + NYC + direct question
+URGENCY_HOT = "HOT"          # profile visitor + prior message + location match
+URGENCY_WARM = "WARM"        # profile visitor only
+URGENCY_COLD = "COLD"        # social mention / search discovery
+URGENCY_IGNORE = "IGNORE"    # spam, competitor, unsafe, out-of-area
+
+URGENCY_ORDER = [URGENCY_NOW, URGENCY_HOT, URGENCY_WARM, URGENCY_COLD, URGENCY_IGNORE]
+
+# ─── Reply classes ─────────────────────────────────────────────────
+
+REPLY_BOOKING_NOW = "booking_now_reply"
+REPLY_PRICE_QUESTION = "price_question_reply"
+REPLY_LOCATION_QUESTION = "location_question_reply"
+REPLY_REPEAT_CLIENT = "repeat_client_reply"
+REPLY_INQUIRY = "inquiry_reply"
+REPLY_FOLLOW_UP = "follow_up_reply"
+REPLY_CLOSE_LOOP = "close_loop_reply"
+
+
+@dataclass
+class LeadState:
+    """One person in the funnel. Sorted by urgency, not by arrival time."""
+    lead_id: str = ""               # person_id_hash
+    username: str = ""
+    source: str = "rentmasseur"
+    first_seen_at: str = ""
+    last_touch_at: str = ""
+    intent_score: float = 0.0
+    urgency: str = URGENCY_COLD
+    location_match: bool = False
+    budget_match: Optional[bool] = None
+    time_urgency: bool = False      # "today", "tonight", "tomorrow"
+    repeat_client: bool = False
+    risk_flag: str = ""             # spam, competitor, unsafe, out_of_area, ""
+    classification: str = "unclassified"
+    recommended_reply_class: str = ""
+    recommended_reply_text: str = ""
+    approval_status: str = "pending"  # pending / approved / rejected / sent
+    booking_status: str = "inquiry"   # inquiry / requested / confirmed / completed / cancelled / no_show
+    collected_amount: float = 0.0
+    message_received: str = ""
+    message_sent: str = ""
+    consent_status: str = "unknown"
+    cooldown_until: str = ""
+    suppressed: bool = False
+    follow_up_due_at: str = ""      # when to send follow-up if no reply
+    close_loop_due_at: str = ""     # when to send close-loop if still no reply
+    first_reply_seconds: float = 0.0  # time from first_seen to first reply
+    is_premium: bool = False
+
+
+@dataclass
+class BookingEvent:
+    """The attribution table. One row per booking journey."""
+    booking_id: str = ""
+    lead_id: str = ""
+    source: str = "rentmasseur"
+    first_action: str = ""           # what triggered the lead
+    first_reply_seconds: float = 0.0
+    booking_requested_at: str = ""
+    booking_confirmed_at: str = ""
+    session_completed_at: str = ""
+    amount_collected: float = 0.0
+    repeat_booking: bool = False
+    attributed_action_id: str = ""
+
+
+@dataclass
+class RevenueMetrics:
+    """Hard revenue metrics. This is what the dashboard shows."""
+    # Lead funnel
+    total_leads: int = 0
+    qualified_leads: int = 0
+    booking_ready_leads: int = 0
+
+    # Conversion
+    reply_rate: float = 0.0
+    booking_request_rate: float = 0.0
+    booking_confirm_rate: float = 0.0
+    show_rate: float = 0.0
+
+    # Revenue
+    collected_revenue: float = 0.0
+    expected_revenue: float = 0.0
+    average_booking_value: float = 0.0
+    repeat_rate: float = 0.0
+
+    # Speed
+    median_reply_time_seconds: float = 0.0
+    median_time_to_booking_hours: float = 0.0
+
+    # Attribution
+    best_source: str = ""
+    worst_source: str = ""
+    source_roi: Dict[str, float] = field(default_factory=dict)
+
+    # Compliance
+    compliance_incidents: int = 0
+    suppressed_count: int = 0
+
+    # Drafts
+    drafts_pending: int = 0
+    drafts_approved: int = 0
+    drafts_sent: int = 0
+
+    # Secondary (upstream, not revenue)
+    total_views: int = 0
+    total_contacts: int = 0
+    ctr: float = 0.0
+    search_rank: int = 0
+
+    def compute(self, leads: List[LeadState], bookings: List[BookingEvent]):
+        self.total_leads = len(leads)
+        self.qualified_leads = sum(1 for l in leads if l.urgency in (URGENCY_NOW, URGENCY_HOT, URGENCY_WARM))
+        self.booking_ready_leads = sum(1 for l in leads if l.urgency == URGENCY_NOW)
+
+        replied = sum(1 for l in leads if l.message_sent)
+        self.reply_rate = round(replied / self.total_leads * 100, 1) if self.total_leads else 0.0
+
+        requested = [b for b in bookings if b.booking_requested_at]
+        confirmed = [b for b in bookings if b.booking_confirmed_at]
+        completed = [b for b in bookings if b.session_completed_at]
+
+        self.booking_request_rate = round(len(requested) / self.qualified_leads * 100, 1) if self.qualified_leads else 0.0
+        self.booking_confirm_rate = round(len(confirmed) / len(requested) * 100, 1) if requested else 0.0
+        self.show_rate = round(len(completed) / len(confirmed) * 100, 1) if confirmed else 0.0
+
+        self.collected_revenue = sum(b.amount_collected for b in completed)
+        self.expected_revenue = sum(b.amount_collected for b in confirmed if not b.session_completed_at)
+        paid = [b for b in completed if b.amount_collected > 0]
+        self.average_booking_value = round(sum(b.amount_collected for b in paid) / len(paid), 2) if paid else 0.0
+
+        repeat = sum(1 for l in leads if l.repeat_client)
+        self.repeat_rate = round(repeat / self.total_leads * 100, 1) if self.total_leads else 0.0

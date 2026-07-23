@@ -1,172 +1,602 @@
-    init_db()
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
+    screenshot: Optional[str] = None
+    html: Optional[str] = None
+    receipt: Optional[str] = None
 
-    stats = {
-        "cycle": cycle_num,
-        "timestamp": _ts(),
-        "platforms": platforms,
-        "posts_scraped": 0,
-        "leads_stored": 0,
-        "leads_classified": 0,
-        "high_intent": 0,
-        "responses_generated": 0,
-        "duplicates_skipped": 0,
-        "errors": 0,
-        "by_platform": {},
-        "by_intent": {},
-    }
 
-    all_posts = []
-    if platforms in ("all", "reddit"):
-        reddit_posts = scrape_reddit()
-        all_posts.extend(reddit_posts)
-        stats["by_platform"]["reddit"] = len(reddit_posts)
+@dataclasses.dataclass
+class ActionSpec:
+    name: str
+    mode: str
+    description: str
+    fn: Callable[[WebDriver, argparse.Namespace], ActionResult]
+    requires_login: bool = True
 
-    if platforms in ("all", "x"):
-        x_posts = scrape_x()
-        all_posts.extend(x_posts)
-        stats["by_platform"]["x"] = len(x_posts)
 
-    stats["posts_scraped"] = len(all_posts)
+class ReceiptLedger:
+    def __init__(self, path: Path = RECEIPT_DIR / "ledger.jsonl"):
+        self.path = path
+        self.entries = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    try:
+                        self.entries.append(json.loads(line))
+                    except Exception:
+                        pass
 
-    if not all_posts:
-        log.info("No posts scraped — nothing to do")
-        conn.close()
-        receipt_id = write_receipt(stats)
-        stats["receipt_id"] = receipt_id
-        return stats
+    def add(self, payload: dict) -> str:
+        prev_hash = self.entries[-1].get("hash", "0" * 64) if self.entries else "0" * 64
+        entry = {
+            "index": len(self.entries),
+            "timestamp": now_iso(),
+            "prev_hash": prev_hash,
+            **payload,
+        }
+        body = json.dumps({k: v for k, v in entry.items() if k != "hash"}, sort_keys=True, default=str)
+        entry["hash"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        self.entries.append(entry)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        receipt_path = RECEIPT_DIR / f"{entry['index']:05d}_{safe_name(payload.get('action', 'action'))}.json"
+        receipt_path.write_text(json.dumps(entry, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        return str(receipt_path)
 
-    for post in all_posts:
-        lead = dict(post)
-        stored = store_lead(conn, lead)
-        if not stored:
-            stats["duplicates_skipped"] += 1
-            continue
-        stats["leads_stored"] += 1
+    def verify(self) -> bool:
+        prev = "0" * 64
+        for entry in self.entries:
+            if entry.get("prev_hash") != prev:
+                return False
+            body = json.dumps({k: v for k, v in entry.items() if k != "hash"}, sort_keys=True, default=str)
+            if hashlib.sha256(body.encode("utf-8")).hexdigest() != entry.get("hash"):
+                return False
+            prev = entry["hash"]
+        return True
 
-        intent, confidence = classify_intent(post)
-        lead["intent"] = intent
-        lead["confidence"] = confidence
-        stats["leads_classified"] += 1
-        stats["by_intent"][intent] = stats["by_intent"].get(intent, 0) + 1
 
-        c_hash = _hash(f"{lead['platform']}:{lead.get('url', '')}:{lead.get('title', '')}")
-        conn.execute(
-            "UPDATE leads SET intent=?, confidence=? WHERE content_hash=?",
-            (intent, confidence, c_hash),
-        )
+LEDGER = ReceiptLedger()
 
-        if intent in HIGH_INTENT:
-            stats["high_intent"] += 1
-            response = generate_response(post)
-            if response:
-                lead["generated_response"] = response
-                stats["responses_generated"] += 1
-                conn.execute(
-                    "UPDATE leads SET generated_response=?, status='response_ready' WHERE content_hash=?",
-                    (response, c_hash),
-                )
-                log.info(f"  ◆ {lead['platform']}/{lead.get('subreddit', '?')}: intent={intent} response generated ({len(response)} chars)")
-            else:
-                conn.execute(
-                    "UPDATE leads SET status='high_intent' WHERE content_hash=?",
-                    (c_hash,),
-                )
-                log.info(f"  ▲ {lead['platform']}/{lead.get('subreddit', '?')}: intent={intent} (no response)")
-        else:
-            conn.execute(
-                "UPDATE leads SET status='low_intent' WHERE content_hash=?",
-                (c_hash,),
-            )
 
-    conn.commit()
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    conn.execute(
-        "INSERT INTO tunnel_cycles (cycle_num, platform, posts_scraped, leads_classified, "
-        "high_intent, responses_generated, errors, timestamp) VALUES (?,?,?,?,?,?,?,?)",
-        (cycle_num, platforms, stats["posts_scraped"], stats["leads_classified"],
-         stats["high_intent"], stats["responses_generated"], stats["errors"], _ts()),
+
+def safe_name(s: str) -> str:
+    return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in s)[:80]
+
+
+def truthy(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def get_username() -> str:
+    return (
+        os.getenv("RM_USER")
+        or os.getenv("RENTMASSEUR_USERNAME")
+        or os.getenv("RM_USERNAME")
+        or ""
     )
-    conn.commit()
-    conn.close()
-
-    receipt_id = write_receipt(stats)
-    stats["receipt_id"] = receipt_id
-
-    log.info(f"  ═══ Social Tunnel Cycle {cycle_num} Complete ═══")
-    log.info(f"  Scraped: {stats['posts_scraped']} | Stored: {stats['leads_stored']} | Duplicates: {stats['duplicates_skipped']}")
-    log.info(f"  Classified: {stats['leads_classified']} | High intent: {stats['high_intent']} | Responses: {stats['responses_generated']}")
-    log.info(f"  By intent: {json.dumps(stats['by_intent'])}")
-    log.info(f"  Receipt: {receipt_id}")
-
-    return stats
 
 
-def show_stats():
-    """Show tunnel statistics."""
-    init_db()
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-
-    total = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
-    by_platform = {r["platform"]: r["count"] for r in conn.execute(
-        "SELECT platform, COUNT(*) as count FROM leads GROUP BY platform").fetchall()}
-    by_intent = {r["intent"]: r["count"] for r in conn.execute(
-        "SELECT intent, COUNT(*) as count FROM leads GROUP BY intent").fetchall()}
-    by_status = {r["status"]: r["count"] for r in conn.execute(
-        "SELECT status, COUNT(*) as count FROM leads GROUP BY status").fetchall()}
-    cycles = conn.execute("SELECT COUNT(*) FROM tunnel_cycles").fetchone()[0]
-    recent_cycles = [dict(r) for r in conn.execute(
-        "SELECT * FROM tunnel_cycles ORDER BY timestamp DESC LIMIT 5").fetchall()]
-
-    print(f"\n  ═══ Social Traffic Tunnel Stats ═══")
-    print(f"  Total leads: {total}")
-    print(f"  Total cycles: {cycles}")
-    print(f"  By platform: {json.dumps(by_platform, indent=2)}")
-    print(f"  By intent: {json.dumps(by_intent, indent=2)}")
-    print(f"  By status: {json.dumps(by_status, indent=2)}")
-    print(f"  Recent cycles:")
-    for c in recent_cycles:
-        print(f"    ◉ cycle {c['cycle_num']}: {c['platform']} | scraped={c['posts_scraped']} "
-              f"classified={c['leads_classified']} high_intent={c['high_intent']} "
-              f"responses={c['responses_generated']}")
-
-    high_intent_leads = [dict(r) for r in conn.execute(
-        "SELECT platform, subreddit, author, title, intent, generated_response, url, created_at "
-        "FROM leads WHERE status='response_ready' ORDER BY created_at DESC LIMIT 10").fetchall()]
-    if high_intent_leads:
-        print(f"\n  ═══ Recent High-Intent Leads (response ready) ═══")
-        for lead in high_intent_leads:
-            print(f"  ◉ [{lead['platform']}] {lead.get('subreddit', '')} — {lead['title'][:60]}")
-            print(f"    intent: {lead['intent']} | author: {lead['author']}")
-            print(f"    url: {lead['url']}")
-            if lead["generated_response"]:
-                print(f"    response: {lead['generated_response'][:120]}...")
-            print()
-
-    conn.close()
+def get_password() -> str:
+    return (
+        os.getenv("RM_PASS")
+        or os.getenv("RENTMASSEUR_PASSWORD")
+        or os.getenv("RM_PASSWORD")
+        or ""
+    )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Social Traffic Tunnel — Reddit + X.com")
-    parser.add_argument("--reddit", action="store_true", help="Scrape Reddit only")
-    parser.add_argument("--x", action="store_true", help="Scrape X.com only")
-    parser.add_argument("--stats", action="store_true", help="Show statistics")
-    parser.add_argument("--cycle", type=int, default=0, help="Cycle number")
+def build_driver(headless: bool = True) -> WebDriver:
+    opts = ChromeOptions()
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--window-size=1440,1200")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    if os.getenv("RM_CHROME_BINARY"):
+        opts.binary_location = os.getenv("RM_CHROME_BINARY")
+    driver = webdriver.Chrome(options=opts)
+    driver.set_page_load_timeout(int(os.getenv("RM_PAGE_TIMEOUT", "45")))
+    driver.implicitly_wait(int(os.getenv("RM_IMPLICIT_WAIT", "8")))
+    return driver
+
+
+def page_text(driver: WebDriver) -> str:
+    try:
+        return driver.execute_script("return document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        return ""
+
+
+def detect_block(driver: WebDriver) -> Optional[str]:
+    txt = page_text(driver).lower()
+    url = (driver.current_url or "").lower()
+    needles = [
+        ("captcha", "captcha_or_challenge_detected"),
+        ("crowdsec", "crowdsec_access_control_detected"),
+        ("access forbidden", "access_forbidden_detected"),
+        ("verify you are human", "human_verification_detected"),
+        ("unusual traffic", "traffic_challenge_detected"),
+        ("too many requests", "rate_limit_detected"),
+    ]
+    for needle, reason in needles:
+        if needle in txt or needle in url:
+            return reason
+    return None
+
+
+def capture(driver: WebDriver, action: str) -> Tuple[Optional[str], Optional[str]]:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    base = f"{ts}_{safe_name(action)}"
+    screenshot_path = SCREEN_DIR / f"{base}.png"
+    html_path = HTML_DIR / f"{base}.html"
+    try:
+        driver.save_screenshot(str(screenshot_path))
+    except Exception:
+        screenshot_path = None
+    try:
+        html_path.write_text(driver.page_source or "", encoding="utf-8", errors="ignore")
+    except Exception:
+        html_path = None
+    return (str(screenshot_path) if screenshot_path else None, str(html_path) if html_path else None)
+
+
+def finish(driver: WebDriver, result: ActionResult) -> ActionResult:
+    result.url = result.url or getattr(driver, "current_url", "")
+    result.screenshot, result.html = capture(driver, result.action)
+    receipt_payload = dataclasses.asdict(result)
+    receipt_payload.pop("receipt", None)
+    result.receipt = LEDGER.add(receipt_payload)
+    (JSON_DIR / f"{safe_name(result.action)}_latest.json").write_text(
+        json.dumps(dataclasses.asdict(result), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return result
+
+
+def blocked(action: str, mode: str, reason: str, driver: Optional[WebDriver] = None) -> ActionResult:
+    res = ActionResult(action=action, ok=False, mode=mode, status="blocked", blocked_reason=reason)
+    if driver:
+        return finish(driver, res)
+    res.receipt = LEDGER.add(dataclasses.asdict(res))
+    return res
+
+
+def approved_actions(args: argparse.Namespace) -> set:
+    values = set()
+    env = os.getenv("RM_APPROVED_ACTIONS", "")
+    if env:
+        values.update([x.strip() for x in env.split(",") if x.strip()])
+    if args.approved_actions_file:
+        path = Path(args.approved_actions_file)
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            values.update(data.get("approved_actions", []))
+    return values
+
+
+def require_mutation(action: str, args: argparse.Namespace, driver: WebDriver) -> Optional[ActionResult]:
+    if not truthy(os.getenv("RM_ENABLE_MUTATIONS")) and not args.allow_mutations:
+        return blocked(action, MUTATION, "mutation_disabled_set_RM_ENABLE_MUTATIONS_true_or_pass_allow_mutations", driver)
+    if action not in approved_actions(args):
+        return blocked(action, MUTATION, f"action_not_approved:{action}", driver)
+    return None
+
+
+def click_first(driver: WebDriver, candidates: List[Tuple[str, str]]) -> bool:
+    for by, sel in candidates:
+        try:
+            els = driver.find_elements(by, sel)
+            for el in els:
+                if el.is_displayed() and el.is_enabled():
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                    time.sleep(0.3)
+                    driver.execute_script("arguments[0].click();", el)
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def find_first_input(driver: WebDriver, candidates: List[Tuple[str, str]]):
+    for by, sel in candidates:
+        try:
+            els = driver.find_elements(by, sel)
+            for el in els:
+                if el.is_displayed() and el.is_enabled():
+                    return el
+        except Exception:
+            continue
+    return None
+
+
+def action_smoke(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "smoke"
+    driver.get(BASE_URL)
+    time.sleep(3)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    data = {"title": driver.title, "base_url": BASE_URL}
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data=data))
+
+
+def action_login(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "login"
+    user = get_username()
+    password = get_password()
+    if not user or not password:
+        return blocked(action, READ_ONLY, "missing_credentials_RM_USER_RM_PASS", driver)
+
+    driver.get(f"{BASE_URL}/login")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+
+    user_el = find_first_input(driver, [
+        (By.CSS_SELECTOR, "input[type='email']"),
+        (By.CSS_SELECTOR, "input[name*='email' i]"),
+        (By.CSS_SELECTOR, "input[name*='user' i]"),
+        (By.CSS_SELECTOR, "input[type='text']"),
+    ])
+    pass_el = find_first_input(driver, [
+        (By.CSS_SELECTOR, "input[type='password']"),
+        (By.CSS_SELECTOR, "input[name*='pass' i]"),
+    ])
+
+    if not user_el or not pass_el:
+        return blocked(action, READ_ONLY, "login_form_not_found", driver)
+
+    driver.execute_script("""
+        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        if (arguments[0]) { ns.call(arguments[0], arguments[2]); arguments[0].dispatchEvent(new Event('input', {bubbles: true})); }
+        if (arguments[1]) { ns.call(arguments[1], arguments[3]); arguments[1].dispatchEvent(new Event('input', {bubbles: true})); }
+    """, user_el, pass_el, user, password)
+    time.sleep(1)
+    try:
+        pass_el.send_keys(Keys.ENTER)
+    except Exception:
+        driver.execute_script("""
+            const btn = document.querySelector('button[type="submit"]') ||
+                        Array.from(document.querySelectorAll('button')).find(b => /login|sign|submit/i.test(b.innerText));
+            if (btn) btn.click();
+        """)
+    time.sleep(6)
+
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+
+    ok = "/login" not in (driver.current_url or "").lower()
+    status = "ok" if ok else "login_failed"
+    return finish(driver, ActionResult(action, ok, READ_ONLY, status, data={"current_url": driver.current_url}))
+
+
+def ensure_login(driver: WebDriver, args: argparse.Namespace) -> Optional[ActionResult]:
+    if "/login" in (driver.current_url or "") or not driver.current_url:
+        res = action_login(driver, args)
+        if not res.ok:
+            return res
+    return None
+
+
+def action_dashboard_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "dashboard_read"
+    driver.get(f"{BASE_URL}/settings")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    data = {
+        "title": driver.title,
+        "text_len": len(txt),
+        "signals": {
+            "availability": "availability" in txt.lower(),
+            "profile": "profile" in txt.lower(),
+            "statistics": "statistics" in txt.lower() or "views" in txt.lower(),
+            "messages": "messages" in txt.lower() or "mailbox" in txt.lower(),
+        },
+    }
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data=data))
+
+
+def action_availability_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "availability_read"
+    driver.get(f"{BASE_URL}/settings?availability=1")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    data = {
+        "text_len": len(txt),
+        "available_word_present": "available" in txt.lower(),
+        "countdown_word_present": "countdown" in txt.lower() or "hour" in txt.lower(),
+    }
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data=data))
+
+
+def action_availability_set(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "availability_set"
+    gate = require_mutation(action, args, driver)
+    if gate:
+        return gate
+
+    driver.get(f"{BASE_URL}/settings?availability=1")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, MUTATION, reason, driver)
+
+    clicked = click_first(driver, [
+        (By.XPATH, "//label[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'available')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'available')]"),
+        (By.CSS_SELECTOR, "button[aria-label*='Available' i]"),
+    ])
+    time.sleep(1)
+
+    saved = click_first(driver, [
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'save')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'apply')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'set')]"),
+        (By.CSS_SELECTOR, "button[type='submit']"),
+    ])
+    time.sleep(3)
+
+    ok = clicked and saved and not detect_block(driver)
+    return finish(driver, ActionResult(action, ok, MUTATION, "ok" if ok else "not_verified", data={"clicked_available": clicked, "clicked_save": saved}))
+
+
+def action_about_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "about_read"
+    driver.get(f"{BASE_URL}/settings/about")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    data = {
+        "text_len": len(txt),
+        "bio_signals": {
+            "headline": "headline" in txt.lower(),
+            "description": "description" in txt.lower() or "about" in txt.lower(),
+            "massage": "massage" in txt.lower(),
+        },
+    }
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data=data))
+
+
+def action_bio_set_approved(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "bio_set_approved"
+    gate = require_mutation(action, args, driver)
+    if gate:
+        return gate
+
+    bio_file = os.getenv("RM_APPROVED_BIO_FILE", args.bio_file or "")
+    if not bio_file or not Path(bio_file).exists():
+        return blocked(action, MUTATION, "missing_RM_APPROVED_BIO_FILE", driver)
+
+    bio_text = Path(bio_file).read_text(encoding="utf-8").strip()
+    if len(bio_text) < 40 or len(bio_text) > int(os.getenv("RM_MAX_BIO_CHARS", "3000")):
+        return blocked(action, MUTATION, "approved_bio_length_out_of_bounds", driver)
+    risky = ["escort", "happy ending", "nude", "naked", "sex", "guaranteed cure"]
+    if any(x in bio_text.lower() for x in risky):
+        return blocked(action, MUTATION, "approved_bio_failed_local_policy_filter", driver)
+
+    driver.get(f"{BASE_URL}/settings/about")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, MUTATION, reason, driver)
+
+    field = find_first_input(driver, [
+        (By.CSS_SELECTOR, "textarea[name*='description' i]"),
+        (By.CSS_SELECTOR, "textarea[name*='bio' i]"),
+        (By.CSS_SELECTOR, "textarea"),
+        (By.CSS_SELECTOR, "[contenteditable='true']"),
+    ])
+    if not field:
+        return blocked(action, MUTATION, "bio_field_not_found", driver)
+
+    try:
+        tag = field.tag_name.lower()
+        if tag == "textarea":
+            field.clear()
+            field.send_keys(bio_text)
+        else:
+            driver.execute_script("arguments[0].innerText = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles:true}));", field, bio_text)
+    except Exception as e:
+        return blocked(action, MUTATION, f"bio_field_write_failed:{e}", driver)
+
+    saved = click_first(driver, [
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'save')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'update')]"),
+        (By.CSS_SELECTOR, "button[type='submit']"),
+    ])
+    time.sleep(4)
+
+    ok = saved and not detect_block(driver)
+    return finish(driver, ActionResult(action, ok, MUTATION, "ok" if ok else "not_verified", data={"bio_chars": len(bio_text), "clicked_save": saved}))
+
+
+def action_search_rank_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "search_rank_read"
+    city = os.getenv("RM_SEARCH_CITY", args.city or "manhattan-ny")
+    username = os.getenv("RM_TARGET_USERNAME", get_username())
+    driver.get(f"{BASE_URL}/search/{city}")
+    time.sleep(5)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+
+    links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+    rank = None
+    hrefs = []
+    for idx, a in enumerate(links[:200], 1):
+        href = a.get_attribute("href") or ""
+        text = (a.text or "").strip()
+        hrefs.append({"rank": idx, "text": text[:80], "href": href})
+        if username and username.lower() in (href + " " + text).lower():
+            rank = idx
+            break
+
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data={"city": city, "target": username, "rank": rank, "sample_links": hrefs[:25]}))
+
+
+def action_mailbox_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "mailbox_read"
+    driver.get(f"{BASE_URL}/mailbox")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    data = {
+        "text_len": len(txt),
+        "message_signals": {
+            "inbox": "inbox" in txt.lower(),
+            "message": "message" in txt.lower(),
+            "email": "email" in txt.lower(),
+        },
+    }
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data=data))
+
+
+def action_blog_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "blog_read"
+    driver.get(f"{BASE_URL}/blogs")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data={"text_len": len(txt), "blog_word_present": "blog" in txt.lower()}))
+
+
+def action_interview_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "interview_read"
+    driver.get(f"{BASE_URL}/settings/interview")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data={"text_len": len(txt), "interview_word_present": "interview" in txt.lower()}))
+
+
+ACTIONS: Dict[str, ActionSpec] = {
+    "smoke": ActionSpec("smoke", READ_ONLY, "Load public homepage and verify no block page.", action_smoke, requires_login=False),
+    "login": ActionSpec("login", READ_ONLY, "Login with first-party credentials; stops on CAPTCHA/challenge.", action_login, requires_login=False),
+    "dashboard_read": ActionSpec("dashboard_read", READ_ONLY, "Read dashboard/settings page and save evidence.", action_dashboard_read),
+    "availability_read": ActionSpec("availability_read", READ_ONLY, "Read availability screen.", action_availability_read),
+    "availability_set": ActionSpec("availability_set", MUTATION, "Set availability only when explicitly approved.", action_availability_set),
+    "about_read": ActionSpec("about_read", READ_ONLY, "Read about/profile settings page.", action_about_read),
+    "bio_set_approved": ActionSpec("bio_set_approved", MUTATION, "Set bio from a pre-approved local file only.", action_bio_set_approved),
+    "search_rank_read": ActionSpec("search_rank_read", READ_ONLY, "Read public search page and estimate target rank.", action_search_rank_read),
+    "mailbox_read": ActionSpec("mailbox_read", READ_ONLY, "Open mailbox page and capture high-level evidence only.", action_mailbox_read),
+    "blog_read": ActionSpec("blog_read", READ_ONLY, "Open blogs page and capture evidence.", action_blog_read),
+    "interview_read": ActionSpec("interview_read", READ_ONLY, "Open interview/settings page and capture evidence.", action_interview_read),
+}
+
+
+def parse_actions(raw: str) -> List[str]:
+    if not raw or raw.strip() in {"default", "safe"}:
+        return ["smoke", "login", "dashboard_read", "availability_read", "about_read", "search_rank_read"]
+    if raw.strip() == "all-read":
+        return [name for name, spec in ACTIONS.items() if spec.mode == READ_ONLY]
+    if raw.strip() == "all":
+        return list(ACTIONS.keys())
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def write_action_catalog() -> None:
+    catalog = {
+        name: {"mode": spec.mode, "description": spec.description, "requires_login": spec.requires_login}
+        for name, spec in ACTIONS.items()
+    }
+    (JSON_DIR / "action_catalog.json").write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+
+
+def run(args: argparse.Namespace) -> int:
+    load_dotenv()
+    write_action_catalog()
+    requested = parse_actions(args.actions)
+    unknown = [a for a in requested if a not in ACTIONS]
+    if unknown:
+        print(json.dumps({"status": "failed", "unknown_actions": unknown, "known_actions": sorted(ACTIONS)}), file=sys.stderr)
+        return 2
+
+    driver = build_driver(headless=not args.headed)
+    results: List[ActionResult] = []
+    try:
+        logged_in = False
+        for name in requested:
+            spec = ACTIONS[name]
+            if spec.requires_login and not logged_in:
+                login_result = action_login(driver, args)
+                results.append(login_result)
+                logged_in = login_result.ok
+                if not logged_in:
+                    break
+
+            try:
+                result = spec.fn(driver, args)
+            except Exception as e:
+                tb = traceback.format_exc()
+                result = ActionResult(name, False, spec.mode, "exception", error=str(e), data={"traceback_tail": tb[-4000:]})
+                result = finish(driver, result)
+            results.append(result)
+
+            if result.blocked_reason in {
+                "captcha_or_challenge_detected",
+                "crowdsec_access_control_detected",
+                "human_verification_detected",
+                "access_forbidden_detected",
+            }:
+                break
+
+            time.sleep(float(os.getenv("RM_ACTION_PAUSE_SECONDS", "2.0")))
+
+    finally:
+        driver.quit()
+
+    summary = {
+        "timestamp": now_iso(),
+        "ok": all(r.ok or r.status == "blocked" for r in results),
+        "ledger_valid": LEDGER.verify(),
+        "artifact_dir": str(ARTIFACT_DIR),
+        "requested_actions": requested,
+        "results": [dataclasses.asdict(r) for r in results],
+    }
+    (ARTIFACT_DIR / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return 0 if summary["ledger_valid"] and not any(r.status == "exception" for r in results) else 1
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Approval-gated Selenium CI/CD harness for RM.")
+    parser.add_argument("--actions", default=os.getenv("RM_ACTIONS", "safe"),
+                        help="safe | all-read | all | comma-separated action names")
+    parser.add_argument("--headed", action="store_true", help="Run visible Chrome. CI should stay headless.")
+    parser.add_argument("--allow-mutations", action="store_true",
+                        help="Still requires approved action list. Prefer RM_ENABLE_MUTATIONS=true.")
+    parser.add_argument("--approved-actions-file", default=os.getenv("RM_APPROVED_ACTIONS_FILE", ""),
+                        help="JSON file with {'approved_actions': ['availability_set', ...]}")
+    parser.add_argument("--bio-file", default="", help="Approved bio file for bio_set_approved.")
+    parser.add_argument("--city", default=os.getenv("RM_SEARCH_CITY", "manhattan-ny"))
+    parser.add_argument("--list-actions", action="store_true")
     args = parser.parse_args()
 
-    if args.stats:
-        show_stats()
+    if args.list_actions:
+        print(json.dumps({
+            name: {"mode": spec.mode, "description": spec.description, "requires_login": spec.requires_login}
+            for name, spec in ACTIONS.items()
+        }, indent=2))
         return
 
-    platforms = "all"
-    if args.reddit and not args.x:
-        platforms = "reddit"
-    elif args.x and not args.reddit:
-        platforms = "x"
-
-    run_tunnel_cycle(cycle_num=args.cycle, platforms=platforms)
+    sys.exit(run(args))
 
 
 if __name__ == "__main__":
@@ -174,627 +604,197 @@ if __name__ == "__main__":
 
 ```
 
-bio_generator:
+photo_rotator.py:
 ```
-Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
-```
+#!/usr/bin/env python3
+"""Photo rotator — rotates profile photos on RentMasseur dynamically.
 
-state_engine.py:
-```
-"""
-Traffic State Engine — reads live RM metrics from verified endpoints and
-turns raw API responses into a canonical TrafficState object.
+Manages a pool of photos, rotates them on a schedule, and tracks which photos
+perform best (correlated with RL feedback). Supports uploading, reordering,
+and setting primary photo.
 
-Verified endpoints (2026-07-09):
-  GET /account/dashboard              → profileStatistics, userSetting, isAdHidden
-  GET /account/dashboard/availability → selected, list, countdown
-  GET /account/dashboard/ad-statistics→ profileStatistics.totalPageViews, totalContactClicks, visits
-  GET /account/keeponline             → newEmails, newVisits, isAdHidden, issues
-  GET /settings/about                 → userProps.assets.headline, userProps.information
-  GET /mailbox                        → emails[] with userCard.username, lastMessage, createdAt
-  POST /search                        → users[], pagination, search rank
-
-Dead endpoints (removed):
-  GET /settings/interview → 404
+Usage:
+    python3 photo_rotator.py                    # rotate to next photo
+    python3 photo_rotator.py --add /path/to/photo.jpg   # add photo to pool
+    python3 photo_rotator.py --list             # list photo pool
+    python3 photo_rotator.py --report           # show performance per photo
 """
 
-import hashlib
+import argparse
 import json
-import logging
+import os
+import sys
 import time
-from dataclasses import dataclass, field, asdict
+import shutil
+import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from typing import Optional
 
-log = logging.getLogger("state_engine")
+from dotenv import load_dotenv
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 
-@dataclass
-class TrafficState:
-    """Canonical state object — what the account looks like right now."""
-    # Identity
-    tenant_id: str = ""
-    timestamp: str = ""
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
 
-    # Traffic metrics
-    views: int = 0
-    contact_clicks: int = 0
-    contact_rate: float = 0.0  # contact_clicks / views * 100
-    emails: int = 0
-    new_visits: int = 0
-    new_emails: int = 0
+RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+RENTMASSEUR_PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
 
-    # Availability
-    available_status: str = ""  # "Available", "Not Set", "Not Available"
-    availability_countdown: int = 0  # epoch seconds when availability expires
-    availability_seconds_left: float = 0.0
-
-    # Profile
-    profile_hidden: bool = False
-    headline: str = ""
-    search_rank: int = 0
-    search_total: int = 0
-
-    # Mailbox
-    mailbox_count: int = 0
-    mailbox_intent_score: float = 0.0  # 0-1, how booking-ready are the messages
-    mailbox_leads: List[Dict] = field(default_factory=list)
-
-    # Derived pressure
-    revenue_pressure: float = 0.0
-    pressure_components: Dict[str, float] = field(default_factory=dict)
-
-    # Endpoint health (for measurement validity)
-    endpoint_errors: List[str] = field(default_factory=list)
-    endpoint_error_count: int = 0
-    measurement_valid: bool = True
-
-    # State hash (for receipt comparison)
-    state_hash: str = ""
-
-    # Raw (for debugging, not persisted in receipts)
-    _raw: Dict[str, Any] = field(default_factory=dict)
-
-    def compute_hash(self) -> str:
-        d = {k: v for k, v in asdict(self).items() if k not in ("_raw", "mailbox_leads", "pressure_components", "endpoint_errors")}
-        self.state_hash = hashlib.sha256(
-            json.dumps(d, sort_keys=True, default=str).encode()
-        ).hexdigest()[:16]
-        return self.state_hash
-
-    def to_dict(self) -> Dict:
-        return asdict(self)
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+PHOTO_POOL_DIR = os.path.join(CONTENT_DIR, "photos")
+PHOTO_STATE_PATH = os.path.join(CONTENT_DIR, "photo_state.json")
+PROFILE_PHOTOS_URL = "https://rentmasseur.com/settings/photos"
 
 
-def collect_state(api, tenant_id: str = "") -> TrafficState:
-    """Read all verified endpoints and build a TrafficState."""
-    state = TrafficState(tenant_id=tenant_id, timestamp=datetime.now(timezone.utc).isoformat())
-
-    # 1. Dashboard — visibility + profile stats
-    try:
-        dash = api.get_dashboard()
-        state._raw["dashboard"] = dash
-        ps = dash.get("profileStatistics") or {}
-        state.views = int(ps.get("totalPageViews", 0))
-        state.contact_clicks = int(ps.get("totalContactClicks", 0))
-        if state.views > 0:
-            state.contact_rate = round(state.contact_clicks / state.views * 100, 2)
-        state.profile_hidden = dash.get("isAdHidden", False)
-        log.info(f"  ◉ Dashboard: views={state.views} contacts={state.contact_clicks} CTR={state.contact_rate}%")
-    except Exception as e:
-        err = str(e)
-        state.endpoint_errors.append(f"dashboard:{err[:60]}")
-        log.warning(f"  ⟁ dashboard error: {e}")
-
-    # 2. Ad statistics — same profileStatistics but with visits breakdown
-    try:
-        stats = api.get_ad_statistics()
-        state._raw["ad_statistics"] = stats
-        ps = stats.get("profileStatistics", {})
-        if not state.views:
-            state.views = int(ps.get("totalPageViews", 0))
-        if not state.contact_clicks:
-            state.contact_clicks = int(ps.get("totalContactClicks", 0))
-            if state.views > 0:
-                state.contact_rate = round(state.contact_clicks / state.views * 100, 2)
-    except Exception as e:
-        err = str(e)
-        state.endpoint_errors.append(f"ad_statistics:{err[:60]}")
-        log.warning(f"  ⟁ ad_statistics error: {e}")
-
-    # 3. KeepOnline — new emails, new visits, frozen status
-    try:
-        keep = api.get_keeponline()
-        state._raw["keeponline"] = keep
-        state.new_emails = int(keep.get("newEmails", 0))
-        state.new_visits = int(keep.get("newVisits", 0))
-        state.profile_hidden = state.profile_hidden or keep.get("isAdHidden", False)
-        log.info(f"  ◉ KeepOnline: new_emails={state.new_emails} new_visits={state.new_visits}")
-    except Exception as e:
-        err = str(e)
-        state.endpoint_errors.append(f"keeponline:{err[:60]}")
-        log.warning(f"  ⟁ keeponline error: {e}")
-
-    # 4. Availability — selected label + countdown
-    try:
-        avail = api.get_availability()
-        state._raw["availability"] = avail
-        state.available_status = avail.get("selected", "Unknown")
-        countdown = avail.get("countdown", 0)
-        state.availability_countdown = int(countdown) if countdown else 0
-        if state.availability_countdown:
-            state.availability_seconds_left = max(0, state.availability_countdown - time.time())
-        log.info(f"  ◉ Availability: {state.available_status} ({state.availability_seconds_left:.0f}s left)")
-    except Exception as e:
-        err = str(e)
-        state.endpoint_errors.append(f"availability:{err[:60]}")
-        log.warning(f"  ⟁ availability error: {e}")
-
-    # 5. About — headline
-    try:
-        about = api.get_about()
-        state._raw["about"] = about
-        props = about.get("userProps", {})
-        assets = props.get("assets", {})
-        state.headline = assets.get("headline", "")
-        log.info(f"  ◉ Headline: '{state.headline}'")
-    except Exception as e:
-        err = str(e)
-        state.endpoint_errors.append(f"about:{err[:60]}")
-        log.warning(f"  ⟁ about error: {e}")
-
-    # 6. Mailbox — leads
-    try:
-        mailbox = api.get_mailbox(page=1, folder=1, sort=1)
-        state._raw["mailbox"] = mailbox
-        emails = mailbox.get("emails", [])
-        state.mailbox_count = len(emails)
-        state.emails = state.mailbox_count
-
-        # Score mailbox intent
-        booking_kw = ["book", "available", "today", "tonight", "tomorrow", "session", "time", "schedule"]
-        price_kw = ["price", "rate", "cost", "how much"]
-        intent_scores = []
-        for email in emails:
-            msg = (email.get("lastMessage", "") or "").lower()
-            score = 0.0
-            if any(kw in msg for kw in booking_kw):
-                score += 0.5
-            if any(kw in msg for kw in price_kw):
-                score += 0.3
-            if msg.strip():
-                score += 0.2
-            intent_scores.append(min(1.0, score))
-
-        state.mailbox_intent_score = round(
-            sum(intent_scores) / len(intent_scores), 2
-        ) if intent_scores else 0.0
-
-        # Store lead summaries (no raw PII in state)
-        for email in emails:
-            uc = email.get("userCard", {})
-            state.mailbox_leads.append({
-                "username": uc.get("username", ""),
-                "is_premium": bool(uc.get("isPremium", 0)),
-                "unread": bool(email.get("unread", 0)),
-                "created_at": email.get("createdAt", 0),
-                "intent_score": min(1.0, (
-                    0.5 if any(kw in (email.get("lastMessage", "") or "").lower() for kw in booking_kw) else 0.0
-                ) + (0.3 if any(kw in (email.get("lastMessage", "") or "").lower() for kw in price_kw) else 0.0)
-                + (0.2 if (email.get("lastMessage", "") or "").strip() else 0.0)),
-            })
-
-        log.info(f"  ◉ Mailbox: {state.mailbox_count} conversations, intent={state.mailbox_intent_score}")
-    except Exception as e:
-        err = str(e)
-        state.endpoint_errors.append(f"mailbox:{err[:60]}")
-        log.warning(f"  ⟁ mailbox error: {e}")
-
-    # 7. Search rank (optional — can be slow)
-    try:
-        results = api.search_masseurs(city="manhattan-ny", page=1)
-        users = results.get("users", [])
-        state.search_total = len(users)
-        # Find our position
-        my_username = ""
+def _load_photo_state() -> dict:
+    if os.path.exists(PHOTO_STATE_PATH):
         try:
-            my_username = api.session.headers.get("X-RM-Username", "")
+            with open(PHOTO_STATE_PATH, "r") as f:
+                return json.load(f)
         except Exception:
             pass
-        for i, user in enumerate(users):
-            if user.get("username") == my_username:
-                state.search_rank = i + 1
-                break
-        log.info(f"  ◉ Search: rank=#{state.search_rank} of {state.search_total}")
-    except Exception as e:
-        err = str(e)
-        state.endpoint_errors.append(f"search:{err[:60]}")
-        log.warning(f"  ⟁ search error: {e}")
-
-    # Determine measurement validity — 3+ endpoint errors = invalid
-    state.endpoint_error_count = len(state.endpoint_errors)
-    critical_endpoints = {"dashboard", "ad_statistics", "keeponline", "availability", "mailbox"}
-    critical_failures = sum(1 for e in state.endpoint_errors if any(c in e for c in critical_endpoints))
-    if critical_failures >= 3:
-        state.measurement_valid = False
-        log.warning(f"  ⟁ MEASUREMENT INVALID: {critical_failures} critical endpoint failures")
-
-    # Compute revenue pressure
-    compute_revenue_pressure(state)
-
-    # Compute state hash
-    state.compute_hash()
-
-    return state
-
-
-def compute_revenue_pressure(state: TrafficState) -> None:
-    """
-    Revenue Pressure Engine — scores how urgently the account needs action.
-
-    revenue_pressure =
-      0.30 * contact_rate_gap      (low CTR = high pressure to fix profile)
-    + 0.20 * availability_risk     (not available = high pressure)
-    + 0.20 * rank_decay            (low rank = high pressure)
-    + 0.15 * unanswered_intent     (mailbox with intent but no replies)
-    + 0.10 * profile_fatigue       (hidden or stale)
-    + 0.05 * traffic_drop          (low views)
-    """
-    # Contact rate gap: target 5%, below that = pressure
-    contact_rate_gap = max(0, (5.0 - state.contact_rate) / 5.0) if state.views > 0 else 0.5
-
-    # Availability risk: not available = 1.0, available with <1h left = 0.5
-    if state.available_status != "Available":
-        availability_risk = 1.0
-    elif state.availability_seconds_left < 3600:
-        availability_risk = 0.5
-    else:
-        availability_risk = 0.0
-
-    # Rank decay: rank > 20 = high pressure, rank 1-5 = low
-    if state.search_rank == 0:
-        rank_decay = 0.3  # unknown
-    elif state.search_rank > 20:
-        rank_decay = 0.8
-    elif state.search_rank > 10:
-        rank_decay = 0.5
-    else:
-        rank_decay = 0.1
-
-    # Unanswered intent: mailbox with high intent but no recent replies
-    unanswered = state.mailbox_intent_score if state.mailbox_count > 0 else 0.0
-
-    # Profile fatigue: hidden or no headline
-    profile_fatigue = 0.0
-    if state.profile_hidden:
-        profile_fatigue += 0.5
-    if not state.headline:
-        profile_fatigue += 0.3
-
-    # Traffic drop: very low views
-    traffic_drop = 0.3 if state.views < 100 else 0.0
-
-    state.pressure_components = {
-        "contact_rate_gap": round(contact_rate_gap, 3),
-        "availability_risk": round(availability_risk, 3),
-        "rank_decay": round(rank_decay, 3),
-        "unanswered_intent": round(unanswered, 3),
-        "profile_fatigue": round(profile_fatigue, 3),
-        "traffic_drop": round(traffic_drop, 3),
+    return {
+        "photos": [],
+        "current_photo_index": 0,
+        "rotation_count": 0,
+        "photo_rewards": {},
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    state.revenue_pressure = round(
-        0.30 * contact_rate_gap
-        + 0.20 * availability_risk
-        + 0.20 * rank_decay
-        + 0.15 * unanswered
-        + 0.10 * profile_fatigue
-        + 0.05 * traffic_drop,
-        3
-    )
 
-```
-
-stats_dashboard.py:
-```
-"""
-Stats Dashboard — generate a simple HTML stats page for the ProfileOps engine.
-"""
-
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-
-from .db import get_conn
-from .traffic_analyzer import conversion_rate, analyze_trend
+def _save_photo_state(state: dict):
+    os.makedirs(CONTENT_DIR, exist_ok=True)
+    with open(PHOTO_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
 
 
-def _get_latest_state():
-    conn = get_conn()
-    snap = conn.execute("SELECT * FROM traffic_snapshots ORDER BY created_at DESC LIMIT 1").fetchone()
-    conn.close()
-    return dict(snap) if snap else {}
+def add_photo_to_pool(filepath: str, label: str = "") -> str:
+    """Add a photo to the rotation pool."""
+    os.makedirs(PHOTO_POOL_DIR, exist_ok=True)
+    if not os.path.exists(filepath):
+        logger.error("Photo not found: %s", filepath)
+        return ""
+
+    ext = os.path.splitext(filepath)[1] or ".jpg"
+    photo_id = f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{len(_load_photo_state().get('photos', []))}"
+    dest = os.path.join(PHOTO_POOL_DIR, f"{photo_id}{ext}")
+    shutil.copy2(filepath, dest)
+
+    state = _load_photo_state()
+    state["photos"].append({
+        "id": photo_id,
+        "path": dest,
+        "label": label or photo_id,
+        "added_at": datetime.now(timezone.utc).isoformat(),
+        "times_used": 0,
+    })
+    _save_photo_state(state)
+    logger.info("Added photo to pool: %s (%s)", photo_id, dest)
+    return photo_id
 
 
-def _get_experiment_count():
-    conn = get_conn()
-    total = conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
-    open_ = conn.execute("SELECT COUNT(*) FROM experiments WHERE ended_at IS NULL").fetchone()[0]
-    conn.close()
-    return {"total": total, "open": open_}
-
-
-def _get_draft_count():
-    conn = get_conn()
-    bio = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='bio' AND status='draft'").fetchone()[0]
-    blog = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='blog' AND status='draft'").fetchone()[0]
-    interview = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='interview' AND status='draft'").fetchone()[0]
-    conn.close()
-    return {"bio": bio, "blog": blog, "interview": interview}
-
-
-def _get_receipt_count():
-    conn = get_conn()
-    total = conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0]
-    verified = conn.execute("SELECT COUNT(*) FROM receipts WHERE verified=1").fetchone()[0]
-    conn.close()
-    return {"total": total, "verified": verified}
-
-
-def _get_recent_receipts(limit: int = 10):
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM receipts ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def generate_html(state: dict = None, output_path: Path = None) -> Path:
-    if state is None:
-        state = _get_latest_state()
-    trend = analyze_trend(hours=24)
-    experiments = _get_experiment_count()
-    drafts = _get_draft_count()
-    receipts = _get_receipt_count()
-    recent = _get_recent_receipts(10)
-
-    views = state.get("profile_views") or 0
-    contacts = state.get("contact_clicks") or 0
-    rate = conversion_rate(views, contacts)
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RM ProfileOps Stats Dashboard</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f7; color: #1d1d1f; }}
-        h1 {{ font-size: 32px; margin-bottom: 8px; }}
-        .timestamp {{ color: #86868b; font-size: 14px; margin-bottom: 24px; }}
-        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }}
-        .card {{ background: white; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-        .card h2 {{ font-size: 14px; color: #86868b; margin: 0 0 8px 0; text-transform: uppercase; letter-spacing: 0.5px; }}
-        .card .value {{ font-size: 32px; font-weight: 600; margin: 0; }}
-        .card .sub {{ font-size: 14px; color: #86868b; margin-top: 4px; }}
-        .section {{ background: white; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-        .section h2 {{ font-size: 18px; margin-top: 0; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-        th, td {{ text-align: left; padding: 10px; border-bottom: 1px solid #eee; }}
-        th {{ color: #86868b; font-weight: 500; }}
-        .ok {{ color: #34c759; }}
-        .warn {{ color: #ff9500; }}
-        .bad {{ color: #ff3b30; }}
-    </style>
-</head>
-<body>
-    <h1>RM ProfileOps Stats Dashboard</h1>
-    <div class="timestamp">Generated: {datetime.now(timezone.utc).isoformat()} UTC</div>
-
-    <div class="grid">
-        <div class="card">
-            <h2>Profile Views</h2>
-            <p class="value">{views}</p>
-        </div>
-        <div class="card">
-            <h2>Contact Clicks</h2>
-            <p class="value">{contacts}</p>
-        </div>
-        <div class="card">
-            <h2>Contact Rate</h2>
-            <p class="value">{rate:.2%}</p>
-        </div>
-        <div class="card">
-            <h2>Receipts</h2>
-            <p class="value">{receipts['total']}</p>
-            <p class="sub">{receipts['verified']} verified</p>
-        </div>
-        <div class="card">
-            <h2>Experiments</h2>
-            <p class="value">{experiments['total']}</p>
-            <p class="sub">{experiments['open']} open</p>
-        </div>
-        <div class="card">
-            <h2>Drafts</h2>
-            <p class="value">{drafts['bio'] + drafts['blog'] + drafts['interview']}</p>
-            <p class="sub">bio {drafts['bio']} | blog {drafts['blog']} | interview {drafts['interview']}</p>
-        </div>
-    </div>
-
-    <div class="section">
-        <h2>24h Trend</h2>
-        <p><strong>Status:</strong> {trend.get('status', 'N/A')}</p>
-        <p><strong>Delta views:</strong> {trend.get('comparison', {}).get('delta_views', 'N/A')}</p>
-        <p><strong>Delta contacts:</strong> {trend.get('comparison', {}).get('delta_clicks', 'N/A')}</p>
-        <p><strong>Rate change:</strong> {trend.get('comparison', {}).get('rate_delta', 'N/A')}</p>
-        <p><strong>Alert:</strong> <span class="{'bad' if trend.get('alert') else 'ok'}">{'YES' if trend.get('alert') else 'NO'}</span></p>
-    </div>
-
-    <div class="section">
-        <h2>Recent Receipts</h2>
-        <table>
-            <tr><th>Time</th><th>Action</th><th>Verified</th></tr>
-            {''.join(f'<tr><td>{r["created_at"]}</td><td>{r["action"]}</td><td class="{"ok" if r["verified"] else "bad"}">{"YES" if r["verified"] else "NO"}</td></tr>' for r in recent)}
-        </table>
-    </div>
-</body>
-</html>
-"""
-
-    output_path = output_path or Path(__file__).parent / "data" / "dashboard" / "index.html"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html)
-    return output_path
-
-
-def generate_dashboard() -> Path:
-    return generate_html()
-
-```
-
-content_optimizer.py:
-```
-"""
-Content Optimizer — conservative bio A/B testing.
-
-Rules:
-- One bio change per 24 hours max.
-- Only rotate through known, hypothesis-driven variants.
-- Store before/after metrics and receipt.
-- Never auto-generate random spam.
-"""
-
-import logging
-import random
-import time
-from datetime import datetime, timezone
-
-from .db import (
-    write_receipt,
-    upsert_content_variant,
-    set_variant_status,
-    get_active_variant,
-    get_variant_history,
-    start_experiment,
-    end_experiment,
-    get_open_experiments,
-    get_latest_traffic_snapshot,
-)
-from .api_client import RentMasseurAPI
-from .bio_variants import get_variant, list_variant_ids
-from .bio_variants_library import get_variant as get_library_variant, list_all as list_all_library_variants, count as library_count
-from .llm_bio_writer import generate_bio_with_llm
-from .content_policy import check_bio_risk
-
-log = logging.getLogger("profileops.content")
-
-MIN_SECONDS_BETWEEN_BIO_CHANGES = 24 * 60 * 60
-
-
-def _last_bio_change_time() -> float:
-    """Return timestamp of last applied bio variant, or 0."""
-    history = get_variant_history("bio", limit=1)
-    if not history:
-        return 0
-    row = history[0]
-    if row.get("status") == "active" and row.get("applied_at"):
-        dt = datetime.fromisoformat(row["applied_at"])
-        return dt.timestamp()
-    return 0
-
-
-def _can_change_bio() -> bool:
-    last = _last_bio_change_time()
-    if not last:
-        return True
-    return (time.time() - last) >= MIN_SECONDS_BETWEEN_BIO_CHANGES
-
-
-def _pick_next_variant(current_id: str) -> dict:
-    """Pick a different variant than the current one."""
-    candidates = [vid for vid in list_variant_ids() if vid != current_id]
-    if not candidates:
-        return None
-    return get_variant(random.choice(candidates))
-
-
-def draft_bio_variant(api: RentMasseurAPI, use_llm: bool = True) -> dict:
-    """
-    Draft a new bio variant. Uses LLM if configured, otherwise library.
-    Does NOT apply it.
-    """
-    about = api.get_about()
-    assets = about.get("userProps", {}).get("assets", {})
-    current_headline = assets.get("headline", "")
-    current_description = assets.get("description", "")
-
-    raw_history = get_latest_traffic_snapshot(7)
-    history = [
-        {"ts": r["created_at"], "views": r["profile_views"], "contact_clicks": r["contact_clicks"], "visits": r["new_visits"]}
-        for r in raw_history
-    ]
-    suggestion = None
-    if use_llm:
-        import os
-        suggestion = generate_bio_with_llm(
-            {"about": about, "stats": {}}, history,
-            current_headline, current_description,
-            city="Manhattan, NYC", provider=os.environ.get("LLM_PROVIDER"),
-            model=os.environ.get("LLM_MODEL")
-        )
-
-    if suggestion:
-        variant_id = f"llm_{int(time.time())}"
-        variant = {
-            "variant_id": variant_id,
-            "headline": suggestion["headline"],
-            "description": suggestion["bio"],
-            "hypothesis": "LLM-generated variant based on profile and recent traffic.",
-        }
-    else:
-        active = get_active_variant("bio")
-        current_idx = -1
-        if active:
-            try:
-                current_idx = int(active["variant_id"].replace("module_", ""))
-            except Exception:
-                pass
-        # Pick next from 30-module library
-        next_idx = (current_idx + 1) % library_count()
-        variant = get_library_variant(next_idx)
-        if not variant:
-            log.warning("No alternative variant found")
-            return None
-
-    # Policy check
-    risk = check_bio_risk(variant["headline"] + " " + variant["description"])
-    variant["risk_score"] = risk
-    if risk > 0.7:
-        log.error("Draft rejected by policy: risk=%.2f", risk)
+def get_next_photo() -> Optional[dict]:
+    """Get the next photo in rotation."""
+    state = _load_photo_state()
+    photos = state.get("photos", [])
+    if not photos:
+        logger.warning("No photos in pool — add some with --add /path/to/photo.jpg")
         return None
 
-    upsert_content_variant(
-        variant["variant_id"], "bio",
-        variant["headline"], variant["description"],
-        hypothesis=variant["hypothesis"],
-        status="draft"
-    )
-    write_receipt(
-        "bio_draft_created_v1",
-        "draft_bio_variant",
-        {"current_headline": current_headline},
-        variant,
-        verified=True,
-    )
-    log.info("Bio draft created: %s", variant["variant_id"])
-    return variant
+    # Pick least-recently-used photo, weighted by reward
+    sorted_photos = sorted(photos, key=lambda p: (p.get("times_used", 0), state.get("photo_rewards", {}).get(p["id"], 0)))
+    next_photo = sorted_photos[0]
+
+    state["current_photo_index"] = photos.index(next_photo)
+    state["rotation_count"] = state.get("rotation_count", 0) + 1
+    next_photo["times_used"] = next_photo.get("times_used", 0) + 1
+    next_photo["last_used"] = datetime.now(timezone.utc).isoformat()
+    _save_photo_state(state)
+
+    logger.info("Next photo: %s (used %d times)", next_photo["id"], next_photo["times_used"])
+    return next_photo
 
 
-def apply_bio_variant(api: RentMasseurAPI, variant_id: str) -> bool:
-    """
-    Apply a drafted bio variant. Enforces 24-hour cooldown and policy.
-    """
-    if not _can_change_bio():
-        log.warning("Bio change blocked: within 24-hour cooldown")
+def rotate_photo_on_profile(photo_path: str) -> bool:
+    """Upload and set a photo as primary on RentMasseur profile."""
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from rentmasseur_core import login, dismiss_popups, POPUP_DISMISS_SELECTORS
+
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+        driver = webdriver.Chrome(options=options)
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+
+        try:
+            if not login(driver):
+                logger.error("Login failed")
+                return False
+
+            logger.info("Navigating to photos settings: %s", PROFILE_PHOTOS_URL)
+            driver.get(PROFILE_PHOTOS_URL)
+            time.sleep(5)
+            dismiss_popups(driver)
+            time.sleep(2)
+
+            # Find file upload input
+            file_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
+            if not file_inputs:
+                logger.error("No file upload input found on photos page")
+                return False
+
+            file_inputs[0].send_keys(os.path.abspath(photo_path))
+            logger.info("Photo uploaded, waiting for processing...")
+            time.sleep(10)
+
+            # Try to set as primary/make main
+            make_primary_btns = driver.find_elements(By.XPATH, "//*[contains(text(), 'Make Main') or contains(text(), 'Set Primary') or contains(text(), 'Make Primary')]")
+            if make_primary_btns:
+                driver.execute_script("arguments[0].click();", make_primary_btns[0])
+                time.sleep(3)
+                logger.info("Set as primary photo")
+
+            # Save
+            save_btns = driver.find_elements(By.XPATH, "//*[contains(text(), 'Save') or @type='submit']")
+            if save_btns:
+                driver.execute_script("arguments[0].click();", save_btns[-1])
+                time.sleep(3)
+
+            logger.info("Photo rotation complete")
+            return True
+        finally:
+            driver.quit()
+    except Exception as e:
+        logger.error("Photo rotation error: %s", e)
         return False
 
-    from .db import get_conn
+
+def list_photos():
+    state = _load_photo_state()
+    photos = state.get("photos", [])
+    print(f"\nPhoto Pool: {len(photos)} photos")
+    print(f"Rotations: {state.get('rotation_count', 0)}")
+    for p in photos:
+        reward = state.get("photo_rewards", {}).get(p["id"], 0)
+        print(f"  {p['id']}: used {p.get('times_used', 0)}x, reward={reward}, label={p.get('label', '')}")
+
+
+def photo_report() -> str:
+    state = _load_photo_state()

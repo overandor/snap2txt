@@ -1,800 +1,800 @@
-    failure_class: str = ""
-    files_changed: List[str] = field(default_factory=list)
-    diff_hash: str = ""
-    test_command: str = ""
-    test_result: str = ""
-    policy_result: str = ""
-    measurement_status: str = ""
-    training_performed: bool = False
-    fine_tuning_performed: bool = False
-    private_cloud_used: bool = False
-    human_approval_required: bool = True
-    timestamp: str = ""
-    rollback_plan: str = ""
-
-
-@dataclass
-class HealingPR:
-    branch_name: str = ""
-    title: str = ""
-    body: str = ""
-    files_changed: List[str] = field(default_factory=list)
-    receipt: ArtifactReceipt = field(default_factory=ArtifactReceipt)
-    ready_to_merge: bool = False
-    auto_merge: bool = False
-
-
-# ─── Engine 1: Failure Intake ───────────────────────────────────────
-
-class FailureIntakeEngine:
-    """Reads failures from GitHub Actions, local receipts, overclock.db, telemetry."""
-
-    def __init__(self, repo_root: str = "."):
-        self.repo_root = Path(repo_root)
-        self.receipts_dir = self.repo_root / "rm_traffic" / "receipts"
-        self.overclock_db = self.repo_root / "rm_traffic" / "overclock_bandit.db"
-
-    def scan_github_actions(self) -> List[FailureEvent]:
-        """Scan for failed GitHub Actions runs."""
-        failures = []
-        # Check for failed workflow logs
-        logs_dir = self.repo_root / ".github" / "logs"
-        if logs_dir.exists():
-            for log_file in logs_dir.glob("*.log"):
-                content = log_file.read_text(errors="replace")
-                if "##[error]" in content or "Error:" in content:
-                    fclass = self._classify_log_error(content)
-                    failures.append(FailureEvent(
-                        failure_id=hashlib.sha256(f"{log_file.name}:{time.time()}".encode()).hexdigest()[:12],
-                        failure_class=fclass,
-                        source="github_actions",
-                        description=content[:500],
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                        raw_data={"log_file": str(log_file)},
-                        severity=SEVERITY_BLOCKER if fclass == FailureClass.SYNTAX_FAILURE else SEVERITY_WARNING,
-                        confidence=0.8,
-                    ))
-        return failures
-
-    def scan_receipts(self) -> List[FailureEvent]:
-        """Scan tamper-evident receipts for measurement_invalid or error markers."""
-        failures = []
-        if not self.receipts_dir.exists():
-            return failures
-
-        for receipt_file in self.receipts_dir.glob("*.json"):
-            try:
-                data = json.loads(receipt_file.read_text())
-                error = data.get("error", "")
-                reason = data.get("reason", "")
-
-                if "measurement_invalid" in error or "measurement_invalid" in reason:
-                    failures.append(FailureEvent(
-                        failure_id=hashlib.sha256(f"{receipt_file.name}:{time.time()}".encode()).hexdigest()[:12],
-                        failure_class=FailureClass.MEASUREMENT_INVALID_403,
-                        source="local_receipt",
-                        description=f"Receipt {receipt_file.name}: {error or reason}",
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                        raw_data=data,
-                        severity=SEVERITY_WARNING,
-                        confidence=0.95,
-                    ))
-                elif error and "login_failed" in error:
-                    failures.append(FailureEvent(
-                        failure_id=hashlib.sha256(f"{receipt_file.name}:{time.time()}".encode()).hexdigest()[:12],
-                        failure_class=FailureClass.API_AUTH_FAILURE,
-                        source="local_receipt",
-                        description=f"Auth failure in {receipt_file.name}: {error}",
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                        raw_data=data,
-                        severity=SEVERITY_BLOCKER,
-                        confidence=0.9,
-                    ))
-            except Exception:
-                continue
-        return failures
-
-    def scan_overclock_db(self) -> List[FailureEvent]:
-        """Scan overclock_bandit.db for reward regressions and invalid measurements."""
-        failures = []
-        if not self.overclock_db.exists():
-            return failures
-
-        try:
-            conn = sqlite3.connect(str(self.overclock_db))
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-
-            # Check for extreme negative rewards (reward regression)
-            cur.execute(
-                "SELECT action, reward, timestamp FROM action_outcomes "
-                "WHERE reward < -50 ORDER BY timestamp DESC LIMIT 10"
-            )
-            for row in cur.fetchall():
-                failures.append(FailureEvent(
-                    failure_id=hashlib.sha256(f"reward:{row['timestamp']}:{time.time()}".encode()).hexdigest()[:12],
-                    failure_class=FailureClass.REWARD_REGRESSION,
-                    source="overclock_db",
-                    description=f"Extreme negative reward: {row['action']} reward={row['reward']}",
-                    timestamp=row["timestamp"],
-                    raw_data={"action": row["action"], "reward": row["reward"]},
-                    severity=SEVERITY_BLOCKER,
-                    confidence=0.85,
-                ))
-
-            conn.close()
-        except Exception as e:
-            log.warning(f"  ⟁ overclock_db scan error: {e}")
-
-        return failures
-
-    def scan_telemetry(self) -> List[FailureEvent]:
-        """Scan last run telemetry for LLM provider failures and bad drafts."""
-        failures = []
-        telemetry_file = self.repo_root / "rm_traffic" / "last_telemetry.json"
-        if not telemetry_file.exists():
-            return failures
-
-        try:
-            data = json.loads(telemetry_file.read_text())
-            action = data.get("action", "")
-            result = data.get("result", {})
-
-            # Check for cloud fallback on private text
-            if result.get("cloud_fallback_attempted"):
-                failures.append(FailureEvent(
-                    failure_id=hashlib.sha256(f"cloud:{time.time()}".encode()).hexdigest()[:12],
-                    failure_class=FailureClass.PRIVACY_POLICY_FAILURE,
-                    source="telemetry",
-                    description=f"Cloud fallback attempted on private text in {action}",
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    raw_data=data,
-                    severity=SEVERITY_BLOCKER,
-                    confidence=0.95,
-                ))
-
-            # Check for bad draft content
-            sample = result.get("sample_draft", "")
-            if sample and self._is_bad_draft(sample):
-                failures.append(FailureEvent(
-                    failure_id=hashlib.sha256(f"draft:{time.time()}".encode()).hexdigest()[:12],
-                    failure_class=FailureClass.BAD_DRAFT,
-                    source="telemetry",
-                    description=f"Bad draft content detected: {sample[:100]}",
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    raw_data=data,
-                    severity=SEVERITY_WARNING,
-                    confidence=0.8,
-                ))
-        except Exception:
-            pass
-
-        return failures
-
-    def scan_all(self) -> List[FailureEvent]:
-        """Run all intake scanners."""
-        all_failures = []
-        all_failures.extend(self.scan_github_actions())
-        all_failures.extend(self.scan_receipts())
-        all_failures.extend(self.scan_overclock_db())
-        all_failures.extend(self.scan_telemetry())
-        log.info(f"  ◉ Failure intake: {len(all_failures)} failures detected")
-        return all_failures
-
-    def _classify_log_error(self, content: str) -> FailureClass:
-        if "SyntaxError" in content or "IndentationError" in content:
-            return FailureClass.SYNTAX_FAILURE
-        if "AssertionError" in content or "FAILED" in content:
-            return FailureClass.TEST_FAILURE
-        if "403" in content and ("forbidden" in content.lower() or "endpoint" in content.lower()):
-            return FailureClass.MEASUREMENT_INVALID_403
-        if "ModuleNotFoundError" in content or "ImportError" in content:
-            return FailureClass.DEPENDENCY_FAILURE
-        if "groq" in content.lower() or "openrouter" in content.lower():
-            return FailureClass.LLM_PROVIDER_FAILURE
-        return FailureClass.UNKNOWN
-
-    def _is_bad_draft(self, text: str) -> bool:
-        """Check if draft text contains bad patterns."""
-        text_lower = text.lower()
-        bad_phrases = ["reaching out to us", "last-minute app", "thank you for reaching out"]
-        if any(p in text_lower for p in bad_phrases):
-            return True
-        # Check for "we/us/our" (should be first person singular)
-        if re.search(r'\b(we|us|our)\b', text_lower):
-            return True
-        # Too many words (> 80)
-        if len(text.split()) > 80:
-            return True
-        # No question mark (no next-step question)
-        if "?" not in text:
-            return True
-        return False
-
-
-# ─── Engine 2: Diagnosis ────────────────────────────────────────────
-
-class DiagnosisEngine:
-    """Maps failures to safe repair types."""
-
-    REPAIR_MAP = {
-        FailureClass.MEASUREMENT_INVALID_403: {
-            "repair_type": "measurement_invalid_self_heal",
-            "files": ["rm_traffic/reward_engine.py", "rm_traffic/state_engine.py"],
-            "description": "Mark cycle MEASUREMENT_INVALID on 403, return zero delta, skip bandit update",
-            "confidence": 0.95,
-            "tests": ["python3 -m pytest tests/test_reward_engine.py -v"],
-        },
-        FailureClass.PRIVACY_POLICY_FAILURE: {
-            "repair_type": "private_llm_policy_self_heal",
-            "files": ["rm_traffic/reply_drafter.py", "rm_traffic/llm_client.py"],
-            "description": "Block cloud providers on private client text, force local-only",
-            "confidence": 0.95,
-            "tests": ["python3 -m pytest tests/test_reply_drafter.py -v"],
-        },
-        FailureClass.BAD_DRAFT: {
-            "repair_type": "bad_draft_self_heal",
-            "files": ["rm_traffic/reply_drafter.py"],
-            "description": "Reject bad LLM output, use template fallback, add quality checks",
-            "confidence": 0.85,
-            "tests": ["python3 -m pytest tests/test_reply_drafter.py -v"],
-        },
-        FailureClass.REWARD_REGRESSION: {
-            "repair_type": "reward_poisoning_self_heal",
-            "files": ["rm_traffic/reward_engine.py"],
-            "description": "Ignore invalid post-state, null reward for invalid measurement",
-            "confidence": 0.80,
-            "tests": ["python3 -m pytest tests/test_reward_engine.py -v"],
-        },
-        FailureClass.SYNTAX_FAILURE: {
-            "repair_type": "syntax_fix",
-            "files": [],
-            "description": "Fix syntax error in identified file",
-            "confidence": 0.50,
-            "tests": ["python3 -m py_compile <target_file>"],
-        },
-        FailureClass.TEST_FAILURE: {
-            "repair_type": "test_fix",
-            "files": [],
-            "description": "Fix failing test or implementation",
-            "confidence": 0.40,
-            "tests": ["python3 -m pytest -v"],
-        },
-        FailureClass.LLM_PROVIDER_FAILURE: {
-            "repair_type": "provider_fallback_fix",
-            "files": ["rm_traffic/llm_client.py", "rm_traffic/reply_drafter.py"],
-            "description": "Fix LLM provider fallback chain, ensure local-first",
-            "confidence": 0.75,
-            "tests": ["python3 -m pytest tests/test_reply_drafter.py -v"],
-        },
-        FailureClass.DEPENDENCY_FAILURE: {
-            "repair_type": "dependency_fix",
-            "files": ["requirements.txt", "pyproject.toml"],
-            "description": "Add or pin missing dependency",
-            "confidence": 0.60,
-            "tests": ["python3 -c 'import rm_traffic'"],
-        },
-        FailureClass.API_AUTH_FAILURE: {
-            "repair_type": "manual_auth_review",
-            "files": [],
-            "description": "Auth failure — manual credential review required, no auto-patch",
-            "confidence": 0.10,
-            "tests": [],
-        },
-        FailureClass.ARTIFACT_MISSING: {
-            "repair_type": "artifact_rebuild",
-            "files": [],
-            "description": "Rebuild missing artifact",
-            "confidence": 0.30,
-            "tests": [],
-        },
-    }
-
-    def diagnose(self, failure: FailureEvent) -> RepairPlan:
-        """Map a failure to a repair plan."""
-        repair = self.REPAIR_MAP.get(failure.failure_class, {
-            "repair_type": "manual_review",
-            "files": [],
-            "description": "Unknown failure — manual review required",
-            "confidence": 0.10,
-            "tests": [],
-        })
-
-        # Validate files are allowlisted
-        safe_files = [f for f in repair["files"] if self._is_allowlisted(f)]
-
-        plan = RepairPlan(
-            failure_id=failure.failure_id,
-            failure_class=failure.failure_class,
-            repair_type=repair["repair_type"],
-            files_to_patch=safe_files[:MAX_FILES_PER_PATCH],
-            patch_description=repair["description"],
-            confidence=repair["confidence"] * failure.confidence,
-            test_commands=repair["tests"],
-            rollback_plan=f"git revert <merge_commit> within {ROLLBACK_WINDOW // 3600}h",
-            policy_checks=[
-                "no_cloud_on_private_text",
-                "no_auto_send_enable",
-                "no_direct_main_push",
-                "no_credential_edit",
-                "tests_required",
-                "measurement_invalid_not_rewarded",
-            ],
-        )
-
-        log.info(f"  ◉ Diagnosis: {failure.failure_class.value} → {plan.repair_type} "
-                 f"(confidence={plan.confidence:.2f}, files={plan.files_to_patch})")
-        return plan
-
-    def _is_allowlisted(self, filepath: str) -> bool:
-        """Check if file is in the allowlist and not protected."""
-        if filepath in PROTECTED_FILES:
-            return False
-        for allowed in ALLOWLISTED_FILES:
-            if filepath.startswith(allowed) or filepath == allowed:
-                return True
-        return False
-
-
-# ─── Engine 3: Patch Generator ──────────────────────────────────────
-
-class PatchGenerator:
-    """Creates repair branches with patches to allowlisted files only."""
-
-    def __init__(self, repo_root: str = "."):
-        self.repo_root = Path(repo_root)
-
-    def generate_branch_name(self, repair_type: str) -> str:
-        ts = int(time.time())
-        return f"{BRANCH_PREFIX}{repair_type}-{ts}"
-
-    def create_patch(self, plan: RepairPlan) -> Tuple[str, ArtifactReceipt]:
-        """Create a patch branch with the repair applied.
-        Returns (branch_name, receipt)."""
-        branch = self.generate_branch_name(plan.repair_type)
-
-        # For now, we generate the branch name and receipt.
-        # Actual file patching would be done by specific repair handlers.
-        receipt = ArtifactReceipt(
-            failure_id=plan.failure_id,
-            failure_class=plan.failure_class.value,
-            files_changed=plan.files_to_patch,
-            diff_hash="",  # filled after patch applied
-            test_command="; ".join(plan.test_commands),
-            test_result="pending",
-            policy_result="pending",
-            measurement_status=MeasurementStatus.NOT_CHECKED.value,
-            training_performed=False,
-            fine_tuning_performed=False,
-            private_cloud_used=False,
-            human_approval_required=True,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            rollback_plan=plan.rollback_plan,
-        )
-
-        log.info(f"  ◆ Patch branch: {branch} ({len(plan.files_to_patch)} files)")
-        return branch, receipt
-
-    def compute_diff_hash(self, diff_content: str) -> str:
-        """Compute SHA-256 hash of diff content for attestation."""
-        return hashlib.sha256(diff_content.encode()).hexdigest()[:16]
-
-
-# ─── Engine 4: Policy Gate ──────────────────────────────────────────
-
-class PolicyGate:
-    """Policy-as-code gate. Blocks unsafe changes before PR can be marked healthy."""
-
-    POLICIES = {
-        "no_cloud_on_private_text": {
-            "description": "Cloud LLM providers must not be called on private client text",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "no_auto_send_enable": {
-            "description": "Auto-send must not be enabled by a patch",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "no_direct_main_push": {
-            "description": "Patches must go through PR, not direct push to main",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "no_credential_edit": {
-            "description": "Credentials, secrets, and .env must not be modified",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "no_fake_visits": {
-            "description": "No fake visits, clicks, or synthetic activity generation",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "tests_required": {
-            "description": "Every patched module must have passing tests",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "measurement_invalid_not_rewarded": {
-            "description": "Invalid measurements must not produce negative rewards",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "max_files_enforced": {
-            "description": f"Max {MAX_FILES_PER_PATCH} files per patch",
-            "severity": SEVERITY_BLOCKER,
-        },
-        "max_lines_enforced": {
-            "description": f"Max {MAX_LINES_CHANGED_PER_PATCH} lines changed per patch",
-            "severity": SEVERITY_BLOCKER,
-        },
-    }
-
-    def evaluate(self, plan: RepairPlan, diff_content: str = "",
-                 test_results: Dict = None) -> Tuple[bool, Dict]:
-        """Evaluate all policies against the repair plan.
-        Returns (passed, results_dict)."""
-        results = {}
-        all_passed = True
-
-        for policy_name, policy_def in self.POLICIES.items():
-            passed = self._check_policy(policy_name, plan, diff_content, test_results)
-            results[policy_name] = {
-                "passed": passed,
-                "severity": policy_def["severity"],
-                "description": policy_def["description"],
-            }
-            if not passed and policy_def["severity"] == SEVERITY_BLOCKER:
-                all_passed = False
-
-        log.info(f"  ◉ Policy gate: {'PASS' if all_passed else 'FAIL'} — "
-                 f"{sum(1 for r in results.values() if r['passed'])}/{len(results)} policies passed")
-        return all_passed, results
-
-    def _check_policy(self, name: str, plan: RepairPlan,
-                      diff: str, test_results: Dict) -> bool:
-        if name == "no_cloud_on_private_text":
-            # Check diff doesn't add cloud calls on private text paths
-            if "groq" in diff.lower() and "private" in diff.lower():
-                return False
-            if "openrouter" in diff.lower() and "private" in diff.lower():
-                return False
-            return True
-
-        if name == "no_auto_send_enable":
-            if "auto_send" in diff and "True" in diff:
-                return False
-            return True
-
-        if name == "no_direct_main_push":
-            # GAG never pushes to main — always branch
-            return True
-
-        if name == "no_credential_edit":
-            for f in plan.files_to_patch:
-                if f in PROTECTED_FILES or ".env" in f or "secret" in f.lower():
-                    return False
-            return True
-
-        if name == "no_fake_visits":
-            if "fake_visit" in diff.lower() or "synthetic_click" in diff.lower():
-                return False
-            return True
-
-        if name == "tests_required":
-            if not plan.test_commands:
-                return False
-            if test_results and not test_results.get("all_passed"):
-                return False
-            return True
-
-        if name == "measurement_invalid_not_rewarded":
-            # Check diff doesn't reward invalid measurements
-            if "measurement_invalid" in diff and "reward" in diff:
-                # Make sure it's setting reward to 0, not computing negative
-                if "reward = 0" not in diff and "return 0.0" not in diff:
-                    return False
-            return True
-
-        if name == "max_files_enforced":
-            return len(plan.files_to_patch) <= MAX_FILES_PER_PATCH
-
-        if name == "max_lines_enforced":
-            if diff:
-                added = sum(1 for line in diff.split("\n") if line.startswith("+") and not line.startswith("+++"))
-                removed = sum(1 for line in diff.split("\n") if line.startswith("-") and not line.startswith("---"))
-                return (added + removed) <= MAX_LINES_CHANGED_PER_PATCH
-            return True
-
-        return True
-
-
-# ─── Engine 5: Healing PR ───────────────────────────────────────────
-
-class HealingPREngine:
-    """Opens PRs with patches, evidence, tests, receipts, and rollback plans."""
-
-    def __init__(self, repo_root: str = "."):
-        self.repo_root = Path(repo_root)
-
-    def create_pr(self, branch: str, plan: RepairPlan,
-                  receipt: ArtifactReceipt, policy_results: Dict,
-                  test_results: Dict = None) -> HealingPR:
-        """Create a healing PR object with full evidence."""
-
-        confidence = plan.confidence
-        ready = (confidence >= MIN_CONFIDENCE_TO_AUTO_LABEL_READY and
-                 all(r["passed"] for r in policy_results.values()) and
-                 test_results and test_results.get("all_passed"))
-
-        pr_body = self._build_pr_body(plan, receipt, policy_results, test_results)
-
-        pr = HealingPR(
-            branch_name=branch,
-            title=f"[GAG] {plan.repair_type}: {plan.failure_class.value}",
-            body=pr_body,
-            files_changed=plan.files_to_patch,
-            receipt=receipt,
-            ready_to_merge=ready,
-            auto_merge=AUTO_MERGE_ENABLED and ready,
-        )
-
-        log.info(f"  ◆ Healing PR: {pr.title}")
-        log.info(f"    Branch: {pr.branch_name}")
-        log.info(f"    Ready: {pr.ready_to_merge} (confidence={confidence:.2f})")
-        log.info(f"    Auto-merge: {pr.auto_merge} (disabled by policy)")
-        return pr
-
-    def _build_pr_body(self, plan: RepairPlan, receipt: ArtifactReceipt,
-                       policy_results: Dict, test_results: Dict = None) -> str:
-        lines = [
-            f"## CI/CD GAG — Self-Healing PR",
-            "",
-            f"**Failure class**: `{plan.failure_class.value}`",
-            f"**Repair type**: `{plan.repair_type}`",
-            f"**Confidence**: `{plan.confidence:.2f}`",
-            f"**Files changed**: `{', '.join(plan.files_to_patch)}`",
-            "",
-            f"### Description",
-            plan.patch_description,
-            "",
-            f"### Policy Gate Results",
-            "",
-        ]
-
-        for name, result in policy_results.items():
-            icon = "✅" if result["passed"] else "❌"
-            lines.append(f"- {icon} **{name}**: {result['description']}")
-
-        lines.extend([
-            "",
-            f"### Test Results",
-            f"```json",
-            json.dumps(test_results or {}, indent=2),
-            "```",
-            "",
-            f"### Artifact Receipt",
-            f"```json",
-            json.dumps(asdict(receipt), indent=2),
-            "```",
-            "",
-            f"### Rollback Plan",
-            receipt.rollback_plan,
-            "",
-            f"### Attestation",
-            f"- `training_performed`: {receipt.training_performed}",
-            f"- `fine_tuning_performed`: {receipt.fine_tuning_performed}",
-            f"- `private_cloud_used`: {receipt.private_cloud_used}",
-            f"- `human_approval_required`: {receipt.human_approval_required}",
-            f"- `auto_merge_enabled`: {AUTO_MERGE_ENABLED}",
-            "",
-            f"---",
-            f"Generated by CI/CD GAG at {receipt.timestamp}",
-        ])
-
-        return "\n".join(lines)
-
-
-# ─── Self-Healing Rules ─────────────────────────────────────────────
-
-def rule1_403_telemetry_self_heal(failure: FailureEvent) -> RepairPlan:
-    """
-    Rule 1: 403 telemetry self-heal.
-    If post-action protected endpoints return 403, mark cycle MEASUREMENT_INVALID,
-    do not compute negative deltas, do not update bandit or hypothesis reward.
-    """
-    return RepairPlan(
-        failure_id=failure.failure_id,
-        failure_class=FailureClass.MEASUREMENT_INVALID_403,
-        repair_type="measurement_invalid_self_heal",
-        files_to_patch=["rm_traffic/reward_engine.py", "rm_traffic/state_engine.py"],
-        patch_description=(
-            "Ensure is_measurement_valid() checks both snapshots for endpoint errors. "
-            "compute_delta returns zero MetricDelta if invalid. "
-            "compute_reward returns 0.0 for invalid measurements. "
-            "Bandit update skipped when measurement_valid=False."
-        ),
-        confidence=0.95,
-        test_commands=[
-            "python3 -c 'from rm_traffic.reward_engine import is_measurement_valid; print(\"OK\")'",
-            "python3 -c 'from rm_traffic.state_engine import TrafficState; assert hasattr(TrafficState, \"measurement_valid\"); print(\"OK\")'",
-        ],
-        rollback_plan=f"git revert <merge_commit> within {ROLLBACK_WINDOW // 3600}h",
-        policy_checks=[
-            "measurement_invalid_not_rewarded",
-            "no_direct_main_push",
-            "tests_required",
-        ],
-    )
-
-
-def rule2_private_llm_policy_self_heal(failure: FailureEvent) -> RepairPlan:
-    """
-    Rule 2: Private LLM policy self-heal.
-    If reply_draft_queue attempts Groq/OpenRouter with private mailbox text,
-    block the provider, force private_local_only, and open a patch PR.
-    """
-    return RepairPlan(
-        failure_id=failure.failure_id,
-        failure_class=FailureClass.PRIVACY_POLICY_FAILURE,
-        repair_type="private_llm_policy_self_heal",
-        files_to_patch=["rm_traffic/reply_drafter.py"],
-        patch_description=(
-            "Remove cloud provider imports from reply_drafter. "
-            "Use local-only LLM (Ollama/Transformers.js) with 8s timeout. "
-            "Template is canonical — LLM is optional polish only. "
-            "No Groq, no OpenRouter on private client text."
-        ),
-        confidence=0.95,
-        test_commands=[
-            "python3 -c 'from rm_traffic.reply_drafter import draft_reply; print(\"OK\")'",
-            "python3 -c 'import inspect; from rm_traffic.reply_drafter import _try_local_llm_polish; src=inspect.getsource(_try_local_llm_polish); assert \"groq\" not in src.lower(); assert \"openrouter\" not in src.lower(); print(\"no cloud in private path OK\")'",
-        ],
-        rollback_plan=f"git revert <merge_commit> within {ROLLBACK_WINDOW // 3600}h",
-        policy_checks=[
-            "no_cloud_on_private_text",
-            "no_direct_main_push",
-            "tests_required",
-        ],
-    )
-
-
-def rule3_bad_draft_self_heal(failure: FailureEvent) -> RepairPlan:
-    """
-    Rule 3: Bad draft self-heal.
-    If local model draft contains 'we/us/our', 'app', unsupported facts,
-    raw phone when disabled, too many words, or no next-step question,
-    reject draft and use template fallback.
-    """
-    return RepairPlan(
-        failure_id=failure.failure_id,
-        failure_class=FailureClass.BAD_DRAFT,
-        repair_type="bad_draft_self_heal",
-        files_to_patch=["rm_traffic/reply_drafter.py"],
-        patch_description=(
-            "Add quality validation to LLM polish output. "
-            "Reject drafts with: 'we/us/our' pronouns, 'app' references, "
-            "known bad phrases ('reaching out to us', 'last-minute app'), "
-            ">80 words, or no question mark. "
-            "Fall back to template on rejection."
-        ),
-        confidence=0.85,
-        test_commands=[
-            "python3 -c 'from rm_traffic.reply_drafter import draft_reply; d=draft_reply(\"Hi, are you available today?\"); assert \"?\" in d.reply_text; print(\"draft has question OK\")'",
-            "python3 -c 'from rm_traffic.reply_drafter import draft_reply; d=draft_reply(\"Hi\"); assert len(d.reply_text.split()) < 80; print(\"draft length OK\")'",
-        ],
-        rollback_plan=f"git revert <merge_commit> within {ROLLBACK_WINDOW // 3600}h",
-        policy_checks=[
-            "no_cloud_on_private_text",
-            "no_direct_main_push",
-            "tests_required",
-        ],
-    )
-
-
-# ─── Main GAG Orchestrator ──────────────────────────────────────────
-
-class CICDGAG:
-    """CI/CD GitHub Actions Governor — main orchestrator."""
-
-    def __init__(self, repo_root: str = "."):
-        self.repo_root = repo_root
-        self.intake = FailureIntakeEngine(repo_root)
-        self.diagnosis = DiagnosisEngine()
-        self.patcher = PatchGenerator(repo_root)
-        self.policy = PolicyGate()
-        self.pr_engine = HealingPREngine(repo_root)
-        self.heal_history: List[Dict] = []
-        self.last_heal_time: float = 0.0
-
-    def run_healing_cycle(self) -> List[HealingPR]:
-        """Run one full healing cycle: detect → diagnose → patch → policy → PR."""
-        print(f"\n{'='*60}")
-        print(f"  CI/CD GAG — HEALING CYCLE")
-        print(f"  {datetime.now(timezone.utc).isoformat()}")
-        print(f"{'='*60}\n")
-
-        # Check cooldown
-        if self.last_heal_time and (time.time() - self.last_heal_time) < COOLDOWN_AFTER_FAILED_HEAL:
-            remaining = COOLDOWN_AFTER_FAILED_HEAL - (time.time() - self.last_heal_time)
-            print(f"  ⧖ Cooldown active — {remaining / 3600:.1f}h remaining")
-            return []
-
-        # Engine 1: Detect failures
-        print("[INTAKE] Scanning for failures...")
-        failures = self.intake.scan_all()
-        if not failures:
-            print("  ◉ No failures detected — system healthy")
-            return []
-
-        prs = []
-        for failure in failures:
-            print(f"\n[DIAGNOSE] {failure.failure_class.value}: {failure.description[:80]}")
-
-            # Engine 2: Diagnose
-            plan = self.diagnosis.diagnose(failure)
-
-            # Apply self-healing rules for known failure classes
-            if failure.failure_class == FailureClass.MEASUREMENT_INVALID_403:
-                plan = rule1_403_telemetry_self_heal(failure)
-            elif failure.failure_class == FailureClass.PRIVACY_POLICY_FAILURE:
-                plan = rule2_private_llm_policy_self_heal(failure)
-            elif failure.failure_class == FailureClass.BAD_DRAFT:
-                plan = rule3_bad_draft_self_heal(failure)
-
-            if plan.confidence < MIN_CONFIDENCE_TO_OPEN_PR:
-                print(f"  ⟁ Confidence {plan.confidence:.2f} < {MIN_CONFIDENCE_TO_OPEN_PR} — skipping")
-                continue
-
-            # Engine 3: Generate patch
-            print(f"[PATCH] Generating repair branch...")
-            branch, receipt = self.patcher.create_patch(plan)
-
-            # Engine 4: Policy gate
-            print(f"[POLICY] Evaluating policies...")
-            policy_passed, policy_results = self.policy.evaluate(plan, diff_content="", test_results=None)
-
-            if not policy_passed:
-                print(f"  ⟁ Policy gate FAILED — PR will be labeled needs-review")
-                receipt.policy_result = "failed"
-            else:
-                receipt.policy_result = "passed"
-
-            # Engine 5: Create healing PR
-            print(f"[PR] Creating healing PR...")
-            pr = self.pr_engine.create_pr(branch, plan, receipt, policy_results)
-            prs.append(pr)
-
-            # Record in history
-            self.heal_history.append({
-                "failure_id": failure.failure_id,
-                "failure_class": failure.failure_class.value,
-                "repair_type": plan.repair_type,
-                "branch": branch,
-                "confidence": plan.confidence,
-                "policy_passed": policy_passed,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-
-        self.last_heal_time = time.time()
-
-        # Summary
-        print(f"\n{'='*60}")
-        print(f"  HEALING CYCLE COMPLETE")
-        print(f"  Failures detected: {len(failures)}")
-        print(f"  PRs generated: {len(prs)}")
-        print(f"  Auto-merge: {AUTO_MERGE_ENABLED} (always disabled by policy)")
-        print(f"{'='*60}\n")
-
-        return prs
-
-    def get_status(self) -> Dict:
-        """Get GAG status summary."""
-        return {
-            "heal_history_count": len(self.heal_history),
-            "last_heal": datetime.fromtimestamp(self.last_heal_time, tz=timezone.utc).isoformat() if self.last_heal_time else None,
-            "cooldown_active": (time.time() - self.last_heal_time) < COOLDOWN_AFTER_FAILED_HEAL if self.last_heal_time else False,
-            "auto_merge_enabled": AUTO_MERGE_ENABLED,
-            "max_files_per_patch": MAX_FILES_PER_PATCH,
-            "max_lines_per_patch": MAX_LINES_CHANGED_PER_PATCH,
-            "protected_files": list(PROTECTED_FILES),
-            "allowlisted_files": list(ALLOWLISTED_FILES),
-        }
-
-
-# ─── CLI ────────────────────────────────────────────────────────────
-
+  const r = await fetch(`${API}/api/files/stats`);
+  const s = await r.json();
+  document.getElementById('totalFiles').textContent = s.total_files.toLocaleString();
+  document.getElementById('totalSize').textContent = fmtSize(s.total_bytes);
+  document.getElementById('lastRun').textContent = s.last_run ? s.last_run.finished_at.slice(0, 19).replace('T', ' ') : '—';
+  document.getElementById('status').textContent = 'Connected';
+
+  const cloud = document.getElementById('extCloud');
+  cloud.innerHTML = '';
+  (s.extensions || []).forEach(e => {
+    const tag = document.createElement('span');
+    tag.className = 'ext-tag';
+    tag.textContent = `${e.ext} · ${e.count}`;
+    tag.onclick = () => {
+      document.getElementById('ext').value = e.ext;
+      doSearch();
+    };
+    cloud.appendChild(tag);
+  });
+}
+
+async function doSearch() {
+  const q = document.getElementById('search').value;
+  const ext = document.getElementById('ext').value;
+  const url = new URL(`${API}/api/files/search`);
+  if (q) url.searchParams.set('q', q);
+  if (ext) url.searchParams.set('ext', ext);
+  url.searchParams.set('limit', '200');
+
+  const r = await fetch(url);
+  const data = await r.json();
+  renderFiles(data.files);
+}
+
+async function loadDuplicates() {
+  const r = await fetch(`${API}/api/files/duplicates?limit=200`);
+  const data = await r.json();
+  const rows = [];
+  data.groups.forEach(g => {
+    g.files.forEach(f => {
+      rows.push({ ...f, dupGroup: g.sha256 });
+    });
+  });
+  renderFiles(rows, true);
+}
+
+function renderFiles(files, showDup = false) {
+  const tbody = document.getElementById('resultsBody');
+  tbody.innerHTML = '';
+  if (!files.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No results</td></tr>';
+    return;
+  }
+
+  files.forEach(f => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="mono" title="${f.sha256}">${f.sha256 ? f.sha256.slice(0, 12) : '—'}</td>
+      <td class="num">${fmtSize(f.size)}</td>
+      <td>${fmtDate(f.mtime)}</td>
+      <td class="path" title="${f.path}">${f.path}</td>
+      <td class="num">${f.entropy != null ? f.entropy.toFixed(2) : '—'}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+document.getElementById('btnSearch').onclick = doSearch;
+document.getElementById('btnDups').onclick = loadDuplicates;
+document.getElementById('search').onkeyup = (e) => { if (e.key === 'Enter') doSearch(); };
+document.getElementById('ext').onkeyup = (e) => { if (e.key === 'Enter') doSearch(); };
+
+loadStats().catch(e => document.getElementById('status').textContent = 'Error: ' + e.message);
+
+```
+
+dashboard.html:
+```
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RentMasseur OS — Unified Control Surface</title>
+<style>
+:root{--bg:#08080c;--panel:#0d0d15;--border:#1a1a2a;--border-hi:#2a2a3a;--orange:#ff6b1a;--green:#4caf50;--yellow:#ffc107;--red:#f44336;--blue:#60a5fa;--text:#e0e0e4;--dim:#6a6a72;--mono:'SF Mono','Monaco',monospace;--sans:system-ui,-apple-system,sans-serif}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);font-size:13px}
+.header{background:var(--panel);padding:12px 24px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;position:sticky;top:0;z-index:100}
+.header-left h1{font-size:15px;font-weight:600;color:var(--orange);letter-spacing:1px;text-transform:uppercase}
+.header-left .sub{font-size:11px;color:var(--dim);margin-top:2px;font-family:var(--mono)}
+.nav{display:flex;gap:2px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:3px}
+.nav button{background:transparent;color:var(--dim);border:none;padding:7px 16px;font-size:12px;font-family:var(--sans);cursor:pointer;border-radius:6px;transition:all .15s;font-weight:500}
+.nav button.active{background:var(--orange);color:#000;font-weight:600}
+.nav button:hover:not(.active){color:var(--text);background:var(--border)}
+.tab-content{display:none}.tab-content.active{display:block;animation:fadeIn .2s}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:16px 24px;max-width:1800px;margin:0 auto}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden;transition:border-color .15s}
+.panel:hover{border-color:var(--border-hi)}
+.panel-h{padding:10px 14px;border-bottom:1px solid var(--border);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);display:flex;justify-content:space-between;align-items:center}
+.panel-h .count{color:var(--orange);font-size:10px}
+.panel-b{padding:14px;font-size:12px;line-height:1.6}
+.full{grid-column:span 3}.wide{grid-column:span 2}.half{grid-column:span 1}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
+.badge.GREEN_REAL{background:rgba(76,175,80,.12);color:var(--green);border:1px solid rgba(76,175,80,.3)}
+.badge.YELLOW_RUNNING{background:rgba(255,193,7,.12);color:var(--yellow);border:1px solid rgba(255,193,7,.3)}
+.badge.RED_FAILED{background:rgba(244,67,54,.12);color:var(--red);border:1px solid rgba(244,67,54,.3)}
+.badge.GRAY_NO_DATA{background:rgba(106,106,114,.08);color:var(--dim);border:1px solid var(--border)}
+.badge.BLACK_DISABLED{background:rgba(244,67,54,.08);color:#ff4444;border:1px solid rgba(244,67,54,.2)}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{text-align:left;padding:6px 8px;color:var(--dim);border-bottom:1px solid var(--border);font-size:10px;text-transform:uppercase;letter-spacing:.3px;font-weight:500}
+td{padding:6px 8px;border-bottom:1px solid rgba(26,26,42,.5)}
+tr:hover td{background:rgba(255,107,26,.04)}
+.mr{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(26,26,42,.4)}
+.mr:last-child{border-bottom:none}
+.ml{color:var(--dim)}.mv{color:var(--text);font-weight:600}
+.missing{color:var(--dim);font-style:italic;padding:8px 0}
+pre{background:#050508;padding:10px;border-radius:6px;overflow-x:auto;font-size:11px;color:#6a9f5a;max-height:180px;overflow-y:auto;font-family:var(--mono);line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.funnel{display:flex;gap:4px;flex-wrap:wrap;margin-top:10px}
+.funnel-step{padding:4px 8px;border-radius:4px;font-size:10px;background:var(--bg);border:1px solid var(--border)}
+.funnel-step.has{background:rgba(76,175,80,.1);color:var(--green);border-color:rgba(76,175,80,.3)}
+.funnel-step.empty{color:#333}
+.mission-status{font-size:20px;font-weight:700;padding:8px 0}
+.mission-status.BOOKING_CONFIRMED{color:var(--green)}
+.mission-status.LEADS_ACTIVE{color:var(--yellow)}
+.mission-status.PROSPECTS_FOUND{color:var(--blue)}
+.mission-status.NO_PROSPECTS{color:var(--dim)}
+.gate-pass{color:var(--green)}.gate-fail{color:var(--red)}
+.warning{background:rgba(244,67,54,.08);border:1px solid rgba(244,67,54,.2);padding:8px 12px;border-radius:6px;color:var(--red);font-size:11px;margin-top:8px}
+.mode-badge{display:inline-block;padding:4px 12px;border-radius:4px;font-size:12px;font-weight:600}
+.mode-0{background:rgba(106,106,114,.1);color:var(--dim);border:1px solid var(--border)}
+.mode-1{background:rgba(76,175,80,.1);color:var(--green);border:1px solid rgba(76,175,80,.3)}
+.mode-2{background:rgba(96,165,250,.1);color:var(--blue);border:1px solid rgba(96,165,250,.3)}
+.mode-3{background:rgba(255,193,7,.1);color:var(--yellow);border:1px solid rgba(255,193,7,.3)}
+.mode-4{background:rgba(244,67,54,.1);color:var(--red);border:1px solid rgba(244,67,54,.3)}
+.fi-bar{display:flex;gap:12px;padding:16px 24px;max-width:1800px;margin:0 auto;align-items:center;flex-wrap:wrap}
+.fi-bar input{background:var(--panel);border:1px solid var(--border);color:var(--text);padding:10px 16px;border-radius:8px;font-family:var(--sans);font-size:13px}
+.fi-bar input:focus{outline:none;border-color:var(--orange)}
+.fi-bar input.search{flex:1;min-width:200px}
+.fi-bar input.ext{width:100px}
+.fi-bar button{background:var(--orange);color:#000;border:none;padding:10px 18px;border-radius:8px;font-weight:600;cursor:pointer;font-family:var(--sans);font-size:13px}
+.fi-bar button:hover{opacity:.85}
+.fi-bar button.secondary{background:transparent;color:var(--orange);border:1px solid var(--orange)}
+.fi-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:0 24px 16px;max-width:1800px;margin:0 auto}
+.fi-stat{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px}
+.fi-stat .val{font-size:24px;font-weight:700;color:var(--orange);margin-bottom:4px}
+.fi-stat .lbl{color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.5px}
+.ext-cloud{display:flex;flex-wrap:wrap;gap:6px;padding:0 24px 16px;max-width:1800px;margin:0 auto}
+.ext-tag{background:var(--panel);border:1px solid var(--border);padding:4px 12px;border-radius:16px;color:var(--dim);cursor:pointer;font-size:11px;transition:all .15s}
+.ext-tag:hover{border-color:var(--orange);color:var(--orange)}
+.ext-tag.active{border-color:var(--orange);color:var(--orange);background:rgba(255,107,26,.08)}
+.fi-table{padding:0 24px 24px;max-width:1800px;margin:0 auto}
+.fi-table .panel{overflow-x:auto}
+.fi-table td.mono{font-family:var(--mono);color:var(--dim);font-size:10px}
+.fi-table td.num{text-align:right;white-space:nowrap;font-family:var(--mono)}
+.fi-table td.path{max-width:550px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:11px}
+.empty-row{color:var(--dim);text-align:center;padding:48px;font-size:14px}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--orange);border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.bio-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;margin:8px 0}
+.bio-card .bio-name{font-weight:600;color:var(--text);font-size:13px}
+.bio-card .bio-preview{margin-top:6px;font-size:11px;color:var(--dim);line-height:1.5;max-height:80px;overflow:hidden;font-family:var(--mono)}
+.health-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;padding:16px 24px;max-width:1800px;margin:0 auto}
+.ep-list{display:flex;flex-wrap:wrap;gap:6px;padding:14px}
+.ep-item{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:4px 10px;font-size:11px;font-family:var(--mono);color:var(--dim)}
+.ep-item .method{color:var(--orange);font-weight:600;margin-right:4px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}.fi-stats{grid-template-columns:1fr 1fr}.health-grid{grid-template-columns:1fr}.fi-bar{flex-direction:column}}
+</style>
+</head>
+<body>
+<div class="header">
+<div class="header-left">
+<h1>◉ RentMasseur OS</h1>
+<div class="sub" id="status">Connecting...</div>
+</div>
+<div class="nav">
+<button class="active" onclick="showTab('files',this)">File Index</button>
+<button onclick="showTab('revenue',this)">Revenue OS</button>
+<button onclick="showTab('health',this)">System Health</button>
+</div>
+</div>
+
+<!-- TAB: File Index -->
+<div id="tab-files" class="tab-content active">
+<div class="fi-stats" id="fi-stats"><div class="fi-stat"><div class="val"><span class="spinner"></span></div><div class="lbl">loading</div></div></div>
+<div class="fi-bar">
+<input class="search" type="text" id="fi-search" placeholder="Search by path, filename, or directory..." autofocus>
+<input class="ext" type="text" id="fi-ext" placeholder=".py">
+<button onclick="fiSearch()">Search</button>
+<button class="secondary" onclick="fiDups()">Duplicates</button>
+<button class="secondary" onclick="fiReset()">Reset</button>
+</div>
+<div class="ext-cloud" id="fi-ext-cloud"></div>
+<div class="fi-table">
+<div class="panel">
+<table>
+<thead><tr><th>SHA256</th><th>Size</th><th>Lines</th><th>Words</th><th>Entropy</th><th>Modified</th><th>Path</th></tr></thead>
+<tbody id="fi-results-body"><tr><td colspan="7" class="empty-row">Loading...</td></tr></tbody>
+</table>
+</div>
+</div>
+</div>
+
+<!-- TAB: Revenue OS -->
+<div id="tab-revenue" class="tab-content">
+<div class="grid">
+<div class="panel full"><div class="panel-h">Mission Control <span class="count" id="mission-date"></span></div><div class="panel-b" id="mission">Click tab to load...</div></div>
+<div class="panel half"><div class="panel-h">Control Mode</div><div class="panel-b" id="cmode">—</div></div>
+<div class="panel half"><div class="panel-h">Test Phase</div><div class="panel-b" id="tphase">—</div></div>
+<div class="panel half"><div class="panel-h">Decision Gate</div><div class="panel-b" id="decision">—</div></div>
+<div class="panel wide"><div class="panel-h">Prospect Ledger <span class="count" id="prospects-count"></span></div><div class="panel-b" id="prospects">—</div></div>
+<div class="panel half"><div class="panel-h">Content Ledger <span class="count" id="content-count"></span></div><div class="panel-b" id="content">—</div></div>
+<div class="panel half"><div class="panel-h">Event Ledger <span class="count" id="events-count"></span></div><div class="panel-b" id="events">—</div></div>
+<div class="panel half"><div class="panel-h">Experiment Ledger <span class="count" id="exp-count"></span></div><div class="panel-b" id="experiments">—</div></div>
+<div class="panel half"><div class="panel-h">Job Ledger <span class="count" id="jobs-count"></span></div><div class="panel-b" id="jobs">—</div></div>
+<div class="panel half"><div class="panel-h">Revenue Proof</div><div class="panel-b" id="revenue">—</div></div>
+<div class="panel full"><div class="panel-h">Profile Stats <span class="count" id="metrics-count"></span></div><div class="panel-b" id="rev-stats">—</div></div>
+<div class="panel wide"><div class="panel-h">Bio Candidates <span class="count" id="bios-count"></span></div><div class="panel-b" id="rev-bios">—</div></div>
+<div class="panel half"><div class="panel-h">Active Experiment</div><div class="panel-b" id="rev-exp">—</div></div>
+<div class="panel half"><div class="panel-h">Interview Variants <span class="count" id="interview-count"></span></div><div class="panel-b" id="rev-interview">—</div></div>
+<div class="panel half"><div class="panel-h">Blog Variants <span class="count" id="blog-count"></span></div><div class="panel-b" id="rev-blog">—</div></div>
+<div class="panel full"><div class="panel-h">Receipt Chain <span class="count" id="receipts-count"></span></div><div class="panel-b" id="rev-receipts">—</div></div>
+</div>
+</div>
+
+<!-- TAB: System Health -->
+<div id="tab-health" class="tab-content">
+<div class="health-grid">
+<div class="panel"><div class="panel-h">System Health</div><div class="panel-b" id="health-panel">Loading...</div></div>
+<div class="panel"><div class="panel-h">File Index DB</div><div class="panel-b" id="fi-health">Loading...</div></div>
+</div>
+<div class="grid">
+<div class="panel full"><div class="panel-h">API Endpoints <span class="count" id="ep-count"></span></div><div class="panel-b" id="endpoints-panel" style="padding:0"><div class="ep-list">Loading...</div></div></div>
+</div>
+</div>
+
+<script>
+const API=window.location.origin;
+function showTab(name,btn){
+document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));
+document.getElementById('tab-'+name).classList.add('active');
+btn.classList.add('active');
+if(name==='revenue')loadRevenue();
+if(name==='health')loadHealth();
+}
+async function api(p){try{const r=await fetch(p);if(!r.ok)return null;return await r.json()}catch(e){return null}}
+function badge(s){return '<span class="badge '+s+'">'+s+'</span>'}
+function fmtSize(b){if(!b)return'0 B';if(b>1e9)return(b/1e9).toFixed(2)+' GB';if(b>1e6)return(b/1e6).toFixed(2)+' MB';if(b>1e3)return(b/1e3).toFixed(1)+' KB';return b+' B'}
+function fmtDate(ts){if(!ts)return'—';if(typeof ts==='string')return ts.slice(0,19).replace('T',' ');const d=new Date(ts*1000);return d.toLocaleDateString()+' '+d.toLocaleTimeString().slice(0,5)}
+function esc(s){return(s||'').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+// ─── File Index ───
+var fiActiveExt='';
+async function fiLoadStats(){
+const s=await api('/api/files/stats');
+if(!s||s.status==='GRAY_NO_DATA'){
+document.getElementById('fi-stats').innerHTML='<div class="fi-stat"><div class="val">—</div><div class="lbl">no index db</div></div>';
+document.getElementById('status').textContent='No file index';return;
+}
+document.getElementById('status').textContent=s.total_files+' files · '+fmtSize(s.total_bytes);
+var exts=s.extensions||[];
+document.getElementById('fi-ext-cloud').innerHTML=exts.map(function(e){
+return '<span class="ext-tag '+(fiActiveExt===e.ext?'active':'')+'" onclick="fiExtClick(\''+e.ext+'\')">'+e.ext+' · '+e.count+'</span>';}).join('');
+var lastRun=s.last_run?fmtDate(s.last_run.finished_at):'—';
+document.getElementById('fi-stats').innerHTML=
+'<div class="fi-stat"><div class="val">'+s.total_files.toLocaleString()+'</div><div class="lbl">files indexed</div></div>'+
+'<div class="fi-stat"><div class="val">'+fmtSize(s.total_bytes)+'</div><div class="lbl">total size</div></div>'+
+'<div class="fi-stat"><div class="val">'+exts.length+'</div><div class="lbl">file types</div></div>'+
+'<div class="fi-stat"><div class="val" style="font-size:14px">'+lastRun+'</div><div class="lbl">last indexed</div></div>';
+}
+function fiExtClick(ext){
+var inp=document.getElementById('fi-ext');
+if(fiActiveExt===ext){fiActiveExt='';inp.value=''}else{fiActiveExt=ext;inp.value=ext}
+fiLoadStats();fiSearch();
+}
+async function fiSearch(){
+var q=document.getElementById('fi-search').value,ext=document.getElementById('fi-ext').value;
+var url=new URL('/api/files/search',API);
+if(q)url.searchParams.set('q',q);if(ext)url.searchParams.set('ext',ext);
+url.searchParams.set('limit','200');
+document.getElementById('fi-results-body').innerHTML='<tr><td colspan="7" class="empty-row"><span class="spinner"></span> Searching...</td></tr>';
+var r=await fetch(url);var data=await r.json();fiRender(data.files||[]);
+}
+async function fiDups(){
+document.getElementById('fi-results-body').innerHTML='<tr><td colspan="7" class="empty-row"><span class="spinner"></span> Finding duplicates...</td></tr>';
+var r=await fetch('/api/files/duplicates?limit=500');var data=await r.json();
+var rows=[];(data.groups||[]).forEach(function(g){g.files.forEach(function(f){rows.push(f)})});
+fiRender(rows);
+}
+function fiReset(){document.getElementById('fi-search').value='';document.getElementById('fi-ext').value='';fiActiveExt='';fiLoadStats();fiSearch()}
+function fiRender(files){
+var tbody=document.getElementById('fi-results-body');
+if(!files.length){tbody.innerHTML='<tr><td colspan="7" class="empty-row">No results</td></tr>';return}
+tbody.innerHTML=files.map(function(f){
+return '<tr><td class="mono" title="'+(f.sha256||'')+'">'+(f.sha256?f.sha256.slice(0,12):'—')+'</td>'+
+'<td class="num">'+fmtSize(f.size)+'</td>'+
+'<td class="num">'+(f.line_count||'—')+'</td>'+
+'<td class="num">'+(f.word_count||'—')+'</td>'+
+'<td class="num">'+(f.entropy!=null?f.entropy.toFixed(2):'—')+'</td>'+
+'<td>'+fmtDate(f.mtime)+'</td>'+
+'<td class="path" title="'+f.path+'">'+f.path+'</td></tr>';}).join('');
+}
+document.getElementById('fi-search').onkeyup=function(e){if(e.key==='Enter')fiSearch()};
+document.getElementById('fi-ext').onkeyup=function(e){if(e.key==='Enter')fiSearch()};
+
+// ─── Revenue OS ───
+var revLoaded=false;
+async function loadRevenue(){
+if(revLoaded)return;revLoaded=true;
+var d=await api('/api/daily-proof');
+if(d){
+document.getElementById('mission-date').textContent=d.date||'—';
+var f=d.funnel||{};var steps=['discovered','qualified','contacted','viewed','clicked','messaged','conversation','appointment','paid'];
+var funnel='<div class="funnel">';
+steps.forEach(function(s){var v=f[s]||0;funnel+='<span class="funnel-step '+(v>0?'has':'empty')+'">'+s+':'+v+'</span>'});
+funnel+='</div>';
+document.getElementById('mission').innerHTML=
+'<div class="mission-status '+d.mission_status+'">'+d.mission_status+'</div>'+
+'<div class="mr"><span class="ml">Verified revenue</span><span class="mv">$'+(d.verified_revenue||0)+'</span></div>'+
+'<div class="mr"><span class="ml">Content versions</span><span class="mv">'+(d.content_versions||0)+'</span></div>'+
+'<div class="mr"><span class="ml">Events recorded</span><span class="mv">'+(d.events_recorded||0)+'</span></div>'+
+'<div class="mr"><span class="ml">Jobs today</span><span class="mv">'+(d.jobs_today||0)+'</span></div>'+
+'<div class="mr"><span class="ml">Control mode</span><span class="mv">'+(d.control_mode_name||'read_only')+'</span></div>'+
+'<div class="mr"><span class="ml">Next action</span><span class="mv" style="font-size:10px;color:var(--orange)">'+esc(d.next_best_action||'')+'</span></div>'+
+funnel;
+var rev=badge(d.verified_revenue>0?'GREEN_REAL':'GRAY_NO_DATA');
+rev+='<div class="mr"><span class="ml">Revenue</span><span class="mv">$'+(d.verified_revenue||0)+'</span></div>';
+rev+='<div class="mr"><span class="ml">Bookings</span><span class="mv">'+(f.paid||0)+'</span></div>';
+rev+='<div class="mr"><span class="ml">Appointments</span><span class="mv">'+(f.appointment||0)+'</span></div>';
+if(!d.verified_revenue)rev+='<div class="missing">Unverified. No estimates.</div>';
+document.getElementById('revenue').innerHTML=rev;
+if(d.metrics){
+var m=d.metrics;var ctr=((m.contact_clicks||0)/Math.max(m.profile_views||1,1)*100).toFixed(2);
+var h=badge('GREEN_REAL')+' <span style="color:var(--dim);font-size:10px">last: '+(m.date||'—')+'</span>';
+h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px">';
+h+='<div class="mr"><span class="ml">Profile views</span><span class="mv">'+(m.profile_views||0)+'</span></div>';
+h+='<div class="mr"><span class="ml">Contact clicks</span><span class="mv">'+(m.contact_clicks||0)+'</span></div>';
+h+='<div class="mr"><span class="ml">New visits</span><span class="mv">'+(m.new_visits||0)+'</span></div>';
+h+='<div class="mr"><span class="ml">New emails</span><span class="mv">'+(m.new_emails||0)+'</span></div>';
+h+='<div class="mr"><span class="ml">Bio</span><span class="mv" style="font-size:10px">'+(m.bio_id||'—')+'</span></div>';
+h+='<div class="mr"><span class="ml">Available</span><span class="mv">'+(m.availability_status?'YES':'NO')+'</span></div>';
+h+='</div>';
+h+='<div class="mr" style="margin-top:8px"><span class="ml">CTR</span><span class="mv" style="color:var(--green)">'+ctr+'%</span></div>';
+document.getElementById('rev-stats').innerHTML=h;
+document.getElementById('metrics-count').textContent='1 entry';
+}else{document.getElementById('rev-stats').innerHTML=badge('GRAY_NO_DATA')+' No metrics';}
+}
+var cm=await api('/api/control-mode');
+if(cm){var h='<span class="mode-badge mode-'+cm.current_mode+'">Mode '+cm.current_mode+': '+cm.mode_name+'</span>';if(cm.current_mode<2)h+='<div class="warning">Mode < 2: no mutations</div>';document.getElementById('cmode').innerHTML=h}
+var tp=await api('/api/test-phase');
+if(tp)document.getElementById('tphase').innerHTML='<b>Phase: '+tp.phase+'</b> (day '+tp.day+')<div style="margin-top:6px;color:var(--dim);font-size:11px">'+esc(tp.reason||'')+'</div>';
+var dg=await api('/api/decision');
+if(dg)document.getElementById('decision').innerHTML=badge('GREEN_REAL')+' <b>'+esc(dg.decision||'')+'</b><div style="margin-top:6px;color:var(--dim);font-size:11px">'+esc(dg.reason||'')+'</div>';
+var p=await api('/api/prospects');
+if(p){if(p.status==='GRAY_NO_DATA'){document.getElementById('prospects').innerHTML=badge('GRAY_NO_DATA')+' No prospects';document.getElementById('prospects-count').textContent='0'}
+else{document.getElementById('prospects-count').textContent=p.count||0;var h=badge('GREEN_REAL')+' '+p.count+' prospects<table style="margin-top:8px"><tr><th>ID</th><th>Stage</th><th>Source</th></tr>';(p.prospects||[]).slice(0,10).forEach(function(x){h+='<tr><td>'+x.id+'</td><td>'+x.stage+'</td><td>'+(x.source||'—')+'</td></tr>'});h+='</table>';document.getElementById('prospects').innerHTML=h}}
+var c=await api('/api/content');
+if(c){if(c.status==='GRAY_NO_DATA'){document.getElementById('content').innerHTML=badge('GRAY_NO_DATA')+' No content';document.getElementById('content-count').textContent='0'}
+else{document.getElementById('content-count').textContent=c.count||0;var h=badge('GREEN_REAL')+' '+c.count+' versions<table style="margin-top:8px"><tr><th>ID</th><th>Type</th><th>Label</th></tr>';(c.content||[]).slice(0,8).forEach(function(x){h+='<tr><td>'+x.id+'</td><td>'+x.type+'</td><td>'+esc(x.label||'—')+'</td></tr>'});h+='</table>';document.getElementById('content').innerHTML=h}}
+var ev=await api('/api/events');
+if(ev){if(ev.status==='GRAY_NO_DATA'){document.getElementById('events').innerHTML=badge('GRAY_NO_DATA')+' No events';document.getElementById('events-count').textContent='0'}
+else{document.getElementById('events-count').textContent=ev.count||0;var h=badge('GREEN_REAL')+' '+ev.count+' events<table style="margin-top:8px"><tr><th>Type</th><th>Content</th><th>Reward</th></tr>';(ev.events||[]).slice(0,8).forEach(function(x){h+='<tr><td>'+x.event_type+'</td><td>'+(x.content_id||'—')+'</td><td>'+x.reward+'</td></tr>'});h+='</table>';document.getElementById('events').innerHTML=h}}
+var e=await api('/api/experiments');
+if(e){if(e.status==='GRAY_NO_DATA'){document.getElementById('experiments').innerHTML=badge('GRAY_NO_DATA')+' No experiments';document.getElementById('exp-count').textContent='0'}
+else{document.getElementById('exp-count').textContent=e.count||0;var h=badge('GREEN_REAL')+' '+e.count+' experiments<table style="margin-top:8px"><tr><th>ID</th><th>Status</th><th>Candidate</th></tr>';(e.experiments||[]).slice(0,8).forEach(function(x){h+='<tr><td>'+x.id+'</td><td>'+x.status+'</td><td>'+esc(x.bio_file||x.candidate_id||'—')+'</td></tr>'});h+='</table>';document.getElementById('experiments').innerHTML=h}}
+var j=await api('/api/jobs');
+if(j){document.getElementById('jobs-count').textContent=(j.jobs||[]).length;var h=badge('GREEN_REAL')+' '+(j.jobs||[]).length+' jobs';if(!(j.jobs||[]).length)h+='<div class="missing" style="margin-top:8px">Admin token required</div>';else{h+='<table style="margin-top:8px"><tr><th>ID</th><th>Command</th><th>Status</th><th>Exit</th></tr>';j.jobs.slice(0,8).forEach(function(x){var sl=x.status==='success'?'GREEN_REAL':x.status==='failed'?'RED_FAILED':'YELLOW_RUNNING';h+='<tr><td>'+x.job_id+'</td><td>'+esc((x.command||'').substring(0,30))+'</td><td>'+badge(sl)+'</td><td>'+(x.exit_code!=null?x.exit_code:'—')+'</td></tr>'});h+='</table>'}document.getElementById('jobs').innerHTML=h}
+var rb=await api('/api/candidates');
+if(rb){var fb=rb.file_bios||[],cb=rb.candidates||[];document.getElementById('bios-count').textContent=fb.length+' bios';if(!fb.length&&!cb.length){document.getElementById('rev-bios').innerHTML=badge('GRAY_NO_DATA')+' No candidates'}
+else{var h=badge('GREEN_REAL')+' '+fb.length+' file bios, '+cb.length+' JSON candidates';fb.slice(0,6).forEach(function(b){h+='<div class="bio-card"><div class="bio-name">'+esc(b.name||b.bio_id||'?')+'</div>';if(b.preview)h+='<pre class="bio-preview">'+esc(b.preview.substring(0,200))+(b.preview.length>200?'…':'')+'</pre>';h+='</div>'});document.getElementById('rev-bios').innerHTML=h}}
+var re=await api('/api/experiments/current');
+if(re){var exps=re.experiments||[];if(!exps.length)document.getElementById('rev-exp').innerHTML=badge('GRAY_NO_DATA')+' No active experiment';
+else{var exp=exps[0];document.getElementById('rev-exp').innerHTML=badge(exp.status==='running'?'YELLOW_RUNNING':'GREEN_REAL')+' <b>'+(exp.experiment_id||exp.bio_id||'—')+'</b><div class="mr"><span class="ml">Status</span><span class="mv">'+(exp.status||'—')+'</span></div><div class="mr"><span class="ml">Bio</span><span class="mv">'+(exp.bio_id||'—')+'</span></div>'}}
+var ri=await api('/api/content?type=interview');
+if(ri){if(ri.status==='GRAY_NO_DATA'||!(ri.content||[]).length){document.getElementById('rev-interview').innerHTML=badge('GRAY_NO_DATA')+' No variants';document.getElementById('interview-count').textContent='0'}
+else{document.getElementById('interview-count').textContent=ri.count||0;var h=badge('GREEN_REAL')+' '+ri.count+' variants<table style="margin-top:6px"><tr><th>ID</th><th>Label</th></tr>';(ri.content||[]).slice(0,5).forEach(function(x){h+='<tr><td>'+x.id+'</td><td>'+esc(x.label||'—')+'</td></tr>'});h+='</table>';document.getElementById('rev-interview').innerHTML=h}}
+var rbl=await api('/api/content?type=blog');
+if(rbl){if(rbl.status==='GRAY_NO_DATA'||!(rbl.content||[]).length){document.getElementById('rev-blog').innerHTML=badge('GRAY_NO_DATA')+' No variants';document.getElementById('blog-count').textContent='0'}
+else{document.getElementById('blog-count').textContent=rbl.count||0;var h=badge('GREEN_REAL')+' '+rbl.count+' variants<table style="margin-top:6px"><tr><th>ID</th><th>Label</th></tr>';(rbl.content||[]).slice(0,5).forEach(function(x){h+='<tr><td>'+x.id+'</td><td>'+esc(x.label||'—')+'</td></tr>'});h+='</table>';document.getElementById('rev-blog').innerHTML=h}}
+var rr=await api('/api/receipts/latest');
+if(rr){if(!rr.receipt){document.getElementById('rev-receipts').innerHTML=badge('GRAY_NO_DATA')+' No receipts';document.getElementById('receipts-count').textContent='0'}
+else{var r=rr.receipt;document.getElementById('receipts-count').textContent='1';document.getElementById('rev-receipts').innerHTML=badge('GREEN_REAL')+' <span style="font-size:10px;color:var(--dim);font-family:var(--mono)">'+(r.hash?r.hash.slice(0,20):'—')+'</span><div class="mr"><span class="ml">Action</span><span class="mv">'+(r.action||'—')+'</span></div><div class="mr"><span class="ml">Time</span><span class="mv">'+(r.created_at||'').slice(0,19)+'</span></div>'}}
+}
+
+// ─── Health ───
+async function loadHealth(){
+var h=await api('/api/health');
+if(h){var html=badge('GREEN_REAL')+' <b>'+(h.service||'RM-OS')+'</b>';html+='<div class="mr"><span class="ml">Status</span><span class="mv">'+h.status+'</span></div>';html+='<div class="mr"><span class="ml">Time</span><span class="mv">'+(h.timestamp||'').slice(0,19)+'</span></div>';html+='<div class="mr"><span class="ml">Mode</span><span class="mv" style="font-size:11px">'+esc(h.mode||'—')+'</span></div>';document.getElementById('health-panel').innerHTML=html;
+var epHtml='<div class="ep-list">';(h.endpoints||[]).forEach(function(e){var parts=e.split(/\s+/);epHtml+='<span class="ep-item"><span class="method">'+(parts[0]||'GET')+'</span>'+(parts[1]||e)+'</span>'});epHtml+='</div>';document.getElementById('endpoints-panel').innerHTML=epHtml;document.getElementById('ep-count').textContent=(h.endpoints||[]).length+' endpoints'}
+var fs=await api('/api/files/stats');
+if(fs&&fs.status==='GREEN_REAL'){document.getElementById('fi-health').innerHTML=badge('GREEN_REAL')+' <b>'+fs.total_files+' files</b><div class="mr"><span class="ml">Size</span><span class="mv">'+fmtSize(fs.total_bytes||0)+'</span></div><div class="mr"><span class="ml">Types</span><span class="mv">'+(fs.extensions||[]).length+'</span></div><div class="mr"><span class="ml">Last run</span><span class="mv">'+(fs.last_run?fmtDate(fs.last_run.finished_at):'—')+'</span></div>'}
+else{document.getElementById('fi-health').innerHTML=badge('GRAY_NO_DATA')+' No DB'}
+}
+
+// ─── Init ───
+fiLoadStats().then(function(){fiSearch()}).catch(function(e){document.getElementById('status').textContent='Error: '+e.message});
+</script>
+</body>
+</html>
+
+```
+
+style.css:
+```
+:root {
+  --bg: #0a0a0c;
+  --panel: #111114;
+  --border: #1e1e24;
+  --orange: #ff6b1a;
+  --green: #00ff88;
+  --red: #ff3344;
+  --text: #e0e0e4;
+  --dim: #6a6a72;
+  --mono: 'SF Mono', 'Monaco', monospace;
+  --sans: system-ui, sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+}
+
+header {
+  padding: 20px 30px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+h1 {
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--orange);
+}
+
+.status {
+  color: var(--dim);
+  font-family: var(--mono);
+}
+
+main {
+  padding: 24px 30px;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.stat {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.stat span {
+  display: block;
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--orange);
+  margin-bottom: 4px;
+}
+
+.stat label {
+  color: var(--dim);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+}
+
+.controls {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.controls input {
+  flex: 1;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-family: var(--sans);
+}
+
+.controls input:focus {
+  outline: none;
+  border-color: var(--orange);
+}
+
+button {
+  background: var(--orange);
+  color: #000;
+  border: none;
+  padding: 10px 18px;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: transparent;
+  color: var(--orange);
+  border: 1px solid var(--orange);
+}
+
+.ext-cloud {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.ext-tag {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  border-radius: 12px;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.ext-tag:hover {
+  border-color: var(--orange);
+  color: var(--orange);
+}
+
+.results {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th, td {
+  text-align: left;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+th {
+  color: var(--dim);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  font-weight: 500;
+}
+
+td.mono {
+  font-family: var(--mono);
+}
+
+td.num {
+  font-family: var(--mono);
+  text-align: right;
+  white-space: nowrap;
+}
+
+td.path {
+  max-width: 400px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.empty {
+  color: var(--dim);
+  text-align: center;
+  padding: 40px;
+}
+
+@media (max-width: 900px) {
+  .stats { grid-template-columns: 1fr; }
+  .controls { flex-direction: column; }
+}
+
+```
+
+engagement.log:
+```
+2026-07-02 18:04:53,090 [INFO] │  DB initialized at /Users/alep/Downloads/windsurf-smoke/rm_traffic/engagement.db
+2026-07-02 18:04:53,090 [INFO] │  === Engagement Engine — single cycle ===
+2026-07-02 18:04:53,090 [INFO] │  Logging in as karpathianwolf...
+2026-07-02 18:04:53,090 [INFO] │  Loaded saved session cookies
+2026-07-02 18:04:53,248 [INFO] │  Saved session expired, trying login
+2026-07-02 18:04:55,538 [INFO] │  Login OK as karpathianwolf
+2026-07-02 18:04:55,538 [INFO] │  API login OK
+2026-07-02 18:04:56,930 [INFO] │  Browser started (profile: /tmp/rm_engagement_chrome, dry_run: True)
+2026-07-02 18:04:56,932 [INFO] │  Logging in as karpathianwolf...
+2026-07-02 18:05:10,023 [INFO] │  Login successful. URL: https://rentmasseur.com/
+2026-07-02 18:05:10,023 [INFO] │  ┌─────────────────────────────────────────────┐
+2026-07-02 18:05:10,023 [INFO] │  │  Engagement Cycle #1 (DRY-RUN)
+2026-07-02 18:05:10,023 [INFO] │  ├─────────────────────────────────────────────┤
+2026-07-02 18:05:13,854 [INFO] │  Scraping 'Who Saw Me' page...
+2026-07-02 18:05:26,201 [INFO] │  Found 13 visitors from Who Saw Me page
+2026-07-02 18:05:26,213 [INFO] │  Visitors: 13 total, 13 new
+2026-07-02 18:05:26,223 [INFO] │  Visiting 13 profiles reciprocally...
+2026-07-02 18:05:26,223 [INFO] │  [DRY-RUN] Would visit profile: topics
+2026-07-02 18:05:28,227 [INFO] │  [DRY-RUN] Would visit profile: darrellsbody
+2026-07-02 18:05:30,233 [INFO] │  [DRY-RUN] Would visit profile: Will_Xavier
+2026-07-02 18:05:32,239 [INFO] │  [DRY-RUN] Would visit profile: Samgl
+2026-07-02 18:05:34,245 [INFO] │  [DRY-RUN] Would visit profile: RodrigoDiPietro
+2026-07-02 18:05:36,248 [INFO] │  [DRY-RUN] Would visit profile: LucasVentura
+2026-07-02 18:05:38,251 [INFO] │  [DRY-RUN] Would visit profile: JacobAA
+2026-07-02 18:05:40,258 [INFO] │  [DRY-RUN] Would visit profile: GoodVibesGuy
+2026-07-02 18:05:42,264 [INFO] │  [DRY-RUN] Would visit profile: Fredericodedeus
+2026-07-02 18:05:44,271 [INFO] │  [DRY-RUN] Would visit profile: ExclusiveTouch
+2026-07-02 18:05:46,277 [INFO] │  [DRY-RUN] Would visit profile: BullLatin
+2026-07-02 18:05:48,283 [INFO] │  [DRY-RUN] Would visit profile: BodyworkBro
+2026-07-02 18:05:50,289 [INFO] │  [DRY-RUN] Would visit profile: AngelStrong
+2026-07-02 18:05:52,295 [INFO] │  Reciprocal visits: 13 success, 0 errors
+2026-07-02 18:05:52,674 [INFO] │  Search manhattan-ny page 1: found 23 profiles
+2026-07-02 18:05:55,048 [INFO] │  Search manhattan-ny page 2: found 47 profiles
+2026-07-02 18:05:57,051 [INFO] │  Found 47 profiles in manhattan-ny
+2026-07-02 18:05:57,378 [INFO] │  Search brooklyn-ny page 1: found 1 profiles
+2026-07-02 18:05:59,694 [INFO] │  Search brooklyn-ny page 2: found 1 profiles
+2026-07-02 18:06:01,698 [INFO] │  Found 1 profiles in brooklyn-ny
+2026-07-02 18:06:02,092 [INFO] │  Search queens-ny page 1: found 1 profiles
+2026-07-02 18:06:04,549 [INFO] │  Search queens-ny page 2: found 1 profiles
+2026-07-02 18:06:06,552 [INFO] │  Found 1 profiles in queens-ny
+2026-07-02 18:06:06,920 [INFO] │  Search bronx-ny page 1: found 23 profiles
+2026-07-02 18:06:09,294 [INFO] │  Search bronx-ny page 2: found 47 profiles
+2026-07-02 18:06:11,297 [INFO] │  Found 47 profiles in bronx-ny
+2026-07-02 18:06:11,606 [INFO] │  Search staten-island-ny page 1: found 1 profiles
+2026-07-02 18:06:13,933 [INFO] │  Search staten-island-ny page 2: found 1 profiles
+2026-07-02 18:06:15,938 [INFO] │  Found 1 profiles in staten-island-ny
+2026-07-02 18:06:16,251 [INFO] │  Search long-island-ny page 1: found 1 profiles
+2026-07-02 18:06:18,581 [INFO] │  Search long-island-ny page 2: found 1 profiles
+2026-07-02 18:06:20,582 [INFO] │  Found 1 profiles in long-island-ny
+2026-07-02 18:06:20,880 [INFO] │  Search westchester-ny page 1: found 1 profiles
+2026-07-02 18:06:21,997 [INFO] │  Shutdown signal received
+2026-07-02 18:06:23,230 [INFO] │  Search westchester-ny page 2: found 1 profiles
+2026-07-02 18:06:25,232 [INFO] │  Found 1 profiles in westchester-ny
+2026-07-02 18:06:25,232 [INFO] │  Visiting 50 NY search profiles...
+2026-07-02 18:06:25,232 [INFO] │  [DRY-RUN] Would visit profile: BuffStallion
+2026-07-02 18:06:27,238 [INFO] │  [DRY-RUN] Would visit profile: HOLLYHOODONLYGEN
+2026-07-02 18:06:29,245 [INFO] │  [DRY-RUN] Would visit profile: Yogi_Ray
+2026-07-02 18:06:31,247 [INFO] │  [DRY-RUN] Would visit profile: DannyJay
+2026-07-02 18:06:33,252 [INFO] │  [DRY-RUN] Would visit profile: COCOTAZO
+2026-07-02 18:06:35,255 [INFO] │  [DRY-RUN] Would visit profile: ItalianAlpha
+2026-07-02 18:06:37,258 [INFO] │  [DRY-RUN] Would visit profile: Angelcolombiano
+2026-07-02 18:06:39,264 [INFO] │  [DRY-RUN] Would visit profile: loganmagichands
+2026-07-02 18:06:41,270 [INFO] │  [DRY-RUN] Would visit profile: AndresNYC
+2026-07-02 18:06:43,273 [INFO] │  [DRY-RUN] Would visit profile: Cristopherbu
+2026-07-02 18:06:45,277 [INFO] │  [DRY-RUN] Would visit profile: Mascnyctop
+2026-07-02 18:06:47,281 [INFO] │  [DRY-RUN] Would visit profile: Davidmills
+2026-07-02 18:06:49,284 [INFO] │  [DRY-RUN] Would visit profile: Wolfnew
+2026-07-02 18:06:51,289 [INFO] │  [DRY-RUN] Would visit profile: Billymonterohot
+2026-07-02 18:06:53,293 [INFO] │  [DRY-RUN] Would visit profile: nicolatinomasseu
+2026-07-02 18:06:55,297 [INFO] │  [DRY-RUN] Would visit profile: HotHandsNYC
+2026-07-02 18:06:57,301 [INFO] │  [DRY-RUN] Would visit profile: Pattersonxxx
+2026-07-02 18:06:59,308 [INFO] │  [DRY-RUN] Would visit profile: NakedHands
+2026-07-02 18:07:01,314 [INFO] │  [DRY-RUN] Would visit profile: BIGMANMASSAGE
+2026-07-02 18:07:03,317 [INFO] │  [DRY-RUN] Would visit profile: SportsMassageNYC
+2026-07-02 18:07:05,321 [INFO] │  [DRY-RUN] Would visit profile: SirIvan
+2026-07-02 18:07:07,328 [INFO] │  [DRY-RUN] Would visit profile: NatesXscape
+2026-07-02 18:07:09,334 [INFO] │  [DRY-RUN] Would visit profile: Arjun
+2026-07-02 18:07:11,339 [INFO] │  [DRY-RUN] Would visit profile: DavisTopBrazil
+2026-07-02 18:07:13,345 [INFO] │  [DRY-RUN] Would visit profile: RelaxwithDaddy
+2026-07-02 18:07:15,347 [INFO] │  [DRY-RUN] Would visit profile: AnthonyNYC
+2026-07-02 18:07:17,354 [INFO] │  [DRY-RUN] Would visit profile: Faraon
+2026-07-02 18:07:19,359 [INFO] │  [DRY-RUN] Would visit profile: joneslatinhot
+2026-07-02 18:07:21,360 [INFO] │  [DRY-RUN] Would visit profile: ItalianHeat
+2026-07-02 18:07:23,367 [INFO] │  [DRY-RUN] Would visit profile: MarlonNY
+2026-07-02 18:07:25,372 [INFO] │  [DRY-RUN] Would visit profile: ColombiaMarco
+2026-07-02 18:07:27,377 [INFO] │  [DRY-RUN] Would visit profile: RelaxwithNick
+2026-07-02 18:07:29,383 [INFO] │  [DRY-RUN] Would visit profile: Henrynyc
+2026-07-02 18:07:31,388 [INFO] │  [DRY-RUN] Would visit profile: JaysonJJ
+2026-07-02 18:07:33,395 [INFO] │  [DRY-RUN] Would visit profile: Toony
+2026-07-02 18:07:35,397 [INFO] │  [DRY-RUN] Would visit profile: DeepTantricman
+2026-07-02 18:07:37,401 [INFO] │  [DRY-RUN] Would visit profile: SantiagoNYC
+2026-07-02 18:07:39,407 [INFO] │  [DRY-RUN] Would visit profile: relaxing_touch
+2026-07-02 18:07:41,410 [INFO] │  [DRY-RUN] Would visit profile: TRANscendentTuch
+2026-07-02 18:07:43,413 [INFO] │  [DRY-RUN] Would visit profile: FirmTouch
+2026-07-02 18:07:45,417 [INFO] │  [DRY-RUN] Would visit profile: VLADTVEE
+2026-07-02 18:07:47,423 [INFO] │  [DRY-RUN] Would visit profile: cleancuttalented
+2026-07-02 18:07:49,424 [INFO] │  [DRY-RUN] Would visit profile: Geofabrazio
+2026-07-02 18:07:51,430 [INFO] │  [DRY-RUN] Would visit profile: Klaus
+2026-07-02 18:07:53,436 [INFO] │  [DRY-RUN] Would visit profile: Slowstrokes
+2026-07-02 18:07:55,439 [INFO] │  [DRY-RUN] Would visit profile: samwilliamsam
+2026-07-02 18:07:57,445 [INFO] │  [DRY-RUN] Would visit profile: YULIAN
+2026-07-02 18:07:59,452 [INFO] │  [DRY-RUN] Would visit profile: Southernjock
+2026-07-02 18:08:01,457 [INFO] │  [DRY-RUN] Would visit profile: Jake_NYC
+2026-07-02 18:08:03,458 [INFO] │  [DRY-RUN] Would visit profile: Alexxsanz
+2026-07-02 18:08:05,460 [INFO] │  NY search visits: 50 success, 0 errors
+2026-07-02 18:08:05,462 [INFO] │  Messaging 13 visitors...
+2026-07-02 18:08:05,462 [INFO] │  Generating with groq/llama-3.1-8b-instant
+2026-07-02 18:08:05,611 [ERROR] │  Groq error: 400 {"error":{"message":"Organization has been restricted. Please reach out to support if you believe this was in error.","type":"invalid_request_error","code":"organization_restricted"}}
+
+2026-07-02 18:08:05,611 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:05,611 [INFO] │  Generating with openrouter/meta-llama/llama-3.1-8b-instruct
+2026-07-02 18:08:05,736 [ERROR] │  OpenRouter error: 401 {"error":{"message":"User not found.","code":401}}
+2026-07-02 18:08:05,736 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:05,736 [ERROR] │  All LLM providers failed
+2026-07-02 18:08:05,736 [WARNING] │  LLM generation failed, using template for topics
+2026-07-02 18:08:05,736 [INFO] │  Sending message to topics: 'Thanks for visiting my profile!'
+2026-07-02 18:08:05,736 [INFO] │  [DRY-RUN] Would message topics: subject='Thanks for visiting my profile!'
+2026-07-02 18:08:11,738 [INFO] │  Generating with groq/llama-3.1-8b-instant
+2026-07-02 18:08:11,806 [ERROR] │  Groq error: 400 {"error":{"message":"Organization has been restricted. Please reach out to support if you believe this was in error.","type":"invalid_request_error","code":"organization_restricted"}}
+
+2026-07-02 18:08:11,806 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:11,806 [INFO] │  Generating with openrouter/meta-llama/llama-3.1-8b-instruct
+2026-07-02 18:08:11,863 [ERROR] │  OpenRouter error: 401 {"error":{"message":"User not found.","code":401}}
+2026-07-02 18:08:11,863 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:11,864 [ERROR] │  All LLM providers failed
+2026-07-02 18:08:11,864 [WARNING] │  LLM generation failed, using template for darrellsbody
+2026-07-02 18:08:11,864 [INFO] │  Sending message to darrellsbody: 'Thanks for visiting my profile!'
+2026-07-02 18:08:11,864 [INFO] │  [DRY-RUN] Would message darrellsbody: subject='Thanks for visiting my profile!'
+2026-07-02 18:08:17,868 [INFO] │  Generating with groq/llama-3.1-8b-instant
+2026-07-02 18:08:17,968 [ERROR] │  Groq error: 400 {"error":{"message":"Organization has been restricted. Please reach out to support if you believe this was in error.","type":"invalid_request_error","code":"organization_restricted"}}
+
+2026-07-02 18:08:17,968 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:17,968 [INFO] │  Generating with openrouter/meta-llama/llama-3.1-8b-instruct
+2026-07-02 18:08:18,016 [ERROR] │  OpenRouter error: 401 {"error":{"message":"User not found.","code":401}}
+2026-07-02 18:08:18,016 [INFO] │  LLM response in 0.0s
+2026-07-02 18:08:18,016 [ERROR] │  All LLM providers failed
+2026-07-02 18:08:18,016 [WARNING] │  LLM generation failed, using template for Will_Xavier
+2026-07-02 18:08:18,016 [INFO] │  Sending message to Will_Xavier: 'Thanks for visiting my profile!'
+2026-07-02 18:08:18,016 [INFO] │  [DRY-RUN] Would message Will_Xavier: subject='Thanks for visiting my profile!'
+2026-07-02 18:08:24,023 [INFO] │  Generating with groq/llama-3.1-8b-instant
+2026-07-02 18:08:24,084 [ERROR] │  Groq error: 400 {"error":{"message":"Organization has been restricted. Please reach out to support if you believe this was in error.","type":"invalid_request_error","code":"organization_restricted"}}
+
+2026-07-02 18:08:24,084 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:24,084 [INFO] │  Generating with openrouter/meta-llama/llama-3.1-8b-instruct
+2026-07-02 18:08:24,172 [ERROR] │  OpenRouter error: 401 {"error":{"message":"User not found.","code":401}}
+2026-07-02 18:08:24,172 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:24,172 [ERROR] │  All LLM providers failed
+2026-07-02 18:08:24,172 [WARNING] │  LLM generation failed, using template for Samgl
+2026-07-02 18:08:24,172 [INFO] │  Sending message to Samgl: 'Thanks for visiting my profile!'
+2026-07-02 18:08:24,172 [INFO] │  [DRY-RUN] Would message Samgl: subject='Thanks for visiting my profile!'
+2026-07-02 18:08:30,177 [INFO] │  Generating with groq/llama-3.1-8b-instant
+2026-07-02 18:08:30,246 [ERROR] │  Groq error: 400 {"error":{"message":"Organization has been restricted. Please reach out to support if you believe this was in error.","type":"invalid_request_error","code":"organization_restricted"}}
+
+2026-07-02 18:08:30,246 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:30,246 [INFO] │  Generating with openrouter/meta-llama/llama-3.1-8b-instruct
+2026-07-02 18:08:30,290 [ERROR] │  OpenRouter error: 401 {"error":{"message":"User not found.","code":401}}
+2026-07-02 18:08:30,290 [INFO] │  LLM response in 0.0s
+2026-07-02 18:08:30,290 [ERROR] │  All LLM providers failed
+2026-07-02 18:08:30,290 [WARNING] │  LLM generation failed, using template for RodrigoDiPietro
+2026-07-02 18:08:30,290 [INFO] │  Sending message to RodrigoDiPietro: 'Thanks for visiting my profile!'
+2026-07-02 18:08:30,290 [INFO] │  [DRY-RUN] Would message RodrigoDiPietro: subject='Thanks for visiting my profile!'
+2026-07-02 18:08:36,297 [INFO] │  Generating with groq/llama-3.1-8b-instant
+2026-07-02 18:08:36,362 [ERROR] │  Groq error: 400 {"error":{"message":"Organization has been restricted. Please reach out to support if you believe this was in error.","type":"invalid_request_error","code":"organization_restricted"}}
+
+2026-07-02 18:08:36,362 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:36,362 [INFO] │  Generating with openrouter/meta-llama/llama-3.1-8b-instruct
+2026-07-02 18:08:36,410 [ERROR] │  OpenRouter error: 401 {"error":{"message":"User not found.","code":401}}
+2026-07-02 18:08:36,410 [INFO] │  LLM response in 0.0s
+2026-07-02 18:08:36,410 [ERROR] │  All LLM providers failed
+2026-07-02 18:08:36,410 [WARNING] │  LLM generation failed, using template for LucasVentura
+2026-07-02 18:08:36,410 [INFO] │  Sending message to LucasVentura: 'Thanks for visiting my profile!'
+2026-07-02 18:08:36,410 [INFO] │  [DRY-RUN] Would message LucasVentura: subject='Thanks for visiting my profile!'
+2026-07-02 18:08:42,414 [INFO] │  Generating with groq/llama-3.1-8b-instant
+2026-07-02 18:08:42,490 [ERROR] │  Groq error: 400 {"error":{"message":"Organization has been restricted. Please reach out to support if you believe this was in error.","type":"invalid_request_error","code":"organization_restricted"}}
+
+2026-07-02 18:08:42,490 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:42,491 [INFO] │  Generating with openrouter/meta-llama/llama-3.1-8b-instruct
+2026-07-02 18:08:42,539 [ERROR] │  OpenRouter error: 401 {"error":{"message":"User not found.","code":401}}
+2026-07-02 18:08:42,539 [INFO] │  LLM response in 0.0s
+2026-07-02 18:08:42,539 [ERROR] │  All LLM providers failed
+2026-07-02 18:08:42,539 [WARNING] │  LLM generation failed, using template for JacobAA
+2026-07-02 18:08:42,539 [INFO] │  Sending message to JacobAA: 'Thanks for visiting my profile!'
+2026-07-02 18:08:42,539 [INFO] │  [DRY-RUN] Would message JacobAA: subject='Thanks for visiting my profile!'
+2026-07-02 18:08:48,547 [INFO] │  Generating with groq/llama-3.1-8b-instant
+2026-07-02 18:08:48,617 [ERROR] │  Groq error: 400 {"error":{"message":"Organization has been restricted. Please reach out to support if you believe this was in error.","type":"invalid_request_error","code":"organization_restricted"}}
+
+2026-07-02 18:08:48,617 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:48,618 [INFO] │  Generating with openrouter/meta-llama/llama-3.1-8b-instruct
+2026-07-02 18:08:48,668 [ERROR] │  OpenRouter error: 401 {"error":{"message":"User not found.","code":401}}
+2026-07-02 18:08:48,669 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:48,669 [ERROR] │  All LLM providers failed
+2026-07-02 18:08:48,669 [WARNING] │  LLM generation failed, using template for GoodVibesGuy
+2026-07-02 18:08:48,669 [INFO] │  Sending message to GoodVibesGuy: 'Thanks for visiting my profile!'
+2026-07-02 18:08:48,669 [INFO] │  [DRY-RUN] Would message GoodVibesGuy: subject='Thanks for visiting my profile!'
+2026-07-02 18:08:54,672 [INFO] │  Generating with groq/llama-3.1-8b-instant
+2026-07-02 18:08:54,747 [ERROR] │  Groq error: 400 {"error":{"message":"Organization has been restricted. Please reach out to support if you believe this was in error.","type":"invalid_request_error","code":"organization_restricted"}}
+
+2026-07-02 18:08:54,747 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:54,747 [INFO] │  Generating with openrouter/meta-llama/llama-3.1-8b-instruct
+2026-07-02 18:08:54,799 [ERROR] │  OpenRouter error: 401 {"error":{"message":"User not found.","code":401}}
+2026-07-02 18:08:54,799 [INFO] │  LLM response in 0.1s
+2026-07-02 18:08:54,799 [ERROR] │  All LLM providers failed
+2026-07-02 18:08:54,799 [WARNING] │  LLM generation failed, using template for Fredericodedeus
