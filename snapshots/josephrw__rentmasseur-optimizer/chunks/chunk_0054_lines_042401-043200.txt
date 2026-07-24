@@ -1,800 +1,800 @@
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-    conn = _db()
-    rows = conn.execute(
-        "SELECT * FROM daily_metrics WHERE tenant_id=? AND date>=? ORDER BY date ASC",
-        (tenant_id, cutoff)
-    ).fetchall()
-    conn.close()
-    if not rows:
-        return {}
-    n = len(rows)
-    return {
-        "avg_views": sum(r["views"] for r in rows) / n,
-        "avg_contacts": sum(r["contact_clicks"] for r in rows) / n,
-        "avg_emails": sum(r["emails_count"] for r in rows) / n,
-        "avg_booking_emails": sum(r["booking_emails"] for r in rows) / n,
-        "avg_ctr": sum(r["ctr"] for r in rows) / n,
-        "avg_ces": sum(r["client_engagement_score"] for r in rows) / n,
-        "search_rank": rows[-1]["search_rank"],
-        "days": n,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Action Attribution
-# ---------------------------------------------------------------------------
-
-def log_action(tenant_id: str, cycle_num: int, action_name: str, category: str,
-               executed: bool, detail: str = "",
-               metric_before: Dict = None, metric_after: Dict = None) -> None:
-    ts = datetime.now(timezone.utc).isoformat()
-    mb = metric_before or {}
-    ma = metric_after or {}
-    v_delta = ma.get("views", 0) - mb.get("views", 0)
-    c_delta = ma.get("contacts", 0) - mb.get("contacts", 0)
-    e_delta = ma.get("emails", 0) - mb.get("emails", 0)
-    score = float(v_delta + c_delta * 2 + e_delta * 3) if executed else 0.0
-
-    conn = _db()
-    conn.execute(
-        """INSERT INTO action_log
-           (tenant_id, ts, cycle_num, action_name, category, executed, detail,
-            views_delta, contacts_delta, emails_delta, attributed_score)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (tenant_id, ts, cycle_num, action_name, category, int(executed),
-         detail[:200], v_delta, c_delta, e_delta, score)
-    )
-    conn.execute(
-        """INSERT INTO attribution_matrix (tenant_id, action_name, total_runs,
-           total_views_delta, total_contacts_delta, total_emails_delta,
-           avg_attributed_score, last_run_ts)
-           VALUES (?, ?, 1, ?, ?, ?, ?, ?)
-           ON CONFLICT(tenant_id, action_name) DO UPDATE SET
-           total_runs=total_runs+1,
-           total_views_delta=total_views_delta+excluded.total_views_delta,
-           total_contacts_delta=total_contacts_delta+excluded.total_contacts_delta,
-           total_emails_delta=total_emails_delta+excluded.total_emails_delta,
-           avg_attributed_score=(avg_attributed_score * (total_runs-1) + excluded.avg_attributed_score) / total_runs,
-           last_run_ts=excluded.last_run_ts""",
-        (tenant_id, action_name, v_delta, c_delta, e_delta, score, ts)
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_attribution_matrix(tenant_id: str) -> List[Dict]:
-    conn = _db()
-    rows = conn.execute(
-        "SELECT * FROM attribution_matrix WHERE tenant_id=? ORDER BY avg_attributed_score DESC",
-        (tenant_id,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# ROI Report + Pricing Calculation
-# ---------------------------------------------------------------------------
-
-def _pct_delta(baseline: float, current: float) -> float:
-    if baseline == 0:
-        return 100.0 if current > 0 else 0.0
-    return ((current - baseline) / baseline) * 100.0
-
-
-def generate_roi_report(tenant_id: str) -> Dict:
-    """Generate a full ROI report with pricing calculation."""
-    tenant = get_tenant(tenant_id)
-    if not tenant:
-        return {"error": "tenant not found"}
-
-    baseline = get_baseline_metrics(tenant_id)
-    current = get_current_metrics(tenant_id)
-
-    if not baseline:
-        return {"error": "baseline not captured", "tenant_id": tenant_id}
-    if not current:
-        return {"error": "no current metrics", "tenant_id": tenant_id}
-
-    views_pct = _pct_delta(baseline["avg_views"], current["avg_views"])
-    contacts_pct = _pct_delta(baseline["avg_contacts"], current["avg_contacts"])
-    emails_pct = _pct_delta(baseline["avg_emails"], current["avg_emails"])
-    bookings_pct = _pct_delta(baseline["avg_booking_emails"], current["avg_booking_emails"])
-    ces_pct = _pct_delta(baseline["avg_ces"], current["avg_ces"])
-
-    rank_base = baseline.get("search_rank", 0)
-    rank_curr = current.get("search_rank", 0)
-    rank_improvement = (rank_base - rank_curr) if rank_base and rank_curr else 0
-
-    avg_rate = tenant.get("avg_session_rate", 234.0)
-
-    # Estimated additional bookings from improvement
-    baseline_booking_rate_pct = baseline["avg_booking_emails"] / max(baseline["avg_views"], 1) * 100
-    current_booking_rate_pct = current["avg_booking_emails"] / max(current["avg_views"], 1) * 100
-    additional_bookings = max(0.0, (current_booking_rate_pct - baseline_booking_rate_pct) / 100 * current["avg_views"] * 4.3)
-    additional_revenue = additional_bookings * avg_rate
-
-    # Pricing
-    performance_cut = additional_revenue * COMMISSION_RATE
-    overall_improvement = (views_pct + contacts_pct + emails_pct + bookings_pct) / 4
-    guarantee_triggered = overall_improvement < (IMPROVEMENT_GUARANTEE_THRESHOLD * 100)
-    base_fee_charged = 0.0 if guarantee_triggered else BASE_FEE_MONTHLY
-    monthly_charge = base_fee_charged + performance_cut
-
-    report = {
-        "tenant_id": tenant_id,
-        "tenant_name": tenant.get("display_name") or tenant.get("username"),
-        "period_start": (datetime.now(timezone.utc) - timedelta(days=MEASUREMENT_WINDOW_DAYS)).strftime("%Y-%m-%d"),
-        "period_end": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "baseline": {k: round(v, 2) for k, v in baseline.items()},
-        "current": {k: round(v, 2) for k, v in current.items()},
-        "improvement": {
-            "views_pct": round(views_pct, 1),
-            "contacts_pct": round(contacts_pct, 1),
-            "emails_pct": round(emails_pct, 1),
-            "bookings_pct": round(bookings_pct, 1),
-            "ces_pct": round(ces_pct, 1),
-            "rank_improvement": rank_improvement,
-            "overall_pct": round(overall_improvement, 1),
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Referer": "https://rentmasseur.com/login",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
         },
-        "pricing": {
-            "base_fee": BASE_FEE_MONTHLY,
-            "base_fee_charged": round(base_fee_charged, 2),
-            "performance_cut": round(performance_cut, 2),
-            "monthly_charge": round(monthly_charge, 2),
-            "guarantee_triggered": guarantee_triggered,
-            "guarantee_threshold_pct": IMPROVEMENT_GUARANTEE_THRESHOLD * 100,
-            "additional_bookings_estimated": round(additional_bookings, 1),
-            "additional_revenue_estimated": round(additional_revenue, 2),
-            "avg_session_rate": avg_rate,
-            "commission_rate": COMMISSION_RATE,
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-1FR21VXTHW&cid=1723937670.1782416143&gtm=45je66o0v9104235959z89104233521za20gzb9104233521zd9104233521&rcb=16&aip=1&dma=0&gcd=13l3l3l3l1l1&npa=0&frm=0&tag_exp=115938465~115938469~119027224~119576891~119576895",
+        "full_url": "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-1FR21VXTHW&cid=1723937670.1782416143&gtm=45je66o0v9104235959z89104233521za20gzb9104233521zd9104233521&rcb=16&aip=1&dma=0&gcd=13l3l3l3l1l1&npa=0&frm=0&tag_exp=115938465~115938469~119027224~119576891~119576895",
+        "request_body": null,
+        "request_headers": {
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
         },
-        "attribution": get_attribution_matrix(tenant_id),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    # Persist report
-    conn = _db()
-    conn.execute(
-        """INSERT INTO roi_reports
-           (tenant_id, period_start, period_end,
-            baseline_views_avg, current_views_avg, views_improvement_pct,
-            baseline_contacts_avg, current_contacts_avg, contacts_improvement_pct,
-            baseline_emails_avg, current_emails_avg, emails_improvement_pct,
-            baseline_booking_emails_avg, current_booking_emails_avg, booking_improvement_pct,
-            baseline_rank, current_rank, rank_improvement,
-            baseline_ces, current_ces, ces_improvement_pct,
-            estimated_additional_bookings, estimated_additional_revenue,
-            monthly_charge, base_fee_charged, performance_cut_charged,
-            guarantee_triggered, report_json, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (tenant_id, report["period_start"], report["period_end"],
-         baseline["avg_views"], current["avg_views"], views_pct,
-         baseline["avg_contacts"], current["avg_contacts"], contacts_pct,
-         baseline["avg_emails"], current["avg_emails"], emails_pct,
-         baseline["avg_booking_emails"], current["avg_booking_emails"], bookings_pct,
-         rank_base, rank_curr, rank_improvement,
-         baseline["avg_ces"], current["avg_ces"], ces_pct,
-         additional_bookings, additional_revenue,
-         monthly_charge, base_fee_charged, performance_cut,
-         int(guarantee_triggered), json.dumps(report, default=str),
-         report["created_at"])
-    )
-    conn.commit()
-    conn.close()
-
-    log.info("ROI report for %s: overall=%.1f%% charge=$%.2f guarantee=%s",
-             tenant_id, overall_improvement, monthly_charge, guarantee_triggered)
-    return report
-
-
-def get_latest_report(tenant_id: str) -> Optional[Dict]:
-    conn = _db()
-    row = conn.execute(
-        "SELECT * FROM roi_reports WHERE tenant_id=? ORDER BY id DESC LIMIT 1",
-        (tenant_id,)
-    ).fetchone()
-    conn.close()
-    if not row:
-        return None
-    try:
-        return json.loads(row["report_json"])
-    except Exception:
-        return dict(row)
-
-
-# ---------------------------------------------------------------------------
-# Action Priority Algorithm
-# ---------------------------------------------------------------------------
-
-def prioritize_actions(tenant_id: str) -> List[Dict]:
-    """
-    Rank actions by historical attribution score for this tenant.
-    Actions with proven metric impact get higher priority.
-    Falls back to default priority for new tenants.
-    """
-    matrix = get_attribution_matrix(tenant_id)
-    if matrix:
-        ranked = sorted(matrix, key=lambda x: x["avg_attributed_score"], reverse=True)
-        return [{"action": r["action_name"], "score": r["avg_attributed_score"],
-                 "runs": r["total_runs"]} for r in ranked[:6]]
-
-    # Default priority for new tenants (no history yet)
-    return [
-        {"action": "refresh_availability", "score": 0.0, "runs": 0},
-        {"action": "ensure_visible", "score": 0.0, "runs": 0},
-        {"action": "send_messages", "score": 0.0, "runs": 0},
-        {"action": "visit_profiles", "score": 0.0, "runs": 0},
-        {"action": "update_bio", "score": 0.0, "runs": 0},
-        {"action": "check_search_rank", "score": 0.0, "runs": 0},
-    ]
-
-```
-
-stats_collector.py:
-```
-"""
-Stats Collector — traffic snapshots every cycle.
-
-Confirmed endpoints:
-    GET /api/v1/account/dashboard
-    GET /api/v1/account/dashboard/ad-statistics
-    GET /api/v1/account/keeponline
-    GET /api/v1/settings/about
-"""
-
-import logging
-
-from .db import write_receipt, write_traffic_snapshot
-from .api_client import RentMasseurAPI
-
-log = logging.getLogger("profileops.stats")
-
-
-def collect_snapshot(api: RentMasseurAPI) -> dict:
-    """Collect a single traffic snapshot and store it."""
-    dashboard = api.get_dashboard()
-    stats = api.get_ad_statistics()
-    keep = api.get_keeponline()
-    about = api.get_about()
-
-    prof_stats = stats.get("profileStatistics", {}) or {}
-    assets = about.get("userProps", {}).get("assets", {})
-    availability = dashboard.get("userSetting", {}).get("availability", {})
-
-    snapshot = {
-        "profile_views": prof_stats.get("totalPageViews"),
-        "contact_clicks": prof_stats.get("totalContactClicks"),
-        "new_visits": keep.get("newVisits"),
-        "new_emails": keep.get("newEmails"),
-        "is_hidden": int(bool(keep.get("isAdHidden", 0))),
-        "is_available": int(availability.get("available", 0)),
-        "availability_valid_to": availability.get("validTo"),
-        "headline": assets.get("headline"),
-        "description_len": len(assets.get("description", "")),
-    }
-
-    write_traffic_snapshot(snapshot)
-    write_receipt(
-        "traffic_snapshot_v1",
-        "collect_snapshot",
-        {},
-        snapshot,
-        verified=True,
-    )
-
-    log.info("Snapshot: views=%s contacts=%s visits=%s emails=%s hidden=%s",
-             snapshot["profile_views"], snapshot["contact_clicks"],
-             snapshot["new_visits"], snapshot["new_emails"], snapshot["is_hidden"])
-    return snapshot
-
-
-def calculate_conversion_rate(views: int, clicks: int) -> float:
-    if not views:
-        return 0.0
-    return round(clicks / views, 4)
-
-
-def compare_to_baseline(current: dict, baseline: dict) -> dict:
-    """Compare current snapshot to baseline and return deltas."""
-    if not baseline:
-        return {"delta_views": 0, "delta_clicks": 0, "delta_rate": 0.0}
-    return {
-        "delta_views": (current.get("profile_views") or 0) - (baseline.get("profile_views") or 0),
-        "delta_clicks": (current.get("contact_clicks") or 0) - (baseline.get("contact_clicks") or 0),
-        "baseline_rate": calculate_conversion_rate(
-            baseline.get("profile_views") or 0, baseline.get("contact_clicks") or 0
-        ),
-        "current_rate": calculate_conversion_rate(
-            current.get("profile_views") or 0, current.get("contact_clicks") or 0
-        ),
-    }
-
-```
-
-action_to_api.py:
-```
-"""
-Selenium Action → API Endpoint Capture
-
-Performs real actions on rentmasseur.com via Selenium, captures the exact
-API calls each action triggers, and outputs a clean API mapping:
-
-  action_name → method, url, headers, body, response
-
-This is the bridge: Selenium does the clicking, we capture the network traffic,
-and produce a callable API spec you can use without Selenium.
-"""
-
-import json
-import os
-import re
-import time
-import logging
-from datetime import datetime, timezone
-from pathlib import Path
-from collections import OrderedDict
-
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.common.exceptions import (
-    NoSuchElementException, StaleElementReferenceException, WebDriverException,
-)
-
-BASE_URL = "https://rentmasseur.com"
-USERNAME = "karpathianwolf"
-PASSWORD = os.environ.get("RM_PASSWORD", "")
-CHROME_PROFILE = "/tmp/rm_action_api"
-OUT = Path(__file__).parent
-CAPTURE_FILE = OUT / "action_api_map.json"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("action_api")
-
-# ---------------------------------------------------------------------------
-# CDP Network Capture — uses Performance Log + CDP to grab all requests
-# ---------------------------------------------------------------------------
-
-INTERCEPT_SCRIPT = r"""
-(function() {
-    window.__net = [];
-    const origFetch = window.fetch;
-    window.fetch = function(input, init) {
-        const url = typeof input === 'string' ? input : (input?.url || String(input));
-        const method = (init?.method) || (typeof input === 'object' ? input?.method : 'GET') || 'GET';
-        const body = init?.body || null;
-        const headers = {};
-        if (init?.headers) {
-            if (init.headers instanceof Headers) {
-                init.headers.forEach((v,k) => headers[k] = v);
-            } else {
-                Object.assign(headers, init.headers);
-            }
+        "response_status": 204,
+        "response_mime": "text/plain",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/login",
+        "full_url": "https://rentmasseur.com/api/v1/login",
+        "request_body": {
+          "email": "REDACTED",
+          "password": "[REDACTED]",
+          "csrf": "[REDACTED]",
+          "remember": 0
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/login",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/locations?withMasseurs=1",
+        "full_url": "https://rentmasseur.com/api/v1/locations?withMasseurs=1",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/webpush/init",
+        "full_url": "https://rentmasseur.com/api/v1/webpush/init",
+        "request_body": {
+          "type": "sw"
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/home/masseurs/today",
+        "full_url": "https://rentmasseur.com/api/v1/home/masseurs/today",
+        "request_body": {
+          "lat": 0,
+          "lng": 0,
+          "searchCity": "manhattan-ny"
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/account/dashboard",
+        "full_url": "https://rentmasseur.com/api/v1/account/dashboard",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Referer": "https://rentmasseur.com/settings",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "idRequired",
+            "banner",
+            "masseurOfTheDay",
+            "sponsor",
+            "featureInterview",
+            "userSetting",
+            "travels",
+            "profileStatistics",
+            "reviewUrl",
+            "service",
+            "twitter",
+            "onlineBookmarks"
+          ],
+          "sample": "{\"idRequired\": 0, \"banner\": null, \"masseurOfTheDay\": null, \"sponsor\": null, \"featureInterview\": {\"isCompleted\": 1, \"isPendingApproved\": 0, \"dates\": null}, \"userSetting\": {\"visibility\": 1, \"sms\": 1, \"availability\": {\"available\": 1, \"message\": \"Available\", \"validTo\": 17223}, \"trackActions\": 1}, \"travels\": [], \"profileStatistics\": null, \"reviewUrl\": \"https://rentmasseur.com/Karpathianwolf/submit-review/\", \"service\": {\"therapeutic\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Therapeutic\"}, \"sensual\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Sensual\"}, \"swedish\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Swedish\"}, \"hotStone\": {\"activated\": true, \"price\": {\"incall\": \"Ask\", \"outcall\": \"Ask\", \"currency\": \"US$\"}, \"label\": \"Hot Stone\"}, \"deepTissue\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Deep Tissue\"}}, \"twitter\": null, \"onlineBookmarks\": 2}"
         }
-        const entry = { type: 'fetch', url, method, body: body ? String(body).substring(0,3000) : null, headers, ts: Date.now() };
-        window.__net.push(entry);
-        return origFetch.apply(this, arguments).then(resp => {
-            entry.status = resp.status;
-            const clone = resp.clone();
-            clone.text().then(t => { entry.response = t.substring(0,5000); }).catch(()=>{});
-            return resp;
-        });
-    };
-    const origOpen = XMLHttpRequest.prototype.open;
-    const origSend = XMLHttpRequest.prototype.send;
-    const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
-    XMLHttpRequest.prototype.open = function(method, url) {
-        this.__net = { type: 'xhr', url, method, body: null, headers: {}, ts: Date.now() };
-        return origOpen.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.setRequestHeader = function(k, v) {
-        if (this.__net) this.__net.headers[k] = v;
-        return origSetHeader.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.send = function(body) {
-        if (this.__net) {
-            this.__net.body = body ? String(body).substring(0,3000) : null;
-            window.__net.push(this.__net);
-            this.addEventListener('load', function() {
-                this.__net.status = this.status;
-                this.__net.response = this.responseText.substring(0,5000);
-            });
+      }
+    ],
+    "call_count": 8
+  },
+  "open_availability_modal": {
+    "action": "open_availability_modal",
+    "api_calls": [
+      {
+        "method": "GET",
+        "path": "/static/site.webmanifest",
+        "full_url": "https://rentmasseur.com/static/site.webmanifest",
+        "request_body": null,
+        "request_headers": {
+          "Referer": "https://rentmasseur.com/login",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/manifest+json",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/login",
+        "full_url": "https://rentmasseur.com/api/v1/login",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Referer": "https://rentmasseur.com/login",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-1FR21VXTHW&cid=1723937670.1782416143&gtm=45je66o0v9104235959z89104233521za20gzb9104233521zd9104233521&rcb=16&aip=1&dma=0&gcd=13l3l3l3l1l1&npa=0&frm=0&tag_exp=115938465~115938469~119027224~119576891~119576895",
+        "full_url": "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-1FR21VXTHW&cid=1723937670.1782416143&gtm=45je66o0v9104235959z89104233521za20gzb9104233521zd9104233521&rcb=16&aip=1&dma=0&gcd=13l3l3l3l1l1&npa=0&frm=0&tag_exp=115938465~115938469~119027224~119576891~119576895",
+        "request_body": null,
+        "request_headers": {
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 204,
+        "response_mime": "text/plain",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/login",
+        "full_url": "https://rentmasseur.com/api/v1/login",
+        "request_body": {
+          "email": "REDACTED",
+          "password": "[REDACTED]",
+          "csrf": "[REDACTED]",
+          "remember": 0
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/login",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/locations?withMasseurs=1",
+        "full_url": "https://rentmasseur.com/api/v1/locations?withMasseurs=1",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/webpush/init",
+        "full_url": "https://rentmasseur.com/api/v1/webpush/init",
+        "request_body": {
+          "type": "sw"
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/home/masseurs/today",
+        "full_url": "https://rentmasseur.com/api/v1/home/masseurs/today",
+        "request_body": {
+          "lat": 0,
+          "lng": 0,
+          "searchCity": "manhattan-ny"
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/account/dashboard",
+        "full_url": "https://rentmasseur.com/api/v1/account/dashboard",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Referer": "https://rentmasseur.com/settings",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "idRequired",
+            "banner",
+            "masseurOfTheDay",
+            "sponsor",
+            "featureInterview",
+            "userSetting",
+            "travels",
+            "profileStatistics",
+            "reviewUrl",
+            "service",
+            "twitter",
+            "onlineBookmarks"
+          ],
+          "sample": "{\"idRequired\": 0, \"banner\": null, \"masseurOfTheDay\": null, \"sponsor\": null, \"featureInterview\": {\"isCompleted\": 1, \"isPendingApproved\": 0, \"dates\": null}, \"userSetting\": {\"visibility\": 1, \"sms\": 1, \"availability\": {\"available\": 1, \"message\": \"Available\", \"validTo\": 17223}, \"trackActions\": 1}, \"travels\": [], \"profileStatistics\": null, \"reviewUrl\": \"https://rentmasseur.com/Karpathianwolf/submit-review/\", \"service\": {\"therapeutic\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Therapeutic\"}, \"sensual\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Sensual\"}, \"swedish\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Swedish\"}, \"hotStone\": {\"activated\": true, \"price\": {\"incall\": \"Ask\", \"outcall\": \"Ask\", \"currency\": \"US$\"}, \"label\": \"Hot Stone\"}, \"deepTissue\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Deep Tissue\"}}, \"twitter\": null, \"onlineBookmarks\": 2}"
         }
-        return origSend.apply(this, arguments);
-    };
-})();
-"""
-
-
-class ActionCapture:
-    """Run a Selenium action and capture the API calls it triggered."""
-
-    def __init__(self, driver):
-        self.driver = driver
-        self._marker = 0
-        self._installed = False
-
-    def install(self):
-        """Install interceptor AFTER login to avoid breaking login page JS."""
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": INTERCEPT_SCRIPT
-        })
-        self._installed = True
-        log.info("Network interceptor installed")
-
-    def _get_net(self):
-        try:
-            return self.driver.execute_script(
-                "return (window.__net || []).slice();"
-            ) or []
-        except WebDriverException:
-            return []
-
-    def mark(self):
-        """Set a marker — call before an action to know which calls are new."""
-        self._marker = len(self._get_net())
-        return self._marker
-
-    def capture_new(self):
-        """Get all network entries since last mark."""
-        all_net = self._get_net()
-        new = all_net[self._marker:]
-        self._marker = len(all_net)
-        return new
-
-    def capture_all(self):
-        return self._get_net()
-
-
-# ---------------------------------------------------------------------------
-# Browser setup
-# ---------------------------------------------------------------------------
-
-def create_driver():
-    opts = Options()
-    opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument(f"--user-data-dir={CHROME_PROFILE}")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    return webdriver.Chrome(options=opts)
-
-
-def dismiss_popups(driver):
-    time.sleep(1)
-    # First remove any overlay dialogs via JS
-    try:
-        driver.execute_script("""
-            document.querySelectorAll('.DialogOverlay, [class*="overlay"]').forEach(e => e.remove());
-        """)
-    except Exception:
-        pass
-    for xpath in [
-        "//button[contains(text(),'Not now')]",
-        "//button[contains(text(),'Accept all')]",
-        "//button[contains(text(),'Close')]",
-        "//*[contains(@aria-label,'Close')]",
-    ]:
-        try:
-            for el in driver.find_elements(By.XPATH, xpath):
-                if el.is_displayed():
-                    driver.execute_script("arguments[0].click();", el)
-                    time.sleep(0.5)
-        except Exception:
-            pass
-
-
-def login(driver):
-    log.info("Logging in...")
-    driver.get(f"{BASE_URL}/login")
-    time.sleep(4)
-    dismiss_popups(driver)
-
-    for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
-        itype = (inp.get_attribute("type") or "").lower()
-        iname = (inp.get_attribute("name") or "").lower()
-        if (itype == "email" or "email" in iname or "user" in iname) and inp.is_displayed():
-            inp.clear()
-            inp.send_keys(USERNAME)
-        if itype == "password" and inp.is_displayed():
-            inp.clear()
-            inp.send_keys(PASSWORD)
-
-    time.sleep(0.3)
-    for by, sel in [
-        (By.CSS_SELECTOR, "button[type='submit']"),
-        (By.XPATH, "//button[contains(text(),'LOG')]"),
-        (By.XPATH, "//button[contains(text(),'Log')]"),
-        (By.CSS_SELECTOR, "form button"),
-    ]:
-        for el in driver.find_elements(by, sel):
-            if el.is_displayed():
-                driver.execute_script("arguments[0].click();", el)
-                time.sleep(6)
-                break
-        else:
-            continue
-        break
-
-    dismiss_popups(driver)
-    ok = "/login" not in driver.current_url
-    log.info("Login: %s", "OK" if ok else "FAILED")
-    return ok
-
-
-# ---------------------------------------------------------------------------
-# Actions — each returns (action_name, captured_api_calls)
-# ---------------------------------------------------------------------------
-
-def action_load_settings(cap):
-    """Load settings dashboard."""
-    cap.mark()
-    cap.driver.get(f"{BASE_URL}/settings")
-    time.sleep(5)
-    dismiss_popups(cap.driver)
-    return "load_settings", cap.capture_new()
-
-
-def action_open_availability_modal(cap):
-    """Open the availability modal."""
-    cap.driver.get(f"{BASE_URL}/settings?availability=1")
-    time.sleep(5)
-    dismiss_popups(cap.driver)
-    cap.mark()
-    try:
-        panel = cap.driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
-        panel.click()
-        time.sleep(3)
-    except Exception:
-        pass
-    return "open_availability_modal", cap.capture_new()
-
-
-def action_set_availability(cap):
-    """Set availability to Available with 1 hour duration."""
-    driver = cap.driver
-    driver.get(f"{BASE_URL}/settings?availability=1")
-    time.sleep(5)
-    dismiss_popups(driver)
-
-    # Open modal
-    try:
-        panel = driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
-        panel.click()
-        time.sleep(2)
-    except Exception:
-        pass
-
-    cap.mark()
-
-    # Select "Available"
-    for by, sel in [
-        (By.XPATH, "//label[contains(text(),'Available')]"),
-        (By.XPATH, "//*[contains(text(),'Available') and not(contains(text(),'Not')) and not(contains(text(),'Status'))]"),
-        (By.CSS_SELECTOR, "input[type='radio']"),
-    ]:
-        try:
-            els = driver.find_elements(by, sel)
-            for el in els:
-                if el.is_displayed():
-                    el.click()
-                    time.sleep(0.5)
-                    break
-        except Exception:
-            pass
-
-    # Select duration 1 Hour
-    from selenium.webdriver.support.ui import Select
-    for sel_el in driver.find_elements(By.CSS_SELECTOR, "select"):
-        try:
-            s = Select(sel_el)
-            if "1 Hour" in [o.text for o in s.options]:
-                s.select_by_visible_text("1 Hour")
-                time.sleep(0.3)
-                break
-        except Exception:
-            pass
-
-    # Click SET
-    for by, sel in [
-        (By.XPATH, "//button[contains(text(),'SET')]"),
-        (By.XPATH, "//button[contains(text(),'Set')]"),
-    ]:
-        for el in driver.find_elements(by, sel):
-            if el.is_displayed():
-                el.click()
-                time.sleep(3)
-                break
-
-    return "set_availability", cap.capture_new()
-
-
-def action_toggle_visibility(cap):
-    """Toggle profile visibility."""
-    cap.driver.get(f"{BASE_URL}/settings")
-    time.sleep(4)
-    dismiss_popups(cap.driver)
-    cap.mark()
-    try:
-        vis = cap.driver.find_element(By.CSS_SELECTOR, "#visibility")
-        vis.click()
-        time.sleep(3)
-    except Exception:
-        pass
-    return "toggle_visibility", cap.capture_new()
-
-
-def action_toggle_sms(cap):
-    """Toggle SMS alerts."""
-    cap.driver.get(f"{BASE_URL}/settings")
-    time.sleep(4)
-    dismiss_popups(cap.driver)
-    cap.mark()
-    try:
-        sms = cap.driver.find_element(By.CSS_SELECTOR, "#sms")
-        sms.click()
-        time.sleep(3)
-    except Exception:
-        pass
-    return "toggle_sms_alerts", cap.capture_new()
-
-
-def action_toggle_track_actions(cap):
-    """Toggle track actions."""
-    cap.driver.get(f"{BASE_URL}/settings")
-    time.sleep(4)
-    dismiss_popups(cap.driver)
-    cap.mark()
-    try:
-        track = cap.driver.find_element(By.CSS_SELECTOR, "#trackActions")
-        track.click()
-        time.sleep(3)
-    except Exception:
-        pass
-    return "toggle_track_actions", cap.capture_new()
-
-
-def action_search_city(cap):
-    """Search masseurs in a city."""
-    cap.mark()
-    cap.driver.get(f"{BASE_URL}/gay-massage/manhattan-ny/")
-    time.sleep(5)
-    dismiss_popups(cap.driver)
-    # Scroll to trigger lazy load
-    cap.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(3)
-    return "search_city", cap.capture_new()
-
-
-def action_search_available(cap):
-    """Search available-now masseurs."""
-    cap.mark()
-    cap.driver.get(f"{BASE_URL}/gay-massage/manhattan-ny/?available=1")
-    time.sleep(5)
-    dismiss_popups(cap.driver)
-    return "search_available_now", cap.capture_new()
-
-
-def action_load_more(cap):
-    """Click 'Load more' on search results."""
-    cap.driver.get(f"{BASE_URL}/gay-massage/manhattan-ny/")
-    time.sleep(4)
-    dismiss_popups(cap.driver)
-    cap.mark()
-    try:
-        btn = cap.driver.find_element(By.XPATH, "//button[contains(text(),'Load more')]")
-        btn.click()
-        time.sleep(3)
-    except Exception:
-        pass
-    return "load_more_results", cap.capture_new()
-
-
-def action_view_profile(cap):
-    """View a masseur profile."""
-    cap.mark()
-    cap.driver.get(f"{BASE_URL}/ArmyMike")
-    time.sleep(4)
-    return "view_profile", cap.capture_new()
-
-
-def action_load_mailbox(cap):
-    """Load mailbox."""
-    cap.mark()
-    cap.driver.get(f"{BASE_URL}/settings/mailbox")
-    time.sleep(4)
-    dismiss_popups(cap.driver)
-    return "load_mailbox", cap.capture_new()
-
-
-def action_get_stats(cap):
-    """Scroll to stats section to trigger stats API."""
-    cap.driver.get(f"{BASE_URL}/settings")
-    time.sleep(4)
-    dismiss_popups(cap.driver)
-    cap.mark()
-    # Scroll to bottom to trigger lazy stats loading
-    cap.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(5)
-    return "load_stats", cap.capture_new()
-
-
-# ---------------------------------------------------------------------------
-# Process captured calls into clean API spec
-# ---------------------------------------------------------------------------
-
-def clean_url(url):
-    """Remove base URL prefix, keep path + query."""
-    if url.startswith(BASE_URL):
-        return url[len(BASE_URL):]
-    if url.startswith("https://rentmasseur.com"):
-        return url[len("https://rentmasseur.com"):]
-    return url
-
-
-def is_api_call(entry):
-    """Filter out static assets, JS chunks, images."""
-    url = entry.get("url", "").lower()
-    if not url:
-        return False
-    if any(url.endswith(ext) for ext in [
-        ".js", ".css", ".png", ".jpg", ".jpeg", ".svg", ".gif",
-        ".woff", ".woff2", ".ico", ".webp", ".map",
-    ]):
-        return False
-    if "/_next/static/" in url:
-        return False
-    if "/images/" in url:
-        return False
-    if "google" in url or "gstatic" in url or "cloudflare" in url:
-        return False
-    if "fonts." in url:
-        return False
-    return True
-
-
-def parse_response(resp_text):
-    """Try to parse response as JSON, return structured data."""
-    if not resp_text:
-        return None
-    try:
-        data = json.loads(resp_text)
-        if isinstance(data, dict):
-            return {"keys": list(data.keys())[:20], "sample": json.dumps(data, default=str)[:1000]}
-        if isinstance(data, list) and data:
-            if isinstance(data[0], dict):
-                return {"type": "array", "count": len(data), "item_keys": list(data[0].keys())[:15]}
-            return {"type": "array", "count": len(data)}
-        return {"type": type(data).__name__, "value": str(data)[:200]}
-    except (json.JSONDecodeError, TypeError):
-        return {"raw": resp_text[:300]}
-
-
-def parse_body(body_text):
-    """Parse request body."""
-    if not body_text:
-        return None
-    try:
-        return json.loads(body_text)
-    except (json.JSONDecodeError, TypeError):
-        return body_text[:300]
-
-
-def build_api_map(action_results):
-    """Build the action → API mapping."""
-    api_map = OrderedDict()
-
-    for action_name, calls in action_results:
-        api_calls = []
-        for call in calls:
-            if not is_api_call(call):
-                continue
-
-            url = call.get("url", "")
-            method = (call.get("method") or "GET").upper()
-            clean = clean_url(url)
-
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/account/dashboard/availability",
+        "full_url": "https://rentmasseur.com/api/v1/account/dashboard/availability",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Referer": "https://rentmasseur.com/settings?availability=1",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "selected",
+            "list",
+            "countdown"
+          ],
+          "sample": "{\"selected\": \"Available\", \"list\": [{\"id\": 0, \"label\": \"Not Set\", \"timePeriods\": null}, {\"id\": 1, \"label\": \"Available\", \"timePeriods\": {\"0\": \"1 Hour\", \"1\": \"2 Hours\", \"2\": \"3 Hours\", \"3\": \"4 Hours\", \"4\": \"5 Hours\", \"5\": \"6 Hours\"}}, {\"id\": 2, \"label\": \"Not Available\", \"timePeriods\": {\"0\": \"1 Hour\", \"1\": \"2 Hours\", \"2\": \"3 Hours\", \"3\": \"4 Hours\", \"4\": \"5 Hours\", \"5\": \"6 Hours\", \"6\": \"1 Day\", \"7\": \"3 Days\", \"8\": \"1 Week\"}}], \"countdown\": 1782433379}"
+        }
+      }
+    ],
+    "call_count": 9
+  },
+  "set_availability": {
+    "action": "set_availability",
+    "api_calls": [
+      {
+        "method": "GET",
+        "path": "/static/site.webmanifest",
+        "full_url": "https://rentmasseur.com/static/site.webmanifest",
+        "request_body": null,
+        "request_headers": {
+          "Referer": "https://rentmasseur.com/login",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/manifest+json",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/login",
+        "full_url": "https://rentmasseur.com/api/v1/login",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Referer": "https://rentmasseur.com/login",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-1FR21VXTHW&cid=1723937670.1782416143&gtm=45je66o0v9104235959z89104233521za20gzb9104233521zd9104233521&rcb=16&aip=1&dma=0&gcd=13l3l3l3l1l1&npa=0&frm=0&tag_exp=115938465~115938469~119027224~119576891~119576895",
+        "full_url": "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-1FR21VXTHW&cid=1723937670.1782416143&gtm=45je66o0v9104235959z89104233521za20gzb9104233521zd9104233521&rcb=16&aip=1&dma=0&gcd=13l3l3l3l1l1&npa=0&frm=0&tag_exp=115938465~115938469~119027224~119576891~119576895",
+        "request_body": null,
+        "request_headers": {
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 204,
+        "response_mime": "text/plain",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/login",
+        "full_url": "https://rentmasseur.com/api/v1/login",
+        "request_body": {
+          "email": "REDACTED",
+          "password": "[REDACTED]",
+          "csrf": "[REDACTED]",
+          "remember": 0
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/login",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/locations?withMasseurs=1",
+        "full_url": "https://rentmasseur.com/api/v1/locations?withMasseurs=1",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/webpush/init",
+        "full_url": "https://rentmasseur.com/api/v1/webpush/init",
+        "request_body": {
+          "type": "sw"
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/home/masseurs/today",
+        "full_url": "https://rentmasseur.com/api/v1/home/masseurs/today",
+        "request_body": {
+          "lat": 0,
+          "lng": 0,
+          "searchCity": "manhattan-ny"
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/account/dashboard",
+        "full_url": "https://rentmasseur.com/api/v1/account/dashboard",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Referer": "https://rentmasseur.com/settings",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "idRequired",
+            "banner",
+            "masseurOfTheDay",
+            "sponsor",
+            "featureInterview",
+            "userSetting",
+            "travels",
+            "profileStatistics",
+            "reviewUrl",
+            "service",
+            "twitter",
+            "onlineBookmarks"
+          ],
+          "sample": "{\"idRequired\": 0, \"banner\": null, \"masseurOfTheDay\": null, \"sponsor\": null, \"featureInterview\": {\"isCompleted\": 1, \"isPendingApproved\": 0, \"dates\": null}, \"userSetting\": {\"visibility\": 1, \"sms\": 1, \"availability\": {\"available\": 1, \"message\": \"Available\", \"validTo\": 17223}, \"trackActions\": 1}, \"travels\": [], \"profileStatistics\": null, \"reviewUrl\": \"https://rentmasseur.com/Karpathianwolf/submit-review/\", \"service\": {\"therapeutic\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Therapeutic\"}, \"sensual\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Sensual\"}, \"swedish\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Swedish\"}, \"hotStone\": {\"activated\": true, \"price\": {\"incall\": \"Ask\", \"outcall\": \"Ask\", \"currency\": \"US$\"}, \"label\": \"Hot Stone\"}, \"deepTissue\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Deep Tissue\"}}, \"twitter\": null, \"onlineBookmarks\": 2}"
+        }
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/account/dashboard/availability",
+        "full_url": "https://rentmasseur.com/api/v1/account/dashboard/availability",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Referer": "https://rentmasseur.com/settings?availability=1",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "selected",
+            "list",
+            "countdown"
+          ],
+          "sample": "{\"selected\": \"Available\", \"list\": [{\"id\": 0, \"label\": \"Not Set\", \"timePeriods\": null}, {\"id\": 1, \"label\": \"Available\", \"timePeriods\": {\"0\": \"1 Hour\", \"1\": \"2 Hours\", \"2\": \"3 Hours\", \"3\": \"4 Hours\", \"4\": \"5 Hours\", \"5\": \"6 Hours\"}}, {\"id\": 2, \"label\": \"Not Available\", \"timePeriods\": {\"0\": \"1 Hour\", \"1\": \"2 Hours\", \"2\": \"3 Hours\", \"3\": \"4 Hours\", \"4\": \"5 Hours\", \"5\": \"6 Hours\", \"6\": \"1 Day\", \"7\": \"3 Days\", \"8\": \"1 Week\"}}], \"countdown\": 1782433379}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/search",
+        "full_url": "https://rentmasseur.com/api/v1/search",
+        "request_body": {
+          "searchCity": "manhattan-ny",
+          "available": 1
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/settings",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "raw": "{\"massageTypes\":[{\"type\":\"hotStone\",\"label\":\"HotStone\",\"count\":1},{\"type\":\"swedish\",\"label\":\"Swedish\",\"count\":1},{\"type\":\"therapeutic\",\"label\":\"Therapeutic\",\"count\":1},{\"type\":\"sensual\",\"label\":\"Sensual\",\"count\":1},{\"type\":\"deepTissue\",\"label\":\"DeepTissue\",\"count\":1}],\"seo\":\"<section><p>Manhattan mo"
+        }
+      }
+    ],
+    "call_count": 10
+  },
+  "toggle_visibility": {
+    "action": "toggle_visibility",
+    "api_calls": [
+      {
+        "method": "GET",
+        "path": "/static/site.webmanifest",
+        "full_url": "https://rentmasseur.com/static/site.webmanifest",
+        "request_body": null,
+        "request_headers": {
+          "Referer": "https://rentmasseur.com/login",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/manifest+json",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/login",
+        "full_url": "https://rentmasseur.com/api/v1/login",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Referer": "https://rentmasseur.com/login",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-1FR21VXTHW&cid=1723937670.1782416143&gtm=45je66o0v9104235959z89104233521za20gzb9104233521zd9104233521&rcb=16&aip=1&dma=0&gcd=13l3l3l3l1l1&npa=0&frm=0&tag_exp=115938465~115938469~119027224~119576891~119576895",
+        "full_url": "https://stats.g.doubleclick.net/g/collect?v=2&tid=G-1FR21VXTHW&cid=1723937670.1782416143&gtm=45je66o0v9104235959z89104233521za20gzb9104233521zd9104233521&rcb=16&aip=1&dma=0&gcd=13l3l3l3l1l1&npa=0&frm=0&tag_exp=115938465~115938469~119027224~119576891~119576895",
+        "request_body": null,
+        "request_headers": {
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 204,
+        "response_mime": "text/plain",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/login",
+        "full_url": "https://rentmasseur.com/api/v1/login",
+        "request_body": {
+          "email": "REDACTED",
+          "password": "[REDACTED]",
+          "csrf": "[REDACTED]",
+          "remember": 0
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/login",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/locations?withMasseurs=1",
+        "full_url": "https://rentmasseur.com/api/v1/locations?withMasseurs=1",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/webpush/init",
+        "full_url": "https://rentmasseur.com/api/v1/webpush/init",
+        "request_body": {
+          "type": "sw"
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/home/masseurs/today",
+        "full_url": "https://rentmasseur.com/api/v1/home/masseurs/today",
+        "request_body": {
+          "lat": 0,
+          "lng": 0,
+          "searchCity": "manhattan-ny"
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": null
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/account/dashboard",
+        "full_url": "https://rentmasseur.com/api/v1/account/dashboard",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Referer": "https://rentmasseur.com/settings",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "idRequired",
+            "banner",
+            "masseurOfTheDay",
+            "sponsor",
+            "featureInterview",
+            "userSetting",
+            "travels",
+            "profileStatistics",
+            "reviewUrl",
+            "service",
+            "twitter",
+            "onlineBookmarks"
+          ],
+          "sample": "{\"idRequired\": 0, \"banner\": null, \"masseurOfTheDay\": null, \"sponsor\": null, \"featureInterview\": {\"isCompleted\": 1, \"isPendingApproved\": 0, \"dates\": null}, \"userSetting\": {\"visibility\": 1, \"sms\": 1, \"availability\": {\"available\": 1, \"message\": \"Available\", \"validTo\": 17223}, \"trackActions\": 1}, \"travels\": [], \"profileStatistics\": null, \"reviewUrl\": \"https://rentmasseur.com/Karpathianwolf/submit-review/\", \"service\": {\"therapeutic\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Therapeutic\"}, \"sensual\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Sensual\"}, \"swedish\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Swedish\"}, \"hotStone\": {\"activated\": true, \"price\": {\"incall\": \"Ask\", \"outcall\": \"Ask\", \"currency\": \"US$\"}, \"label\": \"Hot Stone\"}, \"deepTissue\": {\"activated\": true, \"price\": {\"incall\": 199, \"outcall\": 269, \"currency\": \"US$\"}, \"label\": \"Deep Tissue\"}}, \"twitter\": null, \"onlineBookmarks\": 2}"
+        }
+      },
+      {
+        "method": "GET",
+        "path": "/api/v1/account/dashboard/availability",
+        "full_url": "https://rentmasseur.com/api/v1/account/dashboard/availability",
+        "request_body": null,
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Referer": "https://rentmasseur.com/settings?availability=1",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "keys": [
+            "selected",
+            "list",
+            "countdown"
+          ],
+          "sample": "{\"selected\": \"Available\", \"list\": [{\"id\": 0, \"label\": \"Not Set\", \"timePeriods\": null}, {\"id\": 1, \"label\": \"Available\", \"timePeriods\": {\"0\": \"1 Hour\", \"1\": \"2 Hours\", \"2\": \"3 Hours\", \"3\": \"4 Hours\", \"4\": \"5 Hours\", \"5\": \"6 Hours\"}}, {\"id\": 2, \"label\": \"Not Available\", \"timePeriods\": {\"0\": \"1 Hour\", \"1\": \"2 Hours\", \"2\": \"3 Hours\", \"3\": \"4 Hours\", \"4\": \"5 Hours\", \"5\": \"6 Hours\", \"6\": \"1 Day\", \"7\": \"3 Days\", \"8\": \"1 Week\"}}], \"countdown\": 1782433379}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/search",
+        "full_url": "https://rentmasseur.com/api/v1/search",
+        "request_body": {
+          "searchCity": "manhattan-ny",
+          "available": 1
+        },
+        "request_headers": {
+          "Accept": "application/json, text/plain, */*",
+          "Authorization": "[REDACTED]",
+          "Content-Type": "application/json",
+          "Referer": "https://rentmasseur.com/settings",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+          "sec-ch-ua": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"macOS\""
+        },
+        "response_status": 200,
+        "response_mime": "application/json",
+        "response": {
+          "raw": "{\"massageTypes\":[{\"type\":\"hotStone\",\"label\":\"HotStone\",\"count\":1},{\"type\":\"swedish\",\"label\":\"Swedish\",\"count\":1},{\"type\":\"therapeutic\",\"label\":\"Therapeutic\",\"count\":1},{\"type\":\"sensual\",\"label\":\"Sensual\",\"count\":1},{\"type\":\"deepTissue\",\"label\":\"DeepTissue\",\"count\":1}],\"seo\":\"<section><p>Manhattan mo"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/api/v1/home/top-sponsors",
+        "full_url": "https://rentmasseur.com/api/v1/home/top-sponsors",
+        "request_body": {
+          "lat": 0,
+          "lng": 0,

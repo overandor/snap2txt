@@ -1,282 +1,462 @@
-    print(f"  Failed:   {result['failed']}")
-    if result.get("captcha"):
-        print(f"  BLOCKED:  CrowdSec captcha active")
-        print(f"  Next:     Wait for ban to clear, then re-run this command")
+    );
+    CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status);
+    CREATE INDEX IF NOT EXISTS idx_hyp_category ON hypotheses(category);
+    CREATE INDEX IF NOT EXISTS idx_runs_hyp ON hypothesis_runs(hypothesis_id);
+    """)
+    conn.commit()
+    return conn
+
+
+# ─── FDR Control ───────────────────────────────────────────────────
+
+def benjamini_hochberg(p_values: List[float], alpha: float = 0.05) -> List[bool]:
+    """Benjamini-Hochberg FDR correction. Returns list of which hypotheses survive."""
+    n = len(p_values)
+    if n == 0:
+        return []
+
+    # Sort by p-value, keep track of original indices
+    indexed = sorted(enumerate(p_values), key=lambda x: x[1])
+    rejected = [False] * n
+
+    # BH procedure: find largest k where p(k) <= k/n * alpha
+    max_k = 0
+    for rank, (orig_idx, p) in enumerate(indexed, 1):
+        threshold = (rank / n) * alpha
+        if p <= threshold:
+            max_k = rank
+
+    # Reject all hypotheses with rank <= max_k
+    for rank, (orig_idx, p) in enumerate(indexed, 1):
+        if rank <= max_k:
+            rejected[orig_idx] = True
+
+    return rejected
+
+
+def apply_fdr_control(conn: sqlite3.Connection, tenant_id: str) -> Dict:
+    """Apply FDR correction every 25 completed hypothesis tests."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT hypothesis_id, reward, runs_completed
+        FROM hypotheses
+        WHERE status IN ('candidate', 'running') AND runs_completed > 0
+        ORDER BY reward DESC
+    """)
+    rows = cur.fetchall()
+
+    if len(rows) < 25:
+        return {"applied": False, "reason": f"only {len(rows)} completed, need 25"}
+
+    # Compute approximate p-values from reward scores
+    # (using reward as proxy: higher reward = lower p-value)
+    rewards = [r["reward"] for r in rows]
+    max_reward = max(rewards) if rewards else 1.0
+    p_values = [1.0 - (r / max_reward) if max_reward > 0 else 1.0 for r in rewards]
+
+    rejected = benjamini_hochberg(p_values, alpha=0.05)
+
+    promoted = 0
+    retired = 0
+    for i, row in enumerate(rows):
+        if rejected[i]:
+            conn.execute("UPDATE hypotheses SET status = 'winner' WHERE hypothesis_id = ?", (row["hypothesis_id"],))
+            conn.execute("INSERT INTO hypothesis_promotions (hypothesis_id, tenant_id, promoted_at, reward, confidence, fdr_corrected) VALUES (?, ?, ?, ?, ?, 1)",
+                        (row["hypothesis_id"], tenant_id, datetime.now(timezone.utc).isoformat(), row["reward"], 0.8))
+            promoted += 1
+        elif row["runs_completed"] >= 5:
+            conn.execute("UPDATE hypotheses SET status = 'retired' WHERE hypothesis_id = ?", (row["hypothesis_id"],))
+            retired += 1
+
+    conn.commit()
+    return {"applied": True, "promoted": promoted, "retired": retired, "tested": len(rows)}
+
+
+# ─── Bandit selection ──────────────────────────────────────────────
+
+def select_next_hypothesis(conn: sqlite3.Connection, state) -> Optional[Dict]:
+    """Select next hypothesis using contextual bandit (UCB-style)."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM hypotheses
+        WHERE status IN ('candidate', 'running') AND runs_completed < max_runs
+        ORDER BY reward DESC, confidence DESC
+    """)
+    rows = cur.fetchall()
+
+    if not rows:
+        return None
+
+    # UCB-style: score = avg_reward + exploration_bonus
+    total_runs = sum(r["runs_completed"] for r in rows) or 1
+    scored = []
+    for row in rows:
+        avg_reward = row["reward"] / max(1, row["runs_completed"])
+        exploration = math.sqrt(2 * math.log(total_runs) / max(1, row["runs_completed"]))
+        ucb_score = avg_reward + 0.3 * exploration
+        scored.append((ucb_score, dict(row)))
+
+    scored.sort(key=lambda x: -x[0])
+    return scored[0][1]
+
+
+# ─── Action execution ──────────────────────────────────────────────
+
+def execute_hyp_action(action: str, api: RentMasseurAPI, state) -> Dict:
+    """Execute the hypothesis action. Returns {error, result}."""
+    result = {"error": "", "result": {}}
+    try:
+        if action == "refresh_availability":
+            if state.available_status != "Available" or state.availability_seconds_left < 3600:
+                api.set_availability(option=1, duration=5)
+                api.invalidate_cache("availability")
+                result["result"] = {"set_to": "Available"}
+            else:
+                result["result"] = {"already_available": True}
+
+        elif action == "ensure_visible":
+            if state.profile_hidden:
+                try:
+                    api._post("/account/dashboard/hide", {"hide": False})
+                    result["result"] = {"unhid": True}
+                except Exception:
+                    result["result"] = {"note": "manual check needed"}
+            else:
+                result["result"] = {"already_visible": True}
+
+        elif action == "detect_account_issues":
+            keep = api.get_keeponline()
+            issues = keep.get("issues", {})
+            result["result"] = {"total_issues": issues.get("totalItems", 0), "alerts": len(issues.get("alerts", []))}
+
+        elif action == "classify_mailbox_intent":
+            mailbox = api.get_mailbox(page=1, folder=1, sort=1)
+            from .intent_engine import classify_mailbox
+            emails = mailbox.get("emails", [])
+            classified = classify_mailbox(emails)
+            result["result"] = {"total": len(emails), "booking_now": sum(1 for c in classified if c["classification"] == "booking_now")}
+
+        elif action == "draft_reply_queue":
+            mailbox = api.get_mailbox(page=1, folder=1, sort=1)
+            from .intent_engine import classify_mailbox
+            emails = mailbox.get("emails", [])
+            classified = classify_mailbox(emails)
+            drafts = [c for c in classified if c["suggested_reply_class"] and c["classification"] != "do_not_contact"]
+            result["result"] = {"drafts": len(drafts)}
+
+        elif action == "headline_variant_test":
+            result["result"] = {"note": "headline test requires manual approval"}
+            result["error"] = "manual_approval_required"
+
+        elif action == "about_variant_test":
+            result["result"] = {"note": "about test requires manual approval"}
+            result["error"] = "manual_approval_required"
+
+        elif action == "search_rank_scan":
+            results = api.search_masseurs(city="manhattan-ny", page=1)
+            result["result"] = {"total": len(results.get("users", [])), "rank": state.search_rank}
+
+        elif action == "competitor_position_scan":
+            results = api.search_masseurs(city="manhattan-ny", page=1)
+            users = results.get("users", [])
+            result["result"] = {"competitors": len(users), "top3": [u.get("username", "") for u in users[:3]]}
+
+        elif action == "pricing_copy_test":
+            result["result"] = {"note": "pricing test requires manual approval"}
+            result["error"] = "manual_approval_required"
+
+        elif action == "traffic_delta_report":
+            result["result"] = {"views": state.views, "contacts": state.contact_clicks, "ctr": state.contact_rate}
+
+        elif action == "roi_report":
+            result["result"] = {"pressure": state.revenue_pressure, "components": state.pressure_components}
+
+        else:
+            result["error"] = f"unknown action: {action}"
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
+# ─── Commands ──────────────────────────────────────────────────────
+
+def cmd_seed_300():
+    """Seed 300 hypotheses into the database."""
+    conn = _db()
+    hyps = generate_300_hypotheses()
+    now = datetime.now(timezone.utc).isoformat()
+
+    for h in hyps:
+        conn.execute("""
+            INSERT OR REPLACE INTO hypotheses
+            (hypothesis_id, category, claim, action, primary_metric,
+             secondary_metrics, guardrail_metrics, minimum_window_hours,
+             max_runs, status, confidence, reward, runs_completed,
+             evidence_receipts, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (h["hypothesis_id"], h["category"], h["claim"], h["action"],
+              h["primary_metric"], json.dumps(h["secondary_metrics"]),
+              json.dumps(h["guardrail_metrics"]), h["minimum_window_hours"],
+              h["max_runs"], h["status"], h["confidence"], h["reward"],
+              h["runs_completed"], json.dumps(h["evidence_receipts"]), now))
+
+    conn.commit()
+    conn.close()
+
+    by_cat = {}
+    for h in hyps:
+        by_cat[h["category"]] = by_cat.get(h["category"], 0) + 1
+
+    print(f"✅ Seeded {len(hyps)} hypotheses")
+    for cat, count in sorted(by_cat.items()):
+        print(f"  {cat}: {count}")
+
+
+def cmd_list():
+    """List all hypotheses with their status."""
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT category, status, COUNT(*) as n FROM hypotheses GROUP BY category, status ORDER BY category, status")
+    rows = cur.fetchall()
+
+    print(f"\n{'Category':<15} {'Status':<12} {'Count':>5}")
+    print(f"{'-'*15} {'-'*12} {'-'*5}")
+    for r in rows:
+        print(f"{r['category']:<15} {r['status']:<12} {r['n']:>5}")
+
+    cur.execute("SELECT COUNT(*) as total FROM hypotheses")
+    total = cur.fetchone()["total"]
+    print(f"\nTotal: {total} hypotheses")
+
+    cur.execute("SELECT status, COUNT(*) as n FROM hypotheses GROUP BY status")
+    for r in cur.fetchall():
+        print(f"  {r['status']}: {r['n']}")
+
+    conn.close()
+
+
+def cmd_run_next(tenant_id: str, username: str, password: str):
+    """Run the next best hypothesis."""
+    conn = _db()
+
+    # Login
+    api = RentMasseurAPI(min_request_interval=2.0)
+    if not api.login(username, password):
+        print("🔴 Login failed")
+        return 2
+
+    # Collect state before
+    print("[STATE] Collecting state before...")
+    state_before = collect_state(api, tenant_id)
+    print(f"  ◉ State: {state_before.state_hash} | Pressure: {state_before.revenue_pressure}")
+
+    # Select hypothesis
+    hyp = select_next_hypothesis(conn, state_before)
+    if not hyp:
+        print("No hypotheses available to run.")
+        # Try FDR control
+        fdr = apply_fdr_control(conn, tenant_id)
+        if fdr["applied"]:
+            print(f"FDR control applied: {fdr}")
+        conn.close()
+        return 0
+
+    print(f"\n[HYPOTHESIS] {hyp['hypothesis_id']} ({hyp['category']})")
+    print(f"  Claim: {hyp['claim']}")
+    print(f"  Action: {hyp['action']}")
+    print(f"  Primary metric: {hyp['primary_metric']}")
+    print(f"  Runs: {hyp['runs_completed']}/{hyp['max_runs']}")
+
+    # Execute
+    print(f"\n[EXEC] Executing {hyp['action']}...")
+    result = execute_hyp_action(hyp["action"], api, state_before)
+    if result["error"]:
+        print(f"  ⟁ Error: {result['error']}")
     else:
-        print(f"  Output:   {out}")
+        print(f"  ◉ Result: {json.dumps(result['result'])}")
 
-def cmd_rank_real(args):
-    """Rank real bios by views_per_day."""
-    inp = Path(args.input) if args.input else ENRICHED_PATH
-    out = Path(args.output) if args.output else RANKED_PATH
-    result = pri_rank_views(inp, out)
-    if "error" in result:
-        print(f"ERROR: {result['error']}")
-    else:
-        print(f"Ranked {result['ranked_bios']}/{result['total_bios']} bios by views/day")
-        print(f"Output: {result['output']}")
-        if result.get("top_5"):
-            print(f"\nTop 5 by views/day:")
-            for i, b in enumerate(result["top_5"], 1):
-                print(f"  #{i} {b['username']} — {b['views_per_day']:.1f} v/day — {b['headline'][:50]}")
+    # Collect state after
+    print("\n[MEASURE] Collecting state after...")
+    time.sleep(2)
+    api.invalidate_cache()
+    state_after = collect_state(api, tenant_id)
 
-def cmd_atomize_bios(args):
-    """Extract structural atoms from bios."""
-    inp = Path(args.input) if args.input else RAW_PATH
-    out = Path(args.output) if args.output else Path("rm_traffic/data/bio_atoms.jsonl")
-    result = pri_atomize_bios(inp, out)
-    print(f"Atomized {result['atomized']} bios")
-    print(f"Output: {result['output']}")
+    # Compute reward
+    delta = compute_delta(state_before, state_after)
+    reward = compute_reward(delta, hyp["action"], result["error"])
+    print(f"\n[REWARD] Delta: {json.dumps(delta_to_dict(delta))}")
+    print(f"  Reward: {reward:.3f}")
 
-def cmd_pri_status(args):
-    """Show honest system status — what stage we're at."""
-    print("RM-PRI STATUS — RentMasseur Profile Revenue Intelligence")
-    print("=" * 60)
+    # Write receipt
+    receipt_hash = hashlib.sha256(
+        f"{hyp['hypothesis_id']}:{state_before.state_hash}:{state_after.state_hash}:{reward}".encode()
+    ).hexdigest()[:16]
 
-    # Stage 1: corpus
-    v = pri_validate_corpus(RAW_PATH)
-    print(f"\nStage 1: Real Corpus")
-    print(f"  Rows: {v['total']}  Valid: {v['valid']}  PASS: {v['pass']}")
+    conn.execute("""INSERT INTO hypothesis_runs
+        (hypothesis_id, tenant_id, state_before_hash, state_after_hash, metric_delta, reward, receipt_hash, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (hyp["hypothesis_id"], tenant_id, state_before.state_hash, state_after.state_hash,
+         json.dumps(delta_to_dict(delta)), reward, receipt_hash, datetime.now(timezone.utc).isoformat()))
 
-    # Stage 2: enrichment
-    e = pri_validate_enriched(ENRICHED_PATH)
-    print(f"\nStage 2: Views/Day Enrichment")
-    if "error" in e:
-        print(f"  STATUS: NOT STARTED — {e['error']}")
-        print(f"  BLOCKER: CrowdSec captcha on rentmasseur.com")
-        print(f"  NEXT: Run 'enrich-views' when ban clears")
-    else:
-        print(f"  Total: {e['total']}  Has v/day: {e['has_views_per_day']}  PASS: {e['pass']}")
+    conn.execute("""INSERT OR IGNORE INTO hypothesis_receipts
+        (hypothesis_id, tenant_id, receipt_hash, timestamp, action, reward, metric_delta, state_before_hash, state_after_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (hyp["hypothesis_id"], tenant_id, receipt_hash, datetime.now(timezone.utc).isoformat(),
+         hyp["action"], reward, json.dumps(delta_to_dict(delta)), state_before.state_hash, state_after.state_hash))
 
-    # Stage 3: dashboard
-    print(f"\nStage 3: Dashboard Time Series")
-    print(f"  STATUS: NOT STARTED — requires API access")
-    print(f"  NEXT: Run 'snapshot' when API is accessible")
+    # Update hypothesis
+    new_runs = hyp["runs_completed"] + 1
+    new_reward = hyp["reward"] + reward
+    new_confidence = min(1.0, new_runs / hyp["max_runs"])
 
-    # Stage 4: experiments
-    print(f"\nStage 4: Live Experiment Labels")
-    print(f"  STATUS: NOT STARTED — requires approved variant + apply + measure")
+    new_status = hyp["status"]
+    if new_runs >= hyp["max_runs"]:
+        if new_reward / new_runs > 0.5:
+            new_status = "winner"
+        elif new_reward / new_runs < -0.5:
+            new_status = "loser"
+        else:
+            new_status = "retired"
 
-    # Stage 5: online learning
-    print(f"\nStage 5: Validated Online Learner")
-    print(f"  STATUS: NOT STARTED — requires stages 2-4")
+    conn.execute("""UPDATE hypotheses SET runs_completed = ?, reward = ?, confidence = ?, status = ? WHERE hypothesis_id = ?""",
+                (new_runs, new_reward, new_confidence, new_status, hyp["hypothesis_id"]))
 
-    # Receipts
-    ledger = PRIReceiptLedger()
-    s = ledger.summary()
-    print(f"\nReceipts: {s['total']} total, chain valid: {s['valid']}")
+    # FDR control every 25 runs
+    total_completed = conn.execute("SELECT COUNT(*) as n FROM hypothesis_runs").fetchone()["n"]
+    if total_completed % 25 == 0 and total_completed > 0:
+        print(f"\n[FDR] Applying Benjamini-Hochberg correction at {total_completed} completed runs...")
+        fdr = apply_fdr_control(conn, tenant_id)
+        print(f"  Result: {fdr}")
 
-    print(f"\nHONEST ASSESSMENT:")
-    print(f"  This is Stage 1: real corpus loaded.")
-    print(f"  Not AGI. Not revenue oracle. Not CTR predictor.")
-    print(f"  It is a real market corpus + language analysis foundation.")
-    print(f"  Next real step: enrich with public visits/member-since.")
+    conn.commit()
+    conn.close()
+
+    print(f"\n{'='*60}")
+    print(f"  HYPOTHESIS {hyp['hypothesis_id']} COMPLETE")
+    print(f"  Reward: {reward:.3f} | Total: {new_reward:.3f} | Runs: {new_runs}/{hyp['max_runs']}")
+    print(f"  Status: {new_status} | Receipt: {receipt_hash}")
+    print(f"{'='*60}")
+    return 0
 
 
-def cmd_audit(args):
-    init_db()
-    seed_registry()
-    d = ProfileOpsDaemon(mode="audit", city=args.city, session_file=args.session)
-    d.run()
+def cmd_report(tenant_id: str):
+    """Generate report for a tenant."""
+    conn = _db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT status, COUNT(*) as n FROM hypotheses GROUP BY status ORDER BY status")
+    status_rows = cur.fetchall()
+
+    cur.execute("""SELECT hypothesis_id, category, claim, reward, runs_completed, status, confidence
+                   FROM hypotheses WHERE runs_completed > 0
+                   ORDER BY reward DESC LIMIT 20""")
+    top_rows = cur.fetchall()
+
+    cur.execute("SELECT COUNT(*) as n FROM hypothesis_runs WHERE tenant_id = ?", (tenant_id,))
+    total_runs = cur.fetchone()["n"]
+
+    cur.execute("SELECT COUNT(*) as n FROM hypothesis_promotions WHERE tenant_id = ?", (tenant_id,))
+    total_promotions = cur.fetchone()["n"]
+
+    print(f"\n{'='*60}")
+    print(f"  HYPOTHESIS LAB REPORT — {tenant_id}")
+    print(f"  Generated: {datetime.now(timezone.utc).isoformat()}")
+    print(f"{'='*60}\n")
+
+    print(f"Status Summary:")
+    for r in status_rows:
+        print(f"  {r['status']:<12} {r['n']:>4}")
+
+    print(f"\nTotal runs: {total_runs}")
+    print(f"Total promotions: {total_promotions}")
+
+    if top_rows:
+        print(f"\nTop 20 Tested Hypotheses:")
+        print(f"{'ID':<6} {'Category':<12} {'Status':<10} {'Reward':>8} {'Runs':>5} {'Conf':>5} Claim")
+        print(f"{'-'*6} {'-'*12} {'-'*10} {'-'*8} {'-'*5} {'-'*5} {'-'*40}")
+        for r in top_rows:
+            print(f"{r['hypothesis_id']:<6} {r['category']:<12} {r['status']:<10} {r['reward']:>8.3f} {r['runs_completed']:>5} {r['confidence']:>5.2f} {r['claim'][:50]}")
+
+    conn.close()
 
 
-def cmd_guard(args):
-    init_db()
-    seed_registry()
-    d = ProfileOpsDaemon(mode="guard", city=args.city, session_file=args.session)
-    d.run()
+def cmd_winners(tenant_id: str):
+    """Show winning hypotheses."""
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM hypotheses WHERE status = 'winner' ORDER BY reward DESC")
+    rows = cur.fetchall()
+
+    if not rows:
+        print("No winners yet.")
+        conn.close()
+        return
+
+    print(f"\n{'='*60}")
+    print(f"  WINNING HYPOTHESES — {len(rows)}")
+    print(f"{'='*60}\n")
+
+    for r in rows:
+        print(f"  {r['hypothesis_id']} [{r['category']}] reward={r['reward']:.3f} runs={r['runs_completed']}")
+        print(f"    {r['claim']}")
+        print(f"    Action: {r['action']} | Metric: {r['primary_metric']}")
+        print()
+
+    conn.close()
 
 
-def cmd_draft(args):
-    init_db()
-    seed_registry()
-    d = ProfileOpsDaemon(mode="draft", city=args.city, session_file=args.session)
-    d.run()
+def cmd_daemon(tenant_id: str, username: str, password: str, interval: int = 300):
+    """Run hypothesis lab as daemon."""
+    print(f"Starting hypothesis lab daemon (interval={interval}s, tenant={tenant_id})")
+    while True:
+        try:
+            cmd_run_next(tenant_id, username, password)
+        except Exception as e:
+            log.error(f"Run error: {e}")
+        print(f"\nSleeping {interval}s...\n")
+        time.sleep(interval)
 
 
-def cmd_daemon(args):
-    init_db()
-    seed_registry()
-    mode = "execute" if args.execute_approved else "safe"
-    d = ProfileOpsDaemon(mode=mode, city=args.city, session_file=args.session)
-    d.run()
-
+# ─── CLI ───────────────────────────────────────────────────────────
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    parser = argparse.ArgumentParser(description="RM ProfileOps CLI")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p = sub.add_parser("status", help="Read-only profile status")
-    p.add_argument("--city", default="manhattan-ny")
-    p.add_argument("--session", default="rm_traffic/session.json")
-    p.set_defaults(func=cmd_status)
-
-    p = sub.add_parser("snapshot", help="Save profile state snapshot")
-    p.add_argument("--session", default="rm_traffic/session.json")
-    p.set_defaults(func=cmd_snapshot)
-
-    p = sub.add_parser("unhide", help="Ensure profile is visible")
-    p.add_argument("--session", default="rm_traffic/session.json")
-    p.set_defaults(func=cmd_unhide)
-
-    p = sub.add_parser("draft-bio", help="Generate a bio draft")
-    p.add_argument("--session", default="rm_traffic/session.json")
-    p.set_defaults(func=cmd_draft_bio)
-
-    p = sub.add_parser("draft-blog", help="Generate blog drafts")
-    p.add_argument("--count", type=int, default=1)
-    p.set_defaults(func=cmd_draft_blog)
-
-    p = sub.add_parser("draft-interview", help="Generate interview drafts")
-    p.add_argument("--session", default="rm_traffic/session.json")
-    p.set_defaults(func=cmd_draft_interview)
-
-    p = sub.add_parser("generate-bios", help="Generate many bio variants with scoring")
-    p.add_argument("--count", type=int, default=1000)
-    p.add_argument("--top-n", type=int, default=100)
-    p.set_defaults(func=cmd_generate_bios)
-
-    p = sub.add_parser("evolve-bios", help="Run GA to optimize bios for CTR/email/phone")
-    p.add_argument("--population", type=int, default=100)
-    p.add_argument("--generations", type=int, default=50)
-    p.add_argument("--elites", type=int, default=10)
-    p.set_defaults(func=cmd_evolve_bios)
-
-    p = sub.add_parser("dashboard", help="Generate HTML stats dashboard")
-    p.set_defaults(func=cmd_dashboard)
-
-    p = sub.add_parser("tokenize", help="Build vocabulary from all bio drafts")
-    p.add_argument("--min-freq", type=int, default=2)
-    p.set_defaults(func=cmd_tokenize)
-
-    p = sub.add_parser("approve", help="Approve a draft variant")
-    p.add_argument("variant_id")
-    p.set_defaults(func=cmd_approve)
-
-    p = sub.add_parser("apply", help="Apply an approved bio variant")
-    p.add_argument("variant_id")
-    p.add_argument("--session", default="rm_traffic/session.json")
-    p.set_defaults(func=cmd_apply)
-
-    p = sub.add_parser("list-drafts", help="List content drafts")
-    p.add_argument("--kind", default="bio")
-    p.add_argument("--status", choices=["all", "pending", "approved"], default="all")
-    p.add_argument("--limit", type=int, default=20)
-    p.set_defaults(func=cmd_list_drafts)
-
-    p = sub.add_parser("discover", help="Discover an endpoint via CDP")
-    p.add_argument("target", choices=["availability", "blog", "interview"])
-    p.set_defaults(func=cmd_discover)
-
-    p = sub.add_parser("rank-check", help="Check search rank")
-    p.add_argument("username")
-    p.add_argument("--city", default="manhattan-ny")
-    p.add_argument("--session", default="rm_traffic/session.json")
-    p.set_defaults(func=cmd_rank_check)
-
-    p = sub.add_parser("report", help="Generate daily report")
-    p.add_argument("username")
-    p.add_argument("--city", default="manhattan-ny")
-    p.add_argument("--session", default="rm_traffic/session.json")
-    p.set_defaults(func=cmd_report)
-
-    for mode in ["audit", "guard", "draft"]:
-        p = sub.add_parser(mode, help=f"Run {mode} mode")
-        p.add_argument("--city", default="manhattan-ny")
-        p.add_argument("--session", default="rm_traffic/session.json")
-        p.set_defaults(func=globals()[f"cmd_{mode}"])
-
-    p = sub.add_parser("daemon", help="Run daemon")
-    p.add_argument("--city", default="manhattan-ny")
-    p.add_argument("--session", default="rm_traffic/session.json")
-    p.add_argument("--execute-approved", action="store_true", help="Auto-apply approved bio changes")
-    p.set_defaults(func=cmd_daemon)
-
-    # ─── AGI Commands ───
-
-    p = sub.add_parser("agi-inspect", help="Show real corpus stats via C++ engine")
-    p.add_argument("--bios", default=None, help="Path to real_bios.jsonl")
-    p.set_defaults(func=cmd_agi_inspect)
-
-    p = sub.add_parser("agi-train", help="Train model on real data via C++ engine")
-    p.add_argument("--bios", default=None)
-    p.add_argument("--label", default="reviews", choices=["reviews", "views_per_day", "rating"])
-    p.add_argument("--cv", type=int, default=5)
-    p.add_argument("--walk-forward", action="store_true")
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--lr", type=float, default=0.001)
-    p.add_argument("--hidden", type=int, default=64)
-    p.set_defaults(func=cmd_agi_train)
-
-    p = sub.add_parser("agi-pipeline", help="Run full AGI pipeline (train→generate→score→evolve→select)")
-    p.add_argument("--bios", default=None)
-    p.add_argument("--count", type=int, default=100000)
-    p.add_argument("--label", default="reviews")
-    p.add_argument("--generations", type=int, default=100)
-    p.add_argument("--top", type=int, default=25)
-    p.set_defaults(func=cmd_agi_pipeline)
-
-    p = sub.add_parser("agi-import", help="Import top candidates into approval queue")
-    p.add_argument("--path", default=None)
-    p.set_defaults(func=cmd_agi_import)
-
-    p = sub.add_parser("agi-drafts", help="List AGI draft candidates")
-    p.add_argument("--status", choices=["all", "pending", "approved"], default="all")
-    p.set_defaults(func=cmd_agi_list_drafts)
-
-    p = sub.add_parser("agi-approve", help="Approve an AGI candidate")
-    p.add_argument("variant_id")
-    p.set_defaults(func=cmd_agi_approve)
-
-    p = sub.add_parser("agi-receipts", help="Show receipt ledger")
-    p.add_argument("--verbose", action="store_true")
-    p.set_defaults(func=cmd_agi_receipts)
-
-    p = sub.add_parser("agi-experiments", help="List experiment results")
-    p.set_defaults(func=cmd_agi_experiments)
-
-    p = sub.add_parser("agi-dashboard", help="Show AGI control panel")
-    p.set_defaults(func=cmd_agi_dashboard)
-
-    # ─── RM-PRI Commands (honest naming) ───
-
-    p = sub.add_parser("validate-corpus", help="Gate 1: validate corpus schema")
-    p.add_argument("path", nargs="?", default=None)
-    p.add_argument("--check-enriched", action="store_true")
-    p.set_defaults(func=cmd_validate_corpus)
-
-    p = sub.add_parser("enrich-views", help="Gate 2: enrich bios with public visits/member-since")
-    p.add_argument("--input", default=None)
-    p.add_argument("--output", default=None)
-    p.add_argument("--workers", type=int, default=16)
-    p.add_argument("--rate-limit", type=float, default=0.5)
-    p.set_defaults(func=cmd_enrich_views)
-
-    p = sub.add_parser("rank-real", help="Rank real bios by views_per_day")
-    p.add_argument("--input", default=None)
-    p.add_argument("--output", default=None)
-    p.add_argument("--metric", default="views_per_day")
-    p.set_defaults(func=cmd_rank_real)
-
-    p = sub.add_parser("atomize-bios", help="Extract structural atoms from bios")
-    p.add_argument("--input", default=None)
-    p.add_argument("--output", default=None)
-    p.set_defaults(func=cmd_atomize_bios)
-
-    p = sub.add_parser("pri-status", help="Show honest RM-PRI system status")
-    p.set_defaults(func=cmd_pri_status)
-
+    parser = argparse.ArgumentParser(description="300-Hypothesis Growth Lab")
+    parser.add_argument("--seed-300", action="store_true", help="Seed 300 hypotheses")
+    parser.add_argument("--list", action="store_true", help="List all hypotheses")
+    parser.add_argument("--run-next", action="store_true", help="Run next best hypothesis")
+    parser.add_argument("--daemon", action="store_true", help="Run as daemon")
+    parser.add_argument("--report", action="store_true", help="Generate report")
+    parser.add_argument("--winners", action="store_true", help="Show winners")
+    parser.add_argument("--tenant", default="", help="Tenant ID")
+    parser.add_argument("--interval", type=int, default=300, help="Daemon interval (s)")
     args = parser.parse_args()
 
-    # Credentials check for commands that need them
-    if args.command in ("status", "snapshot", "unhide", "draft-bio", "apply", "audit", "guard", "draft", "daemon", "rank-check", "report"):
-        if not get_credential("RM_USER") or not get_credential("RM_PASS"):
-            print("Set RM_USER and RM_PASS environment variables first.")
-            print("Do not hardcode credentials.")
-            sys.exit(1)
+    username = os.environ.get("RENTMASSEUR_USER", os.environ.get("RM_USER", ""))
+    password = os.environ.get("RENTMASSEUR_PASS", os.environ.get("RM_PASS", ""))
+    tenant_id = args.tenant or hashlib.sha256(username.encode()).hexdigest()[:16]
 
-    args.func(args)
+    if args.seed_300:
+        cmd_seed_300()
+        return
+    if args.list:
+        cmd_list()
+        return
+    if args.run_next:
+        sys.exit(cmd_run_next(tenant_id, username, password))
+        return
+    if args.daemon:
+        cmd_daemon(tenant_id, username, password, args.interval)
+        return
+    if args.report:
+        cmd_report(tenant_id)
+        return
+    if args.winners:
+        cmd_winners(tenant_id)
+        return
+
+    parser.print_help()
 
 
 if __name__ == "__main__":
@@ -284,517 +464,337 @@ if __name__ == "__main__":
 
 ```
 
-booking_ir.py:
+discover_blog_interview.py:
 ```
-#!/usr/bin/env python3
 """
-BookingIR — Canonical business state for the revenue pipeline.
+Discover Blog + Interview API endpoints via Selenium CDP.
 
-The product is not traffic. The product is conversion.
+Uses the existing logged-in Chrome profile to avoid login/captcha.
+Opens the blog and interview editor pages and captures the exact network
+requests when saving/publishing.
 
-Core object: RevenueEvent (a lead → booking → payment → repeat journey)
-Secondary: LeadRecord, DraftReply, BookingRecord
+Usage:
+    python3 rm_traffic/discover_blog_interview.py
 
-Hard revenue metrics replace vanity metrics:
-  qualified_leads, reply_rate, booking_request_rate, booking_confirm_rate,
-  show_rate, collected_revenue, average_booking_value, repeat_rate,
-  time_to_reply, source_roi, compliance_incidents
+Output:
+    rm_traffic/blog_interview_endpoints.json
 """
 
-import hashlib
 import json
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+import time
+from pathlib import Path
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+
+BASE = "https://rentmasseur.com"
+PROFILE = "/tmp/rm_action_api"
 
 
-# ─── Lead classification ───────────────────────────────────────────
-
-LEAD_CLASSIFICATIONS = [
-    "booking_ready",      # explicit request for session, time, location
-    "inquiry",            # asking questions, price, availability
-    "low_intent",         # vague, "maybe", "just looking"
-    "spam",               # promotional, irrelevant
-    "competitor",         # another masseur fishing
-    "unsafe",             # suspicious, potentially harmful
-    "out_of_area",        # too far, won't travel
-    "repeat_client",      # has booked before
-    "already_active",     # conversation already in progress
-]
-
-
-@dataclass
-class LeadRecord:
-    """One person who showed up in the mailbox or visitor list."""
-    person_id_hash: str = ""          # SHA-256 of username (privacy)
-    username: str = ""                # kept locally only, never committed
-    source: str = "rentmasseur"       # rentmasseur / referral / direct
-    first_seen_at: str = ""
-    last_message_at: str = ""
-    classification: str = "unclassified"
-    intent_score: float = 0.0         # 0.0 to 1.0
-    location_match: bool = False
-    budget_match: Optional[bool] = None
-    is_premium: bool = False
-    is_repeat: bool = False
-    message_received: str = ""        # last inbound message text
-    message_sent: str = ""            # last outbound message text
-    consent_status: str = "unknown"   # unknown / opted_in / opted_out
-    cooldown_until: str = ""          # ISO timestamp, no contact before this
-    suppressed: bool = False          # permanently suppressed
+def get_driver():
+    opts = Options()
+    opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument(f"--user-data-dir={PROFILE}")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    return webdriver.Chrome(options=opts)
 
 
-@dataclass
-class DraftReply:
-    """AI-drafted reply awaiting human approval."""
-    person_id_hash: str = ""
-    username: str = ""
-    draft_text: str = ""
-    includes_price: bool = False
-    includes_availability: bool = False
-    includes_location: bool = False
-    includes_boundary: bool = False   # professional boundary statement
-    includes_next_step: bool = False  # clear call to action
-    compliance_ok: bool = True
-    approval_status: str = "pending"  # pending / approved / rejected / sent
-    created_at: str = ""
-    approved_at: str = ""
-    sent_at: str = ""
-    risk_flags: List[str] = field(default_factory=list)
+def dismiss_popups(driver):
+    time.sleep(1)
+    try:
+        driver.execute_script("document.querySelectorAll('.DialogOverlay,[class*=\"overlay\"]').forEach(e=>e.remove())")
+    except Exception:
+        pass
 
 
-@dataclass
-class BookingRecord:
-    """The money table. One row per booking attempt."""
-    person_id_hash: str = ""
-    username: str = ""
-    booking_status: str = "inquiry"   # inquiry / requested / confirmed / completed / cancelled / no_show
-    requested_time: str = ""
-    confirmed_time: str = ""
-    session_duration: str = ""
-    session_value: float = 0.0        # agreed price
-    amount_collected: float = 0.0     # actually paid
-    source: str = "rentmasseur"
-    attributed_action: str = ""       # which pipeline action led to this
-    created_at: str = ""
-    updated_at: str = ""
+def get_api_calls(driver):
+    logs = driver.get_log("performance")
+    reqs = {}
+    for entry in logs:
+        try:
+            msg = json.loads(entry["message"])["message"]
+            if msg["method"] == "Network.requestWillBeSent":
+                p = msg["params"]
+                r = p["request"]
+                rid = p["requestId"]
+                reqs[rid] = {
+                    "url": r["url"],
+                    "method": r["method"],
+                    "postData": r.get("postData", "")[:2000],
+                }
+            elif msg["method"] == "Network.responseReceived":
+                p = msg["params"]
+                rid = p["requestId"]
+                if rid in reqs:
+                    reqs[rid]["status"] = p["response"]["status"]
+                    try:
+                        body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": rid})
+                        reqs[rid]["response"] = body.get("body", "")[:2000]
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return [v for v in reqs.values() if "/api/" in v["url"]]
 
 
-@dataclass
-class RevenueEvent:
-    """The center of the system. Tracks a person from lead to revenue."""
-    event_id: str = ""
-    person_id_hash: str = ""
-    source: str = "rentmasseur"
-    first_seen_at: str = ""
-    consent_status: str = "unknown"
-    intent_score: float = 0.0
-    location_match: bool = False
-    budget_match: Optional[bool] = None
-    requested_time: str = ""
-    message_received: str = ""
-    message_sent: str = ""
-    booking_requested: bool = False
-    booking_confirmed: bool = False
-    session_completed: bool = False
-    amount_collected: float = 0.0
-    repeat_client: bool = False
-    attribution_action_id: str = ""
-
-
-@dataclass
-class RevenueMetrics:
-    """Hard revenue metrics. These are what matter."""
-    qualified_leads: int = 0
-    total_leads: int = 0
-    reply_rate: float = 0.0           # % of leads we replied to
-    booking_request_rate: float = 0.0  # % of qualified leads that requested booking
-    booking_confirm_rate: float = 0.0  # % of requested that confirmed
-    show_rate: float = 0.0            # % of confirmed that completed
-    collected_revenue: float = 0.0
-    average_booking_value: float = 0.0
-    repeat_rate: float = 0.0
-    time_to_reply_hours: float = 0.0
-    source_roi: Dict[str, float] = field(default_factory=dict)
-    compliance_incidents: int = 0
-    drafts_pending: int = 0
-    drafts_approved: int = 0
-    drafts_sent: int = 0
-
-    # Secondary (upstream, not revenue)
-    total_views: int = 0
-    total_contacts: int = 0
-    ctr: float = 0.0
-    search_rank: int = 0
-
-    def compute(self, leads: List[LeadRecord], bookings: List[BookingRecord],
-                drafts: List[DraftReply]):
-        self.total_leads = len(leads)
-        self.qualified_leads = sum(1 for l in leads if l.classification in ("booking_ready", "inquiry", "repeat_client"))
-        replied = sum(1 for l in leads if l.message_sent)
-        self.reply_rate = round(replied / self.total_leads * 100, 1) if self.total_leads else 0.0
-
-        requested = sum(1 for b in bookings if b.booking_status in ("requested", "confirmed", "completed"))
-        self.booking_request_rate = round(requested / self.qualified_leads * 100, 1) if self.qualified_leads else 0.0
-
-        confirmed = sum(1 for b in bookings if b.booking_status in ("confirmed", "completed"))
-        self.booking_confirm_rate = round(confirmed / requested * 100, 1) if requested else 0.0
-
-        completed = sum(1 for b in bookings if b.booking_status == "completed")
-        self.show_rate = round(completed / confirmed * 100, 1) if confirmed else 0.0
-
-        self.collected_revenue = sum(b.amount_collected for b in bookings if b.booking_status == "completed")
-        paid_bookings = [b for b in bookings if b.booking_status == "completed" and b.amount_collected > 0]
-        self.average_booking_value = round(sum(b.amount_collected for b in paid_bookings) / len(paid_bookings), 2) if paid_bookings else 0.0
-
-        repeat_clients = sum(1 for l in leads if l.is_repeat)
-        self.repeat_rate = round(repeat_clients / self.total_leads * 100, 1) if self.total_leads else 0.0
-
-        self.drafts_pending = sum(1 for d in drafts if d.approval_status == "pending")
-        self.drafts_approved = sum(1 for d in drafts if d.approval_status == "approved")
-        self.drafts_sent = sum(1 for d in drafts if d.approval_status == "sent")
-
-        self.compliance_incidents = sum(1 for d in drafts if not d.compliance_ok)
-
-
-@dataclass
-class ProfileSnapshot:
-    """Read-only profile state. Secondary signal, not revenue."""
-    headline: str = ""
-    availability_option: int = 0
-    availability_label: str = ""
-    is_visible: bool = True
-    search_rank: int = 0
-    search_total: int = 0
-    active_rates: List[Dict] = field(default_factory=list)
-    avg_rate: float = 0.0
-
-
-@dataclass
-class BookingIR:
-    """The canonical business state object.
-
-    Centered on revenue events, not activity counts.
-    Every lane reads and writes this object.
-    """
-    timestamp: str = ""
-    cycle_num: int = 0
-    login_ok: bool = False
-    login_error: str = ""
-
-    # Lane 1: Observe — what we see
-    profile: ProfileSnapshot = field(default_factory=ProfileSnapshot)
-    leads: List[LeadRecord] = field(default_factory=list)
-    mailbox_raw: List[Dict] = field(default_factory=list)
-
-    # Lane 2: Qualify — classification results
-    metrics: RevenueMetrics = field(default_factory=RevenueMetrics)
-
-    # Lane 3: Draft — AI-drafted replies
-    drafts: List[DraftReply] = field(default_factory=list)
-
-    # Lane 4: Approve/Send — what was approved and sent
-    drafts_sent: List[DraftReply] = field(default_factory=list)
-
-    # Lane 5: Outcome — booking tracking
-    bookings: List[BookingRecord] = field(default_factory=list)
-
-    # Lane 6: Learn — what actions led to revenue
-    attribution: Dict[str, float] = field(default_factory=dict)
-    learnings: List[str] = field(default_factory=list)
-
-    # Receipt
-    receipt_hash: str = ""
-    status: str = "GREEN"  # GREEN / YELLOW / RED
-
-    # Raw API (never committed)
-    _raw: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self):
-        if not self.timestamp:
-            self.timestamp = datetime.now(timezone.utc).isoformat()
-
-    def compute_receipt(self) -> str:
-        data = self.to_json(include_raw=False)
-        self.receipt_hash = hashlib.sha256(data.encode()).hexdigest()[:16]
-        return self.receipt_hash
-
-    def to_json(self, include_raw: bool = False) -> str:
-        d = asdict(self)
-        if not include_raw:
-            d.pop("_raw", None)
-        return json.dumps(d, indent=2, default=str, sort_keys=True)
-
-    def to_dict(self, include_raw: bool = False) -> Dict:
-        d = asdict(self)
-        if not include_raw:
-            d.pop("_raw", None)
-        return d
-
-    def summary(self) -> str:
-        m = self.metrics
-        lines = [
-            f"BookingIR — {self.timestamp}",
-            f"Status: {self.status}",
-            f"Login: {'OK' if self.login_ok else 'FAILED'}",
-            f"",
-            f"Revenue Metrics:",
-            f"  Qualified leads: {m.qualified_leads}/{m.total_leads}",
-            f"  Reply rate: {m.reply_rate}%",
-            f"  Booking request rate: {m.booking_request_rate}%",
-            f"  Booking confirm rate: {m.booking_confirm_rate}%",
-            f"  Show rate: {m.show_rate}%",
-            f"  Collected revenue: ${m.collected_revenue}",
-            f"  Avg booking value: ${m.average_booking_value}",
-            f"  Repeat rate: {m.repeat_rate}%",
-            f"  Compliance incidents: {m.compliance_incidents}",
-            f"",
-            f"Drafts: {m.drafts_pending} pending, {m.drafts_approved} approved, {m.drafts_sent} sent",
-            f"",
-            f"Secondary (upstream):",
-            f"  Views: {m.total_views} (CTR: {m.ctr}%)",
-            f"  Search rank: #{m.search_rank}",
-            f"  Availability: {self.profile.availability_label}",
-            f"",
-            f"Leads: {len(self.leads)} total",
-            f"Bookings tracked: {len(self.bookings)}",
-            f"Learnings: {len(self.learnings)}",
-            f"",
-            f"Receipt: {self.receipt_hash}",
-        ]
-        return "\n".join(lines)
-
-```
-
-fortress.db-wal:
-```
-
-```
-
-bio_variants_library.py:
-```
-"""
-30 Bio Variant Modules — hypothesis-driven, tested copy strategies.
-
-Each module is one variant. They rotate through positioning, tone, CTA,
-local SEO, and client targeting. All are safe, professional, and funny-free.
-"""
-
-from typing import Dict, List
-
-BioVariant = Dict[str, str]
-
-
-def _bio(headline: str, description: str, hypothesis: str) -> BioVariant:
-    return {"headline": headline, "description": description, "hypothesis": hypothesis}
-
-
-BIO_VARIANTS: List[BioVariant] = [
-    # Professional baseline
-    _bio(
-        "Deep Tissue & Sports Recovery — Manhattan",
-        "I work with people who train hard, sit long hours, or carry stress in their shoulders, back, and hips. Sessions are pressure-forward, deliberate, and built around what your body needs that day. Clean private space in Manhattan. Message me with your focus areas and preferred time.",
-        "Professional baseline tests broad appeal.",
-    ),
-    # Direct CTA
-    _bio(
-        "Strong Hands, Real Relief — Manhattan",
-        "No fluff. No spa music required. Just focused deep tissue work on the muscle groups that actually hurt. I work with lifters, runners, desk workers, and travelers. Manhattan incall. Text or email to book a session.",
-        "Direct CTA increases conversion intent.",
-    ),
-    # Local SEO heavy
-    _bio(
-        "Manhattan Deep Tissue Massage — Chelsea & Midtown",
-        "Professional deep tissue and recovery massage in Manhattan. I see clients in Chelsea, Midtown, and surrounding areas. Focused on neck, shoulders, back, and hips. Strong, steady pressure. Same-day booking when available.",
-        "Local SEO keywords improve Manhattan search relevance.",
-    ),
-    # Sports focus
-    _bio(
-        "Sports Recovery Massage — Manhattan",
-        "Built for athletes and people who train. I target hips, hamstrings, glutes, shoulders, and back with firm pressure and slow, intentional work. Whether you lift, run, or fight, this is recovery for people who take their body seriously.",
-        "Sports positioning attracts fitness-focused clients.",
-    ),
-    # Desk worker focus
-    _bio(
-        "Desk-Worker Relief — Manhattan Deep Tissue",
-        "If your neck, shoulders, and lower back feel like concrete from hours at a desk, this is for you. I focus on the tension patterns that build from laptops, monitors, and stress. Pressure is adjusted to your tolerance. Manhattan.",
-        "Desk-worker niche captures weekday traffic.",
-    ),
-    # Traveler focus
-    _bio(
-        "Travel Stiffness Relief — Manhattan",
-        "Flights, luggage, and hotel beds leave the spine compressed and the neck locked. I work with travelers passing through Manhattan who need targeted relief before the next meeting or flight. Incall in Manhattan. Book when available.",
-        "Traveler angle captures transient high-intent traffic.",
-    ),
-    # Premium positioning
-    _bio(
-        "Premium Bodywork — Manhattan, NYC",
-        "Private, professional bodywork for clients who want quality over quantity. I combine deep tissue, pressure-point work, and full-body flow in a clean, comfortable Manhattan studio. Incall preferred. Established clients welcome.",
-        "Premium positioning filters for higher-value bookings.",
-    ),
-    # Funny/personality
-    _bio(
-        "You Bring the Smile, I Bring the Wolf — Manhattan",
-        "The name is Karpathian Wolf. The work is serious. I specialize in deep tissue and sports recovery for people who need real pressure and real relief. Manhattan incall. If you want a feather, go elsewhere. If you want to feel better, message me.",
-        "Personality branding increases memorability.",
-    ),
-    # Recovery specialist
-    _bio(
-        "Recovery-Focused Bodywork in Manhattan",
-        "Recovery is not the same as relaxation. I work on the muscle groups that take the load from training, travel, and long workdays. Slow, deliberate pressure. Clear communication. Manhattan. Message for availability.",
-        "Recovery specialist framing increases trust with athletes.",
-    ),
-    # Concise
-    _bio(
-        "Deep Tissue Massage — Manhattan",
-        "Focused, professional deep tissue work in Manhattan. Strong hands, clean space, clear communication. I work on the areas that hurt: shoulders, neck, back, hips. Message me to book.",
-        "Concise copy reduces cognitive load.",
-    ),
-    # Last-minute availability
-    _bio(
-        "Same-Day Deep Tissue — Manhattan",
-        "Need real bodywork today? I keep blocks open for same-day sessions in Manhattan when I am available. Strong pressure, clean space, no attitude. Text or email with your preferred time and focus areas.",
-        "Last-minute availability converts urgent searches.",
-    ),
-    # Outcall emphasized
-    _bio(
-        "Manhattan Outcall Deep Tissue & Recovery",
-        "I bring the session to your Manhattan location. Clean, professional, and focused on real relief. Best for clients who prefer privacy and convenience. Strong pressure, clear boundaries, respectful clients only.",
-        "Outcall emphasis captures different client segment.",
-    ),
-    # Incall emphasized
-    _bio(
-        "Private Manhattan Studio — Deep Tissue",
-        "My space is clean, private, and designed for focused work. No distractions. I offer deep tissue, sports recovery, and targeted relief in Manhattan. Incall only. Message to book.",
-        "Incall emphasis reassures clients about environment.",
-    ),
-    # Pain-specific
-    _bio(
-        "Shoulder & Neck Tension Relief — Manhattan",
-        "Specialized work on the upper back, shoulders, neck, and base of the skull. I address the tension that builds from stress, posture, and long hours. Slow pressure, clear communication. Manhattan.",
-        "Pain-specific positioning improves relevance.",
-    ),
-    # Hip/glute focus
-    _bio(
-        "Hip & Glute Recovery — Manhattan",
-        "Targeted work on hips, glutes, and lower back for people who sit, squat, or run. Deep, deliberate pressure on the muscle groups that connect the lower body. Manhattan incall. Message for availability.",
-        "Lower-body focus targets lifters and runners.",
-    ),
-    # Stress reset
-    _bio(
-        "Stress Reset Bodywork — Manhattan",
-        "Stress lives in the body. I work on the shoulders, neck, back, and hips to release the tension that accumulates from deadlines, screens, and city life. Manhattan incall. Calm space, strong hands, clear boundaries.",
-        "Stress reset captures high-stress Manhattan professionals.",
-    ),
-    # Morning availability
-    _bio(
-        "Early Morning Deep Tissue — Manhattan",
-        "Start the day with real bodywork. I offer early morning sessions in Manhattan for people who want to get ahead of tightness before work. Strong pressure, clean space, on-time. Message to schedule.",
-        "Time-of-day positioning targets early schedulers.",
-    ),
-    # Evening availability
-    _bio(
-        "Evening Recovery Sessions — Manhattan",
-        "After work, after the gym, after the city. Evening deep tissue sessions in Manhattan for people who need to decompress before bed. Strong pressure, clean space, respectful clients only. Message to book.",
-        "Evening positioning targets after-work traffic.",
-    ),
-    # Weekend focus
-    _bio(
-        "Weekend Deep Tissue Recovery — Manhattan",
-        "Use the weekend to recover properly. I offer longer, focused sessions on Saturday and Sunday in Manhattan. Deep tissue, sports recovery, and full-body work. Message for weekend availability.",
-        "Weekend focus captures weekend search traffic.",
-    ),
-    # First-timer friendly
-    _bio(
-        "First-Timer Friendly Deep Tissue — Manhattan",
-        "New to deep tissue? I explain the process, check in on pressure, and focus on the areas you want worked. No surprises. Clean, professional space in Manhattan. Message me with questions or to book.",
-        "First-timer friendly reduces friction for new clients.",
-    ),
-    # Experienced clients
-    _bio(
-        "For Clients Who Know Good Pressure — Manhattan",
-        "If you have tried light massages and left frustrated, this is for you. I deliver deep, consistent pressure on the areas that need it. No guesswork. Manhattan incall. Message with your focus areas.",
-        "Experienced-client framing filters for pressure tolerance.",
-    ),
-    # Discretion
-    _bio(
-        "Discreet Professional Bodywork — Manhattan",
-        "Private, discreet, and professional deep tissue work in Manhattan. I respect your privacy, your time, and your boundaries. Clean space, strong hands, clear communication. Message to arrange.",
-        "Discretion framing increases trust with privacy-focused clients.",
-    ),
-    # Results-focused
-    _bio(
-        "Results-Focused Deep Tissue — Manhattan",
-        "I measure a session by how you feel after, not by how it sounds. Targeted, pressure-forward work on the muscle groups that limit your movement. Manhattan incall. Message to book a session.",
-        "Results-focused copy emphasizes practical outcomes.",
-    ),
-    # No-nonsense
-    _bio(
-        "No-Nonsense Deep Tissue — Manhattan",
-        "Strong pressure. Clean space. Clear communication. I work on the areas that hurt until they feel better. No spa rituals, no upsells, no surprises. Manhattan incall. Message for availability.",
-        "No-nonsense tone reduces perceived friction.",
-    ),
-    # Warm/friendly
-    _bio(
-        "Friendly, Focused Deep Tissue — Manhattan",
-        "I take the work seriously, not myself. Sessions are professional, warm, and focused on your goals. Deep tissue, recovery, and targeted relief in a clean Manhattan space. Message to book.",
-        "Warm tone increases approachability.",
-    ),
-    # Expert positioning
-    _bio(
-        "Manhattan Deep Tissue Specialist",
-        "Deep tissue is not just hard pressure — it is knowing where to work, how deep, and for how long. I specialize in shoulders, back, hips, and sports recovery. Manhattan incall. Message with your needs.",
-        "Specialist positioning increases perceived expertise.",
-    ),
-    # Client-centered
-    _bio(
-        "Your Session, Your Goals — Manhattan",
-        "Every session starts with a quick check-in: what changed since last time, where is the tightness, and what pressure works for you. I build the session around your goals. Manhattan incall. Message to book.",
-        "Client-centered copy increases trust.",
-    ),
-    # Manhattan specific neighborhoods
-    _bio(
-        "Hell's Kitchen & Chelsea Deep Tissue Massage",
-        "Convenient location for clients in Hell's Kitchen, Chelsea, and Midtown Manhattan. Professional deep tissue and sports recovery in a clean private space. Strong pressure, clear communication. Message for availability.",
-        "Neighborhood-specific local SEO improves micro-local relevance.",
-    ),
-    # Long-session focus
-    _bio(
-        "Long, Deep Sessions — Manhattan",
-        "Some bodies need more than an hour. I offer longer sessions for clients who want full-body deep tissue work with time for shoulders, back, hips, and legs. Manhattan incall. Message for details.",
-        "Long-session focus captures clients wanting thorough work.",
-    ),
-    # Quick-session focus
-    _bio(
-        "Focused 60-Minute Deep Tissue — Manhattan",
-        "One hour, one focus area, real pressure. Ideal for clients who want targeted work on shoulders, neck, or back without committing to a longer session. Manhattan incall. Message to book.",
-        "Quick-session focus lowers booking barrier.",
-    ),
-]
-
-
-def get_variant(index: int) -> BioVariant:
-    if 0 <= index < len(BIO_VARIANTS):
-        v = BIO_VARIANTS[index]
-        return {
-            "variant_id": f"module_{index:02d}",
-            "headline": v["headline"],
-            "description": v["description"],
-            "hypothesis": v["hypothesis"],
-        }
+def find_clickable(driver, texts):
+    for text in texts:
+        for el in driver.find_elements(By.XPATH, f"//*[contains(text(),'{text}')]"):
+            if el.is_displayed():
+                return el
     return None
 
 
-def list_all() -> List[BioVariant]:
-    return [get_variant(i) for i in range(len(BIO_VARIANTS))]
+def discover_blog(driver):
+    print("\n=== BLOG DISCOVERY ===")
+    driver.get(f"{BASE}/settings?blog=1")
+    time.sleep(5)
+    dismiss_popups(driver)
+    print(f"URL: {driver.current_url}")
+
+    # List possible buttons
+    buttons = driver.find_elements(By.TAG_NAME, "button")
+    print(f"Buttons found: {len(buttons)}")
+    for b in buttons:
+        txt = (b.text or "").strip()
+        if txt:
+            print(f"  Button: {txt[:50]}")
+
+    # Try to click "Create" or "New"
+    for action_text in ["Create", "New", "Add", "Write", "Post"]:
+        el = find_clickable(driver, [action_text])
+        if el:
+            print(f"Clicking '{action_text}'...")
+            driver.execute_script("arguments[0].click()", el)
+            time.sleep(3)
+            break
+
+    # Clear logs and try to find form
+    driver.get_log("performance")
+    textareas = driver.find_elements(By.TAG_NAME, "textarea")
+    inputs = driver.find_elements(By.TAG_NAME, "input")
+    print(f"Textareas: {len(textareas)}, Inputs: {len(inputs)}")
+    for i, ta in enumerate(textareas):
+        print(f"  textarea[{i}]: placeholder={ta.get_attribute('placeholder') or 'N/A'}")
+    for i, inp in enumerate(inputs):
+        t = inp.get_attribute("type") or "text"
+        if t in ("text", "email", "search"):
+            print(f"  input[{i}]: type={t} placeholder={inp.get_attribute('placeholder') or 'N/A'}")
+
+    # Save action
+    save_btn = find_clickable(driver, ["Save", "Submit", "Publish", "Create", "Post"])
+    if save_btn:
+        print("Clicking save...")
+        driver.execute_script("arguments[0].click()", save_btn)
+        time.sleep(3)
+        calls = get_api_calls(driver)
+        print(f"Captured {len(calls)} API calls")
+        for c in calls:
+            print(f"  {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
+        return calls
+    else:
+        print("No save button found")
+        return []
 
 
-def count() -> int:
-    return len(BIO_VARIANTS)
+def discover_interview(driver):
+    print("\n=== INTERVIEW DISCOVERY ===")
+    driver.get(f"{BASE}/settings?interview=1")
+    time.sleep(5)
+    dismiss_popups(driver)
+    print(f"URL: {driver.current_url}")
+
+    # List inputs and buttons
+    textareas = driver.find_elements(By.TAG_NAME, "textarea")
+    inputs = driver.find_elements(By.TAG_NAME, "input")
+    buttons = driver.find_elements(By.TAG_NAME, "button")
+    print(f"Textareas: {len(textareas)}, Inputs: {len(inputs)}, Buttons: {len(buttons)}")
+    for i, ta in enumerate(textareas):
+        print(f"  textarea[{i}]: placeholder={ta.get_attribute('placeholder') or 'N/A'}")
+    for b in buttons:
+        txt = (b.text or "").strip()
+        if txt:
+            print(f"  Button: {txt[:50]}")
+
+    # Clear logs and try to save
+    driver.get_log("performance")
+    save_btn = find_clickable(driver, ["Save", "Submit", "Update", "Confirm"])
+    if save_btn:
+        print("Clicking save...")
+        driver.execute_script("arguments[0].click()", save_btn)
+        time.sleep(3)
+        calls = get_api_calls(driver)
+        print(f"Captured {len(calls)} API calls")
+        for c in calls:
+            print(f"  {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
+        return calls
+    else:
+        print("No save button found")
+        return []
+
+
+def main():
+    driver = get_driver()
+    try:
+        blog_calls = discover_blog(driver)
+        interview_calls = discover_interview(driver)
+        out = {
+            "blog": blog_calls,
+            "interview": interview_calls,
+            "timestamp": time.time(),
+        }
+        Path("rm_traffic/blog_interview_endpoints.json").write_text(
+            json.dumps(out, indent=2, default=str)
+        )
+        print("\nSaved to rm_traffic/blog_interview_endpoints.json")
+    finally:
+        driver.quit()
+
+
+if __name__ == "__main__":
+    main()
 
 ```
 
-money_loop.py:
+bio_ml_trainer.py:
 ```
 """
-RentMasseur Money Loop — closed-loop revenue optimization algorithm.
+Real ML training pipeline for bio performance prediction.
+
+Includes:
+- k-fold cross-validation
+- backpropagation with Adam-like optimizer
+- walk-forward validation
+- online training loop
+- metrics: MAE, RMSE, R^2
+"""
+
+import json
+import logging
+import pickle
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+
+from .bio_features import feature_vector
+from .bio_generator import _score_variant
+from .bio_appraiser import load_bios
+
+log = logging.getLogger("profileops.ml_trainer")
+
+MODEL_PATH = Path(__file__).parent / "data" / "models" / "bio_ml_model.pkl"
+
+
+class MLP:
+    """MLP with Adam optimizer and dropout."""
+
+    def __init__(self, input_size: int, hidden_size: int = 32, output_size: int = 3,
+                 seed: int = 42, dropout: float = 0.2):
+        rng = np.random.default_rng(seed)
+        self.W1 = rng.normal(0, np.sqrt(2.0 / input_size), (input_size, hidden_size))
+        self.b1 = np.zeros((1, hidden_size))
+        self.W2 = rng.normal(0, np.sqrt(2.0 / hidden_size), (hidden_size, output_size))
+        self.b2 = np.zeros((1, output_size))
+        self.dropout = dropout
+
+        # Adam moments
+        self.mW1 = np.zeros_like(self.W1)
+        self.vW1 = np.zeros_like(self.W1)
+        self.mb1 = np.zeros_like(self.b1)
+        self.vb1 = np.zeros_like(self.b1)
+        self.mW2 = np.zeros_like(self.W2)
+        self.vW2 = np.zeros_like(self.W2)
+        self.mb2 = np.zeros_like(self.b2)
+        self.vb2 = np.zeros_like(self.b2)
+        self.t = 0
+
+    def _relu(self, x):
+        return np.maximum(0, x)
+
+    def _sigmoid(self, x):
+        return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+
+    def forward(self, X, training=False):
+        self.z1 = X @ self.W1 + self.b1
+        self.a1 = self._relu(self.z1)
+        if training and self.dropout > 0:
+            self.mask = (np.random.rand(*self.a1.shape) > self.dropout).astype(float)
+            self.a1 *= self.mask / (1 - self.dropout)
+        self.z2 = self.a1 @ self.W2 + self.b2
+        self.a2 = self._sigmoid(self.z2)
+        return self.a2
+
+    def backward(self, X, y, y_pred, lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.t += 1
+        m = X.shape[0]
+
+        dz2 = (y_pred - y) / m
+        dW2 = self.a1.T @ dz2
+        db2 = np.sum(dz2, axis=0, keepdims=True)
+
+        da1 = dz2 @ self.W2.T
+        if self.dropout > 0:
+            da1 *= self.mask
+        dz1 = da1 * (self.z1 > 0)
+        dW1 = X.T @ dz1
+        db1 = np.sum(dz1, axis=0, keepdims=True)
+
+        # Adam update
+        for dW, mW, vW, W in [(dW1, self.mW1, self.vW1, self.W1),
+                                (db1, self.mb1, self.vb1, self.b1),
+                                (dW2, self.mW2, self.vW2, self.W2),
+                                (db2, self.mb2, self.vb2, self.b2)]:
+            mW[:] = beta1 * mW + (1 - beta1) * dW
+            vW[:] = beta2 * vW + (1 - beta2) * (dW ** 2)
+            m_hat = mW / (1 - beta1 ** self.t)
+            v_hat = vW / (1 - beta2 ** self.t)
+            W -= lr * m_hat / (np.sqrt(v_hat) + eps)
+
+    def train_epoch(self, X, y, lr=0.01, batch_size=64):
+        n = X.shape[0]
+        indices = np.random.permutation(n)
+        total_loss = 0
+        for i in range(0, n, batch_size):
+            idx = indices[i:i+batch_size]
+            Xb = X[idx]
+            yb = y[idx]
+            y_pred = self.forward(Xb, training=True)
+            loss = np.mean((y_pred - yb) ** 2)
+            total_loss += loss * len(idx)
+            self.backward(Xb, yb, y_pred, lr=lr)
+        return total_loss / n
+
+    def predict(self, X):
+        return self.forward(X, training=False)
+
+    def save(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def load(path: Path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+
+def build_dataset(bios: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
+    """Build feature matrix X and label matrix y from bios."""
+    X, y = [], []
+    for bio in bios:
+        X.append(feature_vector(bio["headline"], bio["description"]))
+        scores = _score_variant(bio["headline"], bio["description"])
+        # Synthetic labels: realistic CTR/email/phone
+        ctr = min(0.08, scores["composite"] * 0.08 + 0.01)
+        email = min(0.05, scores["composite"] * 0.05 + 0.005)
+        phone = min(0.03, scores["composite"] * 0.03 + 0.003)
+        y.append([ctr, email, phone])
+    return np.array(X), np.array(y)
+

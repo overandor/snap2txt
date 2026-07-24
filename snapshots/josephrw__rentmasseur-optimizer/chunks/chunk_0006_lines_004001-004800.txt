@@ -1,800 +1,800 @@
-        "You are an expert A/B testing judge for massage therapy profiles. "
-        "Score the given bio on a scale of 0-100 for each criterion. "
-        "Return ONLY valid JSON with these fields:\n"
-        '{"phone_cta_strength": 0-100, "urgency": 0-100, "emotional_hook": 0-100, '
-        '"seo_keywords": 0-100, "uniqueness": 0-100, "length_optimal": 0-100, '
-        '"beats_competitors": 0-100, "overall_score": 0-100, "reasoning": "one sentence"}'
-    )
-    user_prompt = (
-        f"BIO TO SCORE:\n{bio}\n\n"
-        f"TOP COMPETITOR BIOS:\n{competitor_sample}\n\n"
-        f"Score this bio. The overall_score must reflect whether it beats ALL competitors. "
-        f"Be harsh — only bios that are clearly better than competitors should score above 80."
-    )
-
-    result = _groq_json(system_prompt, user_prompt, max_tokens=400)
-    if result:
-        try:
-            result["overall_score"] = int(result.get("overall_score", 0))
-            return result
-        except (ValueError, TypeError):
-            result["overall_score"] = 0
-    return {"overall_score": 0, "reasoning": "Failed to score"}
-
-
-def ab_test_bios(variants: list, competitor_bios: list) -> dict:
-    """Run A/B testing tournament on all bio variants."""
-    logger.info("=== A/B Testing %d bio variants ===", len(variants))
-    os.makedirs(AB_TEST_DIR, exist_ok=True)
-
-    scored = []
-    for v in variants:
-        logger.info("Scoring: %s (%d chars)", v["strategy"], v["length"])
-        score = score_bio(v["bio"], competitor_bios)
-        scored.append({
-            "strategy": v["strategy"],
-            "bio": v["bio"],
-            "length": v["length"],
-            "file": v["file"],
-            "score": score,
-        })
-        logger.info("  Score: %d/100 — %s", score.get("overall_score", 0), score.get("reasoning", ""))
-        time.sleep(1)
-
-    scored.sort(key=lambda x: x["score"].get("overall_score", 0), reverse=True)
-
-    # Head-to-head final: top 3 vs each other
-    top3 = scored[:3]
-    if len(top3) >= 2:
-        logger.info("=== Final head-to-head: top 3 ===")
-        winner = top3[0]
-        for candidate in top3[1:]:
-            system_prompt = (
-                "You are the final judge in a bio A/B test. "
-                "Pick the bio that will generate MORE PHONE CALLS. "
-                "Return ONLY valid JSON: {\"winner\": \"A\" or \"B\", \"reasoning\": \"one sentence\"}"
-            )
-            user_prompt = (
-                f"BIO A (current winner — {winner['strategy']}, score {winner['score']['overall_score']}):\n{winner['bio']}\n\n"
-                f"BIO B (challenger — {candidate['strategy']}, score {candidate['score']['overall_score']}):\n{candidate['bio']}\n\n"
-                f"Which bio generates more phone calls? Pick A or B."
-            )
-            result = _groq_json(system_prompt, user_prompt, max_tokens=200)
-            if result and result.get("winner") == "B":
-                logger.info("  Challenger %s beats %s!", candidate["strategy"], winner["strategy"])
-                winner = candidate
-            else:
-                logger.info("  %s retains crown over %s", winner["strategy"], candidate["strategy"])
-            time.sleep(1)
-    else:
-        winner = scored[0] if scored else None
-
-    # Save A/B test results
-    results_path = os.path.join(AB_TEST_DIR, f"results_{datetime.now().strftime('%Y%m%d')}.json")
-    with open(results_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "date": datetime.now(timezone.utc).isoformat(),
-            "total_variants": len(variants),
-            "competitors_analyzed": len(competitor_bios),
-            "all_scores": [{k: v for k, v in s.items() if k != "bio"} for s in scored],
-            "winner": winner["strategy"] if winner else None,
-            "winner_score": winner["score"] if winner else None,
-        }, f, indent=2)
-
-    logger.info("=== A/B Test Winner: %s (score: %d) ===",
-                winner["strategy"] if winner else "NONE",
-                winner["score"]["overall_score"] if winner else 0)
-
-    return winner
-
-
-def get_current_bio() -> Optional[str]:
-    """Get current bio from RentMasseur profile."""
-    try:
-        from rentmasseur_core import setup_driver, login
-        driver = setup_driver(headless=True)
-        try:
-            if not login(driver):
-                return None
-            driver.get("https://rentmasseur.com/settings/about")
-            time.sleep(5)
-            from selenium.webdriver.common.by import By
-            textarea = driver.find_element(By.CSS_SELECTOR, "textarea#description, textarea[name='description']")
-            current = textarea.get_attribute("value") or textarea.text
-            logger.info("Current bio: %d chars", len(current))
-            return current
-        finally:
-            driver.quit()
-    except Exception as e:
-        logger.warning("Could not get current bio: %s", e)
-        return None
-
-
-def verify_bio_beats_current(winner_bio: str, current_bio: str) -> bool:
-    """Verify the winning bio is better than the current one."""
-    if not current_bio:
-        logger.info("No current bio to compare — uploading winner")
-        return True
-
-    system_prompt = (
-        "You are a bio verification judge. "
-        "Return ONLY valid JSON: {\"winner\": \"new\" or \"current\", \"confidence\": 0-100, \"reasoning\": \"one sentence\"}"
-    )
-    user_prompt = (
-        f"CURRENT BIO (on profile now):\n{current_bio}\n\n"
-        f"NEW BIO (A/B test winner):\n{winner_bio}\n\n"
-        f"Which bio will generate MORE PHONE CALLS? Be strict. "
-        f"Only pick 'new' if it is clearly better."
-    )
-    result = _groq_json(system_prompt, user_prompt, max_tokens=200)
-    if result:
-        is_better = result.get("winner") == "new"
-        confidence = result.get("confidence", 0)
-        logger.info("Verification: %s (confidence: %d%%) — %s",
-                     "NEW WINS" if is_better else "CURRENT KEEPS",
-                     confidence, result.get("reasoning", ""))
-        return is_better and confidence >= 70
-    return False
-
-
-def upload_bio(bio_text: str) -> bool:
-    """Upload the winning bio to RentMasseur profile."""
-    try:
-        from rentmasseur_core import setup_driver, login, update_bio, save_bio_field
-        driver = setup_driver(headless=True)
-        try:
-            if not login(driver):
-                logger.error("Login failed")
-                return False
-            logger.info("Login successful, finding bio field...")
-            result = update_bio(driver, "")
-            if result is None or (isinstance(result, dict) and result.get("error")):
-                logger.error("Could not find bio field")
-                return False
-            field_info, current_bio = result
-            saved = save_bio_field(driver, field_info, bio_text)
-            if saved:
-                logger.info("Bio uploaded and saved successfully!")
-                return True
-            logger.error("Failed to save bio")
-            return False
-        finally:
-            driver.quit()
-    except Exception as e:
-        logger.error("Upload error: %s", e)
-        return False
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Bio A/B testing engine")
-    parser.add_argument("--dry-run", action="store_true", help="Don't upload, just test")
-    parser.add_argument("--competitors-only", action="store_true", help="Only scrape competitors")
-    parser.add_argument("--min-score", type=int, default=75, help="Minimum score to upload")
-    args = parser.parse_args()
-
-    os.makedirs(AB_TEST_DIR, exist_ok=True)
-    os.makedirs(BIOS_DIR, exist_ok=True)
-
-    # Step 1: Scrape competitors
-    competitor_bios = scrape_competitor_bios()
-    if args.competitors_only:
-        print(json.dumps({"competitors_scraped": len(competitor_bios)}, indent=2))
-        return
-
-    # Step 2: Generate variants
-    variants = generate_bio_variants()
-    if not variants:
-        logger.error("No bio variants generated")
-        sys.exit(1)
-
-    # Step 3: A/B test
-    winner = ab_test_bios(variants, competitor_bios)
-    if not winner:
-        logger.error("No winner determined")
-        sys.exit(1)
-
-    winner_score = winner["score"].get("overall_score", 0)
-    if winner_score < args.min_score:
-        logger.warning("Winner score %d below minimum %d — not uploading", winner_score, args.min_score)
-        print(json.dumps({"winner": winner["strategy"], "score": winner_score, "uploaded": False, "reason": "below_min_score"}, indent=2))
-        return
-
-    # Step 4: Verify against current bio
-    current_bio = get_current_bio()
-    if current_bio and not verify_bio_beats_current(winner["bio"], current_bio):
-        logger.warning("Winner did not beat current bio — keeping current")
-        print(json.dumps({"winner": winner["strategy"], "score": winner_score, "uploaded": False, "reason": "current_bio_is_better"}, indent=2))
-        return
-
-    # Step 5: Upload
-    if args.dry_run:
-        logger.info("Dry run — not uploading")
-        print(json.dumps({"winner": winner["strategy"], "score": winner_score, "uploaded": False, "reason": "dry_run"}, indent=2))
-        return
-
-    success = upload_bio(winner["bio"])
-    print(json.dumps({
-        "winner": winner["strategy"],
-        "score": winner_score,
-        "uploaded": success,
-        "competitors_analyzed": len(competitor_bios),
-        "variants_tested": len(variants),
-        "date": datetime.now(timezone.utc).isoformat(),
-    }, indent=2))
-    sys.exit(0 if success else 1)
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-files_index.bin:
-```
-Error reading file: 'utf-8' codec can't decode byte 0x8d in position 98: invalid start byte
-```
-
-_deploy_settings.py:
-```
-#!/usr/bin/env python3
-"""Login + navigate to settings + find and update bio."""
-import time, os, sys, json
-import undetected_chromedriver as uc
-from dotenv import load_dotenv
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from datetime import datetime, timezone
-
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv()
-
-USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
-BIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "bios", "controlled_wolf_v1.md")
-
-with open(BIO_FILE, "r") as f:
-    BIO_TEXT = f.read().strip()
-
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,900")
-
-driver = uc.Chrome(options=options, version_main=149)
-
-try:
-    # Login
-    print("[1] Login...")
-    driver.get("https://rentmasseur.com/login")
-    time.sleep(6)
-    driver.execute_script("""
-        const pwd = document.querySelector('input[type="password"]');
-        const user = document.querySelector('input[type="text"], input[type="email"]');
-        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
-        if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
-    """, USERNAME, PASSWORD)
-    time.sleep(1)
-    driver.find_element(By.CSS_SELECTOR, 'input[type="password"]').send_keys(Keys.ENTER)
-    time.sleep(5)
-    print(f"  URL: {driver.current_url}")
-    
-    # Go to settings/dashboard
-    print("\n[2] Settings page...")
-    driver.get("https://rentmasseur.com/settings")
-    time.sleep(5)
-    print(f"  URL: {driver.current_url}")
-    print(f"  Title: {driver.title}")
-    
-    # Dump everything
-    info = driver.execute_script("""
-        const r = {textareas: [], inputs: [], contenteditable: [], buttons: [], links: [], tabs: []};
-        document.querySelectorAll('textarea').forEach(t => r.textareas.push({id:t.id,name:t.name,ph:t.placeholder,val:(t.value||'').substring(0,80),vis:t.offsetParent!==null}));
-        document.querySelectorAll('input').forEach(i => r.inputs.push({type:i.type,id:i.id,name:i.name,ph:i.placeholder,val:(i.value||'').substring(0,40),vis:i.offsetParent!==null}));
-        document.querySelectorAll('[contenteditable]').forEach(e => r.contenteditable.push({tag:e.tagName,id:e.id,cls:e.className,txt:(e.innerText||'').substring(0,80)}));
-        document.querySelectorAll('button, [role="button"]').forEach(b => r.buttons.push({txt:(b.innerText||'').trim().substring(0,30),type:b.type,id:b.id}));
-        document.querySelectorAll('a').forEach(a => {if(a.innerText.trim()) r.links.push({txt:a.innerText.trim().substring(0,30),href:a.href})});
-        document.querySelectorAll('[role="tab"], .nav-link, .tab').forEach(t => r.tabs.push({txt:(t.innerText||'').trim(),href:t.getAttribute('href')||'',id:t.id}));
-        return r;
-    """)
-    
-    print(f"\nTextareas: {len(info['textareas'])}")
-    for t in info['textareas']:
-        print(f"  id={t['id']} name={t['name']} ph={t['ph']} vis={t['vis']} val={t['val'][:60]}")
-    
-    print(f"\nInputs: {len(info['inputs'])}")
-    for i in info['inputs']:
-        print(f"  type={i['type']} id={i['id']} name={i['name']} ph={i['ph']} vis={i['vis']}")
-    
-    print(f"\nContenteditable: {len(info['contenteditable'])}")
-    for c in info['contenteditable']:
-        print(f"  {c['tag']} id={c['id']} cls={c['cls']} txt={c['txt'][:60]}")
-    
-    print(f"\nButtons: {len(info['buttons'])}")
-    for b in info['buttons']:
-        print(f"  {b['txt']} type={b['type']} id={b['id']}")
-    
-    print(f"\nTabs: {len(info['tabs'])}")
-    for t in info['tabs']:
-        print(f"  {t['txt']} href={t['href']} id={t['id']}")
-    
-    print(f"\nLinks: {len(info['links'])}")
-    for l in info['links'][:25]:
-        print(f"  {l['txt']} -> {l['href']}")
-    
-    driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/settings_page.png")
-    
-    # Try clicking through tabs to find bio editor
-    print("\n[3] Looking for bio tab...")
-    bio_tabs = [l for l in info['links'] if any(w in (l['txt']+l['href']).lower() for w in ['bio', 'about', 'profile', 'edit', 'content'])]
-    print(f"  Bio-related links: {len(bio_tabs)}")
-    for bt in bio_tabs:
-        print(f"    {bt['txt']} -> {bt['href']}")
-    
-    # Try each bio-related link
-    for bt in bio_tabs:
-        print(f"\n  Trying: {bt['href']}")
-        driver.get(bt['href'])
-        time.sleep(4)
-        textareas = driver.find_elements(By.CSS_SELECTOR, 'textarea')
-        editables = driver.find_elements(By.CSS_SELECTOR, '[contenteditable]')
-        print(f"    textareas={len(textareas)} editables={len(editables)}")
-        if textareas:
-            for ta in textareas:
-                val = ta.get_attribute("value") or ""
-                print(f"    textarea id={ta.get_attribute('id')} name={ta.get_attribute('name')} len={len(val)} preview={val[:80]}")
-            
-            # Update the bio textarea (longest one or one with bio/about in name)
-            updated = driver.execute_script("""
-                const tas = Array.from(document.querySelectorAll('textarea'));
-                let best = null, bestScore = 0;
-                for (const ta of tas) {
-                    const ctx = (ta.id||'') + ' ' + (ta.name||'') + ' ' + (ta.placeholder||'');
-                    if (/bio|about|description|profile/i.test(ctx)) { best = ta; break; }
-                    if ((ta.value||'').length > bestScore) { bestScore = (ta.value||'').length; best = ta; }
-                }
-                if (!best && tas.length > 0) best = tas[0];
-                if (!best) return {error: 'no_textarea'};
-                const ns = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-                ns.call(best, arguments[0]);
-                best.dispatchEvent(new Event('input', {bubbles: true}));
-                best.dispatchEvent(new Event('change', {bubbles: true}));
-                best.dispatchEvent(new Event('blur', {bubbles: true}));
-                return {id: best.id, name: best.name, new_len: arguments[0].length};
-            """, BIO_TEXT)
-            print(f"    Updated: {updated}")
-            
-            if isinstance(updated, dict) and 'error' not in updated:
-                time.sleep(1)
-                saved = driver.execute_script("""
-                    const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-                    const sb = btns.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'')+' '+(b.value||'')));
-                    if (sb) { sb.click(); return {ok: true, text: sb.innerText}; }
-                    return {ok: false};
-                """)
-                print(f"    Save: {saved}")
-                time.sleep(5)
-                
-                # Receipt
-                receipts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
-                os.makedirs(receipts_dir, exist_ok=True)
-                receipt = {"action": "bio_deploy", "bio_id": "controlled_wolf_v1", "experiment_id": "exp_001_targeted_wolf", "success": True, "timestamp": datetime.now(timezone.utc).isoformat(), "url": driver.current_url}
-                rpath = os.path.join(receipts_dir, f"deploy_controlled_wolf_v1_{receipt['timestamp'].replace(':','-')}.json")
-                with open(rpath, "w") as f:
-                    json.dump(receipt, f, indent=2)
-                print(f"\n=== BIO DEPLOYED === Receipt: {rpath}")
-                break
-        if editables:
-            for e in editables:
-                txt = e.get_attribute("innerText") or ""
-                print(f"    editable tag={e.tag_name} id={e.get_attribute('id')} txt={txt[:80]}")
-    
-finally:
-    driver.quit()
-    print("\nDone.")
-
-```
-
-hf_app.py:
-```
-#!/usr/bin/env python3
-"""RentMasseur Operating System — Hugging Face Space App.
-
-Glassmorphism UI + real-time metrics + competitor intelligence + RL/GA training.
-Feeds into CI/CD pipelines to select perfect selling bio candidates.
-
-Endpoints:
-  GET /          — glassmorphism dashboard
-  GET /api/os/report     — full operating system state
-  POST /api/os/train     — train RL/GA on all bios
-  GET /api/os/competitors — competitor intelligence
-  GET /api/os/bios       — all bio candidates with scores
-  POST /api/os/ingest    — ingest metrics from Vercel functions
-  GET /run/orchestrator  — run master orchestrator
-  GET /run/availability  — run availability keeper
-  GET /run/ga-rl         — run GA+RL optimizer
-"""
-
-import os
-import json
-import glob
-import sqlite3
-import subprocess
-import time
-import random
-import requests
-from datetime import datetime, timezone
-from pathlib import Path
-from fastapi import FastAPI, BackgroundTasks, Request
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
-
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv()
-
-app = FastAPI(title="RentMasseur OS", docs_url="/docs")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
-ORCHESTRATOR_LOG = os.path.join(CONTENT_DIR, "orchestrator.log")
-VERCEL_BACKEND_URL = os.getenv("VERCEL_BACKEND_URL", "")
-REBRANDLY_LINK = os.getenv("REBRANDLY_LINK", "")
-
-ENGAGEMENT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts", "engagement", "engagement.db")
-BIO_EXPERIMENTS_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts", "engagement", "bio_experiments.db")
-BIO_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts", "engagement", "current_bio.json")
-
-os.makedirs(CONTENT_DIR, exist_ok=True)
-
-
-def load_json(path: str, default=None):
-    if os.path.exists(path):
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return default if default is not None else {}
-
-
-def _content_counts():
-    counts = {}
-    for subdir in ["bios", "blog_posts", "interview_questions", "social_posts", "email_templates", "seo_keywords", "ab_tests", "photos"]:
-        path = os.path.join(CONTENT_DIR, subdir)
-        counts[subdir] = len(glob.glob(os.path.join(path, "*"))) if os.path.exists(path) else 0
-    return counts
-
-
-def _load_all_bios():
-    bios = []
-    bios_dir = os.path.join(CONTENT_DIR, "bios")
-    if os.path.exists(bios_dir):
-        for f in sorted(glob.glob(os.path.join(bios_dir, "*.md")), reverse=True):
-            with open(f, "r", encoding="utf-8") as fh:
-                bios.append({
-                    "id": os.path.basename(f).replace(".md", ""),
-                    "file": os.path.basename(f),
-                    "chars": os.path.getsize(f),
-                    "preview": fh.read()[:200],
-                })
-    return bios
-
-
-def _engagement_stats():
-    if not os.path.exists(ENGAGEMENT_DB):
-        return {"total": 0, "repeat_3plus": 0, "messages_sent": 0, "top_visitors": [], "recent_visits": [], "visit_events": 0, "last_updated": None}
-    conn = sqlite3.connect(ENGAGEMENT_DB)
-    conn.row_factory = sqlite3.Row
-    total = conn.execute("SELECT COUNT(*) FROM visitors").fetchone()[0]
-    repeat_3 = conn.execute("SELECT COUNT(*) FROM visitors WHERE visit_count >= 3").fetchone()[0]
-    msgs = conn.execute("SELECT COUNT(*) FROM message_log WHERE status='sent'").fetchone()[0]
-    visit_events = conn.execute("SELECT COUNT(*) FROM visit_log").fetchone()[0]
-    top = conn.execute(
-        "SELECT username, visit_count, last_online, last_messaged FROM visitors ORDER BY visit_count DESC LIMIT 10"
-    ).fetchall()
-    recent = conn.execute(
-        "SELECT username, visited_at, status, content_hash FROM visit_log ORDER BY visited_at DESC LIMIT 20"
-    ).fetchall()
-    last_updated_row = conn.execute("SELECT visited_at FROM visit_log ORDER BY visited_at DESC LIMIT 1").fetchone()
-    conn.close()
-    return {
-        "total": total,
-        "repeat_3plus": repeat_3,
-        "messages_sent": msgs,
-        "visit_events": visit_events,
-        "top_visitors": [dict(r) for r in top],
-        "recent_visits": [dict(r) for r in recent],
-        "last_updated": last_updated_row[0] if last_updated_row else None,
+        "format": meta.get("filename", "").rsplit(".", 1)[-1].lower() if "." in meta.get("filename", "") else "unknown",
+        "dossier_version": "1.0",
     }
 
+    # ── Identity ──
+    r["identity"] = {
+        "name": filename,
+        "species": species,
+        "dna_sequence": dna_seq[:40] if dna_seq else "",
+        "size": size_human,
+        "lines": total_lines,
+        "words": total_words,
+        "chunks": total_chunks,
+        "symbols": total_symbols,
+        "vocabulary": len(word_freq),
+        "merkle_prefix": merkle[:16] if merkle else "",
+        "primary_purpose": valuation.get("purpose", {}).get("primary", "unknown"),
+        "all_purposes": valuation.get("purpose", {}).get("roles", []),
+    }
 
-def _bio_experiments():
-    if not os.path.exists(BIO_EXPERIMENTS_DB):
-        return []
-    conn = sqlite3.connect(BIO_EXPERIMENTS_DB)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT id, bio_text, model, score, deployed_at, status, visitors_during FROM bio_experiments ORDER BY created_at DESC LIMIT 20"
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def _current_bio():
-    if os.path.exists(BIO_CACHE):
+    # ── Structural DNA ──
+    genes = {}
+    if isinstance(dna, dict):
         try:
-            with open(BIO_CACHE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"bio": "(not fetched)", "char_count": 0}
+            genes = json.loads(dna.get("genes", "{}")) if isinstance(dna.get("genes"), str) else dna.get("genes", {})
+        except:
+            genes = dna.get("genes", {}) if isinstance(dna.get("genes"), dict) else {}
+    r["structural_dna"] = {
+        "species": species,
+        "complexity_score": complexity,
+        "genes": genes,
+        "genome_size": len(dna_seq) if dna_seq else 0,
+        "interpretation": (
+            "highly structured, symbol-dense" if complexity > 20 else
+            "moderately structured" if complexity > 5 else
+            "lightly structured" if complexity > 1 else
+            "flat/plain text"
+        ),
+    }
+
+    # ── KPI Summary ──
+    kpi_by_cat = {}
+    for k in kpis:
+        cat = k["category"]
+        if cat not in kpi_by_cat:
+            kpi_by_cat[cat] = []
+        kpi_by_cat[cat].append(k)
+    r["kpi_summary"] = {
+        "total": len(kpis),
+        "by_category": {cat: len(items) for cat, items in kpi_by_cat.items()},
+        "top_financial": [{"name": k["name"], "value": k["value"], "line": k["line"]} for k in kpis if k["category"] == "financial"][:5],
+        "top_technical": [{"name": k["name"], "value": k["value"], "line": k["line"]} for k in kpis if k["category"] == "technical"][:5],
+        "top_operational": [{"name": k["name"], "value": k["value"], "line": k["line"]} for k in kpis if k["category"] == "operational"][:5],
+    }
+
+    # ── Financial Profile ──
+    prof = profile if isinstance(profile, dict) else {}
+    r["financial_profile"] = {
+        "accounting_concepts": prof.get("accounting", {}).get("concepts_found", {}),
+        "standards": prof.get("accounting", {}).get("standards_detected", []),
+        "has_financial_statements": prof.get("accounting", {}).get("has_financial_statements", False),
+        "finance_metrics": prof.get("finance", {}).get("metrics_detected", {}),
+        "monetary_references": prof.get("finance", {}).get("monetary_references", 0),
+        "collateral_grade": prof.get("collateral", {}).get("grade", "F"),
+        "collateral_score": prof.get("collateral", {}).get("score", 0),
+        "liquidity_grade": prof.get("liquidity", {}).get("grade", "F"),
+        "liquidity_score": prof.get("liquidity", {}).get("score", 0),
+        "time_to_liquidate": prof.get("liquidity", {}).get("time_to_liquidate", "illiquid"),
+    }
+
+    # ── Legal Profile ──
+    r["legal_profile"] = {
+        "concepts": prof.get("law", {}).get("legal_concepts", {}),
+        "has_contract_language": prof.get("law", {}).get("has_contract_language", False),
+        "regulatory": prof.get("law", {}).get("regulatory_references", []),
+        "ip_references": prof.get("law", {}).get("ip_references", []),
+    }
+
+    # ── ML Insights ──
+    ml = ml_result if isinstance(ml_result, dict) else {}
+    r["ml_insights"] = {
+        "available": ml.get("available", False),
+        "topics": [{"id": t.get("topic_id", 0), "keywords": t.get("keywords", [])[:5], "strength": t.get("strength", 0)} for t in ml.get("topics", [])],
+        "tfidf_top": [t.get("term", "") for t in ml.get("tfidf_top_terms", [])[:8]],
+        "anomaly_count": len(ml.get("anomalies", [])),
+        "inferred_kpis": ml.get("inferred_kpis", []),
+        "semantic_dimensions": ml.get("latent_features", {}).get("lsa_components", 0),
+        "llm_extrapolation": ml.get("llm_extrapolation", None),
+    }
+
+    # ── Valuation Summary ──
+    val = valuation if isinstance(valuation, dict) else {}
+    r["valuation_summary"] = {
+        "production_readiness_grade": val.get("production_readiness", {}).get("grade", "F"),
+        "production_readiness_score": val.get("production_readiness", {}).get("score", 0),
+        "distance_to_prod": val.get("production_readiness", {}).get("distance_to_prod", "unknown"),
+        "blocking_issues": val.get("production_readiness", {}).get("blocking_issues", []),
+        "build_cost_usd": val.get("build_cost", {}).get("estimated_usd", 0),
+        "replacement_cost_usd": val.get("replacement_cost", {}).get("estimated_usd", 0),
+        "depreciation_score": val.get("depreciation", {}).get("score", 0),
+        "remaining_value_pct": val.get("depreciation", {}).get("remaining_value_pct", 100),
+        "depreciated_value_usd": val.get("depreciation", {}).get("depreciated_value_usd", 0),
+        "insurance_value_usd": val.get("insurance_value", {}).get("estimated_usd", 0),
+        "time_to_rebuild_days": val.get("replacement_cost", {}).get("time_to_rebuild", {}).get("days", 0),
+        "difficulty": val.get("replacement_cost", {}).get("difficulty", "unknown"),
+    }
+
+    # ── Risk Assessment ──
+    r["risk_assessment"] = {
+        "level": prof.get("risk", {}).get("level", "low"),
+        "score": prof.get("risk", {}).get("score", 0),
+        "signals": prof.get("risk", {}).get("signals", []),
+        "origin": prof.get("origin", {}).get("primary", "unknown"),
+        "origin_confidence": prof.get("origin", {}).get("detected", [{}])[0].get("confidence", 0) if prof.get("origin", {}).get("detected") else 0,
+    }
+
+    # ── Recommendations ──
+    recs = []
+    pr_score = val.get("production_readiness", {}).get("score", 0)
+    if pr_score < 40:
+        recs.append({"priority": "critical", "action": "add_tests", "reason": "no test coverage detected, production risk"})
+    if val.get("production_readiness", {}).get("blocking_issues"):
+        for issue in val.get("production_readiness", {}).get("blocking_issues", [])[:5]:
+            recs.append({"priority": "high", "action": f"fix_{issue}", "reason": f"blocking issue: {issue}"})
+    dep_score = val.get("depreciation", {}).get("score", 0)
+    if dep_score > 30:
+        recs.append({"priority": "medium", "action": "modernize_codebase", "reason": f"depreciation score {dep_score}/100, legacy patterns detected"})
+    if prof.get("risk", {}).get("level") == "high":
+        recs.append({"priority": "critical", "action": "security_review", "reason": "high risk score, potential secret or compliance exposure"})
+    liq_grade = prof.get("liquidity", {}).get("grade", "F")
+    if liq_grade in ("D", "F"):
+        recs.append({"priority": "low", "action": "improve_liquidity", "reason": "low liquidity, hard to convert to value quickly"})
+    coll_grade = prof.get("collateral", {}).get("grade", "F")
+    if coll_grade in ("A", "B"):
+        recs.append({"priority": "info", "action": "consider_collateralization", "reason": f"strong collateral profile (grade {coll_grade}), could be used as backing"})
+    if ml.get("anomalies") and len(ml.get("anomalies", [])) > 2:
+        recs.append({"priority": "medium", "action": "review_anomalies", "reason": f"{len(ml['anomalies'])} anomalous chunks detected by isolation forest"})
+    if val.get("build_cost", {}).get("estimated_usd", 0) > 50000:
+        recs.append({"priority": "info", "action": "document_knowledge", "reason": "high build cost, critical to preserve domain knowledge"})
+    if prof.get("law", {}).get("has_contract_language"):
+        recs.append({"priority": "info", "action": "legal_review", "reason": "contract language detected, ensure enforceability"})
+    recs.sort(key=lambda x: {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}.get(x["priority"], 5))
+    r["recommendations"] = recs
+
+    # ── Narrative ──
+    parts = []
+    parts.append(f"FILE: {filename} ({file_id})")
+    parts.append(f"Species: {species} | Complexity: {complexity:.1f} | {total_lines} lines, {total_chunks} chunks, {total_symbols} symbols")
+    parts.append(f"Purpose: {valuation.get('purpose', {}).get('primary', 'unknown')}")
+    parts.append(f"Merkle: {merkle[:32]}...")
+    parts.append("")
+    parts.append(f"PRODUCTION READINESS: {val.get('production_readiness', {}).get('grade', 'F')} ({pr_score}/100) — {val.get('production_readiness', {}).get('distance_to_prod', 'unknown')}")
+    if val.get("production_readiness", {}).get("blocking_issues"):
+        parts.append(f"  Blocking: {', '.join(val['production_readiness']['blocking_issues'][:5])}")
+    parts.append("")
+    parts.append(f"VALUATION:")
+    parts.append(f"  Build cost: ${val.get('build_cost', {}).get('estimated_usd', 0):,}")
+    parts.append(f"  Replacement cost: ${val.get('replacement_cost', {}).get('estimated_usd', 0):,}")
+    parts.append(f"  Depreciated value: ${val.get('depreciation', {}).get('depreciated_value_usd', 0):,} ({val.get('depreciation', {}).get('remaining_value_pct', 100)}% remaining)")
+    parts.append(f"  Insurance value: ${val.get('insurance_value', {}).get('estimated_usd', 0):,}")
+    parts.append(f"  Time to rebuild: {val.get('replacement_cost', {}).get('time_to_rebuild', {}).get('days', 0)} days ({val.get('replacement_cost', {}).get('difficulty', '?')})")
+    parts.append("")
+    parts.append(f"FINANCIAL PROFILE:")
+    parts.append(f"  Collateral: {prof.get('collateral', {}).get('grade', 'F')} ({prof.get('collateral', {}).get('score', 0)}/100)")
+    parts.append(f"  Liquidity: {prof.get('liquidity', {}).get('grade', 'F')} ({prof.get('liquidity', {}).get('score', 0)}/100) — {prof.get('liquidity', {}).get('time_to_liquidate', 'illiquid')}")
+    fin_metrics = prof.get("finance", {}).get("metrics_detected", {})
+    if fin_metrics:
+        parts.append(f"  Metrics: {', '.join(list(fin_metrics.keys())[:5])}")
+    parts.append("")
+    parts.append(f"LEGAL: {prof.get('law', {}).get('legal_concepts', {})}")
+    parts.append(f"RISK: {prof.get('risk', {}).get('level', 'low')} ({prof.get('risk', {}).get('score', 0)}/100) — {', '.join(prof.get('risk', {}).get('signals', [])[:3])}")
+    parts.append("")
+    if ml.get("available"):
+        parts.append(f"ML INSIGHTS:")
+        for t in ml.get("topics", [])[:3]:
+            parts.append(f"  Topic {t.get('topic_id', 0)}: {', '.join(t.get('keywords', [])[:5])} (strength: {t.get('strength', 0)})")
+        if ml.get("inferred_kpis"):
+            parts.append(f"  Inferred: {', '.join(k.get('name', '') + '=' + k.get('value', '') for k in ml['inferred_kpis'][:5])}")
+        if ml.get("anomalies"):
+            parts.append(f"  Anomalies: {len(ml['anomalies'])} chunks flagged")
+        if ml.get("llm_extrapolation"):
+            llm = ml["llm_extrapolation"]
+            if isinstance(llm, dict):
+                parts.append(f"  LLM: {llm.get('inferred_purpose', '')} | Hidden value: {llm.get('hidden_value', '')}")
+    parts.append("")
+    parts.append(f"KPIs: {len(kpis)} total ({', '.join(f'{cat}:{cnt}' for cat, cnt in r['kpi_summary']['by_category'].items())})")
+    parts.append("")
+    parts.append(f"RECOMMENDATIONS ({len(recs)}):")
+    for rec in recs[:8]:
+        parts.append(f"  [{rec['priority'].upper()}] {rec['action']}: {rec['reason']}")
+    r["narrative"] = "\n".join(parts)
+
+    # ── Dossier text (novel format) ──
+    dossier = f"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║  JORKI FILE DOSSIER — {filename[:40]:<40s}  ║
+║  ID: {file_id}  ·  Merkle: {merkle[:20]}...{'':>{20}}  ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+┌─ IDENTITY ────────────────────────────────────────────────────────────────┐
+│  Species:    {species:<20s}  DNA: {dna_seq[:24]:<24s}           │
+│  Size:       {size_human:<20s}  Lines: {total_lines:<8d}  Words: {total_words:<8d}        │
+│  Chunks:     {total_chunks:<20d}  Symbols: {total_symbols:<8d}  Vocab: {len(word_freq):<8d}       │
+│  Purpose:    {str(valuation.get('purpose', {}).get('primary', 'unknown'))[:60]:<60s}│
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ STRUCTURAL DNA ──────────────────────────────────────────────────────────┐
+│  Complexity: {complexity:.1f}/100  ·  {r['structural_dna']['interpretation']:<40s}   │
+│  Genome:     {len(dna_seq) if dna_seq else 0} bytes  ·  Species: {species:<20s}              │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ VALUATION ───────────────────────────────────────────────────────────────┐
+│  Build Cost:      ${val.get('build_cost', {}).get('estimated_usd', 0):>10,}  ·  {val.get('build_cost', {}).get('time_estimate', {}).get('days', 0)} days  │
+│  Replacement:     ${val.get('replacement_cost', {}).get('estimated_usd', 0):>10,}  ·  {val.get('replacement_cost', {}).get('difficulty', '?'):<10s}     │
+│  Depreciated:     ${val.get('depreciation', {}).get('depreciated_value_usd', 0):>10,}  ·  {val.get('depreciation', {}).get('remaining_value_pct', 100)}% value   │
+│  Insurance:       ${val.get('insurance_value', {}).get('estimated_usd', 0):>10,}  ·  incl. business risk │
+│  Prod Readiness:  {val.get('production_readiness', {}).get('grade', 'F')} ({pr_score}/100)  ·  {val.get('production_readiness', {}).get('distance_to_prod', '?'):<30s}│
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ FINANCIAL & LEGAL ───────────────────────────────────────────────────────┐
+│  Collateral:  {prof.get('collateral', {}).get('grade', 'F')} ({prof.get('collateral', {}).get('score', 0):>3}/100)  ·  Liquidity: {prof.get('liquidity', {}).get('grade', 'F')} ({prof.get('liquidity', {}).get('score', 0):>3}/100)  │
+│  Time→Cash:   {prof.get('liquidity', {}).get('time_to_liquidate', 'illiquid'):<12s}  ·  Origin: {prof.get('origin', {}).get('primary', 'unknown'):<16s}│
+│  Risk Level:  {prof.get('risk', {}).get('level', 'low'):<6s} ({prof.get('risk', {}).get('score', 0):>3}/100)  ·  Signals: {', '.join(prof.get('risk', {}).get('signals', [])[:3])[:30]}│
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ KPIs ({len(kpis)} total) ───────────────────────────────────────────────────┐"""
+    for cat, items in kpi_by_cat.items():
+        top = items[:3]
+        vals = ", ".join(f"{k['name']}={k['value']}" for k in top)
+        dossier += f"\n│  {cat:<14s} ({len(items):>2d}): {vals[:55]:<55s}│"
+    dossier += "\n└──────────────────────────────────────────────────────────────────────────┘"
+
+    if ml.get("available"):
+        dossier += "\n\n┌─ ML INSIGHTS ────────────────────────────────────────────────────────────┐"
+        for t in ml.get("topics", [])[:3]:
+            dossier += f"\n│  Topic {t.get('topic_id', 0)}: {', '.join(t.get('keywords', [])[:6])[:55]:<55s}│"
+        if ml.get("inferred_kpis"):
+            for k in ml["inferred_kpis"][:4]:
+                dossier += f"\n│  {k.get('name', ''):<20s} = {k.get('value', '')[:30]:<30s} ({k.get('method', '')[:8]})│"
+        if ml.get("anomalies"):
+            dossier += f"\n│  Anomalies: {len(ml['anomalies'])} chunks flagged by Isolation Forest{'':>16}│"
+        dossier += "\n└──────────────────────────────────────────────────────────────────────────┘"
+
+    dossier += f"\n\n┌─ RECOMMENDATIONS ({len(recs)}) ───────────────────────────────────────────────┐"
+    for rec in recs[:8]:
+        dossier += f"\n│  [{rec['priority'].upper():>8s}] {rec['action']:<20s} — {rec['reason'][:35]:<35s}│"
+    dossier += "\n└──────────────────────────────────────────────────────────────────────────┘"
+    dossier += f"\n\n◆ Jorki Dossier v1.0 · Generated from {len(kpis)} KPIs, {total_chunks} chunks, {total_symbols} symbols"
+    dossier += f"\n◆ DNA: {dna_seq[:40] if dna_seq else 'N/A'} · Merkle: {merkle[:32]}..."
+
+    r["dossier_text"] = dossier
+    return r
 
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    rl_state = load_json(os.path.join(CONTENT_DIR, "rl_state.json"), {})
-    ga_state = load_json(os.path.join(CONTENT_DIR, "ga_rl_state.json"), {})
-    counts = _content_counts()
-    availability = load_json(os.path.join(os.path.dirname(__file__), "availability.json"), {})
-    competitors = load_json(os.path.join(CONTENT_DIR, "competitor_bios.json"), [])
-    revenue = ga_state.get("best_revenue", 0)
-    target = 300
-    progress = min(100, round((revenue / target) * 100, 1))
-    eng = _engagement_stats()
-    bio_exp = _bio_experiments()
-    current_bio = _current_bio()
+@app.get("/resume/{file_id}")
+async def jorki_resume(file_id: str, format: str = "json"):
+    """Complete file dossier — combines all analysis layers into one document."""
+    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
+    if not idx_path.exists():
+        return {"error": f"Index not found for {file_id}"}
+    conn = sqlite3.connect(str(idx_path))
+    meta_rows = conn.execute("SELECT key, value FROM file_meta").fetchall()
+    kpi_rows = conn.execute("SELECT id, name, value, line, category, confidence FROM kpis").fetchall()
+    dna_rows = conn.execute("SELECT key, value FROM dna").fetchall()
+    word_rows = conn.execute("SELECT word, count FROM word_freq").fetchall()
+    chunk_rows = conn.execute("SELECT idx, line_start, line_end, boundary_type, preview, line_count FROM chunks").fetchall()
+    sym_rows = conn.execute("SELECT line, name, type FROM symbols").fetchall()
+    conn.close()
+    _jorki_track_query(file_id, "resume")
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RentMasseur Operating System</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
-* {{ box-sizing: border-box; }}
-body {{
-    margin: 0;
-    font-family: 'Inter', sans-serif;
-    background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
-    color: #fff;
-    min-height: 100vh;
-}}
-.glass {{
-    background: rgba(255, 255, 255, 0.08);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    border: 1px solid rgba(255, 255, 255, 0.18);
-    border-radius: 20px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-}}
-.header {{
-    padding: 30px 40px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 20px;
-}}
-.header h1 {{
-    margin: 0;
-    font-size: 32px;
-    font-weight: 700;
-    background: linear-gradient(90deg, #00f5ff, #b026ff, #ff2a6d);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-}}
-.sub {{ font-size: 14px; color: rgba(255,255,255,0.6); margin-top: 4px; }}
-.live {{
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-    color: #00f5a0;
-    font-weight: 600;
-}}
-.pulse {{
-    width: 10px;
-    height: 10px;
-    background: #00f5a0;
-    border-radius: 50%;
-    animation: pulse 2s infinite;
-}}
-@keyframes pulse {{
-    0%, 100% {{ opacity: 1; transform: scale(1); }}
-    50% {{ opacity: 0.5; transform: scale(1.3); }}
-}}
-.grid {{
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-    gap: 20px;
-    padding: 0 40px 40px;
-}}
-.card {{
-    padding: 24px;
-    transition: transform 0.2s;
-}}
-.card:hover {{ transform: translateY(-4px); }}
-.card h3 {{
-    margin: 0 0 12px 0;
-    font-size: 14px;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    color: rgba(255,255,255,0.7);
-}}
-.card .num {{
-    font-size: 42px;
-    font-weight: 700;
-    margin: 8px 0;
-    background: linear-gradient(90deg, #00f5ff, #b026ff);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-}}
-.card .sub {{
-    font-size: 13px;
-    color: rgba(255,255,255,0.6);
-}}
-.progress-bar {{
-    width: 100%;
-    height: 12px;
-    background: rgba(255,255,255,0.1);
-    border-radius: 6px;
-    overflow: hidden;
-    margin-top: 12px;
-}}
-.progress-fill {{
-    height: 100%;
-    background: linear-gradient(90deg, #00f5ff, #b026ff);
-    border-radius: 6px;
-    transition: width 0.5s;
-    width: {progress}%;
-}}
-.actions {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
-    padding: 0 40px 40px;
-}}
-.btn {{
-    padding: 12px 24px;
-    border-radius: 12px;
-    border: 1px solid rgba(255,255,255,0.25);
-    background: rgba(255,255,255,0.1);
-    color: #fff;
-    text-decoration: none;
-    font-weight: 600;
-    font-size: 13px;
-    transition: all 0.2s;
-    cursor: pointer;
-}}
-.btn:hover {{
-    background: rgba(255,255,255,0.2);
-    border-color: rgba(255,255,255,0.4);
-}}
-.btn.primary {{
-    background: linear-gradient(90deg, #00f5ff, #b026ff);
-    border: none;
-    color: #0f0c29;
-}}
-.btn.primary:hover {{ opacity: 0.9; }}
-.section {{
-    padding: 0 40px 40px;
-}}
-.section h2 {{
-    font-size: 18px;
-    margin-bottom: 16px;
-    color: rgba(255,255,255,0.9);
-}}
-.table {{
-    width: 100%;
-    border-collapse: collapse;
-}}
-.table th, .table td {{
-    text-align: left;
-    padding: 12px;
-    font-size: 13px;
-    border-bottom: 1px solid rgba(255,255,255,0.1);
-}}
-.table th {{
-    color: rgba(255,255,255,0.6);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    font-size: 11px;
-}}
-pre {{
-    background: rgba(0,0,0,0.3);
-    padding: 16px;
-    border-radius: 12px;
-    overflow-x: auto;
-    font-size: 12px;
-    color: rgba(255,255,255,0.8);
-}}
-.link {{
-    color: #00f5ff;
-    text-decoration: none;
-}}
-.footer {{
-    text-align: center;
-    padding: 40px;
-    font-size: 12px;
-    color: rgba(255,255,255,0.4);
-}}
-</style>
-</head>
-<body>
-<div class="header">
-    <div>
-        <h1>RentMasseur Operating System</h1>
-        <div class="sub">Autonomous availability, dynamic content, revenue optimization</div>
-    </div>
-    <div class="live">
-        <div class="pulse"></div>
-        <span>LIVE SYSTEM</span>
-    </div>
-</div>
+    meta = {r[0]: r[1] for r in meta_rows}
+    kpis = [{"id": r[0], "name": r[1], "value": r[2], "line": r[3], "category": r[4], "confidence": r[5]} for r in kpi_rows]
+    dna = {r[0]: r[1] for r in dna_rows}
+    word_freq = {r[0]: int(r[1]) for r in word_rows}
+    chunks = [{"idx": r[0], "line_start": r[1], "line_end": r[2], "boundary_type": r[3], "preview": r[4], "line_count": r[5]} for r in chunk_rows]
+    symbols = [{"line": r[0], "name": r[1], "type": r[2]} for r in sym_rows]
+    text = "\n".join(c["preview"] for c in chunks)
+    lines = text.split("\n")
 
-<div class="grid">
-    <div class="card glass">
-        <h3>Revenue Estimate</h3>
-        <div class="num">${revenue:.0f}</div>
-        <div class="sub">of $300/day target</div>
-        <div class="progress-bar"><div class="progress-fill"></div></div>
-    </div>
-    <div class="card glass">
-        <h3>24/7 Availability</h3>
-        <div class="num">{availability.get('status', 'ACTIVE')}</div>
-        <div class="sub">Last checked: {availability.get('checked_at', 'now')}</div>
-    </div>
-    <div class="card glass">
-        <h3>Bio Candidates</h3>
-        <div class="num">{counts.get('bios', 0)}</div>
-        <div class="sub">Trained and scored</div>
-    </div>
-    <div class="card glass">
-        <h3>GA Generations</h3>
-        <div class="num">{ga_state.get('generation', 0)}</div>
-        <div class="sub">Evolving toward $300/day</div>
-    </div>
-    <div class="card glass">
-        <h3>Competitor Bios</h3>
-        <div class="num">{len(competitors)}</div>
-        <div class="sub">Analyzed for advantage</div>
-    </div>
-    <div class="card glass">
-        <h3>Content Assets</h3>
-        <div class="num">{sum(counts.values())}</div>
-        <div class="sub">Total generated items</div>
-    </div>
-    <div class="card glass">
-        <h3>Visitors Tracked</h3>
-        <div class="num">{eng.get('total', 0)}</div>
-        <div class="sub">{eng.get('repeat_3plus', 0)} repeat (3+ visits)</div>
-    </div>
-    <div class="card glass">
-        <h3>Visit Events</h3>
-        <div class="num">{eng.get('visit_events', 0)}</div>
-        <div class="sub">Total profile visits logged</div>
-    </div>
-    <div class="card glass">
-        <h3>Messages Sent</h3>
-        <div class="num">{eng.get('messages_sent', 0)}</div>
-        <div class="sub">Auto-engagement pipeline</div>
-    </div>
-    <div class="card glass">
-        <h3>Bio Experiments</h3>
-        <div class="num">{len(bio_exp)}</div>
-        <div class="sub">Ollama-generated candidates</div>
-    </div>
-</div>
+    try:
+        dna_obj = json.loads(dna.get("genes", "{}")) if isinstance(dna.get("genes"), str) else {}
+        dna_dict = {"genes": dna_obj, "complexity_score": float(dna.get("complexity_score", 0)),
+                    "dna_sequence": dna.get("dna_sequence", ""), "species": dna.get("species", "")}
+    except:
+        dna_dict = {}
 
-<div class="actions">
-    <a href="/run/ga-rl?apply=1" class="btn primary">Train GA+RL & Apply Winner</a>
-    <a href="/run/orchestrator?all=1" class="btn">Run Full Orchestrator</a>
-    <a href="/run/availability" class="btn">Run Availability Keeper</a>
-    <a href="/api/os/train" class="btn">Train on All Bios</a>
-    <a href="/api/os/report" class="btn">Full OS Report</a>
+    profile = _jorki_compute_profile(text, lines, word_freq, kpis, dna_dict)
+    valuation = _jorki_valuate(text, lines, chunks, symbols, word_freq, kpis, dna_dict, meta)
+    try:
+        ml_result = _jorki_ml_extract(text, lines, chunks, word_freq, kpis, dna_dict)
+    except Exception as e:
+        ml_result = {"available": False, "error": str(e), "topics": [], "clusters": {}, "anomalies": [], "inferred_kpis": [], "tfidf_top_terms": []}
+
+    resume = _jorki_generate_resume(file_id, meta, kpis, dna_dict, word_freq, chunks, symbols, profile, valuation, ml_result)
+
+    # ── LLM 30 Facts (served as KPIs) ──
+    llm_facts = _jorki_llm_30_facts(text, kpis, dna_dict, ml_result, meta)
+    if llm_facts:
+        resume["llm_facts"] = llm_facts
+
+    if format == "text":
+        return PlainTextResponse(resume["dossier_text"])
+    return {"file_id": file_id, "resume": resume}
+
+# ─── Formulas API: All KPI, Valuation, ML, and Scoring Formulas ──────────
+
+@app.get("/formulas")
+async def jorki_formulas():
+    """Complete documentation of all formulas, algorithms, and scoring models used by Jorki."""
+    return {
+        "service": "jorki",
+        "version": "2.0",
+        "description": "Every formula, algorithm, and scoring model used across all Jorki analysis endpoints",
+        "categories": {
+            "kpi_extraction": {
+                "endpoint": "/kpi/{file_id}",
+                "formulas": [
+                    {
+                        "name": "monetary_value",
+                        "pattern": r"\\$[\\d,]+(?:\\.\\d+)?|\\b\\d{1,3}(?:,\\d{3})+(?:\\.\\d+)?\\s*(?:USD|dollars?)\\b",
+                        "formula": "regex_match(text) → extract $ amounts, revenue figures, dollar values",
+                        "confidence": "1.0 if exact $ match, 0.8 if contextual",
+                        "category": "financial",
+                    },
+                    {
+                        "name": "percentage",
+                        "pattern": r"\\b\\d+(?:\\.\\d+)?%\\b|\\b\\d+(?:\\.\\d+)?\\s*(?:percent|bps|basis points)\\b",
+                        "formula": "regex_match(text) → extract percentage values",
+                        "confidence": "0.9",
+                        "category": "financial",
+                    },
+                    {
+                        "name": "revenue",
+                        "pattern": r"\\b(?:revenue|MRR|ARR|GMV|LTV|CAC|ARPU|churn rate|burn rate|net retention|gross retention|EBITDA|EBIT|net income|gross profit|operating income|free cash flow)\\b",
+                        "formula": "keyword_match(text) → extract SaaS/financial metric references",
+                        "confidence": "0.85",
+                        "category": "financial",
+                    },
+                    {
+                        "name": "valuation",
+                        "pattern": r"\\b(?:valuation|market cap|enterprise value|equity value|pre-money|post-money|wacc|dcf|npv|irr|moic|roi|roe|roa|roic)\\b",
+                        "formula": "keyword_match(text) → extract valuation/investment terms",
+                        "confidence": "0.8",
+                        "category": "financial",
+                    },
+                    {
+                        "name": "date_temporal",
+                        "pattern": r"\\b(?:Q[1-4]\\s*\\d{4}|FY\\d{2,4}|fiscal year|quarter ending|\\d{4}-\\d{2}-\\d{2}|\\d{1,2}/\\d{1,2}/\\d{4})\\b",
+                        "formula": "regex_match(text) → extract fiscal periods and dates",
+                        "confidence": "0.9",
+                        "category": "temporal",
+                    },
+                    {
+                        "name": "operational_metrics",
+                        "pattern": r"\\b(?:users|customers|sessions|requests|latency|uptime|throughput|errors|QPS|RPS|concurrent|active users|MAU|DAU|WAU)\\b",
+                        "formula": "keyword_match(text) → extract operational KPIs",
+                        "confidence": "0.75",
+                        "category": "operational",
+                    },
+                    {
+                        "name": "api_endpoint",
+                        "pattern": r"\\b(?:GET|POST|PUT|DELETE|PATCH)\\s+/[\\w/{}-]+",
+                        "formula": "regex_match(text) → extract REST API endpoints",
+                        "confidence": "0.95",
+                        "category": "technical",
+                    },
+                    {
+                        "name": "config_value",
+                        "pattern": r"\\b[A-Z_]{3,}\\s*=\\s*\\S+",
+                        "formula": "regex_match(text) → extract configuration key=value pairs",
+                        "confidence": "0.7",
+                        "category": "config",
+                    },
+                    {
+                        "name": "table_count",
+                        "formula": "count(occurrences of '|---' or markdown table separators)",
+                        "confidence": "0.6",
+                        "category": "structural",
+                    },
+                    {
+                        "name": "dominant_terms",
+                        "formula": "word_freq → sort by count → top 5 non-stopwords",
+                        "confidence": "0.5",
+                        "category": "structural",
+                    },
+                ],
+            },
+            "dna_fingerprinting": {
+                "endpoint": "/dna/{file_id}",
+                "formulas": [
+                    {
+                        "name": "gene_height",
+                        "formula": "len(text.split('\\n')) / 1000  →  normalized line count",
+                        "range": "0.0 - 1.0+",
+                    },
+                    {
+                        "name": "gene_max_width",
+                        "formula": "max(len(line) for line in lines) / 200  →  normalized max line width",
+                        "range": "0.0 - 1.0+",
+                    },
+                    {
+                        "name": "gene_symbol_density",
+                        "formula": "len(symbols) / max(len(lines), 1)  →  symbols per line",
+                        "range": "0.0 - 1.0+",
+                    },
+                    {
+                        "name": "gene_chunk_count",
+                        "formula": "len(chunks) / 100  →  normalized chunk count",
+                        "range": "0.0 - 1.0+",
+                    },
+                    {
+                        "name": "gene_vocab_richness",
+                        "formula": "len(unique_words) / max(len(total_words), 1)  →  type-token ratio",
+                        "range": "0.0 - 1.0",
+                    },
+                    {
+                        "name": "gene_avg_line_length",
+                        "formula": "mean(len(line) for line in lines) / 100  →  normalized avg line length",
+                        "range": "0.0 - 1.0+",
+                    },
+                    {
+                        "name": "gene_blank_ratio",
+                        "formula": "count(empty_lines) / max(total_lines, 1)  →  proportion of blank lines",
+                        "range": "0.0 - 1.0",
+                    },
+                    {
+                        "name": "gene_comment_ratio",
+                        "formula": "count(comment_lines) / max(total_lines, 1)  →  proportion of comments",
+                        "range": "0.0 - 1.0",
+                    },
+                    {
+                        "name": "gene_entropy",
+                        "formula": "-Σ(p_i * log2(p_i)) for byte frequencies in first 4096 bytes  →  Shannon entropy",
+                        "range": "0.0 - 8.0",
+                    },
+                    {
+                        "name": "gene_merkle_prefix",
+                        "formula": "int(merkle_root[:4], 16) / 65535  →  normalized first 16 bits of SHA-256 merkle root",
+                        "range": "0.0 - 1.0",
+                    },
+                    {
+                        "name": "dna_sequence",
+                        "formula": "concat(hex(gene_value)[:4] for each gene)  →  40-char hex string encoding all 10 genes",
+                    },
+                    {
+                        "name": "species_classification",
+                        "formula": "if ext in (.py) → pythonicus; (.js/.jsx) → javascriptus; (.json) → jsonicus; (.html/.xml/.svg) → markupus; (.csv/.tsv) → tabularis; else → textus",
+                    },
+                    {
+                        "name": "complexity_score",
+                        "formula": "symbol_density * 10 + chunk_count * 0.5 + vocab_richness * 5 + entropy * 0.5 + avg_line_length * 2",
+                        "range": "0.0 - 30+",
+                    },
+                ],
+            },
+            "semantic_profile": {
+                "endpoint": "/profile/{file_id}",
+                "formulas": [
+                    {
+                        "name": "origin_detection",
+                        "formula": "for each origin_type: count(signal_keyword_hits) → if hits >= 2: confidence = min(hits / total_signals, 1.0)",
+                        "signals": ["source_code", "financial_statement", "invoice", "contract", "spreadsheet", "research_report", "api_doc", "audit", "dataset"],
+                    },
+                    {
+                        "name": "accounting_concepts",
+                        "formula": "regex_match(text) for each of 14 accounting patterns (GAAP, IFRS, accrual, depreciation, amortization, revenue_recognition, AR, AP, inventory, goodwill, deferred_revenue, working_capital, EBITDA, fiscal_year)",
+                    },
+                    {
+                        "name": "finance_metrics",
+                        "formula": "regex_match(text) for each of 17 finance patterns (revenue, EBITDA_margin, net_income, gross_profit, OpEx, CapEx, FCF, WACC, DCF, NPV, IRR, MOIC, ROI, ROE, ROA, D/E, current_ratio, quick_ratio)",
+                    },
+                    {
+                        "name": "legal_concepts",
+                        "formula": "regex_match(text) for each of 18 legal patterns (NDA, IP_assignment, indemnification, liability, jurisdiction, governing_law, arbitration, confidentiality, termination, warranty, license, copyright, patent, trademark, compliance, GDPR, SOX, SEC_filing)",
+                    },
+                    {
+                        "name": "collateral_score",
+                        "formula": "signal_count = len(financial_metrics) + len(accounting_concepts) + len(legal_concepts) + len(kpis) + int(dna_complexity > 5 ? complexity : 0) + (origin_detected ? 5 : 0) → score = min(signal_count * 3, 100)",
+                        "grade": "A≥80, B≥60, C≥40, D≥20, F<20",
+                    },
+                    {
+                        "name": "liquidity_score",
+                        "formula": "signals = cash_hits*5 + time_hits*4 + (marketable?8:0) + (recurring_revenue?10:0) + (asset_backed?8:0) + (financial_doc?6:0) → score = min(signals * 2, 100)",
+                        "grade": "A≥80, B≥60, C≥40, D≥20, F<20",
+                        "time_to_liquidate": "days if ≥60, weeks if ≥30, months if ≥15, illiquid if <15",
+                    },
+                    {
+                        "name": "risk_score",
+                        "formula": "confidentiality(+15) + secret_exposure(+25) + litigation(+20) + credit_risk(+30) + forward_looking(+10) + unverified(+15) → min(sum, 100)",
+                        "level": "high≥50, medium≥25, low<25",
+                    },
+                ],
+            },
+            "valuation": {
+                "endpoint": "/valuation/{file_id}",
+                "formulas": [
+                    {
+                        "name": "effective_loc",
+                        "formula": "count(lines where line.strip() and not line.startswith('#', '//', '/*', '*'))  →  non-blank, non-comment lines",
+                    },
+                    {
+                        "name": "complexity_factor",
+                        "formula": "1.0 + (dna_complexity / 20.0), capped at 3.0",
+                        "range": "1.0 - 3.0",
+                    },
+                    {
+                        "name": "language_factor",
+                        "formula": "pythonicus=1.0, javascriptus=1.1, jsonicus=0.3, markupus=0.5, tabularis=0.4, textus=0.2",
+                    },
+                    {
+                        "name": "build_cost",
+                        "formula": "effective_loc × species_rate × complexity_factor + test_cost(code only) + deploy_cost(code only) + security_audit(code/config only), capped at $3M",
+                        "unit": "USD",
+                        "rates": "pythonicus=$0.20/LOC, javascriptus=$0.20, golangus=$0.20, rusticus=$0.20, ceplusplus=$0.20, scripticus=$0.15, jsonicus=$0.02, markupus=$0.05, tabularis=$0.03, configus=$0.08, textus=$0.000005", "max_rate": "$0.20/LOC"
+                    },
+                    {
+                        "name": "build_time",
+                        "formula": "hours = effective_loc / 50, days = hours / 8",
+                        "developer_level": "mid if complexity<10, senior if <25, staff if ≥25",
+                    },
+                    {
+                        "name": "replacement_cost",
+                        "formula": "build_cost × knowledge_loss_factor (1.5 for code, 1.2 for script, 1.1 for docs) + ramp_up ($1000 code, $500 other), capped at $3M",
+                        "unit": "USD",
+                    },
+                    {
+                        "name": "rebuild_time",
+                        "formula": "hours = effective_loc / 40 (slower due to lost context), days = hours / 8, weeks = days / 5",
+                    },
+                    {
+                        "name": "depreciation_score",
+                        "formula": "legacy_python2(+30) + legacy_js(+20) + deprecated_framework(+25) + legacy_protocol(+15) + insufficient_docs(+10) + no_tests(+15) → min(sum, 100)",
+                    },
+                    {
+                        "name": "depreciated_value",
+                        "formula": "replacement_cost × (1 - depreciation_score/100)",
+                    },
+                    {
+                        "name": "insurance_value",
+                        "formula": "replacement_cost + business_interruption_risk",
+                        "business_risk": "has_security(+$5000) + payments(+$10000) + auth(+$8000) + production_grade(+$3000)",
+                    },
+                    {
+                        "name": "production_readiness_score",
+                        "formula": "has_tests(+15) + error_handling(+10) + logging(+8) + config_separation(+10) + documentation(+8) + type_safety(+7) + security_patterns(+10) + complexity_balanced(+7) + dependencies(+5) + deployment(+10) + no_secrets(+10 or -15) → clamp(0, 100)",
+                        "grade": "A≥80, B≥60, C≥40, D≥20, F<20",
+                    },
+                ],
+            },
+            "ml_inference": {
+                "endpoint": "/ml/{file_id}",
+                "formulas": [
+                    {
+                        "name": "tfidf",
+                        "formula": "TF-IDF = TF(term, chunk) × log(N / DF(term)) where N=total_chunks, DF=chunks containing term",
+                        "params": "max_features=100, stop_words=english, ngram_range=(1,2)",
+                    },
+                    {
+                        "name": "nmf_topic_modeling",
+                        "formula": "minimize ||V - WH||_F where V=tfidf_matrix, W=topic_weights, H=topic_terms",
+                        "params": "n_components=min(3, chunks-1), random_state=42, max_iter=200",
+                        "output": "topics with keywords, chunk assignments, strength = Σ(W[:,k]) / Σ(W)",
+                    },
+                    {
+                        "name": "lsa_svd",
+                        "formula": "TruncatedSVD: X = UΣV^T, take top k components → latent semantic space",
+                        "params": "n_components=min(5, features-1, chunks-1), random_state=42",
+                        "output": "explained_variance_ratio, semantic_dimensions with top terms, file_embedding = mean(chunk_embeddings)",
+                    },
+                    {
+                        "name": "kmeans_clustering",
+                        "formula": "minimize Σ||x_i - μ_c||² for cluster c",
+                        "params": "n_clusters=min(3, chunks-1), random_state=42, n_init=10",
+                        "output": "cluster sizes, chunk assignments, centroid terms",
+                    },
+                    {
+                        "name": "isolation_forest",
+                        "formula": "random partition tree → anomalies = points with shortest average path length",
+                        "params": "contamination=0.15, random_state=42",
+                        "output": "anomalous chunk indices with previews",
+                    },
+                    {
+                        "name": "shannon_entropy",
+                        "formula": "H = -Σ(p_i × log2(p_i)) for character frequencies in first 8192 chars",
+                        "unit": "bits/char",
+                        "range": "0.0 - 8.0",
+                    },
+                    {
+                        "name": "zipf_slope",
+                        "formula": "linear regression on (log(rank), log(frequency)) → slope of Zipf's law fit",
+                        "interpretation": "slope ≈ -1.0 indicates natural language, steeper = more concentrated vocabulary",
+                    },
+                    {
+                        "name": "vocabulary_concentration",
+                        "formula": "max(word_freq) / sum(word_freq)  →  proportion of most frequent word",
+                        "range": "0.0 - 1.0",
+                    },
+                    {
+                        "name": "topic_coherence",
+                        "formula": "max(topic.strength for all topics)  →  how focused the document is on one topic",
+                        "range": "0.0 - 1.0",
+                    },
+                    {
+                        "name": "structural_balance",
+                        "formula": "1.0 - (max(cluster_sizes) - min(cluster_sizes)) / sum(cluster_sizes)  →  how evenly chunks distribute across clusters",
+                        "range": "0.0 - 1.0",
+                    },
+                    {
+                        "name": "anomaly_rate",
+                        "formula": "len(anomalies) / len(chunks)  →  proportion of anomalous chunks",
+                        "range": "0.0 - 1.0",
+                    },
+                    {
+                        "name": "semantic_complexity",
+                        "formula": "mean(explained_variance[:3])  →  average of top 3 LSA component variances",
+                        "range": "0.0 - 1.0",
+                    },
+                ],
+            },
+            "password_security": {
+                "endpoint": "/password/{file_id}",
+                "formulas": [
+                    {
+                        "name": "password_hashing",
+                        "algorithm": "PBKDF2-HMAC-SHA256",
+                        "params": "iterations=100000, salt=random 32 bytes, dklen=64",
+                        "formula": "dk = pbkdf2(password, salt, 100000, 64, hashlib.sha256)",
+                        "storage": "salt + dk stored as hex in access_control table",
+                    },
+                    {
+                        "name": "password_verification",
+                        "formula": "recompute PBKDF2(input_password, stored_salt) → compare with stored_dk using constant-time comparison",
+                    },
+                ],
+            },
+            "file_indexing": {
+                "endpoint": "/index",
+                "formulas": [
+                    {
+                        "name": "merkle_root",
+                        "formula": "SHA-256 of all chunk hashes combined → tree root hash = file_id",
+                        "description": "Each chunk is SHA-256 hashed, then hashes are combined into a Merkle tree, root = file identifier",
+                    },
+                    {
+                        "name": "semantic_chunking",
+                        "formula": "split on boundaries: blank lines, class/function definitions, markdown headers, paragraph breaks → chunks of 5-50 lines",
+                        "boundary_types": ["blank_line", "function_def", "class_def", "header", "paragraph", "code_block"],
+                    },
+                    {
+                        "name": "word_frequency",
+                        "formula": "tokenize(text) → lowercase → remove stopwords → count occurrences → store top 200 in word_freq table",
+                    },
+                    {
+                        "name": "symbol_extraction",
+                        "formula": "regex patterns for: def name, class name, function name, const name, interface name, struct name → store in symbols table with line numbers",
+                    },
+                ],
+            },
+        },
+        "scoring_summary": {
+            "collateral": "0-100, grade A-F, weighted by financial+accounting+legal+KPI+DNA+origin signals × 3",
+            "liquidity": "0-100, grade A-F, weighted by cash+time+marketability+revenue+assets+doc_type × 2",
+            "risk": "0-100, level high/medium/low, additive from 6 risk signal categories",
+            "production_readiness": "0-100, grade A-F, 12 weighted checks (tests, errors, logging, config, docs, types, security, complexity, deps, deploy, secrets)",
+            "depreciation": "0-100, additive from legacy patterns + maintenance signals",
+            "complexity": "0-30+, weighted formula from symbol density, chunks, vocab, entropy, line length",
+        },
+        "total_formulas": 47,
+        "total_endpoints_with_formulas": 7,
+    }
+
+# ─── Video Export: Render Dossier as Animated MP4/GIF ────────────────────
+
+def _jorki_render_video(resume, file_id, filename):
+    """Render file dossier as an animated video using matplotlib."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+    from matplotlib.patches import FancyBboxPatch
+    import numpy as np
+
+    # Colors — Jorki brand
+    BG = "#0a0a0a"
+    ORANGE = "#ff8c00"
+    WHITE = "#e0e0e0"
+    DIM = "#555555"
+    GREEN = "#00ff88"
+    RED = "#ff4444"
+    YELLOW = "#ffcc00"
+
+    val = resume.get("valuation_summary", {})
+    prof = resume.get("financial_profile", {})
+    risk = resume.get("risk_assessment", {})
+    ml = resume.get("ml_insights", {})
+    ident = resume.get("identity", {})
+    dna_info = resume.get("structural_dna", {})
+    kpi_sum = resume.get("kpi_summary", {})
+
+    # Build frames — each frame is a "scene"
+    scenes = []
+
+    # Scene 1: Title card
+    scenes.append({
+        "type": "title",
+        "title": filename or "unknown",
+        "subtitle": f"JORKI FILE DOSSIER",
+        "info": f"ID: {file_id}  ·  Species: {ident.get('species', '?')}  ·  {ident.get('lines', 0)} lines",
+    })
+
+    # Scene 2: Identity
+    scenes.append({
+        "type": "stats",
+        "title": "IDENTITY",
+        "stats": [
+            ("Species", ident.get("species", "unknown")),
+            ("Lines", str(ident.get("lines", 0))),
+            ("Words", str(ident.get("words", 0))),
+            ("Chunks", str(ident.get("chunks", 0))),
+            ("Symbols", str(ident.get("symbols", 0))),
+            ("Vocabulary", str(ident.get("vocabulary", 0))),
+            ("Purpose", ident.get("primary_purpose", "unknown")[:40]),
+        ],
+    })
+
+    # Scene 3: DNA
+    genes = dna_info.get("genes", {})
+    scenes.append({
+        "type": "dna",
+        "title": "STRUCTURAL DNA",
+        "complexity": dna_info.get("complexity_score", 0),
+        "interpretation": dna_info.get("interpretation", ""),
+        "species": dna_info.get("species", "?"),
+        "genes": genes,
+    })
+
+    # Scene 4: KPIs
+    scenes.append({
+        "type": "kpi",
+        "title": f"KPIs ({kpi_sum.get('total', 0)} total)",
+        "by_category": kpi_sum.get("by_category", {}),
+        "top_financial": resume.get("kpi_summary", {}).get("top_financial", []),
+        "top_technical": resume.get("kpi_summary", {}).get("top_technical", []),
+    })
+
+    # Scene 5: Financial Profile
+    scenes.append({
+        "type": "grades",
+        "title": "FINANCIAL PROFILE",
+        "grades": [
+            ("Collateral", prof.get("collateral_grade", "F"), prof.get("collateral_score", 0), 100),
+            ("Liquidity", prof.get("liquidity_grade", "F"), prof.get("liquidity_score", 0), 100),
+        ],
+        "extra": [
+            f"Time to liquidate: {prof.get('time_to_liquidate', 'illiquid')}",
+            f"Monetary refs: {prof.get('monetary_references', 0)}",
+            f"Standards: {', '.join(prof.get('standards', [])) or 'none'}",
+        ],
+    })
+
+    # Scene 6: Valuation
+    scenes.append({
+        "type": "valuation",
+        "title": "VALUATION",
+        "items": [
+            ("Build Cost", f"${val.get('build_cost_usd', 0):,}"),
+            ("Replacement", f"${val.get('replacement_cost_usd', 0):,}"),
+            ("Depreciated", f"${val.get('depreciated_value_usd', 0):,}"),
+            ("Insurance", f"${val.get('insurance_value_usd', 0):,}"),
+            ("Rebuild Time", f"{val.get('time_to_rebuild_days', 0)} days"),
+            ("Difficulty", val.get("difficulty", "?")),
+        ],
+        "pr_grade": val.get("production_readiness_grade", "F"),
+        "pr_score": val.get("production_readiness_score", 0),
+        "distance": val.get("distance_to_prod", "?"),
+    })
+
+    # Scene 7: Risk
+    scenes.append({
+        "type": "risk",
+        "title": "RISK ASSESSMENT",
+        "level": risk.get("level", "low"),
+        "score": risk.get("score", 0),
+        "signals": risk.get("signals", []),
+        "origin": risk.get("origin", "unknown"),
+    })
+
+    # Scene 8: ML Insights
+    if ml.get("available"):
+        scenes.append({
+            "type": "ml",
+            "title": "ML INSIGHTS",
+            "topics": ml.get("topics", []),
+            "tfidf": ml.get("tfidf_top", []),
+            "anomalies": ml.get("anomaly_count", 0),
+            "inferred": ml.get("inferred_kpis", [])[:6],
+        })
+
+    # Scene 9: Recommendations
+    scenes.append({

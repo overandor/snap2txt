@@ -1,283 +1,785 @@
-        "name": "meditation_guide",
-        "prompt": "Guided meditation + massage. Mindfulness, breath, presence. Tranquil, centered, deep. CTA.",
-    },
-    {
-        "name": "hot_stone_specialist",
-        "prompt": "Hot stone specialty. Warm stones, heat therapy, deep relaxation. Expert, unique, indulgent. CTA.",
-    },
-    {
-        "name": "quick_lunch",
-        "prompt": "Express lunch-break massage. 30-45 min, in-and-out, midday recharge. Fast, effective, convenient. CTA.",
-    },
-    {
-        "name": "birthday_gift",
-        "prompt": "Gift-worthy experience. Treat yourself, special occasion, deserved indulgence. Celebratory, gift-like, memorable. CTA.",
-    },
-    {
-        "name": "weekly_ritual",
-        "prompt": "Subscription/recurring angle. Weekly maintenance, body upkeep, ritual. Committed, long-term, investment in self. CTA for repeat booking.",
-    },
-]
-
-
-def _load_bio_history() -> list:
-    if os.path.exists(BIO_HISTORY_FILE):
-        try:
-            with open(BIO_HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
-
-
-def _save_bio_history(history: list) -> None:
-    try:
-        with open(BIO_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history[-50:], f, indent=2)  # keep last 50
-    except Exception as e:
-        logger.warning("Failed to save bio history: %s", e)
-
-
-def _bio_hash(bio: str) -> str:
-    return hashlib.md5(bio.strip().lower().encode()).hexdigest()[:12]
-
-
-def groq_generate_bio_variants(current_bio: Optional[str], location_hint: str = "Manhattan, NY") -> Optional[list]:
-    if not GROQ_API_KEY:
-        logger.error("No GROQ_API_KEY")
-        return None
-
-    history = _load_bio_history()
-    used_hashes = {entry.get("hash", "") for entry in history}
-
-    system_base = (
-        "You are an elite copywriter for massage therapy profiles. "
-        "Each bio must be under 300 words, magnetic, SEO-friendly, and conversion-optimized. "
-        "Avoid explicit content. Include keywords: massage, therapeutic, deep tissue, relaxation, session, "
-        f"{location_hint}. Always end with a subtle call-to-action."
-    )
-
-    context = f"\nCurrent bio:\n---\n{current_bio}\n---\n" if current_bio and current_bio.strip() else ""
-
-    variants = []
-    for strategy in BIO_STRATEGIES:
-        user_prompt = (
-            f"{context}"
-            f"Strategy: {strategy['name']}\n"
-            f"Instructions: {strategy['prompt']}\n"
-            f"Now write ONLY the bio text. No labels, no quotes, no explanation. Just the bio."
-        )
-
-        try:
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_base},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.9,
-                    "max_tokens": 600,
-                },
-                timeout=60,
-            )
-            resp.raise_for_status()
-            bio = resp.json()["choices"][0]["message"]["content"].strip()
-            bio = bio.strip('"').strip("'")
-            h = _bio_hash(bio)
-            if h not in used_hashes:
-                variants.append({"bio": bio, "strategy": strategy["name"], "hash": h, "chars": len(bio)})
-            else:
-                logger.info("Skipping duplicate bio strategy=%s", strategy["name"])
-        except Exception as e:
-            logger.warning("Groq failed for strategy %s: %s", strategy["name"], e)
-
-    if not variants:
-        logger.error("No fresh bio variants generated")
-        return None
-
-    logger.info("Generated %d fresh bio variants: %s", len(variants), [v["strategy"] for v in variants])
-    return variants
-
-
-def groq_generate_bio(current_bio: Optional[str]) -> Optional[str]:
-    variants = groq_generate_bio_variants(current_bio)
-    if not variants:
-        return None
-
-    # Pick longest (most complete) variant as default
-    best = max(variants, key=lambda v: v["chars"])
-
-    # Record history
-    history = _load_bio_history()
-    history.append({
-        "timestamp": datetime.now().isoformat(),
-        "strategy": best["strategy"],
-        "hash": best["hash"],
-        "chars": best["chars"],
-        "bio_preview": best["bio"][:120],
-    })
-    _save_bio_history(history)
-
-    logger.info("Selected bio: strategy=%s chars=%d", best["strategy"], best["chars"])
-    return best["bio"]
-
-
-def update_bio(driver: webdriver.Chrome, new_bio: str) -> bool:
-    try:
-        urls_to_try = [
-            "https://rentmasseur.com/settings/about",
-            PROFILE_URL,
-            "https://rentmasseur.com/settings?bio=1",
-            "https://rentmasseur.com/settings",
-            "https://rentmasseur.com/profile/edit",
-            f"https://rentmasseur.com/{RENTMASSEUR_USERNAME}/edit",
-        ]
-
-        for url in urls_to_try:
-            logger.info("Trying profile settings: %s", url)
-            driver.get(url)
-            time.sleep(3)
-
-            result = driver.execute_script("""
-                const textareas = Array.from(document.querySelectorAll('textarea'));
-                const editables = Array.from(document.querySelectorAll('[contenteditable=\"true\"]'));
-                const inputs = Array.from(document.querySelectorAll('input[type=\"text\"]'));
-                function scoreBio(el, isTextarea) {
-                    const clues = ['bio', 'about', 'description', 'profile', 'intro', 'summary'];
-                    const text = (el.placeholder + ' ' + el.name + ' ' + (el.id||'') + ' ' + (el.getAttribute('aria-label')||'')).toLowerCase();
-                    let score = 0;
-                    for (const c of clues) if (text.includes(c)) score += 3;
-                    if (isTextarea) score += 5; // strongly prefer textarea
-                    const val = el.value || el.innerText || '';
-                    if (val.length > 30) score += 2; // likely existing bio content
-                    if (val.length > 100) score += 3;
-                    return score;
-                }
-                let best = null;
-                let bestScore = -1;
-                for (const el of textareas) {
-                    const s = scoreBio(el, true);
-                    if (s > bestScore) { bestScore = s; best = el; }
-                }
-                for (const el of editables) {
-                    const s = scoreBio(el, false);
-                    if (s > bestScore) { bestScore = s; best = el; }
-                }
-                if (!best && inputs.length > 0) {
-                    for (const el of inputs) { const s = scoreBio(el, false); if (s > bestScore) { bestScore = s; best = el; } }
-                }
-                if (!best) return {error: 'no_bio_field'};
-                const current = best.value || best.innerText || '';
-                return {
-                    tag: best.tagName.toLowerCase(),
-                    id: best.id || '',
-                    name: best.name || '',
-                    class: (best.className && typeof best.className === 'string') ? best.className.split(' ').filter(Boolean).join(' ') : '',
-                    placeholder: best.placeholder || '',
-                    contenteditable: best.getAttribute('contenteditable') || '',
-                    current: current.slice(0, 500),
-                    selector: best.tagName.toLowerCase() + (best.id ? '#' + best.id : '') + (best.name ? '[name=\"' + best.name + '\"]' : ''),
-                };
-            """)
-
-            if isinstance(result, dict) and result.get('error'):
-                logger.info("No bio field at %s, trying next...", url)
-                continue
-
-            logger.info("Found bio field: %s", result.get('selector'))
-            current_bio = result.get('current', '')
-            logger.info("Current bio preview: %s...", current_bio[:80])
-
-            optimized_bio = groq_generate_bio(current_bio)
-            if not optimized_bio:
-                logger.error("Bio generation failed, skipping update")
-                return False
-
-            sel = result['selector']
-            if result.get('contenteditable') == 'true':
-                el = driver.find_element(By.CSS_SELECTOR, sel)
-                driver.execute_script("arguments[0].innerText = arguments[1];", el, optimized_bio)
-                driver.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles: true}));", el)
-            else:
-                el = driver.find_element(By.CSS_SELECTOR, sel)
-                el.clear()
-                el.send_keys(optimized_bio)
-
-            # Click save
-            save_ok = driver.execute_script("""
-                const buttons = Array.from(document.querySelectorAll('button, input[type=\"submit\"], a[role=\"button\"]'));
-                let saveBtn = buttons.find(b => /save|update|submit|apply|confirm/i.test((b.innerText || '') + ' ' + (b.value || '') + ' ' + (b.textContent || '')));
-                if (!saveBtn) {
-                    const form = document.querySelector('textarea')?.closest('form');
-                    if (form) {
-                        const fb = Array.from(form.querySelectorAll('button, input[type=\"submit\"]'));
-                        saveBtn = fb.find(b => /save|update|submit|apply|confirm/i.test((b.innerText || '') + ' ' + (b.value || '')));
-                    }
-                }
-                if (!saveBtn) return {error: 'no_save_button'};
-                saveBtn.click();
-                return {ok: true};
-            """)
-            if isinstance(save_ok, dict) and save_ok.get('error'):
-                logger.error("Save button not found: %s", save_ok['error'])
-                _dump_debug(driver, "bio_no_save")
-                return False
-
-            logger.info("Bio updated and saved")
-            time.sleep(2)
-            return True
-
-        logger.error("Bio field not found on any settings page")
-        _dump_debug(driver, "bio_not_found")
-        return False
-
-    except Exception as e:
-        logger.error("Bio update exception: %s", e)
-        _dump_debug(driver, "bio_exception")
-        return False
-
-
-def run_once(headless: bool = True, skip_bio: bool = False) -> dict:
-    driver: Optional[webdriver.Chrome] = None
-    results = {"availability": False, "bio": False, "login": False}
-    try:
-        driver = setup_driver(headless=headless)
-        if not login(driver):
-            return results
-        results["login"] = True
-
-        results["availability"] = set_availability_24_7(driver)
-
-        if not skip_bio:
-            results["bio"] = update_bio(driver, "")
-
-        return results
-    except Exception as e:
-        logger.error("Unexpected error: %s", e)
-        return results
-    finally:
-        if driver:
-            driver.quit()
+        print_json(revenue_summary(db_path=args.db))
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--headless", default="true", help="Run headless (true/false)")
-    parser.add_argument("--skip-bio", action="store_true", help="Skip bio update")
-    parser.add_argument("--skip-availability", action="store_true", help="Skip availability")
-    args = parser.parse_args()
+    main()
 
-    headless = args.headless.lower() != "false"
-    results = run_once(headless=headless, skip_bio=args.skip_bio)
-    print(json.dumps(results, indent=2))
-    sys.exit(0 if results["login"] and (args.skip_availability or results["availability"]) else 1)
+```
+
+ga_rl_optimizer.cpp:
+```
+/*
+ * GA + RL Revenue Optimizer — C++ Native
+ * High-performance genetic algorithm + reinforcement learning for
+ * RentMasseur revenue maximization ($300/day target).
+ *
+ * Build: g++ -O3 -std=c++17 -o ga_rl_optimizer ga_rl_optimizer.cpp
+ * Run:   ./ga_rl_optimizer
+ *        ./ga_rl_optimizer --population 20 --generations 10 --target 300
+ *        ./ga_rl_optimizer --report
+ */
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <algorithm>
+#include <random>
+#include <chrono>
+#include <ctime>
+#include <cmath>
+#include <cstdlib>
+
+struct AccountConfig {
+    std::string id;
+    std::string bio;
+    int price;
+    std::string photo_style;
+    std::string cta;
+    std::string headline;
+    double fitness;
+    double revenue_estimate;
+    double reward;
+    int generation;
+    int uses;
+};
+
+struct GAState {
+    std::vector<AccountConfig> population;
+    int generation;
+    AccountConfig best_config;
+    double best_fitness;
+    double best_revenue;
+    std::vector<std::map<std::string, double>> history;
+};
+
+const double AVG_SESSION_PRICE = 200.0;
+const double CALL_CONVERSION_RATE = 0.20;
+const double VIEW_TO_CLICK_RATE = 0.05;
+const double BOOKING_CLOSE_RATE = 0.40;
+const double REVENUE_TARGET = 300.0;
+
+std::vector<std::string> CTAS = {
+    "Call me now to book your session",
+    "Pick up the phone and call today",
+    "Text or call — I'm available now",
+    "Don't wait — call me right now",
+    "Book now: your body will thank you",
+    "Call today for same-day availability",
+};
+
+std::vector<std::string> HEADLINES = {
+    "Elite Male Masseur in Manhattan",
+    "Your Private Massage Therapist in NYC",
+    "Deep Tissue & Sensory Massage by Request",
+    "Manhattan's Most Sought-After Masseur",
+    "Therapeutic Touch in the Heart of NYC",
+    "Late-Night Relief Available Now",
+    "Premium In-Home Massage Experience",
+    "The Masseur Who Actually Listens",
+};
+
+std::vector<std::string> PHOTO_STYLES = {
+    "professional", "casual", "athletic", "luxury", "mystery", "warm",
+};
+
+std::vector<int> PRICES = {120, 150, 180, 200, 220, 250, 280, 300};
+
+std::mt19937 rng;
+
+static std::string iso_timestamp() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+    return std::string(buf);
+}
+
+static std::string read_file(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return "";
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static void write_file(const std::string& path, const std::string& content) {
+    std::ofstream f(path);
+    if (f) f << content;
+}
+
+static double random_double() {
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    return dist(rng);
+}
+
+static int random_int(int min, int max) {
+    std::uniform_int_distribution<int> dist(min, max);
+    return dist(rng);
+}
+
+static double calculate_revenue_estimate(const std::map<std::string, int>& stats, int price) {
+    double views = stats.count("views") ? stats.at("views") : 0;
+    double phone_clicks = stats.count("phone_clicks") ? stats.at("phone_clicks") : 0;
+    double email_clicks = stats.count("email_clicks") ? stats.at("email_clicks") : 0;
+    double booking_inquiries = stats.count("booking_inquiries") ? stats.at("booking_inquiries") : 0;
+    double messages = stats.count("messages") ? stats.at("messages") : 0;
+
+    double price_factor = 1.0 - ((price - 200) / 1000.0);
+    phone_clicks *= price_factor;
+    booking_inquiries *= price_factor;
+
+    double view_revenue = views * VIEW_TO_CLICK_RATE * AVG_SESSION_PRICE;
+    double call_revenue = phone_clicks * CALL_CONVERSION_RATE * AVG_SESSION_PRICE;
+    double inquiry_revenue = booking_inquiries * BOOKING_CLOSE_RATE * AVG_SESSION_PRICE;
+    double message_revenue = messages * 0.10 * AVG_SESSION_PRICE;
+    double email_revenue = email_clicks * 0.05 * AVG_SESSION_PRICE;
+
+    return view_revenue + call_revenue + inquiry_revenue + message_revenue + email_revenue;
+}
+
+static double calculate_fitness(const std::map<std::string, int>& stats, double revenue, double target) {
+    double reward = 0;
+    reward += (stats.count("views") ? stats.at("views") : 0) * 1;
+    reward += (stats.count("email_clicks") ? stats.at("email_clicks") : 0) * 5;
+    reward += (stats.count("phone_clicks") ? stats.at("phone_clicks") : 0) * 10;
+    reward += (stats.count("booking_inquiries") ? stats.at("booking_inquiries") : 0) * 50;
+    reward += (stats.count("favorites") ? stats.at("favorites") : 0) * 3;
+    reward += (stats.count("messages") ? stats.at("messages") : 0) * 8;
+
+    double target_bonus = std::max(0.0, std::min(100.0, (revenue / target) * 100.0));
+    double target_penalty = std::abs(target - revenue) * 0.1;
+
+    return reward + target_bonus - target_penalty;
+}
+
+static AccountConfig create_random_config(int generation) {
+    AccountConfig c;
+    c.id = "cfg_" + iso_timestamp() + "_" + std::to_string(random_int(1000, 9999));
+    c.bio = "[Generated bio placeholder — C++ version uses static templates; call Python LLM for real bio]";
+    c.price = PRICES[random_int(0, PRICES.size() - 1)];
+    c.photo_style = PHOTO_STYLES[random_int(0, PHOTO_STYLES.size() - 1)];
+    c.cta = CTAS[random_int(0, CTAS.size() - 1)];
+    c.headline = HEADLINES[random_int(0, HEADLINES.size() - 1)];
+    c.fitness = 0;
+    c.revenue_estimate = 0;
+    c.reward = 0;
+    c.generation = generation;
+    c.uses = 0;
+    return c;
+}
+
+static AccountConfig mutate_config(const AccountConfig& parent, int generation) {
+    AccountConfig c = parent;
+    c.id = "cfg_" + iso_timestamp() + "_" + std::to_string(random_int(1000, 9999));
+
+    if (random_double() < 0.5) {
+        c.price = std::max(80, std::min(500, c.price + random_int(-30, 50)));
+    }
+    if (random_double() < 0.3) {
+        c.cta = CTAS[random_int(0, CTAS.size() - 1)];
+    }
+    if (random_double() < 0.3) {
+        c.headline = HEADLINES[random_int(0, HEADLINES.size() - 1)];
+    }
+    if (random_double() < 0.3) {
+        c.photo_style = PHOTO_STYLES[random_int(0, PHOTO_STYLES.size() - 1)];
+    }
+    c.generation = generation;
+    return c;
+}
+
+static AccountConfig crossover(const AccountConfig& p1, const AccountConfig& p2) {
+    AccountConfig c;
+    c.id = "cfg_" + iso_timestamp() + "_" + std::to_string(random_int(1000, 9999));
+    c.bio = random_double() > 0.5 ? p1.bio : p2.bio;
+    c.price = random_double() > 0.5 ? p1.price : p2.price;
+    c.photo_style = random_double() > 0.5 ? p1.photo_style : p2.photo_style;
+    c.cta = random_double() > 0.5 ? p1.cta : p2.cta;
+    c.headline = random_double() > 0.5 ? p1.headline : p2.headline;
+    c.fitness = 0;
+    c.revenue_estimate = 0;
+    c.reward = 0;
+    c.generation = std::max(p1.generation, p2.generation) + 1;
+    c.uses = 0;
+    return c;
+}
+
+static std::map<std::string, int> get_default_stats() {
+    return {
+        {"views", 0}, {"email_clicks", 0}, {"phone_clicks", 0},
+        {"booking_inquiries", 0}, {"messages", 0}, {"favorites", 0},
+    };
+}
+
+static std::vector<AccountConfig> evaluate_population(std::vector<AccountConfig>& pop, const std::map<std::string, int>& stats, double target) {
+    for (auto& c : pop) {
+        c.revenue_estimate = calculate_revenue_estimate(stats, c.price);
+        c.fitness = calculate_fitness(stats, c.revenue_estimate, target);
+    }
+    std::sort(pop.begin(), pop.end(), [](const auto& a, const auto& b) { return a.fitness > b.fitness; });
+    return pop;
+}
+
+static void print_report(const GAState& state) {
+    std::cout << "=" << std::string(60, '=') << "\n";
+    std::cout << "GA + RL C++ REVENUE OPTIMIZER REPORT\n";
+    std::cout << "=" << std::string(60, '=') << "\n";
+    std::cout << "Generation: " << state.generation << "\n";
+    std::cout << "Best fitness: " << state.best_fitness << "\n";
+    std::cout << "Best revenue: $" << state.best_revenue << "\n";
+    std::cout << "Target: $" << REVENUE_TARGET << "\n";
+    if (!state.best_config.id.empty()) {
+        std::cout << "\nBest config:\n";
+        std::cout << "  ID: " << state.best_config.id << "\n";
+        std::cout << "  Price: $" << state.best_config.price << "\n";
+        std::cout << "  CTA: " << state.best_config.cta << "\n";
+        std::cout << "  Headline: " << state.best_config.headline << "\n";
+        std::cout << "  Photo: " << state.best_config.photo_style << "\n";
+    }
+}
+
+static GAState evolve(int population_size, int generations, double target) {
+    GAState state;
+    state.generation = 0;
+    state.best_fitness = 0;
+    state.best_revenue = 0;
+
+    std::map<std::string, int> stats = get_default_stats();
+
+    // Initialize population
+    for (int i = 0; i < population_size; i++) {
+        state.population.push_back(create_random_config(0));
+    }
+
+    for (int gen = 1; gen <= generations; gen++) {
+        std::cout << "=== Generation " << gen << " ===\n";
+        evaluate_population(state.population, stats, target);
+
+        std::cout << "Best fitness: " << state.population[0].fitness
+                  << ", revenue: $" << state.population[0].revenue_estimate << "\n";
+
+        if (state.population[0].fitness > state.best_fitness) {
+            state.best_fitness = state.population[0].fitness;
+            state.best_revenue = state.population[0].revenue_estimate;
+            state.best_config = state.population[0];
+        }
+
+        state.generation = gen;
+
+        std::map<std::string, double> h;
+        h["generation"] = gen;
+        h["best_fitness"] = state.population[0].fitness;
+        h["best_revenue"] = state.population[0].revenue_estimate;
+        state.history.push_back(h);
+
+        // Selection + crossover + mutation
+        std::vector<AccountConfig> new_pop;
+        new_pop.push_back(state.population[0]);  // Elitism
+        new_pop.push_back(state.population[1]);
+
+        while ((int)new_pop.size() < population_size) {
+            const auto& p1 = state.population[random_int(0, state.population.size() / 2)];
+            const auto& p2 = state.population[random_int(0, state.population.size() / 2)];
+            auto child = crossover(p1, p2);
+            child = mutate_config(child, gen);
+            new_pop.push_back(child);
+        }
+
+        state.population = new_pop;
+    }
+
+    return state;
+}
+
+int main(int argc, char* argv[]) {
+    rng.seed(std::random_device()());
+
+    int population_size = 12;
+    int generations = 5;
+    double target = REVENUE_TARGET;
+    bool report = false;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--population" && i + 1 < argc) population_size = std::atoi(argv[++i]);
+        else if (arg == "--generations" && i + 1 < argc) generations = std::atoi(argv[++i]);
+        else if (arg == "--target" && i + 1 < argc) target = std::atof(argv[++i]);
+        else if (arg == "--report") report = true;
+        else if (arg == "--help") {
+            std::cout << "Usage: ga_rl_optimizer [options]\n"
+                      << "  --population N    Population size\n"
+                      << "  --generations N   Number of generations\n"
+                      << "  --target X        Revenue target\n"
+                      << "  --report          Show report\n";
+            return 0;
+        }
+    }
+
+    if (report) {
+        GAState state;
+        print_report(state);
+        return 0;
+    }
+
+    auto state = evolve(population_size, generations, target);
+    print_report(state);
+
+    if (state.best_revenue >= target * 0.5) {
+        std::cout << "\nWinning config reaches target. Apply with Python ga_rl_optimizer.py --apply-winner\n";
+    } else {
+        std::cout << "\nNo config reached target threshold. Continue evolving.\n";
+    }
+
+    return 0;
+}
+
+```
+
+settings_page.png:
+```
+Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
+```
+
+kpis.py:
+```
+#!/usr/bin/env python3
+"""
+Hourly KPI collector — computes immortality and virality scores from metrics history.
+
+Immortality = profile longevity & staying power
+Virality = profile spread velocity & acceleration
+
+Runs hourly via GitHub Actions. Reads metrics from content/metrics_ingest.jsonl,
+computes derived KPIs, writes to content/kpis/hourly_kpis.jsonl, and POSTs
+to HF Space /api/metrics/ingest if HF_URL is set.
+"""
+
+import json
+import os
+import sys
+import time
+import math
+import requests
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Dict, Optional
+
+CONTENT_DIR = Path(__file__).parent / "content"
+METRICS_PATH = CONTENT_DIR / "metrics_ingest.jsonl"
+KPI_DIR = CONTENT_DIR / "kpis"
+KPI_PATH = KPI_DIR / "hourly_kpis.jsonl"
+RECEIPTS_DIR = Path(__file__).parent / "receipts"
+
+KPI_DIR.mkdir(parents=True, exist_ok=True)
+RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+HF_URL = os.getenv("HF_URL", "https://josephrw-rentmasseur-optimizer.hf.space")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+
+def load_metrics() -> List[Dict]:
+    """Load all ingested metrics from JSONL."""
+    if not METRICS_PATH.exists():
+        return []
+    metrics = []
+    for line in METRICS_PATH.open():
+        if line.strip():
+            metrics.append(json.loads(line))
+    return metrics
+
+
+def compute_immortality(metrics: List[Dict]) -> Dict:
+    """
+    Immortality KPI — profile longevity & staying power.
+    
+    Components:
+    - days_online: total days profile has been active
+    - views_per_day_trend: is traffic sustaining or declining?
+    - visibility_persistence: how consistently is profile visible?
+    - availability_stability: how stable is availability?
+    - profile_age_score: normalized longevity (0-1)
+    - retention_score: views don't drop off over time
+    """
+    if not metrics:
+        return {"score": 0, "grade": "NO_DATA", "components": {}}
+
+    latest = metrics[-1]
+    pub = latest.get("public_profile", {})
+    dash = latest.get("dashboard", {})
+
+    days_online = pub.get("days_online", 0)
+    views_per_day = pub.get("views_per_day", 0)
+    profile_visible = dash.get("profile_visible", False)
+    available = dash.get("available", False)
+
+    # Profile age score: 1.0 at 1000+ days, scales down
+    profile_age_score = min(days_online / 1000.0, 1.0) if days_online > 0 else 0
+
+    # Views per day trend: compare last 3 data points if available
+    vpd_values = []
+    for m in metrics[-5:]:
+        v = m.get("public_profile", {}).get("views_per_day", 0)
+        if v > 0:
+            vpd_values.append(v)
+
+    if len(vpd_values) >= 2:
+        recent_avg = sum(vpd_values[-2:]) / 2
+        older_avg = sum(vpd_values[:-2]) / max(len(vpd_values) - 2, 1)
+        if older_avg > 0:
+            trend_ratio = recent_avg / older_avg
+        else:
+            trend_ratio = 1.0
+        views_per_day_trend = min(max(trend_ratio, 0), 2.0) / 2.0  # normalize 0-1
+    else:
+        views_per_day_trend = 0.5  # neutral if not enough data
+
+    # Visibility persistence: fraction of snapshots where visible=True
+    visibility_count = sum(1 for m in metrics if m.get("dashboard", {}).get("profile_visible", False))
+    visibility_persistence = visibility_count / len(metrics) if metrics else 0
+
+    # Availability stability: fraction of snapshots where available=True
+    avail_count = sum(1 for m in metrics if m.get("dashboard", {}).get("available", False))
+    availability_stability = avail_count / len(metrics) if metrics else 0
+
+    # Retention score: views_per_day doesn't collapse
+    if views_per_day > 0:
+        retention_score = min(views_per_day / 100.0, 1.0)
+    else:
+        retention_score = 0
+
+    # Weighted composite
+    score = (
+        profile_age_score * 0.25 +
+        views_per_day_trend * 0.25 +
+        visibility_persistence * 0.20 +
+        availability_stability * 0.15 +
+        retention_score * 0.15
+    )
+
+    # Grade
+    if score >= 0.80:
+        grade = "IMMORTAL"
+    elif score >= 0.60:
+        grade = "RESILIENT"
+    elif score >= 0.40:
+        grade = "STABLE"
+    elif score >= 0.20:
+        grade = "FRAGILE"
+    else:
+        grade = "DECLINING"
+
+    return {
+        "score": round(score, 4),
+        "grade": grade,
+        "components": {
+            "days_online": days_online,
+            "views_per_day": views_per_day,
+            "profile_age_score": round(profile_age_score, 4),
+            "views_per_day_trend": round(views_per_day_trend, 4),
+            "visibility_persistence": round(visibility_persistence, 4),
+            "availability_stability": round(availability_stability, 4),
+            "retention_score": round(retention_score, 4),
+        }
+    }
+
+
+def compute_virality(metrics: List[Dict]) -> Dict:
+    """
+    Virality KPI — profile spread velocity & acceleration.
+    
+    Components:
+    - views_velocity: rate of new views per hour
+    - views_acceleration: is velocity increasing?
+    - contact_click_velocity: rate of new contact clicks
+    - new_visitor_rate: new visits as fraction of total views
+    - bookmark_rate: bookmarks per view
+    - email_rate: emails per view
+    - spread_score: composite velocity metric
+    """
+    if not metrics:
+        return {"score": 0, "grade": "NO_DATA", "components": {}}
+
+    latest = metrics[-1]
+    dash = latest.get("dashboard", {})
+
+    profile_views = dash.get("profile_views", 0)
+    contact_clicks = dash.get("contact_clicks", 0)
+    new_visits = dash.get("new_visits", 0)
+    new_emails = dash.get("new_emails", 0)
+    online_bookmarks = dash.get("online_bookmarks", 0)
+
+    # Views velocity: views gained since last snapshot
+    views_velocity = 0
+    views_acceleration = 0
+    if len(metrics) >= 2:
+        prev_views = metrics[-2].get("dashboard", {}).get("profile_views", 0)
+        views_velocity = max(profile_views - prev_views, 0)
+
+    if len(metrics) >= 3:
+        prev_prev_views = metrics[-3].get("dashboard", {}).get("profile_views", 0)
+        prev_views = metrics[-2].get("dashboard", {}).get("profile_views", 0)
+        v1 = max(prev_views - prev_prev_views, 0)
+        v2 = max(profile_views - prev_views, 0)
+        if v1 > 0:
+            views_acceleration = (v2 - v1) / v1
+        elif v2 > 0:
+            views_acceleration = 1.0
+
+    # Contact click velocity
+    contact_click_velocity = 0
+    if len(metrics) >= 2:
+        prev_clicks = metrics[-2].get("dashboard", {}).get("contact_clicks", 0)
+        contact_click_velocity = max(contact_clicks - prev_clicks, 0)
+
+    # Rates
+    new_visitor_rate = new_visits / profile_views if profile_views > 0 else 0
+    bookmark_rate = online_bookmarks / profile_views if profile_views > 0 else 0
+    email_rate = new_emails / profile_views if profile_views > 0 else 0
+    contact_click_rate = contact_clicks / profile_views if profile_views > 0 else 0
+
+    # Spread score: how fast is the profile reaching new people
+    # Normalize components to 0-1
+    views_velocity_norm = min(views_velocity / 50.0, 1.0)  # 50+ new views per snapshot = max
+    views_accel_norm = min(max(views_acceleration, 0) / 0.5, 1.0)  # 50% acceleration = max
+    contact_velocity_norm = min(contact_click_velocity / 10.0, 1.0)  # 10+ new clicks = max
+    new_visitor_norm = min(new_visitor_rate / 0.05, 1.0)  # 5% new visitor rate = max
+    bookmark_norm = min(bookmark_rate / 0.01, 1.0)  # 1% bookmark rate = max
+    email_norm = min(email_rate / 0.01, 1.0)  # 1% email rate = max
+    ctr_norm = min(contact_click_rate / 0.10, 1.0)  # 10% CTR = max
+
+    score = (
+        views_velocity_norm * 0.25 +
+        views_accel_norm * 0.15 +
+        contact_velocity_norm * 0.20 +
+        new_visitor_norm * 0.15 +
+        bookmark_norm * 0.05 +
+        email_norm * 0.05 +
+        ctr_norm * 0.15
+    )
+
+    # Grade
+    if score >= 0.70:
+        grade = "VIRAL"
+    elif score >= 0.50:
+        grade = "ACCELERATING"
+    elif score >= 0.30:
+        grade = "STEADY"
+    elif score >= 0.15:
+        grade = "SLOW"
+    else:
+        grade = "STAGNANT"
+
+    return {
+        "score": round(score, 4),
+        "grade": grade,
+        "components": {
+            "profile_views": profile_views,
+            "views_velocity": views_velocity,
+            "views_acceleration": round(views_acceleration, 4),
+            "contact_clicks": contact_clicks,
+            "contact_click_velocity": contact_click_velocity,
+            "new_visits": new_visits,
+            "new_visitor_rate": round(new_visitor_rate, 4),
+            "online_bookmarks": online_bookmarks,
+            "bookmark_rate": round(bookmark_rate, 4),
+            "new_emails": new_emails,
+            "email_rate": round(email_rate, 4),
+            "contact_click_rate": round(contact_click_rate, 4),
+        }
+    }
+
+
+def write_receipt(kpi_packet: Dict) -> Path:
+    """Write a tamper-evident receipt for the KPI computation."""
+    ts = datetime.now(timezone.utc).isoformat()
+    receipt = {
+        "id": f"kpi_{int(time.time())}",
+        "timestamp": ts,
+        "action": "hourly_kpi_computation",
+        "data": kpi_packet,
+    }
+    path = RECEIPTS_DIR / f"kpi_{ts.replace(':', '-').replace('+', '-')}.json"
+    with path.open("w") as f:
+        json.dump(receipt, f, indent=2)
+    return path
+
+
+def post_to_hf(kpi_packet: Dict) -> bool:
+    """POST KPI packet to HF Space /api/metrics/ingest."""
+    if not HF_URL:
+        return False
+    try:
+        headers = {"Content-Type": "application/json"}
+        if ADMIN_TOKEN:
+            headers["Authorization"] = f"Bearer {ADMIN_TOKEN}"
+        r = requests.post(
+            f"{HF_URL}/api/metrics/ingest",
+            json=kpi_packet,
+            headers=headers,
+            timeout=15,
+        )
+        return r.status_code == 200
+    except Exception as e:
+        print(f"HF POST failed: {e}", file=sys.stderr)
+        return False
+
+
+def main():
+    print("=== Hourly KPI Collection ===")
+    print(f"Time: {datetime.now(timezone.utc).isoformat()}")
+
+    metrics = load_metrics()
+    print(f"Loaded {len(metrics)} metric snapshots")
+
+    immortality = compute_immortality(metrics)
+    virality = compute_virality(metrics)
+
+    kpi_packet = {
+        "packet_type": "rm_hourly_kpis",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "immortality": immortality,
+        "virality": virality,
+        "metrics_snapshots_used": len(metrics),
+    }
+
+    # Write to JSONL
+    with KPI_PATH.open("a") as f:
+        f.write(json.dumps(kpi_packet) + "\n")
+    print(f"KPIs written to {KPI_PATH}")
+
+    # Write receipt
+    receipt_path = write_receipt(kpi_packet)
+    print(f"Receipt: {receipt_path}")
+
+    # Print summary
+    print()
+    print(f"IMMORTALITY: {immortality['score']:.4f} ({immortality['grade']})")
+    for k, v in immortality["components"].items():
+        print(f"  {k}: {v}")
+
+    print()
+    print(f"VIRALITY: {virality['score']:.4f} ({virality['grade']})")
+    for k, v in virality["components"].items():
+        print(f"  {k}: {v}")
+
+    # POST to HF
+    if HF_URL:
+        ok = post_to_hf(kpi_packet)
+        if ok:
+            print(f"\nPOSTed to {HF_URL}/api/metrics/ingest -> 200")
+        else:
+            print(f"\nHF POST failed (non-fatal)")
+
+    print("\n=== KPI Collection Complete ===")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+dashboard.html:
+```
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RM 24/7 Availability</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--g:#00ffa3;--r:#ff3b6b;--p:#b14dff}
+body{font-family:'SF Mono',-apple-system,monospace;background:radial-gradient(ellipse at 30% 0%,#0a0a1a 0%,#050510 60%);color:#c8c8e0;min-height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 80% 90%,rgba(177,77,255,.06) 0%,transparent 50%),radial-gradient(circle at 10% 50%,rgba(0,255,163,.04) 0%,transparent 50%);pointer-events:none}
+.glass{background:rgba(12,12,24,.55);backdrop-filter:blur(24px) saturate(1.4);-webkit-backdrop-filter:blur(24px) saturate(1.4);border:1px solid rgba(255,255,255,.06);border-radius:20px;box-shadow:0 8px 32px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.05);padding:40px;max-width:580px;width:92%;position:relative}
+.glass::before{content:'';position:absolute;inset:0;border-radius:20px;padding:1px;background:linear-gradient(135deg,rgba(0,255,163,.15),transparent 40%,rgba(177,77,255,.12));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}
+h1{font-size:1.3rem;font-weight:300;letter-spacing:.02em;color:#f0f0ff;margin-bottom:2px}
+.sub{color:#5a5a7a;font-size:.75rem;margin-bottom:28px;letter-spacing:.03em}
+.row{display:flex;align-items:center;gap:14px;padding:14px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;box-shadow:0 0 12px currentColor}
+.lbl{font-size:.75rem;color:#7878a0;flex:1;letter-spacing:.02em}
+.val{font-size:.75rem;font-weight:500;font-variant-numeric:tabular-nums;letter-spacing:.04em}
+.sec{font-size:.625rem;text-transform:uppercase;letter-spacing:.12em;color:#3a3a5a;margin:20px 0 6px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 24px}
+.k{color:#4a4a6a;font-size:.6875rem}
+.v{color:#a8a8c8;font-size:.6875rem;font-variant-numeric:tabular-nums;text-align:right}
+.err{color:var(--r);font-size:.625rem;margin-top:10px;word-break:break-word;opacity:.8}
+.bar{height:3px;background:rgba(255,255,255,.04);border-radius:2px;margin:6px 0 14px;overflow:hidden}
+.bar-fill{height:100%;background:linear-gradient(90deg,var(--p),var(--g));border-radius:2px;transition:width .8s ease;box-shadow:0 0 8px var(--p)}
+.btn{display:inline-block;padding:7px 14px;border-radius:8px;font-size:.6875rem;font-weight:500;border:1px solid rgba(255,255,255,.08);cursor:pointer;margin:3px 4px 0 0;text-decoration:none;background:rgba(255,255,255,.03);color:#c8c8e0;transition:all .2s;letter-spacing:.03em}
+.btn:hover{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.12)}
+.btn-a{border-color:rgba(177,77,255,.3);color:var(--p)}
+.btn-a:hover{background:rgba(177,77,255,.08);box-shadow:0 0 16px rgba(177,77,255,.15)}
+.btn-g{border-color:rgba(0,255,163,.25);color:var(--g)}
+.btn-g:hover{background:rgba(0,255,163,.06);box-shadow:0 0 16px rgba(0,255,163,.1)}
+.api{margin-top:18px;padding-top:18px;border-top:1px solid rgba(255,255,255,.04)}
+.api a{color:#4a6a9a;text-decoration:none;font-size:.625rem;display:inline-block;padding:2px 8px;letter-spacing:.02em}
+.api a:hover{color:#6a8aba}
+.pulse{animation:p 2s ease-in-out infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.3}}
+.loading{color:#5a5a7a;font-size:.6875rem;text-align:center;padding:40px}
+</style>
+</head>
+<body>
+<div class="glass">
+<h1>RentMasseur 24/7</h1>
+<p class="sub">autonomous availability · visibility guard · jitter bursts</p>
+<div id="content"><div class="loading">connecting to live API…</div></div>
+</div>
+<script>
+const API='https://josephrw-rentmasseur-optimizer.hf.space';
+async function poll(){
+  try{
+    const s=await fetch(API+'/api/automation/status').then(r=>r.json());
+    const r=s.rm_state||{};
+    const avail=r.available?'AVAILABLE':'OFFLINE';
+    const availC=r.available?'#00ffa3':'#ff3b6b';
+    const vis=r.is_hidden===false?'VISIBLE':r.is_hidden===true?'HIDDEN':'UNKNOWN';
+    const visC=r.is_hidden===false?'#00ffa3':r.is_hidden===true?'#ff3b6b':'#6b7280';
+    const jitOn=r.jitter_enabled;
+    const jitC=jitOn?'#b14dff':'#6b7280';
+    const jitT=jitOn?'ON · '+(r.jitter_bursts||0)+' bursts':'OFF';
+    const jitPct=jitOn&&r.next_burst_in>0?Math.min(100,Math.max(0,100-r.next_burst_in/18)):100;
+    const err=r.last_error?'<div class="err">⚠ '+r.last_error+'</div>':'';
+    document.getElementById('content').innerHTML=
+      '<div class="row"><div class="dot pulse" style="background:'+availC+';color:'+availC+'"></div><span class="lbl">Availability</span><span class="val" style="color:'+availC+'">'+avail+'</span></div>'+
+      '<div class="row"><div class="dot" style="background:'+visC+';color:'+visC+'"></div><span class="lbl">Visibility</span><span class="val" style="color:'+visC+'">'+vis+'</span></div>'+
+      '<div class="row"><div class="dot pulse" style="background:'+jitC+';color:'+jitC+'"></div><span class="lbl">Jitter Bursts</span><span class="val" style="color:'+jitC+'">'+jitT+'</span></div>'+
+      '<div class="sec">Metrics</div>'+
+      '<div class="grid">'+
+      '<div><span class="k">cycles</span></div><div><span class="v">'+(r.cycles||0)+'</span></div>'+
+      '<div><span class="k">refreshes</span></div><div><span class="v">'+(r.refreshes||0)+'</span></div>'+
+      '<div><span class="k">burst count</span></div><div><span class="v">'+(r.jitter_bursts||0)+'</span></div>'+
+      '<div><span class="k">last offline</span></div><div><span class="v">'+(r.last_burst_duration||0)+'s</span></div>'+
+      '<div><span class="k">next burst</span></div><div><span class="v">'+(r.next_burst_in||0)+'s</span></div>'+
+      '<div><span class="k">credentials</span></div><div><span class="v">'+(r.credentials||'?')+'</span></div>'+
+      '</div>'+
+      '<div class="bar"><div class="bar-fill" style="width:'+jitPct+'%"></div></div>'+err+
+      '<div class="sec">Controls</div>'+
+      '<a class="btn btn-a" href="#" onclick="fetch(API+\'/api/jitter/burst\',{method:\'POST\'}).then(()=>setTimeout(poll,1000));return false">Burst Now</a>'+
+      '<a class="btn '+(jitOn?'':'btn-g')+'" href="#" onclick="fetch(API+\'/api/jitter/toggle\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:\'{}\'}).then(()=>setTimeout(poll,500));return false">'+(jitOn?'Disable':'Enable')+' Jitter</a>'+
+      '<a class="btn btn-g" href="#" onclick="fetch(API+\'/api/availability/refresh\',{method:\'POST\'}).then(()=>setTimeout(poll,1000));return false">Refresh Now</a>'+
+      '<div class="api">'+
+      '<a href="'+API+'/api/automation/status">status</a> ·'+
+      '<a href="'+API+'/api/availability/history">history</a> ·'+
+      '<a href="'+API+'/api/jitter/history">bursts</a> ·'+
+      '<a href="'+API+'/api/visibility/guard">visibility</a> ·'+
+      '<a href="'+API+'/api/visit-back">visits</a> ·'+
+      '<a href="'+API+'/api/bio/post">bio</a> ·'+
+      '<a href="'+API+'/health">health</a> ·'+
+      '<a href="'+API+'/api/kpis">kpis</a>'+
+      '</div>';
+  }catch(e){
+    document.getElementById('content').innerHTML='<div class="loading">API unreachable — space may be starting up…</div>';
+  }
+}
+poll();setInterval(poll,15000);
+</script>
+</body>
+</html>
 
 ```
 
@@ -296,505 +798,3 @@ manifest.json:
   "host_permissions": [
     "https://rentmasseur.com/*",
     "http://localhost:3000/*",
-    "<all_urls>"
-  ],
-  "content_scripts": [
-    {
-      "matches": [
-        "https://rentmasseur.com/*"
-      ],
-      "js": [
-        "content.js"
-      ],
-      "css": [
-        "content.css"
-      ],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": [
-        "<all_urls>"
-      ],
-      "js": [
-        "tts_content.js"
-      ],
-      "run_at": "document_idle"
-    }
-  ],
-  "action": {
-    "default_popup": "popup.html",
-    "default_icon": {
-      "16": "icon16.png",
-      "48": "icon48.png",
-      "128": "icon128.png"
-    }
-  },
-  "icons": {
-    "16": "icon16.png",
-    "48": "icon48.png",
-    "128": "icon128.png"
-  }
-}
-```
-
-DEMO_STATUS.txt:
-```
-NEXT:open browser preview to http://127.0.0.1:8000/demo.html to see the injected panel. If Check Availability fails, it is because the booking server at localhost:3000 is not running; that is expected in this demo.
-
-```
-
-_deploy_bio_uc.py:
-```
-#!/usr/bin/env python3
-"""Login + deploy bio using undetected-chromedriver to bypass CAPTCHA detection."""
-import time, os, sys
-import undetected_chromedriver as uc
-from dotenv import load_dotenv
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv()
-
-USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
-LOGIN_URL = "https://rentmasseur.com/login"
-PROFILE_URL = "https://rentmasseur.com/profile"
-BIO_URL = "https://rentmasseur.com/profile/edit"
-
-BIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "bios", "controlled_wolf_v1.md")
-
-print(f"Username: {USERNAME}")
-print(f"Bio file: {BIO_FILE}")
-
-with open(BIO_FILE, "r") as f:
-    BIO_TEXT = f.read().strip()
-print(f"Bio length: {len(BIO_TEXT)} chars")
-
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,900")
-
-driver = uc.Chrome(options=options, version_main=149)
-try:
-    print("\n[1] Navigating to login...")
-    driver.set_page_load_timeout(90)
-    driver.get(LOGIN_URL)
-    time.sleep(8)
-    
-    print(f"  Title: {driver.title}")
-    print(f"  URL: {driver.current_url}")
-    
-    # Check if CAPTCHA is present
-    captcha = driver.execute_script("""
-        return !!document.querySelector('.g-recaptcha, #captcha, iframe[src*="recaptcha"], iframe[src*="captcha"]');
-    """)
-    print(f"  CAPTCHA present: {captcha}")
-    
-    if captcha:
-        print("\n[2] CAPTCHA detected. Waiting up to 120s for it to be solved...")
-        for i in range(24):
-            time.sleep(5)
-            captcha_still = driver.execute_script("""
-                const iframe = document.querySelector('iframe[src*="recaptcha"]');
-                if (!iframe) return false;
-                // Check if recaptcha response is filled
-                try {
-                    return !grecaptcha.getResponse();
-                } catch(e) {
-                    return true;
-                }
-            """)
-            if not captcha_still:
-                print("  CAPTCHA solved!")
-                break
-            print(f"  Waiting for CAPTCHA solve... ({(i+1)*5}s)")
-        else:
-            print("  CAPTCHA not solved in time. Trying to proceed anyway...")
-    
-    # Wait for login form to appear
-    print("\n[3] Looking for login form...")
-    for attempt in range(10):
-        time.sleep(3)
-        inputs = driver.execute_script("""
-            return Array.from(document.querySelectorAll('input')).map(i => ({
-                type: i.type, name: i.name, id: i.id, placeholder: i.placeholder,
-                visible: i.offsetParent !== null
-            }));
-        """)
-        print(f"  Attempt {attempt+1}: {len(inputs)} inputs found")
-        for inp in inputs:
-            print(f"    type={inp['type']} name={inp['name']} id={inp['id']} placeholder={inp['placeholder']} visible={inp['visible']}")
-        
-        pwd = driver.execute_script("""
-            return document.querySelector('input[type="password"]') ||
-                   document.querySelector('input[name*="pass" i]') ||
-                   document.querySelector('input[placeholder*="pass" i]');
-        """)
-        if pwd:
-            print("  Password field found!")
-            break
-    else:
-        print("  No login form found after waiting. Dumping page...")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/login_after_captcha.png")
-        with open("/Users/alep/Downloads/rentmasseur-optimizer/login_after.html", "w") as f:
-            f.write(driver.page_source)
-        sys.exit(1)
-    
-    # Fill login form
-    print("\n[4] Filling login form...")
-    driver.execute_script(f"""
-        const pwd = document.querySelector('input[type="password"]') ||
-                    document.querySelector('input[name*="pass" i]');
-        const user = document.querySelector('input[type="text"]') ||
-                     document.querySelector('input[type="email"]') ||
-                     document.querySelector('input[name*="user" i]') ||
-                     document.querySelector('input[name*="email" i]');
-        if (user) {{ user.value = '{USERNAME}'; user.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-        if (pwd) {{ pwd.value = '{PASSWORD}'; pwd.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-    """)
-    time.sleep(2)
-    
-    # Click submit
-    driver.execute_script("""
-        const btn = document.querySelector('button[type="submit"]') ||
-                    document.querySelector('input[type="submit"]') ||
-                    Array.from(document.querySelectorAll('button')).find(b => /login|sign.in|submit/i.test(b.innerText));
-        if (btn) btn.click();
-    """)
-    time.sleep(8)
-    
-    print(f"  After login URL: {driver.current_url}")
-    if "login" in driver.current_url.lower():
-        print("  Login may have failed. Screenshot saved.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/login_failed.png")
-        sys.exit(1)
-    
-    print("  Login successful!")
-    
-    # Navigate to profile edit
-    print("\n[5] Navigating to profile edit...")
-    driver.get(BIO_URL)
-    time.sleep(5)
-    
-    # Find bio textarea
-    print("  Looking for bio textarea...")
-    bio_field = driver.execute_script("""
-        const textareas = Array.from(document.querySelectorAll('textarea'));
-        let best = null, bestScore = 0;
-        for (const ta of textareas) {
-            const score = (ta.value || '').length;
-            if (score > bestScore) { bestScore = score; best = ta; }
-        }
-        if (!best && textareas.length > 0) best = textareas[0];
-        if (best) {
-            best.value = arguments[0];
-            best.dispatchEvent(new Event('input', {bubbles: true}));
-            best.dispatchEvent(new Event('change', {bubbles: true}));
-            return true;
-        }
-        return false;
-    """, BIO_TEXT)
-    
-    if bio_field:
-        print("  Bio field updated!")
-        time.sleep(2)
-        
-        # Click save
-        saved = driver.execute_script("""
-            const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-            const saveBtn = buttons.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'') + ' ' + (b.value||'')));
-            if (saveBtn) { saveBtn.click(); return true; }
-            return false;
-        """)
-        print(f"  Save clicked: {saved}")
-        time.sleep(5)
-        print("\n  BIO DEPLOYED SUCCESSFULLY!")
-    else:
-        print("  No textarea found. Screenshot saved.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/profile_edit.png")
-    
-finally:
-    driver.quit()
-    print("\nDone.")
-
-```
-
-providers.json:
-```
-{
-  "providers": [
-    {
-      "slug": "Preston_Banks",
-      "url": "https://rentmasseur.com/Preston_Banks",
-      "name": "Preston_Banks"
-    },
-    {
-      "slug": "Tonyxxxx",
-      "url": "https://rentmasseur.com/Tonyxxxx",
-      "name": "Tonyxxxx"
-    },
-    {
-      "slug": "MickeyCuteBoy",
-      "url": "https://rentmasseur.com/MickeyCuteBoy",
-      "name": "MickeyCuteBoy"
-    },
-    {
-      "slug": "ExoticYoungGuy",
-      "url": "https://rentmasseur.com/ExoticYoungGuy",
-      "name": "ExoticYoungGuy"
-    }
-  ]
-}
-```
-
-content.css:
-```
-.rm-booker-panel {
-  position: fixed;
-  top: 80px;
-  right: 20px;
-  width: 280px;
-  background: #1a1a1f;
-  border: 1px solid #333;
-  border-radius: 12px;
-  padding: 16px;
-  z-index: 999999;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  color: #f0f0f5;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-}
-
-.rm-booker-panel h3 {
-  margin: 0 0 10px 0;
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.rm-booker-panel .rm-meta {
-  font-size: 12px;
-  color: #9a9aa3;
-  margin-bottom: 12px;
-}
-
-.rm-booker-panel .rm-btn {
-  display: block;
-  width: 100%;
-  padding: 10px;
-  background: #cc8b4a;
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-  text-align: center;
-  text-decoration: none;
-  margin-bottom: 8px;
-}
-
-.rm-booker-panel .rm-btn:hover {
-  background: #e09d5a;
-}
-
-.rm-booker-panel .rm-btn-secondary {
-  background: #2a2a30;
-  border: 1px solid #444;
-  color: #f0f0f5;
-}
-
-.rm-booker-panel .rm-btn-secondary:hover {
-  background: #333;
-}
-
-.rm-booker-panel .rm-close {
-  position: absolute;
-  top: 8px;
-  right: 10px;
-  background: none;
-  border: none;
-  color: #9a9aa3;
-  font-size: 18px;
-  cursor: pointer;
-  line-height: 1;
-}
-
-.rm-booker-panel .rm-close:hover {
-  color: #f0f0f5;
-}
-
-.rm-booker-panel .rm-status {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  margin-right: 6px;
-}
-
-.rm-booker-panel .rm-btn-verify {
-  background: #8b5cf6;
-  margin-bottom: 8px;
-}
-
-.rm-booker-panel .rm-btn-verify:hover {
-  background: #a78bfa;
-}
-
-.rm-booker-panel .rm-status.available {
-  background: #4caf50;
-}
-
-.rm-booker-panel .rm-status.busy {
-  background: #f44336;
-}
-
-.rm-booker-panel .rm-status.unknown {
-  background: #9a9aa3;
-}
-
-.rm-booker-panel .rm-badge {
-  display: inline-block;
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  padding: 2px 6px;
-  border-radius: 4px;
-  background: #2a2a30;
-  color: #9a9aa3;
-  margin-top: 4px;
-}
-```
-
-icon16.png:
-```
-Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
-```
-
-login_failed.png:
-```
-Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
-```
-
-backfill_views.py:
-```
-"""Backfill missing RentMasseur profile views by scraping public profile pages.
-
-This script reads a JSONL of profiles missing views, fetches each public
-profile page, and extracts:
-  - visits           (total profile views)
-  - member_since     (registration date string like "Mar 25, 2014")
-  - days_online      (days since registration)
-  - views_per_day    (visits / days_online)
-
-Output is written as JSONL and merged into the base file.
-
-NOTE: This makes HTTP requests to rentmasseur.com. Use responsibly and
-respect rate limits / robots.txt / Terms of Service.
-"""
-
-from __future__ import annotations
-
-import json
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from pathlib import Path
-
-import requests
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-
-def parse_member_since(html: str) -> str:
-    """Extract Member Since date from profile page HTML."""
-    match = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', html)
-    if match:
-        return match.group(1).strip()
-    # Fallback variants
-    match = re.search(r'Member Since[^<]*<[^>]*value[^>]*>([^<]+)</', html, re.I)
-    return match.group(1).strip() if match else ""
-
-
-def parse_visits(html: str) -> int:
-    """Extract profile visit count from page HTML/JSON."""
-    # Primary: JSON "visits":N (skip 0 which is often the viewer's own stat)
-    vals = [int(v) for v in re.findall(r'"visits":(\d+)', html) if v != "0"]
-    if vals:
-        return max(vals)
-
-    # Fallback text patterns
-    m = re.search(r'(\d[\d,]*)\s+profile\s+views', html, re.I)
-    if m:
-        return int(m.group(1).replace(",", ""))
-
-    m = re.search(r'Profile Views\s*</[^>]*>\s*<[^>]*>([\d,]+)', html, re.I)
-    if m:
-        return int(m.group(1).replace(",", ""))
-
-    return 0
-
-
-def days_since(date_str: str) -> int:
-    """Calculate days since date string like 'Mar 25, 2014'."""
-    if not date_str:
-        return 0
-    try:
-        joined = datetime.strptime(date_str, "%b %d, %Y")
-        return max(1, (datetime.now() - joined).days)
-    except ValueError:
-        return 0
-
-
-def fetch_profile_views(username: str, delay: float = 0.25) -> dict:
-    """Fetch and parse views for one username."""
-    if not username:
-        return _empty_views()
-    url = f"https://rentmasseur.com/{username}"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
-            return _empty_views(error=f"HTTP {resp.status_code}")
-        member_since = parse_member_since(resp.text)
-        visits = parse_visits(resp.text)
-        days = days_since(member_since)
-        views_per_day = round(visits / days, 4) if days else 0
-        time.sleep(delay)
-        return {
-            "visits": visits,
-            "member_since": member_since,
-            "days_online": days,
-            "views_per_day": views_per_day,
-            "_fetch_ok": True,
-        }
-    except Exception as e:
-        return _empty_views(error=str(e))
-
-
-def _empty_views(error: str = "") -> dict:
-    return {
-        "visits": 0,
-        "member_since": "",
-        "days_online": 0,
-        "views_per_day": 0,
-        "_fetch_ok": False,
-        "_error": error,
-    }
-
-
-def backfill(
-    missing_path: Path,
-    base_path: Path | None = None,
-    workers: int = 8,
-    delay: float = 0.25,

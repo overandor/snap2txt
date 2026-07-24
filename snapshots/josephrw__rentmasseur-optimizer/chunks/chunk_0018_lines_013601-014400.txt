@@ -1,800 +1,800 @@
-        logger.info("Navigating to availability settings: %s", AVAILABILITY_URL)
-        driver.get(AVAILABILITY_URL)
-        time.sleep(3)  # Let page render
+    vals = []
+    if last_online:
+        fields.append("last_online=?")
+        vals.append(last_online)
+    if last_visited_my_page:
+        fields.append("last_visited_my_page=?")
+        vals.append(last_visited_my_page)
+    if profile_hash:
+        fields.append("last_profile_hash=?")
+        vals.append(profile_hash)
+    if fields:
+        vals.append(username)
+        conn.execute(f"UPDATE visitors SET {', '.join(fields)} WHERE username=?", vals)
+        conn.commit()
+    conn.close()
 
-        # Dismiss any popups that could block the availability controls
-        dismiss_popups(driver)
 
-        # Do everything in JS since the two selects share identical classes
-        ok = driver.execute_script("""
-            const selects = Array.from(document.querySelectorAll('select'));
-            const buttons = Array.from(document.querySelectorAll('button'));
-            
-            // Find availability status select (options contain 'Available' / 'Not Set')
-            const statusSelect = selects.find(s => {
-                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
-                return opts.includes('available') || opts.includes('not set');
-            });
-            if (!statusSelect) return {error: 'no_status_select'};
-            
-            // Select 'Available' (skip 'Not Available')
-            const availOpt = Array.from(statusSelect.options).find(
-                o => o.text.toLowerCase().includes('available') && !o.text.toLowerCase().includes('not')
-            );
-            if (availOpt) {
-                statusSelect.value = availOpt.value;
-                statusSelect.dispatchEvent(new Event('change', {bubbles: true}));
+def record_message(username: str, message_text: str, status: str, template_index: int):
+    conn = sqlite3.connect(str(DB_PATH))
+    now = now_iso()
+    conn.execute(
+        "INSERT INTO message_log (username, session_id, sent_at, message_text, status, template_index) VALUES (?, ?, ?, ?, ?, ?)",
+        (username, SESSION_ID, now, message_text, status, template_index)
+    )
+    conn.execute(
+        "UPDATE visitors SET last_messaged=?, message_count=message_count+1 WHERE username=?",
+        (now, username)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_visitors() -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute(
+        "SELECT username, visit_count, last_seen, last_online, last_visited_my_page, last_messaged, message_count FROM visitors ORDER BY visit_count DESC"
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "username": r[0], "visit_count": r[1], "last_seen": r[2],
+            "last_online": r[3], "last_visited_my_page": r[4],
+            "last_messaged": r[5], "message_count": r[6],
+        }
+        for r in rows
+    ]
+
+
+def get_repeat_visitors(threshold: int = 3) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute(
+        "SELECT username, visit_count, last_messaged, message_count FROM visitors WHERE visit_count >= ? ORDER BY visit_count DESC",
+        (threshold,)
+    ).fetchall()
+    conn.close()
+    return [
+        {"username": r[0], "visit_count": r[1], "last_messaged": r[2], "message_count": r[3]}
+        for r in rows
+    ]
+
+
+# ─── Browser Engine ──────────────────────────────────────────────────
+
+BLOCK_NEEDLES = [
+    ("captcha", "captcha_detected"),
+    ("crowdsec", "crowdsec_detected"),
+    ("access forbidden", "access_forbidden"),
+    ("verify you are human", "human_verification"),
+    ("unusual traffic", "traffic_challenge"),
+    ("too many requests", "rate_limited"),
+    ("cloudflare", "cloudflare_challenge"),
+]
+
+
+def detect_block_text(text: str, url: str) -> Optional[str]:
+    text_lower = text.lower()
+    url_lower = url.lower()
+    for needle, reason in BLOCK_NEEDLES:
+        if needle in text_lower or needle in url_lower:
+            return reason
+    return None
+
+
+class EngagementEngine:
+    def __init__(self, headed: bool):
+        self.headed = headed
+        self.driver = None
+        self.logged_in = False
+        self.ua = random.choice(USER_AGENTS)
+        log(f"Engine: Selenium (undetected) | UA: {self.ua[:40]}...")
+
+    def start(self):
+        import undetected_chromedriver as uc
+
+        options = uc.ChromeOptions()
+        if not self.headed:
+            options.add_argument("--headless=new")
+        options.add_argument("--window-size=1440,900")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument(f"--user-agent={self.ua}")
+
+        chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if os.path.exists(chrome_path):
+            options.binary_location = chrome_path
+
+        try:
+            import subprocess, re
+            ver_out = subprocess.check_output(
+                [chrome_path, "--version"], stderr=subprocess.DEVNULL
+            ).decode().strip()
+            chrome_major = int(re.search(r'(\d+)\.', ver_out).group(1))
+            self.driver = uc.Chrome(options=options, version_main=chrome_major)
+        except Exception:
+            self.driver = uc.Chrome(options=options)
+
+        self.driver.set_page_load_timeout(45)
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = { runtime: {} };
+            """
+        })
+        log("Browser started (Selenium/undetected)")
+
+    def stop(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+        log("Browser closed")
+
+    def screenshot(self, name: str) -> str:
+        ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        fname = f"{ts}_{SESSION_ID}_{name}.png"
+        path = SCREENSHOTS / fname
+        try:
+            self.driver.save_screenshot(str(path))
+        except Exception:
+            return ""
+        return str(path)
+
+    def screenshot_compressed(self, name: str) -> dict:
+        """Take screenshot, compress to thumbnail, delete original PNG.
+        Returns dict with thumbnail_base64, thumbnail_kb, original_size_kb."""
+        ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        fname = f"{ts}_{SESSION_ID}_{name}"
+        path = SCREENSHOTS / f"{fname}.png"
+        try:
+            self.driver.save_screenshot(str(path))
+            orig_kb = round(path.stat().st_size / 1024, 1)
+            thumb_b64, thumb_kb = compress_screenshot(path)
+            return {
+                "thumbnail_b64": thumb_b64[:500] if thumb_b64 else "",  # truncated for receipt
+                "thumbnail_file": f"{fname}.jpg",
+                "thumbnail_kb": thumb_kb,
+                "original_kb": orig_kb,
+                "compression_ratio": round(thumb_kb / orig_kb, 3) if orig_kb > 0 else 0,
             }
-            
-            // Find time select (options contain 'Hour' or 'Minutes')
-            const timeSelect = selects.find(s => {
-                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
-                return opts.some(t => t.includes('hour') || t.includes('minute'));
-            });
-            if (timeSelect) {
-                // Pick the longest duration (last option that contains a number)
-                const durationOpts = Array.from(timeSelect.options).filter(
-                    o => /\\d/.test(o.text)
-                );
-                if (durationOpts.length > 0) {
-                    const longest = durationOpts[durationOpts.length - 1];
-                    timeSelect.value = longest.value;
-                    timeSelect.dispatchEvent(new Event('change', {bubbles: true}));
+        except Exception as e:
+            return {"error": str(e)}
+
+    def page_text(self) -> str:
+        try:
+            return self.driver.execute_script(
+                "return document.body ? document.body.innerText : ''"
+            )[:8000]
+        except Exception:
+            return ""
+
+    def detect_block(self) -> Optional[str]:
+        return detect_block_text(self.page_text(), self.driver.current_url)
+
+    def login(self, username: str, password: str) -> bool:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.keys import Keys
+
+        log("=== LOGIN ===")
+        try:
+            self.driver.get(f"{BASE_URL}/login")
+            human_delay(3, 5)
+            self.screenshot("01_login_page")
+
+            block = self.detect_block()
+            if block:
+                log(f"BLOCKED: {block}", "ERROR")
+                write_receipt("login", "blocked", {"reason": block})
+                return False
+
+            inputs = self.driver.find_elements(By.CSS_SELECTOR, "input")
+            email_el = pass_el = None
+            for inp in inputs:
+                if not inp.is_displayed():
+                    continue
+                itype = (inp.get_attribute("type") or "").lower()
+                iname = (inp.get_attribute("name") or "").lower()
+                if itype == "password":
+                    pass_el = inp
+                elif "email" in iname or "user" in iname or itype in ("email", "text"):
+                    email_el = inp
+
+            if not email_el or not pass_el:
+                log("Login form not found", "ERROR")
+                write_receipt("login", "fail", {"reason": "form_not_found"})
+                return False
+
+            log("Typing credentials (human-like)...")
+            email_el.click()
+            human_delay(0.3, 0.8)
+            human_type(email_el, username)
+            human_delay(0.5, 1.2)
+            pass_el.click()
+            human_delay(0.3, 0.6)
+            human_type(pass_el, password)
+            human_delay(0.8, 1.5)
+
+            self.screenshot("02_login_filled")
+            pass_el.send_keys(Keys.ENTER)
+            human_delay(4, 7)
+
+            current_url = self.driver.current_url
+            if "/login" in current_url.lower():
+                log("Login failed", "ERROR")
+                self.screenshot("03_login_failed")
+                write_receipt("login", "fail", {"reason": "still_on_login_page", "url": current_url})
+                return False
+
+            self.logged_in = True
+            self.screenshot("03_login_success")
+            log(f"Login OK — URL: {current_url}")
+            write_receipt("login", "pass", {"url": current_url, "ua": self.ua})
+            return True
+
+        except Exception as e:
+            log(f"Login error: {e}", "ERROR")
+            write_receipt("login", "error", {"error": str(e)})
+            return False
+
+    # ── Scrape ALL visitors with Load More ───────────────────────────
+
+    def scrape_all_visitors(self, max_load_more: int = 50) -> list[dict]:
+        from selenium.webdriver.common.by import By
+
+        log("=== SCRAPE ALL VISITORS (with Load More) ===")
+        self.driver.get(f"{BASE_URL}/settings/whosawme")
+        human_delay(4, 6)
+        self.screenshot("04_whosawme_initial")
+
+        block = self.detect_block()
+        if block:
+            log(f"BLOCKED: {block}", "ERROR")
+            write_receipt("scrape_visitors", "blocked", {"reason": block})
+            return []
+
+        all_visitors = []
+        load_more_count = 0
+
+        while load_more_count < max_load_more:
+            # Scrape current page state
+            current_visitors = self.driver.execute_script("""
+                const result = [];
+                const seen = new Set();
+                const profileImgs = document.querySelectorAll('img[alt="Profile photo"], img[alt="profile-picture"]');
+                for (const img of profileImgs) {
+                    const a = img.closest('a');
+                    if (a && a.href) {
+                        const path = new URL(a.href).pathname;
+                        const username = path.replace('/', '');
+                        if (username && !seen.has(username) && !username.includes('settings') && !username.includes('gay-massage')) {
+                            seen.add(username);
+                            result.push({username: username, url: a.href, name: username});
+                        }
+                    }
                 }
+                const links = Array.from(document.querySelectorAll('a[href]'));
+                for (const a of links) {
+                    const href = a.href;
+                    if (!href.startsWith('https://rentmasseur.com/')) continue;
+                    const path = new URL(href).pathname;
+                    if (path && path !== '/' && path.split('/').length === 2 && path.split('/')[1] !== '') {
+                        const username = path.replace('/', '');
+                        if (!seen.has(username) && !username.startsWith('_') && username.length > 2) {
+                            seen.add(username);
+                            result.push({username: username, url: href, name: username});
+                        }
+                    }
+                }
+                return result;
+            """)
+
+            # Merge with existing
+            existing_names = {v["username"] for v in all_visitors}
+            new_count = 0
+            for v in current_visitors:
+                if v["username"] not in existing_names and v["username"] not in EXCLUDE_USERNAMES:
+                    all_visitors.append(v)
+                    new_count += 1
+
+            log(f"  Load More #{load_more_count}: found {len(current_visitors)} on page, {new_count} new, total {len(all_visitors)}")
+
+            # Try to find and click "Load More" button
+            load_more_clicked = False
+            for sel in [
+                "button:has-text('Load More')",
+                "button:has-text('load more')",
+                "button:has-text('LOAD MORE')",
+                "a:has-text('Load More')",
+                "button[class*='load']",
+                "button[class*='more']",
+                "[class*='load-more']",
+                "[class*='loadmore']",
+            ]:
+                try:
+                    # Selenium doesn't support :has-text, use JS
+                    clicked = self.driver.execute_script(f"""
+                        const btns = document.querySelectorAll('button, a');
+                        for (const btn of btns) {{
+                            const text = (btn.textContent || '').toLowerCase().trim();
+                            if (text.includes('load more') || text.includes('loadmore') || text.includes('show more')) {{
+                                if (btn.offsetParent !== null) {{
+                                    btn.click();
+                                    return true;
+                                }}
+                            }}
+                        }}
+                        // Also try class-based
+                        const els = document.querySelectorAll('[class*="load"], [class*="more"]');
+                        for (const el of els) {{
+                            if (el.offsetParent !== null && (el.tagName === 'BUTTON' || el.tagName === 'A')) {{
+                                el.click();
+                                return true;
+                            }}
+                        }}
+                        return false;
+                    """)
+                    if clicked:
+                        load_more_clicked = True
+                        load_more_count += 1
+                        log(f"  Clicked Load More (#{load_more_count})")
+                        human_delay(2, 4)
+                        break
+                except Exception:
+                    continue
+
+            if not load_more_clicked:
+                log(f"  No more Load More button — scraping complete")
+                break
+
+            if new_count == 0 and load_more_count > 3:
+                log(f"  No new visitors in last {load_more_count} clicks — stopping")
+                break
+
+        # Deduplicate
+        seen = set()
+        unique = []
+        for v in all_visitors:
+            if v["username"] not in seen and v["username"] not in EXCLUDE_USERNAMES:
+                seen.add(v["username"])
+                unique.append(v)
+
+        log(f"Total unique visitors: {len(unique)} (after {load_more_count} Load More clicks)")
+        self.screenshot("04_whosawme_final")
+
+        # Record in DB
+        for v in unique:
+            record_visitor_seen(v["username"], v["url"])
+
+        write_receipt("scrape_visitors", "pass", {
+            "total_unique": len(unique),
+            "load_more_clicks": load_more_count,
+            "visitors": unique,
+        })
+        return unique
+
+    # ── Visit profile + extract metadata ─────────────────────────────
+
+    def visit_profile(self, visitor: dict, idx: int, total: int) -> dict:
+        from selenium.webdriver.common.by import By
+
+        uname = visitor["username"]
+        url = visitor["url"]
+
+        # One visit per day — skip if already visited today
+        if already_visited_today(uname):
+            log(f"  [{idx+1}/{total}] Skip {uname} — already visited today")
+            return {"username": uname, "status": "skipped_daily"}
+
+        log(f"  [{idx+1}/{total}] Visiting {uname}...")
+
+        try:
+            self.driver.get(url)
+            human_delay(2, 4)
+
+            block = self.detect_block()
+            if block:
+                log(f"  BLOCKED on {uname}: {block}", "WARN")
+                return {"username": uname, "status": "blocked", "reason": block}
+
+            # Verify URL is a real profile (not redirect/404)
+            current_url = self.driver.current_url
+            page_title = self.driver.title or ""
+            if "404" in page_title or "not found" in page_title.lower():
+                log(f"  404 on {uname}", "WARN")
+                return {"username": uname, "status": "404", "url": current_url}
+
+            # Take compressed screenshot
+            ss_name = f"visit_{idx+1:03d}_{uname}"
+            ss_info = self.screenshot_compressed(ss_name)
+
+            # Extract profile metadata
+            meta = self.driver.execute_script(r"""
+                const text = document.body ? document.body.innerText : '';
+                const result = {};
+
+                // Last online
+                const onlineMatch = text.match(/(?:last\s+online|online\s+status|last\s+active)[:\s]+([^\n]+)/i);
+                if (onlineMatch) result.last_online = onlineMatch[1].trim();
+
+                // Last visit to your page
+                const visitMatch = text.match(/(?:visited\s+you|last\s+visit|visited\s+your\s+profile)[:\s]+([^\n]+)/i);
+                if (visitMatch) result.last_visited_you = visitMatch[1].trim();
+
+                // Visit count from profile
+                const countMatch = text.match(/(?:visited\s+you\s+)(\d+)\s+times?/i);
+                if (countMatch) result.visit_count_profile = parseInt(countMatch[1]);
+
+                // Location
+                const locMatch = text.match(/(?:location|based\s+in)[:\s]+([^\n]+)/i);
+                if (locMatch) result.location = locMatch[1].trim();
+
+                // Available status
+                result.available = text.toLowerCase().includes('available now');
+
+                return result;
+            """)
+
+            page_text = self.page_text()[:1000]
+            content_hash = sha256_text(page_text)
+
+            # Update DB with metadata
+            update_visitor_meta(
+                uname,
+                last_online=meta.get("last_online"),
+                last_visited_my_page=meta.get("last_visited_you"),
+                profile_hash=content_hash,
+            )
+
+            # Record visit in log
+            conn = sqlite3.connect(str(DB_PATH))
+            conn.execute(
+                "INSERT INTO visit_log (username, session_id, visited_at, status, content_hash) VALUES (?, ?, ?, 'ok', ?)",
+                (uname, SESSION_ID, now_iso(), content_hash)
+            )
+            conn.commit()
+            conn.close()
+
+            result = {
+                "username": uname,
+                "url": current_url,
+                "status": "ok",
+                "page_title": page_title,
+                "content_hash": content_hash,
+                "screenshot_thumbnail": ss_info.get("thumbnail_file", ""),
+                "screenshot_kb": ss_info.get("thumbnail_kb", 0),
+                "original_screenshot_kb": ss_info.get("original_kb", 0),
+                "compression_ratio": ss_info.get("compression_ratio", 0),
+                "visited_at": now_iso(),
+                "verified_utc_timestamp": now_iso(),
+                "last_online": meta.get("last_online"),
+                "last_visited_you": meta.get("last_visited_you"),
+                "visit_count_profile": meta.get("visit_count_profile"),
+                "location": meta.get("location"),
+                "available_now": meta.get("available", False),
+                "url_verified": current_url.startswith("https://rentmasseur.com/") and "404" not in page_title,
+                "agent": "rm_engagement_engine",
+                "agent_session": SESSION_ID,
+                "agent_ua": self.ua,
             }
-            
-            // Find and click SET button
-            const setBtn = buttons.find(b => /set|save|apply/i.test(b.innerText));
-            if (!setBtn) return {error: 'no_set_button'};
-            setBtn.click();
-            
-            return {ok: true};
-        """)
-        
-        if isinstance(ok, dict) and ok.get('error'):
-            logger.error("Availability JS automation failed: %s", ok['error'])
-            scan_page(driver)
-            _dump_debug(driver, f"availability_{ok['error']}")
-            return False
-        
-        logger.info("Availability set via JS automation")
-        time.sleep(2)
-        return True
-        
-    except TimeoutException:
-        logger.error("Availability page timed out")
-        return False
-    except WebDriverException as e:
-        logger.error("WebDriver error setting availability: %s", e)
-        return False
+            log(f"    title='{page_title}' online={meta.get('last_online', '?')} visited_you={meta.get('last_visited_you', '?')} thumb={ss_info.get('thumbnail_kb', 0)}KB (was {ss_info.get('original_kb', 0)}KB)")
+            write_receipt("visit_profile", "pass", result)
+            return result
+
+        except Exception as e:
+            log(f"  ERROR visiting {uname}: {e}", "WARN")
+            return {"username": uname, "status": "error", "error": str(e)}
+
+    # ── Message a visitor ────────────────────────────────────────────
+
+    def message_visitor(self, username: str, message_text: str, template_idx: int) -> dict:
+        from selenium.webdriver.common.by import By
+
+        log(f"=== MESSAGE: {username} ===")
+        log(f"  Message: \"{message_text[:80]}...\"")
+
+        try:
+            # Navigate to compose
+            compose_url = f"{BASE_URL}/mailbox/compose?to={username}"
+            self.driver.get(compose_url)
+            human_delay(3, 5)
+
+            block = self.detect_block()
+            if block:
+                log(f"  BLOCKED: {block}", "ERROR")
+                write_receipt("message_visitor", "blocked", {"username": username, "reason": block})
+                record_message(username, message_text, "blocked", template_idx)
+                return {"username": username, "status": "blocked", "reason": block}
+
+            self.screenshot(f"msg_{username}_compose")
+
+            # Find message textarea
+            textarea = None
+            for sel in [
+                "textarea[name*='message' i]",
+                "textarea[name*='body' i]",
+                "textarea[name*='content' i]",
+                "textarea",
+                "[contenteditable='true']",
+            ]:
+                try:
+                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                    for el in els:
+                        if el.is_displayed():
+                            textarea = el
+                            break
+                except Exception:
+                    continue
+                if textarea:
+                    break
+
+            if not textarea:
+                # Debug: dump page source to find the actual form structure
+                page_src = self.driver.page_source[:3000] if self.driver.page_source else ""
+                log(f"  No message field found for {username}", "WARN")
+                log(f"  Page URL: {self.driver.current_url}", "WARN")
+                log(f"  Page title: {self.driver.title}", "WARN")
+                # Check for iframes
+                iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+                log(f"  Iframes on page: {len(iframes)}", "WARN")
+                if iframes:
+                    for i, iframe in enumerate(iframes):
+                        src = iframe.get_attribute("src") or ""
+                        log(f"    iframe[{i}] src={src[:100]}", "WARN")
+                    # Try switching to first iframe and looking for textarea
+                    try:
+                        self.driver.switch_to.frame(iframes[0])
+                        for sel in ["textarea", "[contenteditable='true']", "input[type='text']"]:
+                            els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                            for el in els:
+                                if el.is_displayed():
+                                    textarea = el
+                                    log(f"  Found textarea in iframe[0] via {sel}", "INFO")
+                                    break
+                            if textarea:
+                                break
+                        self.driver.switch_to.default_content()
+                    except Exception as e:
+                        log(f"  iframe switch failed: {e}", "WARN")
+                        self.driver.switch_to.default_content()
+                if not textarea:
+                    log(f"  Page source (first 2000 chars): {page_src[:2000]}", "DEBUG")
+                    write_receipt("message_visitor", "fail", {"username": username, "reason": "no_message_field", "page_url": self.driver.current_url, "page_title": self.driver.title, "iframe_count": len(iframes)})
+                    record_message(username, message_text, "no_field", template_idx)
+                    return {"username": username, "status": "no_field"}
+
+            # Type message human-like
+            log("  Typing message (human-like)...")
+            textarea.click()
+            human_delay(0.5, 1.0)
+            human_type(textarea, message_text)
+            human_delay(1, 2)
+
+            self.screenshot(f"msg_{username}_typed")
+
+            # Find and click send button
+            sent = False
+            for sel in ["button[type='submit']", "button:has-text('Send')", "button:has-text('SEND')", "input[type='submit']"]:
+                try:
+                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                    for el in els:
+                        if el.is_displayed() and el.is_enabled():
+                            self.driver.execute_script("arguments[0].click();", el)
+                            sent = True
+                            break
+                except Exception:
+                    continue
+                if sent:
+                    break
+
+            if not sent:
+                # Try JS-based search
+                sent = self.driver.execute_script("""
+                    const btns = document.querySelectorAll('button, input[type="submit"]');
+                    for (const btn of btns) {
+                        const text = (btn.textContent || btn.value || '').toLowerCase().trim();
+                        if (text.includes('send') && btn.offsetParent !== null) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                """)
+
+            human_delay(3, 5)
+
+            if sent:
+                self.screenshot(f"msg_{username}_sent")
+                log(f"  Message sent to {username}!")
+                write_receipt("message_visitor", "pass", {
+                    "username": username,
+                    "message": message_text,
+                    "template_index": template_idx,
+                })
+                record_message(username, message_text, "sent", template_idx)
+                return {"username": username, "status": "sent", "message": message_text}
+            else:
+                log(f"  Could not find send button for {username}", "WARN")
+                write_receipt("message_visitor", "fail", {"username": username, "reason": "no_send_button"})
+                record_message(username, message_text, "no_send", template_idx)
+                return {"username": username, "status": "no_send_button"}
+
+        except Exception as e:
+            log(f"  ERROR messaging {username}: {e}", "ERROR")
+            write_receipt("message_visitor", "error", {"username": username, "error": str(e)})
+            record_message(username, message_text, "error", template_idx)
+            return {"username": username, "status": "error", "error": str(e)}
 
 
-def run_once(headless: bool = True) -> bool:
-    """Execute a single availability check-and-set cycle."""
-    driver: Optional[webdriver.Chrome] = None
-    try:
-        driver = setup_driver(headless=headless)
-        if not login(driver):
-            return False
-        return set_availability_24_7(driver)
-    except Exception as e:
-        logger.error("Unexpected error: %s", e)
-        return False
-    finally:
-        if driver:
-            driver.quit()
+# ─── Main ────────────────────────────────────────────────────────────
 
-
-def main() -> None:
-    """Run the availability keeper in a loop or once for CI/CD."""
-    parser = argparse.ArgumentParser(description="Keep RentMasseur availability set to 24/7")
-    parser.add_argument("--once", action="store_true", help="Run a single check and exit (for CI/CD)")
-    parser.add_argument("--headless", default="true", help="Run headless (true/false)")
-    parser.add_argument("--interval", type=int, default=CHECK_INTERVAL_MINUTES, help="Loop interval in minutes")
-    args = parser.parse_args()
-
-    headless = args.headless.lower() != "false"
-
-    if args.once:
-        logger.info("Running single availability check")
-        success = run_once(headless=headless)
-        sys.exit(0 if success else 1)
-
-    run_count = 0
-    logger.info("Starting RentMasseur 24/7 availability keeper")
-    logger.info("Check interval: %d minutes", args.interval)
-
-    while True:
-        run_count += 1
-        logger.info("--- Run #%d at %s ---", run_count, datetime.now().isoformat())
-        success = run_once(headless=headless)
-        if success:
-            logger.info("Run #%d completed successfully", run_count)
-        else:
-            logger.error("Run #%d failed", run_count)
-
-        sleep_seconds = args.interval * 60
-        logger.info("Sleeping for %d minutes...", args.interval)
-        time.sleep(sleep_seconds)
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-profile_page.png:
-```
-Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
-```
-
-rotator_engine:
-```
-version https://git-lfs.github.com/spec/v1
-oid sha256:87fc4144612bbb9dbc3cf92c9fdd558f701d0a29bc4a2e9b713ec9c2554b15b1
-size 106448
-
-```
-
-kpis.py:
-```
-#!/usr/bin/env python3
-"""
-Hourly KPI collector — computes immortality and virality scores from metrics history.
-
-Immortality = profile longevity & staying power
-Virality = profile spread velocity & acceleration
-
-Runs hourly via GitHub Actions. Reads metrics from content/metrics_ingest.jsonl,
-computes derived KPIs, writes to content/kpis/hourly_kpis.jsonl, and POSTs
-to HF Space /api/metrics/ingest if HF_URL is set.
-"""
-
-import json
-import os
-import sys
-import time
-import math
-import requests
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import List, Dict, Optional
-
-CONTENT_DIR = Path(__file__).parent / "content"
-METRICS_PATH = CONTENT_DIR / "metrics_ingest.jsonl"
-KPI_DIR = CONTENT_DIR / "kpis"
-KPI_PATH = KPI_DIR / "hourly_kpis.jsonl"
-RECEIPTS_DIR = Path(__file__).parent / "receipts"
-
-KPI_DIR.mkdir(parents=True, exist_ok=True)
-RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
-
-HF_URL = os.getenv("HF_URL", "https://josephrw-rentmasseur-optimizer.hf.space")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-
-
-def load_metrics() -> List[Dict]:
-    """Load all ingested metrics from JSONL."""
-    if not METRICS_PATH.exists():
-        return []
-    metrics = []
-    for line in METRICS_PATH.open():
-        if line.strip():
-            metrics.append(json.loads(line))
-    return metrics
-
-
-def compute_immortality(metrics: List[Dict]) -> Dict:
-    """
-    Immortality KPI — profile longevity & staying power.
-    
-    Components:
-    - days_online: total days profile has been active
-    - views_per_day_trend: is traffic sustaining or declining?
-    - visibility_persistence: how consistently is profile visible?
-    - availability_stability: how stable is availability?
-    - profile_age_score: normalized longevity (0-1)
-    - retention_score: views don't drop off over time
-    """
-    if not metrics:
-        return {"score": 0, "grade": "NO_DATA", "components": {}}
-
-    latest = metrics[-1]
-    pub = latest.get("public_profile", {})
-    dash = latest.get("dashboard", {})
-
-    days_online = pub.get("days_online", 0)
-    views_per_day = pub.get("views_per_day", 0)
-    profile_visible = dash.get("profile_visible", False)
-    available = dash.get("available", False)
-
-    # Profile age score: 1.0 at 1000+ days, scales down
-    profile_age_score = min(days_online / 1000.0, 1.0) if days_online > 0 else 0
-
-    # Views per day trend: compare last 3 data points if available
-    vpd_values = []
-    for m in metrics[-5:]:
-        v = m.get("public_profile", {}).get("views_per_day", 0)
-        if v > 0:
-            vpd_values.append(v)
-
-    if len(vpd_values) >= 2:
-        recent_avg = sum(vpd_values[-2:]) / 2
-        older_avg = sum(vpd_values[:-2]) / max(len(vpd_values) - 2, 1)
-        if older_avg > 0:
-            trend_ratio = recent_avg / older_avg
-        else:
-            trend_ratio = 1.0
-        views_per_day_trend = min(max(trend_ratio, 0), 2.0) / 2.0  # normalize 0-1
-    else:
-        views_per_day_trend = 0.5  # neutral if not enough data
-
-    # Visibility persistence: fraction of snapshots where visible=True
-    visibility_count = sum(1 for m in metrics if m.get("dashboard", {}).get("profile_visible", False))
-    visibility_persistence = visibility_count / len(metrics) if metrics else 0
-
-    # Availability stability: fraction of snapshots where available=True
-    avail_count = sum(1 for m in metrics if m.get("dashboard", {}).get("available", False))
-    availability_stability = avail_count / len(metrics) if metrics else 0
-
-    # Retention score: views_per_day doesn't collapse
-    if views_per_day > 0:
-        retention_score = min(views_per_day / 100.0, 1.0)
-    else:
-        retention_score = 0
-
-    # Weighted composite
-    score = (
-        profile_age_score * 0.25 +
-        views_per_day_trend * 0.25 +
-        visibility_persistence * 0.20 +
-        availability_stability * 0.15 +
-        retention_score * 0.15
-    )
-
-    # Grade
-    if score >= 0.80:
-        grade = "IMMORTAL"
-    elif score >= 0.60:
-        grade = "RESILIENT"
-    elif score >= 0.40:
-        grade = "STABLE"
-    elif score >= 0.20:
-        grade = "FRAGILE"
-    else:
-        grade = "DECLINING"
-
-    return {
-        "score": round(score, 4),
-        "grade": grade,
-        "components": {
-            "days_online": days_online,
-            "views_per_day": views_per_day,
-            "profile_age_score": round(profile_age_score, 4),
-            "views_per_day_trend": round(views_per_day_trend, 4),
-            "visibility_persistence": round(visibility_persistence, 4),
-            "availability_stability": round(availability_stability, 4),
-            "retention_score": round(retention_score, 4),
-        }
-    }
-
-
-def compute_virality(metrics: List[Dict]) -> Dict:
-    """
-    Virality KPI — profile spread velocity & acceleration.
-    
-    Components:
-    - views_velocity: rate of new views per hour
-    - views_acceleration: is velocity increasing?
-    - contact_click_velocity: rate of new contact clicks
-    - new_visitor_rate: new visits as fraction of total views
-    - bookmark_rate: bookmarks per view
-    - email_rate: emails per view
-    - spread_score: composite velocity metric
-    """
-    if not metrics:
-        return {"score": 0, "grade": "NO_DATA", "components": {}}
-
-    latest = metrics[-1]
-    dash = latest.get("dashboard", {})
-
-    profile_views = dash.get("profile_views", 0)
-    contact_clicks = dash.get("contact_clicks", 0)
-    new_visits = dash.get("new_visits", 0)
-    new_emails = dash.get("new_emails", 0)
-    online_bookmarks = dash.get("online_bookmarks", 0)
-
-    # Views velocity: views gained since last snapshot
-    views_velocity = 0
-    views_acceleration = 0
-    if len(metrics) >= 2:
-        prev_views = metrics[-2].get("dashboard", {}).get("profile_views", 0)
-        views_velocity = max(profile_views - prev_views, 0)
-
-    if len(metrics) >= 3:
-        prev_prev_views = metrics[-3].get("dashboard", {}).get("profile_views", 0)
-        prev_views = metrics[-2].get("dashboard", {}).get("profile_views", 0)
-        v1 = max(prev_views - prev_prev_views, 0)
-        v2 = max(profile_views - prev_views, 0)
-        if v1 > 0:
-            views_acceleration = (v2 - v1) / v1
-        elif v2 > 0:
-            views_acceleration = 1.0
-
-    # Contact click velocity
-    contact_click_velocity = 0
-    if len(metrics) >= 2:
-        prev_clicks = metrics[-2].get("dashboard", {}).get("contact_clicks", 0)
-        contact_click_velocity = max(contact_clicks - prev_clicks, 0)
-
-    # Rates
-    new_visitor_rate = new_visits / profile_views if profile_views > 0 else 0
-    bookmark_rate = online_bookmarks / profile_views if profile_views > 0 else 0
-    email_rate = new_emails / profile_views if profile_views > 0 else 0
-    contact_click_rate = contact_clicks / profile_views if profile_views > 0 else 0
-
-    # Spread score: how fast is the profile reaching new people
-    # Normalize components to 0-1
-    views_velocity_norm = min(views_velocity / 50.0, 1.0)  # 50+ new views per snapshot = max
-    views_accel_norm = min(max(views_acceleration, 0) / 0.5, 1.0)  # 50% acceleration = max
-    contact_velocity_norm = min(contact_click_velocity / 10.0, 1.0)  # 10+ new clicks = max
-    new_visitor_norm = min(new_visitor_rate / 0.05, 1.0)  # 5% new visitor rate = max
-    bookmark_norm = min(bookmark_rate / 0.01, 1.0)  # 1% bookmark rate = max
-    email_norm = min(email_rate / 0.01, 1.0)  # 1% email rate = max
-    ctr_norm = min(contact_click_rate / 0.10, 1.0)  # 10% CTR = max
-
-    score = (
-        views_velocity_norm * 0.25 +
-        views_accel_norm * 0.15 +
-        contact_velocity_norm * 0.20 +
-        new_visitor_norm * 0.15 +
-        bookmark_norm * 0.05 +
-        email_norm * 0.05 +
-        ctr_norm * 0.15
-    )
-
-    # Grade
-    if score >= 0.70:
-        grade = "VIRAL"
-    elif score >= 0.50:
-        grade = "ACCELERATING"
-    elif score >= 0.30:
-        grade = "STEADY"
-    elif score >= 0.15:
-        grade = "SLOW"
-    else:
-        grade = "STAGNANT"
-
-    return {
-        "score": round(score, 4),
-        "grade": grade,
-        "components": {
-            "profile_views": profile_views,
-            "views_velocity": views_velocity,
-            "views_acceleration": round(views_acceleration, 4),
-            "contact_clicks": contact_clicks,
-            "contact_click_velocity": contact_click_velocity,
-            "new_visits": new_visits,
-            "new_visitor_rate": round(new_visitor_rate, 4),
-            "online_bookmarks": online_bookmarks,
-            "bookmark_rate": round(bookmark_rate, 4),
-            "new_emails": new_emails,
-            "email_rate": round(email_rate, 4),
-            "contact_click_rate": round(contact_click_rate, 4),
-        }
-    }
-
-
-def write_receipt(kpi_packet: Dict) -> Path:
-    """Write a tamper-evident receipt for the KPI computation."""
-    ts = datetime.now(timezone.utc).isoformat()
-    receipt = {
-        "id": f"kpi_{int(time.time())}",
-        "timestamp": ts,
-        "action": "hourly_kpi_computation",
-        "data": kpi_packet,
-    }
-    path = RECEIPTS_DIR / f"kpi_{ts.replace(':', '-').replace('+', '-')}.json"
-    with path.open("w") as f:
-        json.dump(receipt, f, indent=2)
-    return path
-
-
-def post_to_hf(kpi_packet: Dict) -> bool:
-    """POST KPI packet to HF Space /api/metrics/ingest."""
-    if not HF_URL:
-        return False
-    try:
-        headers = {"Content-Type": "application/json"}
-        if ADMIN_TOKEN:
-            headers["Authorization"] = f"Bearer {ADMIN_TOKEN}"
-        r = requests.post(
-            f"{HF_URL}/api/metrics/ingest",
-            json=kpi_packet,
-            headers=headers,
-            timeout=15,
-        )
-        return r.status_code == 200
-    except Exception as e:
-        print(f"HF POST failed: {e}", file=sys.stderr)
-        return False
+def load_env():
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
 
 
 def main():
-    print("=== Hourly KPI Collection ===")
-    print(f"Time: {datetime.now(timezone.utc).isoformat()}")
+    parser = argparse.ArgumentParser(description="RM Engagement Engine — 24/7 visitor engagement")
+    parser.add_argument("--headed", action="store_true", help="Show browser window")
+    parser.add_argument("--login", action="store_true", help="Login with .env creds")
+    parser.add_argument("--full-run", action="store_true", help="Scrape all + visit back + message repeats")
+    parser.add_argument("--scrape-only", action="store_true", help="Only scrape visitors (with Load More)")
+    parser.add_argument("--visit-back", action="store_true", help="Visit back all scraped visitors")
+    parser.add_argument("--message-repeat", action="store_true", help="Message visitors who visited 3+ times")
+    parser.add_argument("--message-all", action="store_true", help="Message ALL visitors (not just repeats)")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would happen without acting")
+    parser.add_argument("--limit", type=int, default=0, help="Max visitors to visit (0 = all)")
+    parser.add_argument("--threshold", type=int, default=3, help="Visit count threshold for messaging")
+    parser.add_argument("--max-load-more", type=int, default=50, help="Max Load More clicks")
+    parser.add_argument("--message-delay", type=float, default=30.0, help="Seconds between messages (anti-spam)")
+    parser.add_argument("--max-messages", type=int, default=20, help="Max messages per session (safety cap)")
+    args = parser.parse_args()
 
-    metrics = load_metrics()
-    print(f"Loaded {len(metrics)} metric snapshots")
+    load_env()
+    init_db()
 
-    immortality = compute_immortality(metrics)
-    virality = compute_virality(metrics)
+    username = os.getenv("RM_USER") or os.getenv("RENTMASSEUR_USERNAME", "")
+    password = os.getenv("RM_PASS") or os.getenv("RENTMASSEUR_PASSWORD", "")
 
-    kpi_packet = {
-        "packet_type": "rm_hourly_kpis",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "immortality": immortality,
-        "virality": virality,
-        "metrics_snapshots_used": len(metrics),
-    }
+    log("=" * 60)
+    log(f"RM ENGAGEMENT ENGINE — Session: {SESSION_ID}")
+    log(f"Headed: {args.headed} | Login: {args.login} | Full-run: {args.full_run}")
+    log(f"Visit-back: {args.visit_back} | Message-repeat: {args.message_repeat}")
+    log(f"Limit: {args.limit} (0=all) | Threshold: {args.threshold} | MaxLoadMore: {args.max_load_more}")
+    log("=" * 60)
 
-    # Write to JSONL
-    with KPI_PATH.open("a") as f:
-        f.write(json.dumps(kpi_packet) + "\n")
-    print(f"KPIs written to {KPI_PATH}")
+    engine = EngagementEngine(headed=args.headed)
+    results = {"session_id": SESSION_ID, "actions": []}
 
-    # Write receipt
-    receipt_path = write_receipt(kpi_packet)
-    print(f"Receipt: {receipt_path}")
+    try:
+        engine.start()
 
-    # Print summary
-    print()
-    print(f"IMMORTALITY: {immortality['score']:.4f} ({immortality['grade']})")
-    for k, v in immortality["components"].items():
-        print(f"  {k}: {v}")
+        # Login
+        if args.login or args.full_run:
+            if not username or not password:
+                log("No credentials found", "ERROR")
+                write_receipt("login", "skipped", {"reason": "no_credentials"})
+                return
+            ok = engine.login(username, password)
+            results["login"] = ok
+            if not ok:
+                log("Login failed — aborting", "ERROR")
+                return
 
-    print()
-    print(f"VIRALITY: {virality['score']:.4f} ({virality['grade']})")
-    for k, v in virality["components"].items():
-        print(f"  {k}: {v}")
+        # Scrape all visitors
+        if args.full_run or args.scrape_only or args.visit_back:
+            visitors = engine.scrape_all_visitors(max_load_more=args.max_load_more)
+            results["visitors_found"] = len(visitors)
 
-    # POST to HF
-    if HF_URL:
-        ok = post_to_hf(kpi_packet)
-        if ok:
-            print(f"\nPOSTed to {HF_URL}/api/metrics/ingest -> 200")
-        else:
-            print(f"\nHF POST failed (non-fatal)")
+            if args.dry_run:
+                log(f"DRY RUN — found {len(visitors)} visitors")
+                for v in visitors:
+                    stats = get_visitor_stats(v["username"])
+                    log(f"  {v['username']}: {stats['visit_count']} visits")
+                write_receipt("dry_run", "pass", {"visitors": visitors})
+                return
 
-    print("\n=== KPI Collection Complete ===")
+        # Visit back
+        if args.full_run or args.visit_back:
+            to_visit = visitors if args.limit == 0 else visitors[:args.limit]
+            # Organic: shuffle order so we never visit in the same sequence
+            to_visit = organic_shuffle(to_visit)
+            # Organic: don't visit all in one robotic batch
+            if args.limit == 0 and len(to_visit) > 20:
+                session_size = organic_session_size(len(to_visit))
+                log(f"\n=== VISIT BACK: {session_size}/{len(to_visit)} profiles (organic session) ===")
+                to_visit = to_visit[:session_size]
+            else:
+                log(f"\n=== VISIT BACK: {len(to_visit)} profiles ===")
+            visited = []
+            skipped = 0
+            for i, v in enumerate(to_visit):
+                r = engine.visit_profile(v, i, len(to_visit))
+                visited.append(r)
+                if r.get("status") == "skipped_daily":
+                    skipped += 1
+                else:
+                    organic_visit_delay()
+                    organic_batch_pause(i + 1)
+            results["visited"] = visited
+            write_receipt("visit_back_summary", "pass", {
+                "total_in_queue": len(to_visit),
+                "visited_count": sum(1 for v in visited if v.get("status") == "ok"),
+                "skipped_today": skipped,
+                "blocked_count": sum(1 for v in visited if v.get("status") == "blocked"),
+                "error_count": sum(1 for v in visited if v.get("status") == "error"),
+                "404_count": sum(1 for v in visited if v.get("status") == "404"),
+            })
 
+        # Message repeat visitors (or all if --message-all)
+        if args.full_run or args.message_repeat or args.message_all:
+            if args.message_all:
+                repeat_visitors = get_all_visitors()
+                log(f"\n=== MESSAGE ALL VISITORS: {len(repeat_visitors)} ===")
+            else:
+                repeat_visitors = get_repeat_visitors(threshold=args.threshold)
+                log(f"\n=== MESSAGE REPEAT VISITORS: {len(repeat_visitors)} (threshold={args.threshold}) ===")
+            repeat_visitors = repeat_visitors[:args.max_messages]
 
-if __name__ == "__main__":
-    main()
+            if args.dry_run:
+                for rv in repeat_visitors:
+                    msg = pick_message(rv["username"])
+                    log(f"  Would message {rv['username']} ({rv['visit_count']} visits): \"{msg[:60]}...\"")
+                write_receipt("message_dry_run", "pass", {"repeat_visitors": repeat_visitors})
+                return
 
-```
+            messaged = []
+            for i, rv in enumerate(repeat_visitors):
+                uname = rv["username"]
+                stats = get_visitor_stats(uname)
 
-hf_space_app.py:
-```
-"""SystemLake Underwriter — Privacy-Preserving Code Evaluation Gateway.
+                # Skip if already messaged recently (within 24h)
+                if stats.get("last_messaged"):
+                    try:
+                        last_msg_time = datetime.fromisoformat(stats["last_messaged"].replace("Z", "+00:00"))
+                        hours_since = (datetime.now(timezone.utc) - last_msg_time).total_seconds() / 3600
+                        if hours_since < 24:
+                            log(f"  Skip {uname} — messaged {hours_since:.1f}h ago")
+                            continue
+                    except Exception:
+                        pass
 
-The actual product: User uploads files → system crawls + hashes + redacts →
-sends only a metadata cognition packet to GPT → GPT evaluates →
-returns verdict + receipt. Raw files never leave the user's control.
+                template_idx = random.randint(0, len(MESSAGE_TEMPLATES) - 1)
+                message = pick_message(uname)
 
-Pipeline:
-    Upload → Extract → Crawl → Hash → Merkle Root → Detect Systems →
-    Score Collateral → Redact (strip source, keep metadata) →
-    Build Cognition Packet → Send to LLM → Get Evaluation →
-    Write Receipt → Return Verdict
+                log(f"  [{i+1}/{len(repeat_visitors)}] {uname} ({rv['visit_count']} visits)")
+                r = engine.message_visitor(uname, message, template_idx)
+                messaged.append(r)
 
-What goes to GPT (cognition packet):
-    - File hashes (SHA-256), sizes, extensions, categories
-    - Merkle root
-    - System detection results (has_git, has_tests, has_endpoints)
-    - Collateral scores (10 dimensions)
-    - Risk register with classifications
-    - Verification results
-    - Capabilities summary
+                # Anti-spam delay between messages
+                if i < len(repeat_visitors) - 1 and i + 1 < args.max_messages:
+                    log(f"  Waiting {args.message_delay}s before next message (anti-spam)...")
+                    time.sleep(args.message_delay)
 
-What does NOT go to GPT:
-    - Source code content
-    - File names containing secrets
-    - .env, .ssh, keys, wallets, credentials
-    - Binary file contents
-    - Any file content at all — only metadata
+            results["messaged"] = messaged
+            write_receipt("message_summary", "pass", {
+                "messaged_count": len(messaged),
+                "sent_count": sum(1 for m in messaged if m.get("status") == "sent"),
+                "blocked_count": sum(1 for m in messaged if m.get("status") == "blocked"),
+                "error_count": sum(1 for m in messaged if m.get("status") == "error"),
+            })
 
-Endpoints:
-    GET  /              — Upload UI
-    POST /upload        — Upload a zip/tar of your repo
-    GET  /result/{id}   — Get evaluation result + receipt
-    GET  /result/{id}/packet — Get cognition packet only
-    GET  /result/{id}/evaluation — Get LLM evaluation only
-    GET  /result/{id}/receipt — Get receipt only
-    GET  /health        — Health check
-    GET  /telemetry     — Pre-baked telemetry (existing audit)
-"""
+        # Print visitor stats summary
+        all_visitors = get_all_visitors()
+        log(f"\n=== VISITOR STATS (from DB) ===")
+        log(f"Total unique visitors tracked: {len(all_visitors)}")
+        for v in all_visitors[:20]:
+            log(f"  {v['username']}: {v['visit_count']} visits | last_online={v.get('last_online', '?')} | last_messaged={v.get('last_messaged', 'never')}")
 
-import os
-import json
-import hashlib
-import zipfile
-import tarfile
-import shutil
-import threading
-import uuid
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-from pathlib import Path as _Path
-
-from fastapi import FastAPI, HTTPException, UploadFile, File, Body
-from fastapi.responses import HTMLResponse, PlainTextResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-
-# ─── Configuration ──────────────────────────────────────────────────────
-
-# Auto-load .env if present (local dev)
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-if os.path.exists(_env_path):
-    with open(_env_path) as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _k, _v = _line.split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip())
-
-DATA_DIR = os.environ.get("SYSTEMLAKE_DATA_DIR", "/app/audit_data")
-UPLOAD_DIR = os.environ.get("SYSTEMLAKE_UPLOAD_DIR", "/tmp/systemlake_uploads")
-RESULTS_DIR = os.environ.get("SYSTEMLAKE_RESULTS_DIR", "/tmp/systemlake_results")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-PORT = int(os.environ.get("PORT", 7860))
-
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
-
-# ─── Denied file patterns (never hashed, never indexed, never sent) ─────
-
-DENIED_PATTERNS = [
-    '.env', '.env.', '.ssh', '.aws', '.npmrc', '.pypirc',
-    'id_rsa', 'id_ed25519', 'id_ecdsa',
-    '.key', '.pem', '.crt', '.pfx', '.p12',
-    'credentials', 'secrets', 'wallet', 'keystore',
-    '.keystore', '.keychain', 'Keychains',
-    '.gnupg', '.gpg',
-]
-
-DENIED_EXTENSIONS = {
-    '.env', '.key', '.pem', '.crt', '.pfx', '.p12', '.keystore',
-    '.jks', '.gpg', '.pgp',
-}
-
-EXCLUDE_DIRS = {
-    '__pycache__', '.git', 'node_modules', '.venv', 'venv',
-    '.pytest_cache', '.mypy_cache', '.cache', '.npm',
-    'dist', 'build', 'target', '.next', '.nuxt',
-    '.gradle', '.m2', '.cargo', '.rustup',
-    '.vscode', '.cursor', '.windsurf', '.idea',
-}
-
-# ─── Data Loading (for pre-baked telemetry) ─────────────────────────────
-
-def _load_json(filename: str) -> Optional[dict]:
-    path = os.path.join(DATA_DIR, filename)
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
-    return None
-
-def _load_text(filename: str) -> Optional[str]:
-    path = os.path.join(DATA_DIR, filename)
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return f.read()
-    return None
-
-def _load_all() -> dict:
-    return {
-        "systems": _load_json("systems.json"),
-        "scores": _load_json("underwriting_scores.json"),
-        "risks": _load_json("risk_register.json"),
-        "borrowing": _load_json("borrowing_base.json"),
-        "verification": _load_json("verification_results.json"),
-        "merkle": _load_json("merkle_root.json"),
-        "manifest": _load_json("machine_manifest.json"),
-        "receipt": _load_json("receipt.json"),
-        "focus": _load_json("focus_packet.json"),
-        "memo": _load_text("underwriting_memo.md"),
-    }
-
-# ─── Redaction Layer ────────────────────────────────────────────────────
-
-def _is_denied(filename: str) -> bool:
-    lower = filename.lower()
-    for ext in DENIED_EXTENSIONS:
-        if lower.endswith(ext):
-            return True
-    for pattern in DENIED_PATTERNS:
-        if pattern in lower:
-            return True
-    return False
-
-def _compute_merkle_root(hashes: List[str]) -> str:
-    if not hashes:
-        return None
-    leaves = [hashlib.sha256(h.encode()).hexdigest() for h in hashes]
-    while len(leaves) > 1:
-        if len(leaves) % 2 != 0:
-            leaves.append(leaves[-1])
-        leaves = [hashlib.sha256((leaves[i] + leaves[i+1]).encode()).hexdigest()
-                  for i in range(0, len(leaves), 2)]
-    return leaves[0]
-
-def _build_cognition_packet(extracted_dir: str) -> dict:
-    """Crawl extracted files and build a REDACTED cognition packet.
-    Contains NO source code, NO file content. Only hashes, sizes, structure.
-    """
-    packet = {
-        "schema": "membra.systemlake.cognition_packet.v1",
-        "created_at": datetime.now().isoformat(),
-        "files": [],
-        "systems": [],
-        "stats": {
-            "total_files": 0, "total_bytes": 0,
-            "denied_files": 0, "by_extension": {}, "by_category": {},
-        },
-    }
-    file_hashes = []
-
-    for dirpath, dirnames, filenames in os.walk(extracted_dir):
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
-        for fname in filenames:
-            full_path = os.path.join(dirpath, fname)
-            rel_path = os.path.relpath(full_path, extracted_dir)
-            if _is_denied(fname) or _is_denied(rel_path):
-                packet["stats"]["denied_files"] += 1
-                continue
-            try:
-                st = os.stat(full_path)
-            except Exception:
-                continue
-            try:
-                h = hashlib.sha256()
-                with open(full_path, "rb") as f:
-                    while True:
-                        chunk = f.read(8192)
-                        if not chunk:
-                            break
-                        h.update(chunk)
-                sha = h.hexdigest()
-            except Exception:
-                sha = "unreadable"
-            ext = os.path.splitext(fname)[1].lower()
-            size = st.st_size
-            if ext in ('.py',): category = 'python'
-            elif ext in ('.js', '.ts', '.jsx', '.tsx'): category = 'javascript'
-            elif ext in ('.go',): category = 'go'
-            elif ext in ('.rs',): category = 'rust'
-            elif ext in ('.java',): category = 'java'
-            elif ext in ('.md', '.rst', '.txt'): category = 'documentation'
-            elif ext in ('.json', '.yaml', '.yml', '.toml', '.ini', '.cfg'): category = 'config'
-            elif ext in ('.html', '.css', '.vue', '.svelte'): category = 'frontend'
-            elif ext in ('.sql',): category = 'database'
-            elif ext in ('.sh', '.bash'): category = 'script'
-            elif ext in ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico'): category = 'asset'
-            else: category = 'other'
-            packet["files"].append({"path": rel_path, "sha256": sha, "size": size, "extension": ext, "category": category})
-            packet["stats"]["total_files"] += 1
-            packet["stats"]["total_bytes"] += size
-            packet["stats"]["by_extension"][ext] = packet["stats"]["by_extension"].get(ext, 0) + 1
-            packet["stats"]["by_category"][category] = packet["stats"]["by_category"].get(category, 0) + 1
-            file_hashes.append(sha)
-
-    packet["merkle_root"] = _compute_merkle_root(file_hashes) if file_hashes else None
-    packet["systems"] = _detect_systems_metadata(extracted_dir)
-    packet["collateral_scores"] = _score_collateral_metadata(packet)
-    packet["risks"] = _build_risk_register(packet)
-    return packet
-
-def _detect_systems_metadata(root: str) -> list:
-    markers = {'requirements.txt', 'package.json', 'setup.py', 'Makefile',
-               'Dockerfile', '.git', 'README.md', 'pyproject.toml'}
-    systems = []
-    seen = set()
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
-        has_git_dir = '.git' in dirnames
-        dir_files = set(filenames + dirnames)
-        if has_git_dir: dir_files.add('.git')
-        markers_found = markers & dir_files
-        if not markers_found: continue
-        dirname = os.path.basename(dirpath) or 'root'
-        if dirname in seen: continue
-        has_code = any(f.endswith(('.py', '.js', '.ts', '.go', '.rs', '.java')) for f in filenames)
-        strong = markers_found & {'requirements.txt', 'setup.py', 'Dockerfile', 'Makefile', '.git'}
-        if len(markers_found) < 2 and not strong and not (has_git_dir and has_code): continue
-        systems.append({
-            "name": dirname, "root_path": os.path.relpath(dirpath, root),
-            "markers": sorted(list(markers_found)), "has_git": has_git_dir,
-            "has_tests": any('test' in f.lower() for f in filenames),
-            "has_endpoints": bool({'app.py', 'server.py', 'main.py', 'server.js', 'index.js'} & set(filenames)),
-            "has_receipts": any('receipt' in f.lower() for f in filenames),
-            "file_count": len(filenames),
-            "has_dockerfile": 'Dockerfile' in markers_found,
-            "has_requirements": 'requirements.txt' in markers_found,
-            "has_readme": 'README.md' in markers_found,
-        })
-        seen.add(dirname)
-    return systems
-
-def _score_collateral_metadata(packet: dict) -> dict:
-    stats = packet["stats"]
-    systems = packet["systems"]
-    by_cat = stats["by_category"]
-    code_files = sum(by_cat.get(c, 0) for c in ("python", "javascript", "go", "rust", "java"))
-    doc_files = by_cat.get("documentation", 0)
-    config_files = by_cat.get("config", 0)
-    has_git = any(s["has_git"] for s in systems)
-    has_tests = any(s["has_tests"] for s in systems)
-    has_ep = any(s["has_endpoints"] for s in systems)
-    has_docker = any(s["has_dockerfile"] for s in systems)
-    has_receipts = any(s["has_receipts"] for s in systems)
-    has_readme = any(s["has_readme"] for s in systems)
-
-    dims = {
-        "functionality": min(100, 20 + code_files * 2 + (15 if has_ep else 0)),
-        "reproducibility": min(100, 25 + (20 if has_git else 0) + (15 if has_docker else 0) + (10 if config_files > 0 else 0)),
-        "receipt_strength": min(100, 20 + (40 if has_receipts else 0) + (20 if has_git else 0)),
-        "deployability": min(100, 20 + (25 if has_docker else 0) + (15 if has_ep else 0) + (10 if config_files > 2 else 0)),
-        "test_strength": min(100, 15 + (50 if has_tests else 0)),
-        "documentation": min(100, 20 + doc_files * 5 + (20 if has_readme else 0)),
-        "security_cleanliness": min(100, 40 + (20 if stats["denied_files"] == 0 else 0) + (20 if stats["total_files"] < 1000 else 0)),
-        "provenance": min(100, 20 + (50 if has_git else 0) + (15 if has_receipts else 0)),
-        "economic_evidence": min(100, 15 + (10 if has_ep else 0) + (5 if has_receipts else 0)),
-        "marketability": min(100, 20 + (15 if doc_files > 0 else 0) + (10 if has_ep else 0) + (10 if len(systems) > 1 else 0)),
-    }
-    dims = {k: round(v, 1) for k, v in dims.items()}
-    weights = {"functionality": 0.18, "reproducibility": 0.14, "receipt_strength": 0.14,
-               "deployability": 0.12, "test_strength": 0.10, "documentation": 0.10,
-               "security_cleanliness": 0.10, "provenance": 0.08,
-               "economic_evidence": 0.08, "marketability": 0.06}
-    raw = sum(dims[k] * weights[k] for k in dims)
-    haircuts = {}
-    if not has_tests: haircuts["no_tests"] = 10.0
-    if not has_receipts: haircuts["no_receipts"] = 8.0
-    if not has_git: haircuts["no_provenance"] = 15.0
-    if stats["denied_files"] > 0: haircuts["secret_exposure"] = 20.0
-    if not has_readme: haircuts["no_documentation"] = 5.0
-    total_hc = sum(haircuts.values())
-    final = max(0, raw - total_hc)
-    grade = "A" if final >= 80 else "B" if final >= 65 else "C" if final >= 50 else "D" if final >= 35 else "F"
-    return {
-        "dimensions": dims, "raw_score": round(raw, 1), "haircuts": haircuts,
-        "total_haircut": round(total_hc, 1), "final_score": round(final, 1),
-        "grade": grade,
-        "borrowing_base_estimate_usd": {"low": round(final*5,2), "mid": round(final*15,2), "high": round(final*25,2)},
-        "systems_count": len(systems),
-        "capabilities": {"has_git": has_git, "has_tests": has_tests, "has_endpoints": has_ep,
-                         "has_dockerfile": has_docker, "has_receipts": has_receipts},
-    }
-
-def _build_risk_register(packet: dict) -> list:
-    risks = []
-    haircuts = packet.get("collateral_scores", {}).get("haircuts", {})
-    risk_map = {
-        "no_tests": ("missing_evidence", "No test coverage", "Add test files"),
-        "no_receipts": ("missing_evidence", "No execution receipts", "Generate receipts"),
-        "no_provenance": ("missing_evidence", "No git history", "Initialize git repo"),
-        "secret_exposure": ("real", "Exposed secrets detected", "Remove .env and secrets"),
-        "no_documentation": ("missing_evidence", "No README", "Add README.md"),
-    }
-    for hname, val in haircuts.items():
-        cls, desc, rem = risk_map.get(hname, ("real", hname, "Review"))
-        risks.append({"risk_type": hname, "severity": "high" if val >= 15 else "medium" if val >= 8 else "low",
-                      "haircut": val, "classification": cls, "description": desc, "remediation": rem})
-    return risks
-
-# ─── LLM Evaluation Gateway ─────────────────────────────────────────────
+    except KeyboardInterrupt:
+        log("Interrupted by user", "WARN")
+    except Exception as e:
+        log(f"FATAL: {e}", "ERROR")

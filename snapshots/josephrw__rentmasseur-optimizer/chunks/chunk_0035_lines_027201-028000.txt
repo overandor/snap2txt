@@ -1,516 +1,24 @@
-            load_more_clicked = False
-            for sel in [
-                "button:has-text('Load More')",
-                "button:has-text('load more')",
-                "button:has-text('LOAD MORE')",
-                "a:has-text('Load More')",
-                "button[class*='load']",
-                "button[class*='more']",
-                "[class*='load-more']",
-                "[class*='loadmore']",
-            ]:
-                try:
-                    # Selenium doesn't support :has-text, use JS
-                    clicked = self.driver.execute_script(f"""
-                        const btns = document.querySelectorAll('button, a');
-                        for (const btn of btns) {{
-                            const text = (btn.textContent || '').toLowerCase().trim();
-                            if (text.includes('load more') || text.includes('loadmore') || text.includes('show more')) {{
-                                if (btn.offsetParent !== null) {{
-                                    btn.click();
-                                    return true;
-                                }}
-                            }}
-                        }}
-                        // Also try class-based
-                        const els = document.querySelectorAll('[class*="load"], [class*="more"]');
-                        for (const el of els) {{
-                            if (el.offsetParent !== null && (el.tagName === 'BUTTON' || el.tagName === 'A')) {{
-                                el.click();
-                                return true;
-                            }}
-                        }}
-                        return false;
-                    """)
-                    if clicked:
-                        load_more_clicked = True
-                        load_more_count += 1
-                        log(f"  Clicked Load More (#{load_more_count})")
-                        human_delay(2, 4)
-                        break
-                except Exception:
-                    continue
+        "errors": errors,
+    }
 
-            if not load_more_clicked:
-                log(f"  No more Load More button — scraping complete")
-                break
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(record, f, indent=2)
 
-            if new_count == 0 and load_more_count > 3:
-                log(f"  No new visitors in last {load_more_count} clicks — stopping")
-                break
-
-        # Deduplicate
-        seen = set()
-        unique = []
-        for v in all_visitors:
-            if v["username"] not in seen and v["username"] not in EXCLUDE_USERNAMES:
-                seen.add(v["username"])
-                unique.append(v)
-
-        log(f"Total unique visitors: {len(unique)} (after {load_more_count} Load More clicks)")
-        self.screenshot("04_whosawme_final")
-
-        # Record in DB
-        for v in unique:
-            record_visitor_seen(v["username"], v["url"])
-
-        write_receipt("scrape_visitors", "pass", {
-            "total_unique": len(unique),
-            "load_more_clicks": load_more_count,
-            "visitors": unique,
-        })
-        return unique
-
-    # ── Visit profile + extract metadata ─────────────────────────────
-
-    def visit_profile(self, visitor: dict, idx: int, total: int) -> dict:
-        from selenium.webdriver.common.by import By
-
-        uname = visitor["username"]
-        url = visitor["url"]
-
-        # One visit per day — skip if already visited today
-        if already_visited_today(uname):
-            log(f"  [{idx+1}/{total}] Skip {uname} — already visited today")
-            return {"username": uname, "status": "skipped_daily"}
-
-        log(f"  [{idx+1}/{total}] Visiting {uname}...")
-
-        try:
-            self.driver.get(url)
-            human_delay(2, 4)
-
-            block = self.detect_block()
-            if block:
-                log(f"  BLOCKED on {uname}: {block}", "WARN")
-                return {"username": uname, "status": "blocked", "reason": block}
-
-            # Verify URL is a real profile (not redirect/404)
-            current_url = self.driver.current_url
-            page_title = self.driver.title or ""
-            if "404" in page_title or "not found" in page_title.lower():
-                log(f"  404 on {uname}", "WARN")
-                return {"username": uname, "status": "404", "url": current_url}
-
-            # Take compressed screenshot
-            ss_name = f"visit_{idx+1:03d}_{uname}"
-            ss_info = self.screenshot_compressed(ss_name)
-
-            # Extract profile metadata
-            meta = self.driver.execute_script(r"""
-                const text = document.body ? document.body.innerText : '';
-                const result = {};
-
-                // Last online
-                const onlineMatch = text.match(/(?:last\s+online|online\s+status|last\s+active)[:\s]+([^\n]+)/i);
-                if (onlineMatch) result.last_online = onlineMatch[1].trim();
-
-                // Last visit to your page
-                const visitMatch = text.match(/(?:visited\s+you|last\s+visit|visited\s+your\s+profile)[:\s]+([^\n]+)/i);
-                if (visitMatch) result.last_visited_you = visitMatch[1].trim();
-
-                // Visit count from profile
-                const countMatch = text.match(/(?:visited\s+you\s+)(\d+)\s+times?/i);
-                if (countMatch) result.visit_count_profile = parseInt(countMatch[1]);
-
-                // Location
-                const locMatch = text.match(/(?:location|based\s+in)[:\s]+([^\n]+)/i);
-                if (locMatch) result.location = locMatch[1].trim();
-
-                // Available status
-                result.available = text.toLowerCase().includes('available now');
-
-                return result;
-            """)
-
-            page_text = self.page_text()[:1000]
-            content_hash = sha256_text(page_text)
-
-            # Update DB with metadata
-            update_visitor_meta(
-                uname,
-                last_online=meta.get("last_online"),
-                last_visited_my_page=meta.get("last_visited_you"),
-                profile_hash=content_hash,
-            )
-
-            # Record visit in log
-            conn = sqlite3.connect(str(DB_PATH))
-            conn.execute(
-                "INSERT INTO visit_log (username, session_id, visited_at, status, content_hash) VALUES (?, ?, ?, 'ok', ?)",
-                (uname, SESSION_ID, now_iso(), content_hash)
-            )
-            conn.commit()
-            conn.close()
-
-            result = {
-                "username": uname,
-                "url": current_url,
-                "status": "ok",
-                "page_title": page_title,
-                "content_hash": content_hash,
-                "screenshot_thumbnail": ss_info.get("thumbnail_file", ""),
-                "screenshot_kb": ss_info.get("thumbnail_kb", 0),
-                "original_screenshot_kb": ss_info.get("original_kb", 0),
-                "compression_ratio": ss_info.get("compression_ratio", 0),
-                "visited_at": now_iso(),
-                "verified_utc_timestamp": now_iso(),
-                "last_online": meta.get("last_online"),
-                "last_visited_you": meta.get("last_visited_you"),
-                "visit_count_profile": meta.get("visit_count_profile"),
-                "location": meta.get("location"),
-                "available_now": meta.get("available", False),
-                "url_verified": current_url.startswith("https://rentmasseur.com/") and "404" not in page_title,
-                "agent": "rm_engagement_engine",
-                "agent_session": SESSION_ID,
-                "agent_ua": self.ua,
-            }
-            log(f"    title='{page_title}' online={meta.get('last_online', '?')} visited_you={meta.get('last_visited_you', '?')} thumb={ss_info.get('thumbnail_kb', 0)}KB (was {ss_info.get('original_kb', 0)}KB)")
-            write_receipt("visit_profile", "pass", result)
-            return result
-
-        except Exception as e:
-            log(f"  ERROR visiting {uname}: {e}", "WARN")
-            return {"username": uname, "status": "error", "error": str(e)}
-
-    # ── Message a visitor ────────────────────────────────────────────
-
-    def message_visitor(self, username: str, message_text: str, template_idx: int) -> dict:
-        from selenium.webdriver.common.by import By
-
-        log(f"=== MESSAGE: {username} ===")
-        log(f"  Message: \"{message_text[:80]}...\"")
-
-        try:
-            # Navigate to compose
-            compose_url = f"{BASE_URL}/mailbox/compose?to={username}"
-            self.driver.get(compose_url)
-            human_delay(3, 5)
-
-            block = self.detect_block()
-            if block:
-                log(f"  BLOCKED: {block}", "ERROR")
-                write_receipt("message_visitor", "blocked", {"username": username, "reason": block})
-                record_message(username, message_text, "blocked", template_idx)
-                return {"username": username, "status": "blocked", "reason": block}
-
-            self.screenshot(f"msg_{username}_compose")
-
-            # Find message textarea
-            textarea = None
-            for sel in [
-                "textarea[name*='message' i]",
-                "textarea[name*='body' i]",
-                "textarea[name*='content' i]",
-                "textarea",
-                "[contenteditable='true']",
-            ]:
-                try:
-                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                    for el in els:
-                        if el.is_displayed():
-                            textarea = el
-                            break
-                except Exception:
-                    continue
-                if textarea:
-                    break
-
-            if not textarea:
-                # Debug: dump page source to find the actual form structure
-                page_src = self.driver.page_source[:3000] if self.driver.page_source else ""
-                log(f"  No message field found for {username}", "WARN")
-                log(f"  Page URL: {self.driver.current_url}", "WARN")
-                log(f"  Page title: {self.driver.title}", "WARN")
-                # Check for iframes
-                iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
-                log(f"  Iframes on page: {len(iframes)}", "WARN")
-                if iframes:
-                    for i, iframe in enumerate(iframes):
-                        src = iframe.get_attribute("src") or ""
-                        log(f"    iframe[{i}] src={src[:100]}", "WARN")
-                    # Try switching to first iframe and looking for textarea
-                    try:
-                        self.driver.switch_to.frame(iframes[0])
-                        for sel in ["textarea", "[contenteditable='true']", "input[type='text']"]:
-                            els = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                            for el in els:
-                                if el.is_displayed():
-                                    textarea = el
-                                    log(f"  Found textarea in iframe[0] via {sel}", "INFO")
-                                    break
-                            if textarea:
-                                break
-                        self.driver.switch_to.default_content()
-                    except Exception as e:
-                        log(f"  iframe switch failed: {e}", "WARN")
-                        self.driver.switch_to.default_content()
-                if not textarea:
-                    log(f"  Page source (first 2000 chars): {page_src[:2000]}", "DEBUG")
-                    write_receipt("message_visitor", "fail", {"username": username, "reason": "no_message_field", "page_url": self.driver.current_url, "page_title": self.driver.title, "iframe_count": len(iframes)})
-                    record_message(username, message_text, "no_field", template_idx)
-                    return {"username": username, "status": "no_field"}
-
-            # Type message human-like
-            log("  Typing message (human-like)...")
-            textarea.click()
-            human_delay(0.5, 1.0)
-            human_type(textarea, message_text)
-            human_delay(1, 2)
-
-            self.screenshot(f"msg_{username}_typed")
-
-            # Find and click send button
-            sent = False
-            for sel in ["button[type='submit']", "button:has-text('Send')", "button:has-text('SEND')", "input[type='submit']"]:
-                try:
-                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                    for el in els:
-                        if el.is_displayed() and el.is_enabled():
-                            self.driver.execute_script("arguments[0].click();", el)
-                            sent = True
-                            break
-                except Exception:
-                    continue
-                if sent:
-                    break
-
-            if not sent:
-                # Try JS-based search
-                sent = self.driver.execute_script("""
-                    const btns = document.querySelectorAll('button, input[type="submit"]');
-                    for (const btn of btns) {
-                        const text = (btn.textContent || btn.value || '').toLowerCase().trim();
-                        if (text.includes('send') && btn.offsetParent !== null) {
-                            btn.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                """)
-
-            human_delay(3, 5)
-
-            if sent:
-                self.screenshot(f"msg_{username}_sent")
-                log(f"  Message sent to {username}!")
-                write_receipt("message_visitor", "pass", {
-                    "username": username,
-                    "message": message_text,
-                    "template_index": template_idx,
-                })
-                record_message(username, message_text, "sent", template_idx)
-                return {"username": username, "status": "sent", "message": message_text}
-            else:
-                log(f"  Could not find send button for {username}", "WARN")
-                write_receipt("message_visitor", "fail", {"username": username, "reason": "no_send_button"})
-                record_message(username, message_text, "no_send", template_idx)
-                return {"username": username, "status": "no_send_button"}
-
-        except Exception as e:
-            log(f"  ERROR messaging {username}: {e}", "ERROR")
-            write_receipt("message_visitor", "error", {"username": username, "error": str(e)})
-            record_message(username, message_text, "error", template_idx)
-            return {"username": username, "status": "error", "error": str(e)}
-
-
-# ─── Main ────────────────────────────────────────────────────────────
-
-def load_env():
-    env_path = Path(__file__).parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+    return record
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RM Engagement Engine — 24/7 visitor engagement")
-    parser.add_argument("--headed", action="store_true", help="Show browser window")
-    parser.add_argument("--login", action="store_true", help="Login with .env creds")
-    parser.add_argument("--full-run", action="store_true", help="Scrape all + visit back + message repeats")
-    parser.add_argument("--scrape-only", action="store_true", help="Only scrape visitors (with Load More)")
-    parser.add_argument("--visit-back", action="store_true", help="Visit back all scraped visitors")
-    parser.add_argument("--message-repeat", action="store_true", help="Message visitors who visited 3+ times")
-    parser.add_argument("--message-all", action="store_true", help="Message ALL visitors (not just repeats)")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would happen without acting")
-    parser.add_argument("--limit", type=int, default=0, help="Max visitors to visit (0 = all)")
-    parser.add_argument("--threshold", type=int, default=3, help="Visit count threshold for messaging")
-    parser.add_argument("--max-load-more", type=int, default=50, help="Max Load More clicks")
-    parser.add_argument("--message-delay", type=float, default=30.0, help="Seconds between messages (anti-spam)")
-    parser.add_argument("--max-messages", type=int, default=20, help="Max messages per session (safety cap)")
+    parser = argparse.ArgumentParser(description="Check RentMasseur availability")
+    parser.add_argument("--providers", default=DEFAULT_PROVIDERS)
+    parser.add_argument("--output", default=DEFAULT_OUTPUT)
+    parser.add_argument("--mock", action="store_true", help="Use synthetic data")
     args = parser.parse_args()
 
-    load_env()
-    init_db()
-
-    username = os.getenv("RM_USER") or os.getenv("RENTMASSEUR_USERNAME", "")
-    password = os.getenv("RM_PASS") or os.getenv("RENTMASSEUR_PASSWORD", "")
-
-    log("=" * 60)
-    log(f"RM ENGAGEMENT ENGINE — Session: {SESSION_ID}")
-    log(f"Headed: {args.headed} | Login: {args.login} | Full-run: {args.full_run}")
-    log(f"Visit-back: {args.visit_back} | Message-repeat: {args.message_repeat}")
-    log(f"Limit: {args.limit} (0=all) | Threshold: {args.threshold} | MaxLoadMore: {args.max_load_more}")
-    log("=" * 60)
-
-    engine = EngagementEngine(headed=args.headed)
-    results = {"session_id": SESSION_ID, "actions": []}
-
-    try:
-        engine.start()
-
-        # Login
-        if args.login or args.full_run:
-            if not username or not password:
-                log("No credentials found", "ERROR")
-                write_receipt("login", "skipped", {"reason": "no_credentials"})
-                return
-            ok = engine.login(username, password)
-            results["login"] = ok
-            if not ok:
-                log("Login failed — aborting", "ERROR")
-                return
-
-        # Scrape all visitors
-        if args.full_run or args.scrape_only or args.visit_back:
-            visitors = engine.scrape_all_visitors(max_load_more=args.max_load_more)
-            results["visitors_found"] = len(visitors)
-
-            if args.dry_run:
-                log(f"DRY RUN — found {len(visitors)} visitors")
-                for v in visitors:
-                    stats = get_visitor_stats(v["username"])
-                    log(f"  {v['username']}: {stats['visit_count']} visits")
-                write_receipt("dry_run", "pass", {"visitors": visitors})
-                return
-
-        # Visit back
-        if args.full_run or args.visit_back:
-            to_visit = visitors if args.limit == 0 else visitors[:args.limit]
-            # Organic: shuffle order so we never visit in the same sequence
-            to_visit = organic_shuffle(to_visit)
-            # Organic: don't visit all in one robotic batch
-            if args.limit == 0 and len(to_visit) > 20:
-                session_size = organic_session_size(len(to_visit))
-                log(f"\n=== VISIT BACK: {session_size}/{len(to_visit)} profiles (organic session) ===")
-                to_visit = to_visit[:session_size]
-            else:
-                log(f"\n=== VISIT BACK: {len(to_visit)} profiles ===")
-            visited = []
-            skipped = 0
-            for i, v in enumerate(to_visit):
-                r = engine.visit_profile(v, i, len(to_visit))
-                visited.append(r)
-                if r.get("status") == "skipped_daily":
-                    skipped += 1
-                else:
-                    organic_visit_delay()
-                    organic_batch_pause(i + 1)
-            results["visited"] = visited
-            write_receipt("visit_back_summary", "pass", {
-                "total_in_queue": len(to_visit),
-                "visited_count": sum(1 for v in visited if v.get("status") == "ok"),
-                "skipped_today": skipped,
-                "blocked_count": sum(1 for v in visited if v.get("status") == "blocked"),
-                "error_count": sum(1 for v in visited if v.get("status") == "error"),
-                "404_count": sum(1 for v in visited if v.get("status") == "404"),
-            })
-
-        # Message repeat visitors (or all if --message-all)
-        if args.full_run or args.message_repeat or args.message_all:
-            if args.message_all:
-                repeat_visitors = get_all_visitors()
-                log(f"\n=== MESSAGE ALL VISITORS: {len(repeat_visitors)} ===")
-            else:
-                repeat_visitors = get_repeat_visitors(threshold=args.threshold)
-                log(f"\n=== MESSAGE REPEAT VISITORS: {len(repeat_visitors)} (threshold={args.threshold}) ===")
-            repeat_visitors = repeat_visitors[:args.max_messages]
-
-            if args.dry_run:
-                for rv in repeat_visitors:
-                    msg = pick_message(rv["username"])
-                    log(f"  Would message {rv['username']} ({rv['visit_count']} visits): \"{msg[:60]}...\"")
-                write_receipt("message_dry_run", "pass", {"repeat_visitors": repeat_visitors})
-                return
-
-            messaged = []
-            for i, rv in enumerate(repeat_visitors):
-                uname = rv["username"]
-                stats = get_visitor_stats(uname)
-
-                # Skip if already messaged recently (within 24h)
-                if stats.get("last_messaged"):
-                    try:
-                        last_msg_time = datetime.fromisoformat(stats["last_messaged"].replace("Z", "+00:00"))
-                        hours_since = (datetime.now(timezone.utc) - last_msg_time).total_seconds() / 3600
-                        if hours_since < 24:
-                            log(f"  Skip {uname} — messaged {hours_since:.1f}h ago")
-                            continue
-                    except Exception:
-                        pass
-
-                template_idx = random.randint(0, len(MESSAGE_TEMPLATES) - 1)
-                message = pick_message(uname)
-
-                log(f"  [{i+1}/{len(repeat_visitors)}] {uname} ({rv['visit_count']} visits)")
-                r = engine.message_visitor(uname, message, template_idx)
-                messaged.append(r)
-
-                # Anti-spam delay between messages
-                if i < len(repeat_visitors) - 1 and i + 1 < args.max_messages:
-                    log(f"  Waiting {args.message_delay}s before next message (anti-spam)...")
-                    time.sleep(args.message_delay)
-
-            results["messaged"] = messaged
-            write_receipt("message_summary", "pass", {
-                "messaged_count": len(messaged),
-                "sent_count": sum(1 for m in messaged if m.get("status") == "sent"),
-                "blocked_count": sum(1 for m in messaged if m.get("status") == "blocked"),
-                "error_count": sum(1 for m in messaged if m.get("status") == "error"),
-            })
-
-        # Print visitor stats summary
-        all_visitors = get_all_visitors()
-        log(f"\n=== VISITOR STATS (from DB) ===")
-        log(f"Total unique visitors tracked: {len(all_visitors)}")
-        for v in all_visitors[:20]:
-            log(f"  {v['username']}: {v['visit_count']} visits | last_online={v.get('last_online', '?')} | last_messaged={v.get('last_messaged', 'never')}")
-
-    except KeyboardInterrupt:
-        log("Interrupted by user", "WARN")
-    except Exception as e:
-        log(f"FATAL: {e}", "ERROR")
-        traceback.print_exc()
-        write_receipt("fatal", "error", {"error": str(e), "traceback": traceback.format_exc()})
-    finally:
-        engine.stop()
-
-    # Write session summary
-    results["end_time"] = now_iso()
-    results["total_elapsed_s"] = elapsed()
-    summary_path = ARTIFACTS / f"session_{SESSION_ID}.json"
-    summary_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
-
-    receipt_count = len(list(RECEIPTS.glob("*.json")))
-    log("=" * 60)
-    log(f"SESSION COMPLETE — {SESSION_ID}")
-    log(f"  Duration: {elapsed():.1f}s")
-    log(f"  Receipts: {receipt_count}")
-    log(f"  Summary: {summary_path}")
-    log("=" * 60)
+    record = run_check(args.providers, args.output, mock=args.mock)
+    print(json.dumps(record, indent=2))
+    if record["errors"]:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -518,35 +26,712 @@ if __name__ == "__main__":
 
 ```
 
-rentmasseur_core.py:
+rm_selenium_cicd.py:
 ```
+#!/usr/bin/env python3
 """
-RentMasseur Core — shared login, driver, availability, and bio update utilities.
-Used by all 30 strategy scripts and the coordinator.
+RM Selenium CI/CD Harness — approval-gated, evidence-only automation.
+
+Safety model:
+- Uses standard Selenium only. No CAPTCHA solving, no stealth/anti-bot bypass.
+- Defaults to read-only actions.
+- Mutations require BOTH:
+  1) RM_ENABLE_MUTATIONS=true
+  2) the action name listed in RM_APPROVED_ACTIONS or --approved-actions-file
+- Stops if CAPTCHA / access-forbidden / verification interstitial is detected.
+- Writes receipts, screenshots, and JSON artifacts for every action.
 """
 
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import json
 import os
-import re
 import sys
 import time
-import json
-import logging
-import hashlib
-import requests
-from datetime import datetime
-from typing import Optional
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-try:
-    import undetected_chromedriver as uc
-    HAS_UC = True
-except ImportError:
-    HAS_UC = False
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+from selenium.webdriver import ChromeOptions
+from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import NoSuchElementException
+
+
+BASE_URL = os.getenv("RM_BASE_URL", "https://rentmasseur.com").rstrip("/")
+ARTIFACT_DIR = Path(os.getenv("RM_ARTIFACT_DIR", "artifacts/rm_selenium"))
+RECEIPT_DIR = ARTIFACT_DIR / "receipts"
+SCREEN_DIR = ARTIFACT_DIR / "screenshots"
+HTML_DIR = ARTIFACT_DIR / "html"
+JSON_DIR = ARTIFACT_DIR / "json"
+
+for d in (RECEIPT_DIR, SCREEN_DIR, HTML_DIR, JSON_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+
+READ_ONLY = "read_only"
+MUTATION = "mutation"
+
+
+@dataclasses.dataclass
+class ActionResult:
+    action: str
+    ok: bool
+    mode: str
+    status: str
+    url: str = ""
+    data: Optional[dict] = None
+    error: Optional[str] = None
+    blocked_reason: Optional[str] = None
+    screenshot: Optional[str] = None
+    html: Optional[str] = None
+    receipt: Optional[str] = None
+
+
+@dataclasses.dataclass
+class ActionSpec:
+    name: str
+    mode: str
+    description: str
+    fn: Callable[[WebDriver, argparse.Namespace], ActionResult]
+    requires_login: bool = True
+
+
+class ReceiptLedger:
+    def __init__(self, path: Path = RECEIPT_DIR / "ledger.jsonl"):
+        self.path = path
+        self.entries = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    try:
+                        self.entries.append(json.loads(line))
+                    except Exception:
+                        pass
+
+    def add(self, payload: dict) -> str:
+        prev_hash = self.entries[-1].get("hash", "0" * 64) if self.entries else "0" * 64
+        entry = {
+            "index": len(self.entries),
+            "timestamp": now_iso(),
+            "prev_hash": prev_hash,
+            **payload,
+        }
+        body = json.dumps({k: v for k, v in entry.items() if k != "hash"}, sort_keys=True, default=str)
+        entry["hash"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        self.entries.append(entry)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        receipt_path = RECEIPT_DIR / f"{entry['index']:05d}_{safe_name(payload.get('action', 'action'))}.json"
+        receipt_path.write_text(json.dumps(entry, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        return str(receipt_path)
+
+    def verify(self) -> bool:
+        prev = "0" * 64
+        for entry in self.entries:
+            if entry.get("prev_hash") != prev:
+                return False
+            body = json.dumps({k: v for k, v in entry.items() if k != "hash"}, sort_keys=True, default=str)
+            if hashlib.sha256(body.encode("utf-8")).hexdigest() != entry.get("hash"):
+                return False
+            prev = entry["hash"]
+        return True
+
+
+LEDGER = ReceiptLedger()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_name(s: str) -> str:
+    return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in s)[:80]
+
+
+def truthy(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def get_username() -> str:
+    return (
+        os.getenv("RM_USER")
+        or os.getenv("RENTMASSEUR_USERNAME")
+        or os.getenv("RM_USERNAME")
+        or ""
+    )
+
+
+def get_password() -> str:
+    return (
+        os.getenv("RM_PASS")
+        or os.getenv("RENTMASSEUR_PASSWORD")
+        or os.getenv("RM_PASSWORD")
+        or ""
+    )
+
+
+def build_driver(headless: bool = True) -> WebDriver:
+    opts = ChromeOptions()
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--window-size=1440,1200")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    if os.getenv("RM_CHROME_BINARY"):
+        opts.binary_location = os.getenv("RM_CHROME_BINARY")
+    driver = webdriver.Chrome(options=opts)
+    driver.set_page_load_timeout(int(os.getenv("RM_PAGE_TIMEOUT", "45")))
+    driver.implicitly_wait(int(os.getenv("RM_IMPLICIT_WAIT", "8")))
+    return driver
+
+
+def page_text(driver: WebDriver) -> str:
+    try:
+        return driver.execute_script("return document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        return ""
+
+
+def detect_block(driver: WebDriver) -> Optional[str]:
+    txt = page_text(driver).lower()
+    url = (driver.current_url or "").lower()
+    needles = [
+        ("captcha", "captcha_or_challenge_detected"),
+        ("crowdsec", "crowdsec_access_control_detected"),
+        ("access forbidden", "access_forbidden_detected"),
+        ("verify you are human", "human_verification_detected"),
+        ("unusual traffic", "traffic_challenge_detected"),
+        ("too many requests", "rate_limit_detected"),
+    ]
+    for needle, reason in needles:
+        if needle in txt or needle in url:
+            return reason
+    return None
+
+
+def capture(driver: WebDriver, action: str) -> Tuple[Optional[str], Optional[str]]:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    base = f"{ts}_{safe_name(action)}"
+    screenshot_path = SCREEN_DIR / f"{base}.png"
+    html_path = HTML_DIR / f"{base}.html"
+    try:
+        driver.save_screenshot(str(screenshot_path))
+    except Exception:
+        screenshot_path = None
+    try:
+        html_path.write_text(driver.page_source or "", encoding="utf-8", errors="ignore")
+    except Exception:
+        html_path = None
+    return (str(screenshot_path) if screenshot_path else None, str(html_path) if html_path else None)
+
+
+def finish(driver: WebDriver, result: ActionResult) -> ActionResult:
+    result.url = result.url or getattr(driver, "current_url", "")
+    result.screenshot, result.html = capture(driver, result.action)
+    receipt_payload = dataclasses.asdict(result)
+    receipt_payload.pop("receipt", None)
+    result.receipt = LEDGER.add(receipt_payload)
+    (JSON_DIR / f"{safe_name(result.action)}_latest.json").write_text(
+        json.dumps(dataclasses.asdict(result), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return result
+
+
+def blocked(action: str, mode: str, reason: str, driver: Optional[WebDriver] = None) -> ActionResult:
+    res = ActionResult(action=action, ok=False, mode=mode, status="blocked", blocked_reason=reason)
+    if driver:
+        return finish(driver, res)
+    res.receipt = LEDGER.add(dataclasses.asdict(res))
+    return res
+
+
+def approved_actions(args: argparse.Namespace) -> set:
+    values = set()
+    env = os.getenv("RM_APPROVED_ACTIONS", "")
+    if env:
+        values.update([x.strip() for x in env.split(",") if x.strip()])
+    if args.approved_actions_file:
+        path = Path(args.approved_actions_file)
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            values.update(data.get("approved_actions", []))
+    return values
+
+
+def require_mutation(action: str, args: argparse.Namespace, driver: WebDriver) -> Optional[ActionResult]:
+    if not truthy(os.getenv("RM_ENABLE_MUTATIONS")) and not args.allow_mutations:
+        return blocked(action, MUTATION, "mutation_disabled_set_RM_ENABLE_MUTATIONS_true_or_pass_allow_mutations", driver)
+    if action not in approved_actions(args):
+        return blocked(action, MUTATION, f"action_not_approved:{action}", driver)
+    return None
+
+
+def click_first(driver: WebDriver, candidates: List[Tuple[str, str]]) -> bool:
+    for by, sel in candidates:
+        try:
+            els = driver.find_elements(by, sel)
+            for el in els:
+                if el.is_displayed() and el.is_enabled():
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                    time.sleep(0.3)
+                    driver.execute_script("arguments[0].click();", el)
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def find_first_input(driver: WebDriver, candidates: List[Tuple[str, str]]):
+    for by, sel in candidates:
+        try:
+            els = driver.find_elements(by, sel)
+            for el in els:
+                if el.is_displayed() and el.is_enabled():
+                    return el
+        except Exception:
+            continue
+    return None
+
+
+def action_smoke(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "smoke"
+    driver.get(BASE_URL)
+    time.sleep(3)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    data = {"title": driver.title, "base_url": BASE_URL}
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data=data))
+
+
+def action_login(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "login"
+    user = get_username()
+    password = get_password()
+    if not user or not password:
+        return blocked(action, READ_ONLY, "missing_credentials_RM_USER_RM_PASS", driver)
+
+    driver.get(f"{BASE_URL}/login")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+
+    user_el = find_first_input(driver, [
+        (By.CSS_SELECTOR, "input[type='email']"),
+        (By.CSS_SELECTOR, "input[name*='email' i]"),
+        (By.CSS_SELECTOR, "input[name*='user' i]"),
+        (By.CSS_SELECTOR, "input[type='text']"),
+    ])
+    pass_el = find_first_input(driver, [
+        (By.CSS_SELECTOR, "input[type='password']"),
+        (By.CSS_SELECTOR, "input[name*='pass' i]"),
+    ])
+
+    if not user_el or not pass_el:
+        return blocked(action, READ_ONLY, "login_form_not_found", driver)
+
+    driver.execute_script("""
+        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        if (arguments[0]) { ns.call(arguments[0], arguments[2]); arguments[0].dispatchEvent(new Event('input', {bubbles: true})); }
+        if (arguments[1]) { ns.call(arguments[1], arguments[3]); arguments[1].dispatchEvent(new Event('input', {bubbles: true})); }
+    """, user_el, pass_el, user, password)
+    time.sleep(1)
+    try:
+        pass_el.send_keys(Keys.ENTER)
+    except Exception:
+        driver.execute_script("""
+            const btn = document.querySelector('button[type="submit"]') ||
+                        Array.from(document.querySelectorAll('button')).find(b => /login|sign|submit/i.test(b.innerText));
+            if (btn) btn.click();
+        """)
+    time.sleep(6)
+
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+
+    ok = "/login" not in (driver.current_url or "").lower()
+    status = "ok" if ok else "login_failed"
+    return finish(driver, ActionResult(action, ok, READ_ONLY, status, data={"current_url": driver.current_url}))
+
+
+def ensure_login(driver: WebDriver, args: argparse.Namespace) -> Optional[ActionResult]:
+    if "/login" in (driver.current_url or "") or not driver.current_url:
+        res = action_login(driver, args)
+        if not res.ok:
+            return res
+    return None
+
+
+def action_dashboard_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "dashboard_read"
+    driver.get(f"{BASE_URL}/settings")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    data = {
+        "title": driver.title,
+        "text_len": len(txt),
+        "signals": {
+            "availability": "availability" in txt.lower(),
+            "profile": "profile" in txt.lower(),
+            "statistics": "statistics" in txt.lower() or "views" in txt.lower(),
+            "messages": "messages" in txt.lower() or "mailbox" in txt.lower(),
+        },
+    }
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data=data))
+
+
+def action_availability_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "availability_read"
+    driver.get(f"{BASE_URL}/settings?availability=1")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    data = {
+        "text_len": len(txt),
+        "available_word_present": "available" in txt.lower(),
+        "countdown_word_present": "countdown" in txt.lower() or "hour" in txt.lower(),
+    }
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data=data))
+
+
+def action_availability_set(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "availability_set"
+    gate = require_mutation(action, args, driver)
+    if gate:
+        return gate
+
+    driver.get(f"{BASE_URL}/settings?availability=1")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, MUTATION, reason, driver)
+
+    clicked = click_first(driver, [
+        (By.XPATH, "//label[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'available')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'available')]"),
+        (By.CSS_SELECTOR, "button[aria-label*='Available' i]"),
+    ])
+    time.sleep(1)
+
+    saved = click_first(driver, [
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'save')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'apply')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'set')]"),
+        (By.CSS_SELECTOR, "button[type='submit']"),
+    ])
+    time.sleep(3)
+
+    ok = clicked and saved and not detect_block(driver)
+    return finish(driver, ActionResult(action, ok, MUTATION, "ok" if ok else "not_verified", data={"clicked_available": clicked, "clicked_save": saved}))
+
+
+def action_about_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "about_read"
+    driver.get(f"{BASE_URL}/settings/about")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    data = {
+        "text_len": len(txt),
+        "bio_signals": {
+            "headline": "headline" in txt.lower(),
+            "description": "description" in txt.lower() or "about" in txt.lower(),
+            "massage": "massage" in txt.lower(),
+        },
+    }
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data=data))
+
+
+def action_bio_set_approved(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "bio_set_approved"
+    gate = require_mutation(action, args, driver)
+    if gate:
+        return gate
+
+    bio_file = os.getenv("RM_APPROVED_BIO_FILE", args.bio_file or "")
+    if not bio_file or not Path(bio_file).exists():
+        return blocked(action, MUTATION, "missing_RM_APPROVED_BIO_FILE", driver)
+
+    bio_text = Path(bio_file).read_text(encoding="utf-8").strip()
+    if len(bio_text) < 40 or len(bio_text) > int(os.getenv("RM_MAX_BIO_CHARS", "3000")):
+        return blocked(action, MUTATION, "approved_bio_length_out_of_bounds", driver)
+    risky = ["escort", "happy ending", "nude", "naked", "sex", "guaranteed cure"]
+    if any(x in bio_text.lower() for x in risky):
+        return blocked(action, MUTATION, "approved_bio_failed_local_policy_filter", driver)
+
+    driver.get(f"{BASE_URL}/settings/about")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, MUTATION, reason, driver)
+
+    field = find_first_input(driver, [
+        (By.CSS_SELECTOR, "textarea[name*='description' i]"),
+        (By.CSS_SELECTOR, "textarea[name*='bio' i]"),
+        (By.CSS_SELECTOR, "textarea"),
+        (By.CSS_SELECTOR, "[contenteditable='true']"),
+    ])
+    if not field:
+        return blocked(action, MUTATION, "bio_field_not_found", driver)
+
+    try:
+        tag = field.tag_name.lower()
+        if tag == "textarea":
+            field.clear()
+            field.send_keys(bio_text)
+        else:
+            driver.execute_script("arguments[0].innerText = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles:true}));", field, bio_text)
+    except Exception as e:
+        return blocked(action, MUTATION, f"bio_field_write_failed:{e}", driver)
+
+    saved = click_first(driver, [
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'save')]"),
+        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'update')]"),
+        (By.CSS_SELECTOR, "button[type='submit']"),
+    ])
+    time.sleep(4)
+
+    ok = saved and not detect_block(driver)
+    return finish(driver, ActionResult(action, ok, MUTATION, "ok" if ok else "not_verified", data={"bio_chars": len(bio_text), "clicked_save": saved}))
+
+
+def action_search_rank_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "search_rank_read"
+    city = os.getenv("RM_SEARCH_CITY", args.city or "manhattan-ny")
+    username = os.getenv("RM_TARGET_USERNAME", get_username())
+    driver.get(f"{BASE_URL}/search/{city}")
+    time.sleep(5)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+
+    links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+    rank = None
+    hrefs = []
+    for idx, a in enumerate(links[:200], 1):
+        href = a.get_attribute("href") or ""
+        text = (a.text or "").strip()
+        hrefs.append({"rank": idx, "text": text[:80], "href": href})
+        if username and username.lower() in (href + " " + text).lower():
+            rank = idx
+            break
+
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data={"city": city, "target": username, "rank": rank, "sample_links": hrefs[:25]}))
+
+
+def action_mailbox_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "mailbox_read"
+    driver.get(f"{BASE_URL}/mailbox")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    data = {
+        "text_len": len(txt),
+        "message_signals": {
+            "inbox": "inbox" in txt.lower(),
+            "message": "message" in txt.lower(),
+            "email": "email" in txt.lower(),
+        },
+    }
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data=data))
+
+
+def action_blog_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "blog_read"
+    driver.get(f"{BASE_URL}/blogs")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data={"text_len": len(txt), "blog_word_present": "blog" in txt.lower()}))
+
+
+def action_interview_read(driver: WebDriver, args: argparse.Namespace) -> ActionResult:
+    action = "interview_read"
+    driver.get(f"{BASE_URL}/settings/interview")
+    time.sleep(4)
+    reason = detect_block(driver)
+    if reason:
+        return blocked(action, READ_ONLY, reason, driver)
+    txt = page_text(driver)
+    return finish(driver, ActionResult(action, True, READ_ONLY, "ok", data={"text_len": len(txt), "interview_word_present": "interview" in txt.lower()}))
+
+
+ACTIONS: Dict[str, ActionSpec] = {
+    "smoke": ActionSpec("smoke", READ_ONLY, "Load public homepage and verify no block page.", action_smoke, requires_login=False),
+    "login": ActionSpec("login", READ_ONLY, "Login with first-party credentials; stops on CAPTCHA/challenge.", action_login, requires_login=False),
+    "dashboard_read": ActionSpec("dashboard_read", READ_ONLY, "Read dashboard/settings page and save evidence.", action_dashboard_read),
+    "availability_read": ActionSpec("availability_read", READ_ONLY, "Read availability screen.", action_availability_read),
+    "availability_set": ActionSpec("availability_set", MUTATION, "Set availability only when explicitly approved.", action_availability_set),
+    "about_read": ActionSpec("about_read", READ_ONLY, "Read about/profile settings page.", action_about_read),
+    "bio_set_approved": ActionSpec("bio_set_approved", MUTATION, "Set bio from a pre-approved local file only.", action_bio_set_approved),
+    "search_rank_read": ActionSpec("search_rank_read", READ_ONLY, "Read public search page and estimate target rank.", action_search_rank_read),
+    "mailbox_read": ActionSpec("mailbox_read", READ_ONLY, "Open mailbox page and capture high-level evidence only.", action_mailbox_read),
+    "blog_read": ActionSpec("blog_read", READ_ONLY, "Open blogs page and capture evidence.", action_blog_read),
+    "interview_read": ActionSpec("interview_read", READ_ONLY, "Open interview/settings page and capture evidence.", action_interview_read),
+}
+
+
+def parse_actions(raw: str) -> List[str]:
+    if not raw or raw.strip() in {"default", "safe"}:
+        return ["smoke", "login", "dashboard_read", "availability_read", "about_read", "search_rank_read"]
+    if raw.strip() == "all-read":
+        return [name for name, spec in ACTIONS.items() if spec.mode == READ_ONLY]
+    if raw.strip() == "all":
+        return list(ACTIONS.keys())
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def write_action_catalog() -> None:
+    catalog = {
+        name: {"mode": spec.mode, "description": spec.description, "requires_login": spec.requires_login}
+        for name, spec in ACTIONS.items()
+    }
+    (JSON_DIR / "action_catalog.json").write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+
+
+def run(args: argparse.Namespace) -> int:
+    load_dotenv()
+    write_action_catalog()
+    requested = parse_actions(args.actions)
+    unknown = [a for a in requested if a not in ACTIONS]
+    if unknown:
+        print(json.dumps({"status": "failed", "unknown_actions": unknown, "known_actions": sorted(ACTIONS)}), file=sys.stderr)
+        return 2
+
+    driver = build_driver(headless=not args.headed)
+    results: List[ActionResult] = []
+    try:
+        logged_in = False
+        for name in requested:
+            spec = ACTIONS[name]
+            if spec.requires_login and not logged_in:
+                login_result = action_login(driver, args)
+                results.append(login_result)
+                logged_in = login_result.ok
+                if not logged_in:
+                    break
+
+            try:
+                result = spec.fn(driver, args)
+            except Exception as e:
+                tb = traceback.format_exc()
+                result = ActionResult(name, False, spec.mode, "exception", error=str(e), data={"traceback_tail": tb[-4000:]})
+                result = finish(driver, result)
+            results.append(result)
+
+            if result.blocked_reason in {
+                "captcha_or_challenge_detected",
+                "crowdsec_access_control_detected",
+                "human_verification_detected",
+                "access_forbidden_detected",
+            }:
+                break
+
+            time.sleep(float(os.getenv("RM_ACTION_PAUSE_SECONDS", "2.0")))
+
+    finally:
+        driver.quit()
+
+    summary = {
+        "timestamp": now_iso(),
+        "ok": all(r.ok or r.status == "blocked" for r in results),
+        "ledger_valid": LEDGER.verify(),
+        "artifact_dir": str(ARTIFACT_DIR),
+        "requested_actions": requested,
+        "results": [dataclasses.asdict(r) for r in results],
+    }
+    (ARTIFACT_DIR / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return 0 if summary["ledger_valid"] and not any(r.status == "exception" for r in results) else 1
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Approval-gated Selenium CI/CD harness for RM.")
+    parser.add_argument("--actions", default=os.getenv("RM_ACTIONS", "safe"),
+                        help="safe | all-read | all | comma-separated action names")
+    parser.add_argument("--headed", action="store_true", help="Run visible Chrome. CI should stay headless.")
+    parser.add_argument("--allow-mutations", action="store_true",
+                        help="Still requires approved action list. Prefer RM_ENABLE_MUTATIONS=true.")
+    parser.add_argument("--approved-actions-file", default=os.getenv("RM_APPROVED_ACTIONS_FILE", ""),
+                        help="JSON file with {'approved_actions': ['availability_set', ...]}")
+    parser.add_argument("--bio-file", default="", help="Approved bio file for bio_set_approved.")
+    parser.add_argument("--city", default=os.getenv("RM_SEARCH_CITY", "manhattan-ny"))
+    parser.add_argument("--list-actions", action="store_true")
+    args = parser.parse_args()
+
+    if args.list_actions:
+        print(json.dumps({
+            name: {"mode": spec.mode, "description": spec.description, "requires_login": spec.requires_login}
+            for name, spec in ACTIONS.items()
+        }, indent=2))
+        return
+
+    sys.exit(run(args))
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+llm_file_proxy.zip:
+```
+Error reading file: 'utf-8' codec can't decode byte 0x9b in position 10: invalid start byte
+```
+
+test_py.py:
+```
+import sys
+print(f"python {sys.version}")
+with open("/Users/alep/Downloads/02_AI_Agents/rentmasseur-extension/testfile.txt", "w") as f:
+    f.write("hello")
+
+```
+
+email_templates.py:
+```
+#!/usr/bin/env python3
+"""Email template generator — creates booking-related email templates.
+
+Generates: booking confirmation, follow-up, rebooking reminder,
+thank you, and seasonal promotion emails.
+
+Usage:
+    python3 email_templates.py
+"""
+
+import json
+import os
+import sys
+import time
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
+from dotenv import load_dotenv
 
 logging.basicConfig(
     level=logging.INFO,
@@ -558,243 +743,58 @@ logger = logging.getLogger(__name__)
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 load_dotenv()
 
-RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-RENTMASSEUR_PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-LOGIN_URL = "https://rentmasseur.com/login"
-AVAILABILITY_URL = "https://rentmasseur.com/settings?availability=1"
-PROFILE_URL = "https://rentmasseur.com/settings?profile=1"
-IMPLICIT_WAIT = 10
-PAGE_TIMEOUT = 30
 
-BIO_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bio_history.json")
-BIOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bios")
-os.makedirs(BIOS_DIR, exist_ok=True)
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+EMAIL_DIR = os.path.join(CONTENT_DIR, "email_templates")
+
+EMAIL_TYPES = [
+    ("booking_confirmation", "Sent immediately after a client books a session. Include date/time confirmation, what to expect, and preparation tips."),
+    ("follow_up", "Sent 2 hours after the session. Ask for feedback, offer rebooking discount, and thank them."),
+    ("rebooking_reminder", "Sent 2 weeks after last session. Remind them of benefits of regular massage, offer a loyalty discount."),
+    ("thank_you", "Sent 1 day after first session. Welcome them as a new client, share tips, and invite to book again."),
+    ("seasonal_promotion", "Sent seasonally. Offer a seasonal special (winter warmth, summer recovery, holiday stress relief)."),
+    ("no_show_followup", "Sent after a missed appointment. Polite, understanding, and offers easy rescheduling."),
+    ("birthday_gift", "Sent as a promotional email. Position massage as the perfect gift for self or others."),
+    ("newsletter_monthly", "Monthly newsletter with wellness tips, self-care advice, and booking link."),
+]
 
 
-def setup_driver(headless: bool = True) -> webdriver.Chrome:
-    if HAS_UC:
-        opts = uc.ChromeOptions()
-        if headless:
-            opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        try:
-            import subprocess
-            chrome_ver_out = subprocess.check_output(["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--version"], stderr=subprocess.DEVNULL).decode().strip()
-            chrome_major = int(re.search(r'(\d+)\.', chrome_ver_out).group(1))
-            driver = uc.Chrome(options=opts, version_main=chrome_major)
-        except Exception:
-            driver = uc.Chrome(options=opts)
-        driver.implicitly_wait(IMPLICIT_WAIT)
-        driver.set_page_load_timeout(PAGE_TIMEOUT)
-        return driver
-    else:
-        opts = Options()
-        if headless:
-            opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument(
-            "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+def _groq_chat(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> Optional[str]:
+    if not GROQ_API_KEY:
+        logger.error("No GROQ_API_KEY")
+        return None
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.8,
+                "max_tokens": max_tokens,
+            },
+            timeout=60,
         )
-        driver = webdriver.Chrome(options=opts)
-        driver.implicitly_wait(IMPLICIT_WAIT)
-        driver.set_page_load_timeout(PAGE_TIMEOUT)
-        return driver
-
-
-def _dump_debug(driver: webdriver.Chrome, label: str) -> None:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
-    os.makedirs(debug_dir, exist_ok=True)
-    prefix = os.path.join(debug_dir, f"debug_{label}_{ts}")
-    try:
-        driver.save_screenshot(f"{prefix}.png")
-    except Exception:
-        pass
-    try:
-        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
-    except Exception:
-        pass
-
-
-def login(driver: webdriver.Chrome) -> bool:
-    if not RENTMASSEUR_USERNAME or not RENTMASSEUR_PASSWORD:
-        logger.error("Missing credentials")
-        return False
-    try:
-        logger.info("Navigating to login: %s", LOGIN_URL)
-        driver.set_page_load_timeout(90)
-        driver.get(LOGIN_URL)
-        time.sleep(8)
-        for xpath in [
-            "//button[contains(text(),'Accept')]",
-            "//button[contains(text(),'OK')]",
-            "//button[contains(text(),'Got it')]",
-            "//button[contains(text(),'Dismiss')]",
-            "//button[contains(text(),'Agree')]",
-            "//button[contains(text(),'Continue')]",
-        ]:
-            try:
-                el = driver.find_element(By.XPATH, xpath)
-                driver.execute_script("arguments[0].click();", el)
-                time.sleep(1)
-            except NoSuchElementException:
-                pass
-
-        for attempt in range(1, 5):
-            logger.info("Login discovery attempt %d/5", attempt)
-            time.sleep(3)
-            result = driver.execute_script("""
-                let pwd = document.querySelector('input[type=\"password\"]');
-                if (!pwd) {
-                    pwd = document.querySelector('input[name*=\"pass\" i]') ||
-                          document.querySelector('input[id*=\"pass\" i]') ||
-                          document.querySelector('input[placeholder*=\"pass\" i]') ||
-                          document.querySelector('input[class*=\"pass\" i]');
-                    if (pwd) { pwd.type = 'password'; }
-                }
-                if (!pwd) {
-                    const allInputs = Array.from(document.querySelectorAll('input'));
-                    for (const inp of allInputs) {
-                        const ctx = (inp.name||'') + ' ' + (inp.id||'') + ' ' + (inp.placeholder||'') + ' ' + (inp.className||'');
-                        if (/pass/i.test(ctx)) { pwd = inp; break; }
-                    }
-                }
-                if (!pwd) return {error: 'no_password'};
-                const allInputs = Array.from(document.querySelectorAll('input'));
-                const candidates = allInputs.filter(i => i !== pwd && (i.type === 'text' || i.type === 'email'));
-                let user = null, bestDist = Infinity;
-                for (const cand of candidates) {
-                    const pos = pwd.compareDocumentPosition(cand);
-                    if (pos & Node.DOCUMENT_POSITION_PRECEDING) {
-                        let dist = 0, el = cand;
-                        while (el && el !== pwd) { el = el.nextElementSibling || el.parentElement; dist++; if (dist > 100) break; }
-                        if (dist < bestDist) { bestDist = dist; user = cand; }
-                    }
-                }
-                if (!user && candidates.length > 0) user = candidates[0];
-                if (!user) return {error: 'no_username'};
-                let btn = null;
-                const form = pwd.closest('form');
-                if (form) {
-                    btn = form.querySelector('button[type=\"submit\"]') || form.querySelector('input[type=\"submit\"]');
-                    if (!btn) { const fb = Array.from(form.querySelectorAll('button')); btn = fb.find(b => /login|sign.in|submit/i.test(b.innerText)) || fb[0]; }
-                }
-                if (!btn) {
-                    let ancestor = pwd.parentElement;
-                    for (let i = 0; i < 5 && ancestor && !btn; i++) {
-                        const ab = Array.from(ancestor.querySelectorAll('button'));
-                        btn = ab.find(b => /login|sign.in|submit/i.test(b.innerText)) || ab[0];
-                        ancestor = ancestor.parentElement;
-                    }
-                }
-                if (!btn) { const allBtns = Array.from(document.querySelectorAll('button, [role=\"button\"]')); btn = allBtns.find(b => /login|sign.in|submit/i.test(b.innerText)); }
-                if (!btn) return {error: 'no_button'};
-                function attrs(el) { return {tag: el.tagName.toLowerCase(), id: el.id||'', name: el.name||'', type: el.type||'', class: (el.className&&typeof el.className==='string')?el.className.split(' ').filter(Boolean).join(' '):'', placeholder: el.placeholder||''}; }
-                return {user: attrs(user), pwd: attrs(pwd), btn: attrs(btn)};
-            """)
-            if isinstance(result, dict) and 'error' not in result:
-                break
-            logger.warning("Login attempt %d failed: %s", attempt, result.get('error'))
-            if attempt < 5:
-                time.sleep(5)
-            else:
-                logger.error("Login failed after 5 attempts")
-                _dump_debug(driver, f"login_{result.get('error','unknown')}")
-                return False
-
-        def build_selector(info: dict) -> str:
-            if info['id']: return f"#{info['id']}"
-            if info['name']: return f"{info['tag']}[name='{info['name']}']"
-            if info['placeholder']: return f"{info['tag']}[placeholder='{info['placeholder']}']"
-            if info['class']: return f"{info['tag']}.{info['class'].split()[0]}"
-            return info['tag']
-
-        user_sel = build_selector(result['user'])
-        pwd_sel = build_selector(result['pwd'])
-        btn_sel = build_selector(result['btn'])
-        # Use native setter for React/Next.js compatibility
-        driver.execute_script("""
-            const pwd = document.querySelector('input[type="password"]');
-            const user = document.querySelector('input[type="text"], input[type="email"]');
-            const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
-            if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
-        """, RENTMASSEUR_USERNAME, RENTMASSEUR_PASSWORD)
-        time.sleep(1)
-        # Submit via Enter key on password field
-        try:
-            pwd_el = driver.find_element(By.CSS_SELECTOR, 'input[type="password"]')
-            pwd_el.send_keys(Keys.ENTER)
-        except Exception:
-            driver.execute_script("""
-                const btn = document.querySelector('button[type="submit"]') ||
-                            Array.from(document.querySelectorAll('button')).find(b => /login|sign|submit/i.test(b.innerText));
-                if (btn) btn.click();
-            """)
-        time.sleep(5)
-        if LOGIN_URL not in driver.current_url:
-            logger.info("Login successful -> %s", driver.current_url)
-            return True
-        err = driver.execute_script("const el = document.querySelector('[role=alert], .error, .form-error'); return el ? el.innerText : '';")
-        if err:
-            logger.error("Login error: %s", err.strip())
-        _dump_debug(driver, "login_failed")
-        return False
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logger.error("Login exception: %s", e)
-        _dump_debug(driver, "login_exception")
-        return False
+        logger.error("Groq API error: %s", e)
+        return None
 
 
-def set_availability_24_7(driver: webdriver.Chrome) -> bool:
-    try:
-        logger.info("Setting availability: %s", AVAILABILITY_URL)
-        driver.get(AVAILABILITY_URL)
-        time.sleep(3)
-        ok = driver.execute_script("""
-            const selects = Array.from(document.querySelectorAll('select'));
-            const buttons = Array.from(document.querySelectorAll('button'));
-            const statusSelect = selects.find(s => {
-                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
-                return opts.includes('available') || opts.includes('not set');
-            });
-            if (!statusSelect) return {error: 'no_status_select'};
-            const availOpt = Array.from(statusSelect.options).find(
-                o => o.text.toLowerCase().includes('available') && !o.text.toLowerCase().includes('not')
-            );
-            if (availOpt) { statusSelect.value = availOpt.value; statusSelect.dispatchEvent(new Event('change', {bubbles: true})); }
-            const timeSelect = selects.find(s => {
-                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
-                return opts.some(t => t.includes('hour') || t.includes('minute'));
-            });
-            if (timeSelect) {
-                const durationOpts = Array.from(timeSelect.options).filter(o => /\\d/.test(o.text));
-                if (durationOpts.length > 0) {
-                    const longest = durationOpts[durationOpts.length - 1];
-                    timeSelect.value = longest.value;
-                    timeSelect.dispatchEvent(new Event('change', {bubbles: true}));
-                }
-            }
-            const setBtn = buttons.find(b => /set|save|apply/i.test(b.innerText));
-            if (!setBtn) return {error: 'no_set_button'};
-            setBtn.click();
-            return {ok: true};
-        """)
-        if isinstance(ok, dict) and ok.get('error'):
-            logger.error("Availability failed: %s", ok['error'])
-            _dump_debug(driver, f"availability_{ok['error']}")
-            return False
-        logger.info("Availability set successfully")
-        time.sleep(2)
-        return True
-    except Exception as e:
-        logger.error("Availability exception: %s", e)
+def main():
+    os.makedirs(EMAIL_DIR, exist_ok=True)
+    today = datetime.now().strftime("%Y%m%d")
+    total = 0
+
+    system_prompt = (
+        "You are an expert email copywriter for a male massage therapist in Manhattan, NYC. "
+        "Write professional, warm, and conversion-optimized emails. "
+        "Include a subject line, greeting, body, and signature. "
+        "Use [CLIENT_NAME] and [THERAPIST_NAME] as placeholders. "
+        "Avoid explicit content. Format as markdown."

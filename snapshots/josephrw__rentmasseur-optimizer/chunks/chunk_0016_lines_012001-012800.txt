@@ -1,561 +1,93 @@
-        buf = _io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
-    except Exception as e:
-        # If PIL fails, return original bytes — hash still works
-        return image_path.read_bytes()
+        log.info("Running one daemon cycle")
+        run_once(scheduler)
+        return
 
-
-def capture_proof(
-    driver,
-    url: str,
-    page_text: str,
-    session_id: str,
-    action: str,
-    api_data: Optional[dict] = None,
-    name_prefix: str = "visit",
-) -> dict:
-    """
-    Capture a screenshot with embedded metadata and chain it.
-
-    Args:
-        driver: Selenium WebDriver (must be on the page to capture)
-        url: Current URL being captured
-        page_text: Visible text on the page (for content hash)
-        session_id: Unique session identifier
-        action: What action triggered this capture (e.g. "visit_back", "login", "scrape")
-        api_data: Optional API response data to include in receipt
-        name_prefix: Filename prefix
-
-    Returns:
-        Proof receipt dict with all verification data
-    """
-    ts = now_iso()
-    ts_compact = now_compact()
-    page_hash = compute_page_hash(page_text)
-    previous_hash = get_last_chain_hash()
-
-    # Take raw screenshot
-    raw_path = SCREENSHOT_DIR / f"{ts_compact}_{session_id}_{name_prefix}_raw.png"
-    driver.save_screenshot(str(raw_path))
-
-    # Read raw bytes
-    raw_bytes = raw_path.read_bytes()
-
-    # Build metadata (this goes into the hash)
-    metadata = {
-        "timestamp": ts,
-        "url": url,
-        "session_id": session_id,
-        "action": action,
-        "page_hash": page_hash,
-        "previous_hash": previous_hash,
-        "raw_screenshot_sha256": hashlib.sha256(raw_bytes).hexdigest(),
-    }
-
-    # Compute proof hash BEFORE overlay (hash of raw + metadata)
-    proof_hash = compute_screenshot_hash(raw_bytes, metadata)
-    metadata["proof_hash"] = proof_hash
-
-    # Embed timestamp overlay onto a copy
-    final_path = SCREENSHOT_DIR / f"{ts_compact}_{session_id}_{name_prefix}.png"
-    overlay_bytes = embed_timestamp_overlay(raw_path, metadata)
-    final_path.write_bytes(overlay_bytes)
-
-    # Compute final file hash (for file integrity check)
-    final_sha256 = hashlib.sha256(overlay_bytes).hexdigest()
-
-    # Delete raw (we keep only the overlaid version)
-    raw_path.unlink(missing_ok=True)
-
-    # Build receipt
-    receipt = {
-        "action": action,
-        "proof_hash": proof_hash,
-        "previous_hash": previous_hash,
-        "timestamp": ts,
-        "url": url,
-        "session_id": session_id,
-        "page_hash": page_hash,
-        "page_text_length": len(page_text),
-        "page_text_sample": page_text[:200] if page_text else "",
-        "screenshot_file": str(final_path),
-        "screenshot_sha256": final_sha256,
-        "raw_screenshot_sha256": metadata["raw_screenshot_sha256"],
-        "api_data": api_data or {},
-        "chain_index": _get_chain_length(),
-    }
-
-    # Append to chain
-    chain_entry = {
-        "proof_hash": proof_hash,
-        "previous_hash": previous_hash,
-        "timestamp": ts,
-        "url": url,
-        "action": action,
-        "screenshot_file": str(final_path),
-        "screenshot_sha256": final_sha256,
-        "page_hash": page_hash,
-    }
-    with open(CHAIN_FILE, "a") as f:
-        f.write(json.dumps(chain_entry, separators=(",", ":")) + "\n")
-
-    # Write receipt
-    receipt_path = RECEIPT_DIR / f"proof_{action}_{ts_compact}.json"
-    receipt_path.write_text(json.dumps(receipt, indent=2))
-
-    return receipt
-
-
-def _get_chain_length() -> int:
-    if not CHAIN_FILE.exists():
-        return 0
-    return len(CHAIN_FILE.read_text().strip().split("\n"))
-
-
-def verify_proof(receipt_path: str) -> dict:
-    """
-    Verify a proof receipt against the actual screenshot file and chain.
-
-    Checks:
-    1. Screenshot file exists
-    2. Screenshot SHA-256 matches receipt
-    3. Proof hash is in the chain
-    4. Previous hash matches the chain entry before it
-    5. Page hash is consistent with page_text_sample
-    6. Timestamp is present and valid ISO format
-    7. API data is present (if claimed)
-
-    Returns:
-        dict with 'valid': bool and 'checks': list of {check, passed, detail}
-    """
-    receipt = json.loads(Path(receipt_path).read_text())
-    checks = []
-
-    # 1. Screenshot file exists
-    screenshot_path = Path(receipt.get("screenshot_file", ""))
-    file_exists = screenshot_path.exists()
-    checks.append({"check": "screenshot_file_exists", "passed": file_exists, "detail": str(screenshot_path)})
-
-    # 2. Screenshot SHA-256 matches
-    sha_match = False
-    if file_exists:
-        actual_sha = hashlib.sha256(screenshot_path.read_bytes()).hexdigest()
-        sha_match = actual_sha == receipt.get("screenshot_sha256")
-        checks.append({"check": "screenshot_sha256_match", "passed": sha_match,
-                        "detail": f"expected={receipt.get('screenshot_sha256','')[:16]} actual={actual_sha[:16]}"})
-    else:
-        checks.append({"check": "screenshot_sha256_match", "passed": False, "detail": "file missing"})
-
-    # 3. Proof hash is in the chain
-    proof_hash = receipt.get("proof_hash", "")
-    chain_entries = []
-    if CHAIN_FILE.exists():
-        chain_entries = [json.loads(line) for line in CHAIN_FILE.read_text().strip().split("\n") if line]
-    in_chain = any(e.get("proof_hash") == proof_hash for e in chain_entries)
-    checks.append({"check": "proof_hash_in_chain", "passed": in_chain,
-                    "detail": f"proof_hash={proof_hash[:16]}... found={in_chain}"})
-
-    # 4. Previous hash matches chain
-    chain_index = receipt.get("chain_index", -1)
-    prev_match = False
-    if 0 < chain_index <= len(chain_entries):
-        chain_entry = chain_entries[chain_index - 1]
-        prev_match = chain_entry.get("previous_hash") == receipt.get("previous_hash")
-        checks.append({"check": "previous_hash_match", "passed": prev_match,
-                        "detail": f"expected={receipt.get('previous_hash','')[:16]} chain={chain_entry.get('previous_hash','')[:16]}"})
-    elif chain_index == 0 and chain_entries:
-        prev_match = chain_entries[0].get("previous_hash") == receipt.get("previous_hash")
-        checks.append({"check": "previous_hash_match", "passed": prev_match,
-                        "detail": f"expected={receipt.get('previous_hash','')[:16]} chain={chain_entries[0].get('previous_hash','')[:16]}"})
-    else:
-        checks.append({"check": "previous_hash_match", "passed": False,
-                        "detail": f"chain_index={chain_index} out of range"})
-
-    # 5. Page hash consistency
-    page_sample = receipt.get("page_text_sample", "")
-    page_hash = receipt.get("page_hash", "")
-    page_hash_valid = len(page_hash) == 64 and all(c in "0123456789abcdef" for c in page_hash)
-    checks.append({"check": "page_hash_valid", "passed": page_hash_valid,
-                    "detail": f"page_hash={page_hash[:16]}... sample_len={len(page_sample)}"})
-
-    # 6. Timestamp valid
-    ts = receipt.get("timestamp", "")
-    ts_valid = False
-    try:
-        datetime.fromisoformat(ts)
-        ts_valid = True
-    except Exception:
-        pass
-    checks.append({"check": "timestamp_valid_iso", "passed": ts_valid, "detail": ts})
-
-    # 7. API data present
-    api_data = receipt.get("api_data", {})
-    has_api_data = bool(api_data)
-    checks.append({"check": "api_data_present", "passed": has_api_data,
-                    "detail": f"keys={list(api_data.keys()) if has_api_data else 'empty'}"})
-
-    # 8. Chain continuity (no gaps)
-    chain_continuous = True
-    if chain_entries and chain_index is not None:
-        if chain_index > 0 and chain_index <= len(chain_entries):
-            entry = chain_entries[chain_index - 1]
-            if entry.get("proof_hash") != proof_hash:
-                chain_continuous = False
-    checks.append({"check": "chain_continuity", "passed": chain_continuous,
-                    "detail": f"chain_index={chain_index}"})
-
-    all_passed = all(c["passed"] for c in checks)
-    return {
-        "valid": all_passed,
-        "receipt": receipt_path,
-        "proof_hash": proof_hash[:32],
-        "timestamp": ts,
-        "url": receipt.get("url", ""),
-        "action": receipt.get("action", ""),
-        "checks": checks,
-    }
-
-
-def verify_chain() -> dict:
-    """
-    Verify the entire hash chain is unbroken.
-
-    Each entry's previous_hash must match the proof_hash of the entry before it.
-    """
-    if not CHAIN_FILE.exists():
-        return {"valid": True, "entries": 0, "detail": "No chain file"}
-
-    entries = [json.loads(line) for line in CHAIN_FILE.read_text().strip().split("\n") if line]
-    if not entries:
-        return {"valid": True, "entries": 0, "detail": "Empty chain"}
-
-    breaks = []
-    for i, entry in enumerate(entries):
-        if i == 0:
-            if entry.get("previous_hash") != "genesis":
-                breaks.append({"index": 0, "detail": "first entry should have previous_hash=genesis"})
-        else:
-            prev_entry = entries[i - 1]
-            if entry.get("previous_hash") != prev_entry.get("proof_hash"):
-                breaks.append({
-                    "index": i,
-                    "detail": f"previous_hash={entry.get('previous_hash','')[:16]} but prev proof_hash={prev_entry.get('proof_hash','')[:16]}"
-                })
-
-    # Verify each screenshot file still exists and hash matches
-    file_checks = []
-    for i, entry in enumerate(entries):
-        screenshot_path = Path(entry.get("screenshot_file", ""))
-        if screenshot_path.exists():
-            actual_sha = hashlib.sha256(screenshot_path.read_bytes()).hexdigest()
-            if actual_sha != entry.get("screenshot_sha256"):
-                file_checks.append({"index": i, "detail": "sha256 mismatch", "file": str(screenshot_path)})
-        else:
-            file_checks.append({"index": i, "detail": "file missing", "file": str(screenshot_path)})
-
-    return {
-        "valid": len(breaks) == 0 and len(file_checks) == 0,
-        "entries": len(entries),
-        "chain_breaks": breaks,
-        "file_check_failures": file_checks,
-        "first_timestamp": entries[0].get("timestamp") if entries else None,
-        "last_timestamp": entries[-1].get("timestamp") if entries else None,
-    }
-
-
-def verify_screenshot_belongs_to_moment(receipt_path: str) -> dict:
-    """
-    Zero-knowledge verification that a screenshot belongs to the moment of visit.
-
-    This checks that:
-    1. The screenshot file hash matches the receipt
-    2. The proof hash (screenshot + metadata) is in the chain
-    3. The page_hash in the receipt matches a hash of the page text
-    4. The timestamp in the receipt is within the session window
-    5. The previous_hash links correctly in the chain
-
-    The verifier does NOT need to trust the screenshot — they trust the hash chain.
-    If any screenshot is fabricated or replayed, the chain breaks.
-    """
-    result = verify_proof(receipt_path)
-
-    # Additional ZK check: extract timestamp from the image overlay and compare
-    receipt = json.loads(Path(receipt_path).read_text())
-    screenshot_path = Path(receipt.get("screenshot_file", ""))
-
-    zk_checks = []
-
-    # Check: proof hash can be recomputed from raw screenshot hash + metadata
-    # (We can't recompute from overlay image, but we can verify the chain link)
-    zk_checks.append({
-        "check": "chain_link_verified",
-        "passed": result["valid"],
-        "detail": "proof hash is in chain and previous_hash links correctly"
-    })
-
-    # Check: timestamp is recent (within last 24h of verification)
-    ts = receipt.get("timestamp", "")
-    try:
-        ts_dt = datetime.fromisoformat(ts)
-        age = (datetime.now(timezone.utc) - ts_dt).total_seconds()
-        zk_checks.append({
-            "check": "timestamp_recent",
-            "passed": age < 86400,  # within 24 hours
-            "detail": f"age={age:.0f}s ({age/3600:.1f}h)"
-        })
-    except Exception:
-        zk_checks.append({"check": "timestamp_recent", "passed": False, "detail": "invalid timestamp"})
-
-    # Check: page_text_sample is non-empty (proves a page was loaded)
-    sample = receipt.get("page_text_sample", "")
-    zk_checks.append({
-        "check": "page_was_loaded",
-        "passed": len(sample) > 10,
-        "detail": f"sample_length={len(sample)}"
-    })
-
-    # Check: API data contains real metrics (not just {"detail":"Not Found"})
-    api_data = receipt.get("api_data", {})
-    has_real_data = False
-    if api_data:
-        # Check for known real data fields
-        real_fields = ["profileStatistics", "totalPageViews", "newVisits", "newEmails",
-                       "contactClicks", "availability", "userSetting", "masseurs"]
-        has_real_data = any(k in api_data for k in real_fields) or len(str(api_data)) > 100
-    zk_checks.append({
-        "check": "api_data_is_real",
-        "passed": has_real_data,
-        "detail": f"api_keys={list(api_data.keys())[:5] if api_data else 'empty'}"
-    })
-
-    all_zk = all(c["passed"] for c in zk_checks)
-    return {
-        "zk_valid": all_zk and result["valid"],
-        "proof_hash": receipt.get("proof_hash", "")[:32],
-        "timestamp": ts,
-        "url": receipt.get("url", ""),
-        "screenshot": str(screenshot_path),
-        "standard_checks": result["checks"],
-        "zk_checks": zk_checks,
-    }
+    log.info("Entering main loop (interval=%ds)", Config.interval)
+    while True:
+        try:
+            run_once(scheduler)
+        except Exception as e:
+            log.error("Main loop error: %s\n%s", e, traceback.format_exc())
+        time.sleep(Config.interval)
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="RM Proof Verification System")
-    parser.add_argument("--verify", help="Verify a single proof receipt")
-    parser.add_argument("--verify-chain", action="store_true", help="Verify entire hash chain")
-    parser.add_argument("--verify-all", action="store_true", help="Verify all proof receipts")
-    parser.add_argument("--stats", action="store_true", help="Show chain statistics")
-    args = parser.parse_args()
-
-    if args.verify:
-        result = verify_screenshot_belongs_to_moment(args.verify)
-        print(json.dumps(result, indent=2))
-        print(f"\nZK VALID: {result['zk_valid']}")
-    elif args.verify_chain:
-        result = verify_chain()
-        print(json.dumps(result, indent=2))
-        print(f"\nCHAIN VALID: {result['valid']}")
-    elif args.verify_all:
-        proofs = sorted(RECEIPT_DIR.glob("proof_*.json"))
-        print(f"Found {len(proofs)} proof receipts\n")
-        for p in proofs:
-            result = verify_screenshot_belongs_to_moment(str(p))
-            status = "✅" if result["zk_valid"] else "❌"
-            print(f"{status} {p.name} | {result['timestamp'][:19]} | {result['url'][:50]}")
-        print(f"\nChain: {json.dumps(verify_chain(), indent=2)}")
-    elif args.stats:
-        result = verify_chain()
-        print(f"Chain entries: {result['entries']}")
-        print(f"Chain valid: {result['valid']}")
-        print(f"First: {result.get('first_timestamp','?')}")
-        print(f"Last: {result.get('last_timestamp','?')}")
-        if result.get("chain_breaks"):
-            print(f"Breaks: {len(result['chain_breaks'])}")
-        if result.get("file_check_failures"):
-            print(f"File failures: {len(result['file_check_failures'])}")
-    else:
-        parser.print_help()
+    main()
 
 ```
 
-_dump_profile.py:
+docker-compose.yml:
 ```
-#!/usr/bin/env python3
-"""Login + dump profile edit page to find bio field."""
-import time, os
-import undetected_chromedriver as uc
-from dotenv import load_dotenv
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
+version: "3.8"
 
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv()
+services:
+  optimizer:
+    build:
+      context: .
+      dockerfile: Dockerfile.daemon
+    container_name: rentmasseur-optimizer
+    ports:
+      - "7860:7860"
+    environment:
+      - RM_USERNAME=${RM_USERNAME}
+      - RM_PASSWORD=${RM_PASSWORD}
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - SPACE_NAME=${SPACE_NAME:-rentmasseur-optimizer}
+      - BACKFILL_VIEWS_DAILY=0
+      - DAEMON_INTERVAL=60
+      - TRAFFIC_CYCLE_MINUTES=5
+      - DAILY_PROMOTION_HOUR=6
+    volumes:
+      - ./content:/app/content
+      - ./logs:/app/logs
+      - rm_chrome_profile:/tmp/rm_traffic_chrome
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:7860/api/health', timeout=10)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
-USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
-
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,900")
-
-driver = uc.Chrome(options=options, version_main=149)
-
-try:
-    print("[1] Login...")
-    driver.get("https://rentmasseur.com/login")
-    time.sleep(6)
-    
-    driver.execute_script("""
-        const pwd = document.querySelector('input[type="password"]');
-        const user = document.querySelector('input[type="text"], input[type="email"]');
-        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
-        if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
-    """, USERNAME, PASSWORD)
-    time.sleep(1)
-    driver.find_element(By.CSS_SELECTOR, 'input[type="password"]').send_keys(Keys.ENTER)
-    time.sleep(5)
-    print(f"  URL: {driver.current_url}")
-    
-    print("\n[2] Profile edit page...")
-    driver.get("https://rentmasseur.com/profile/edit")
-    time.sleep(5)
-    
-    # Screenshot
-    driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/profile_edit_page.png")
-    print("  Screenshot saved")
-    
-    # Dump all editable elements
-    info = driver.execute_script("""
-        const result = {
-            textareas: [],
-            inputs: [],
-            contenteditable: [],
-            iframes: [],
-            buttons: [],
-            links: []
-        };
-        
-        document.querySelectorAll('textarea').forEach(t => {
-            result.textareas.push({id: t.id, name: t.name, value: (t.value||'').substring(0,100), visible: t.offsetParent !== null});
-        });
-        
-        document.querySelectorAll('input').forEach(i => {
-            result.inputs.push({type: i.type, id: i.id, name: i.name, value: (i.value||'').substring(0,50), placeholder: i.placeholder, visible: i.offsetParent !== null});
-        });
-        
-        document.querySelectorAll('[contenteditable="true"], [contenteditable=""]').forEach(e => {
-            result.contenteditable.push({tag: e.tagName, id: e.id, class: e.className, text: (e.innerText||'').substring(0,100)});
-        });
-        
-        document.querySelectorAll('iframe').forEach(f => {
-            result.iframes.push({src: (f.src||'').substring(0,80), id: f.id, name: f.name});
-        });
-        
-        document.querySelectorAll('button').forEach(b => {
-            result.buttons.push({text: (b.innerText||'').substring(0,30), type: b.type, id: b.id});
-        });
-        
-        document.querySelectorAll('a').forEach(a => {
-            if (a.innerText.trim()) result.links.push({text: a.innerText.trim().substring(0,30), href: a.href});
-        });
-        
-        return result;
-    """)
-    
-    print(f"\nTextareas: {len(info['textareas'])}")
-    for t in info['textareas']:
-        print(f"  id={t['id']} name={t['name']} visible={t['visible']} val={t['value'][:60]}")
-    
-    print(f"\nInputs: {len(info['inputs'])}")
-    for i in info['inputs']:
-        print(f"  type={i['type']} id={i['id']} name={i['name']} placeholder={i['placeholder']} visible={i['visible']}")
-    
-    print(f"\nContenteditable: {len(info['contenteditable'])}")
-    for c in info['contenteditable']:
-        print(f"  {c['tag']} id={c['id']} class={c['class']} text={c['text'][:60]}")
-    
-    print(f"\nIframes: {len(info['iframes'])}")
-    for f in info['iframes']:
-        print(f"  src={f['src']} id={f['id']}")
-    
-    print(f"\nButtons: {len(info['buttons'])}")
-    for b in info['buttons']:
-        print(f"  {b['text']} type={b['type']}")
-    
-    print(f"\nLinks: {len(info['links'])}")
-    for l in info['links'][:20]:
-        print(f"  {l['text']} -> {l['href']}")
-    
-    # Also dump page title and any SPA framework indicators
-    print(f"\nTitle: {driver.title}")
-    print(f"URL: {driver.current_url}")
-    
-    # Check for React/Vue/Angular
-    frameworks = driver.execute_script("""
-        return {
-            react: !!document.querySelector('[data-reactroot]') || !!window.__REACT_DEVTOOLS_GLOBAL_HOOK__,
-            vue: !!window.__VUE__,
-            angular: !!window.ng || !!document.querySelector('[ng-version]'),
-            next: !!window.__NEXT_DATA__,
-            nuxt: !!window.__NUXT__
-        };
-    """)
-    print(f"Frameworks: {frameworks}")
-
-finally:
-    driver.quit()
-    print("\nDone.")
+volumes:
+  rm_chrome_profile:
 
 ```
 
-start_cartman_watcher.sh:
-```
-#!/bin/bash
-# Wrapper to start Cartman watcher with correct python
-export PATH="/Users/alep/miniconda3/bin:$PATH"
-export PYTHONPATH="/Users/alep/miniconda3/lib/python3.12/site-packages"
-exec /Users/alep/miniconda3/bin/python3 "/Users/alep/Downloads/MEMBRA::SURFACE=BUILD@LIVE/02_AI_Agents/rentmasseur-extension/cartman_watcher.py"
-
-```
-
-rl_feedback.py:
+rentmasseur_availability.py:
 ```
 #!/usr/bin/env python3
-"""Reinforcement Learning feedback loop for RentMasseur profile optimization.
-
-Tracks profile views, email clicks, phone calls, and booking inquiries per bio variant.
-Uses reward signals to decide which bios to keep, retire, or promote.
-
-Reward function:
-  reward = (views * 1) + (email_clicks * 5) + (phone_clicks * 10) + (bookings * 50)
-  penalty = (bio_age_days * -0.5)  # stale bios decay
-
-The system scrapes profile stats from RentMasseur, correlates them to the active bio,
-and updates the RL state. Bios that underperform are retired. Top performers are reused
-and mutated by the LLM for variation.
-
-Usage:
-    python3 rl_feedback.py                    # collect stats and update rewards
-    python3 rl_feedback.py --report           # show reward history
-    python3 rl_feedback.py --reset            # reset RL state
+"""
+Selenium automation script to keep rentmasseur.com availability set to 24/7.
+Credentials are loaded from a .env file or environment variables.
 """
 
 import argparse
-import json
-import os
 import sys
 import time
-import random
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Optional
+import os
 
-import requests
 from dotenv import load_dotenv
-
+try:
+    import undetected_chromedriver as uc
+    HAS_UC = True
+except ImportError:
+    HAS_UC = False
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    TimeoutException,
+    NoSuchElementException,
+    WebDriverException,
+    ElementClickInterceptedException,
+)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -563,238 +95,706 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Load .env file if present (project root or current directory)
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Configuration from environment
 RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
 RENTMASSEUR_PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+AVAILABILITY_URL = "https://rentmasseur.com/settings?availability=1"
+LOGIN_URL = "https://rentmasseur.com/login"
 
-CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
-RL_STATE_PATH = os.path.join(CONTENT_DIR, "rl_state.json")
-RL_HISTORY_PATH = os.path.join(CONTENT_DIR, "rl_history.json")
-PROFILE_URL = "https://rentmasseur.com/settings/stats"
-DASHBOARD_URL = "https://rentmasseur.com/dashboard"
-
-REWARD_WEIGHTS = {
-    "views": 1,
-    "email_clicks": 5,
-    "phone_clicks": 10,
-    "booking_inquiries": 50,
-    "favorites": 3,
-    "messages": 8,
-}
+# Timing settings
+IMPLICIT_WAIT = 10
+PAGE_TIMEOUT = 30
+CHECK_INTERVAL_MINUTES = 5
 
 
-def _groq_chat(system_prompt: str, user_prompt: str, max_tokens: int = 800, retries: int = 3) -> Optional[str]:
-    if not GROQ_API_KEY:
-        return None
-    for attempt in range(retries):
+def setup_driver(headless: bool = True) -> webdriver.Chrome:
+    """Configure and return a Chrome WebDriver instance with stealth options."""
+    if HAS_UC:
+        chrome_options = uc.ChromeOptions()
+        if headless:
+            chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         try:
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.9,
-                    "max_tokens": max_tokens,
-                },
-                timeout=90,
-            )
-            if resp.status_code == 429:
-                time.sleep(5 * (attempt + 1))
-                continue
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
+            import subprocess, re
+            chrome_ver_out = subprocess.check_output(["google-chrome", "--version"], stderr=subprocess.DEVNULL).decode().strip()
+            chrome_major = int(re.search(r'(\d+)\.', chrome_ver_out).group(1))
+            driver = uc.Chrome(options=chrome_options, version_main=chrome_major)
         except Exception:
-            if attempt < retries - 1:
-                time.sleep(5 * (attempt + 1))
-    return None
-
-
-def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> Optional[dict]:
-    raw = _groq_chat(system_prompt, user_prompt, max_tokens=max_tokens)
-    if not raw:
-        return None
-    try:
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-
-
-def _load_rl_state() -> dict:
-    if os.path.exists(RL_STATE_PATH):
-        try:
-            with open(RL_STATE_PATH, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
-        "bios": {},
-        "current_bio_id": None,
-        "current_bio_start": None,
-        "total_rotations": 0,
-        "best_bio_id": None,
-        "best_reward": 0,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def _save_rl_state(state: dict):
-    os.makedirs(CONTENT_DIR, exist_ok=True)
-    with open(RL_STATE_PATH, "w") as f:
-        json.dump(state, f, indent=2)
-
-
-def _load_history() -> list:
-    if os.path.exists(RL_HISTORY_PATH):
-        try:
-            with open(RL_HISTORY_PATH, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
-
-
-def _save_history(history: list):
-    os.makedirs(CONTENT_DIR, exist_ok=True)
-    with open(RL_HISTORY_PATH, "w") as f:
-        json.dump(history[-500:], f, indent=2)
-
-
-def scrape_profile_stats() -> dict:
-    """Scrape profile view/click stats from RentMasseur dashboard."""
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-
-        options = Options()
-        options.add_argument("--headless")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("useAutomationExtension", False)
-
-        driver = webdriver.Chrome(options=options)
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        })
-
-        try:
-            from rentmasseur_core import login
-            if not login(driver):
-                logger.error("Login failed for stats scraping")
-                return {}
-
-            driver.get(DASHBOARD_URL)
-            time.sleep(5)
-
-            stats = {
-                "scraped_at": datetime.now(timezone.utc).isoformat(),
-                "views": 0,
-                "email_clicks": 0,
-                "phone_clicks": 0,
-                "booking_inquiries": 0,
-                "favorites": 0,
-                "messages": 0,
-            }
-
-            page_text = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
-            page_html = driver.execute_script("return document.documentElement ? document.documentElement.outerHTML : '';") or ""
-
-            import re
-            patterns = {
-                "views": [r"(\d+)\s*(?:profile\s*)?views?", r"views?:\s*(\d+)", r"(\d+)\s*views"],
-                "email_clicks": [r"(\d+)\s*email\s*(?:clicks?|opens?)", r"email:\s*(\d+)", r"(\d+)\s*email"],
-                "phone_clicks": [r"(\d+)\s*phone\s*(?:clicks?|calls?)", r"phone:\s*(\d+)", r"(\d+)\s*phone"],
-                "booking_inquiries": [r"(\d+)\s*(?:booking|inquir|appoint)", r"bookings?:\s*(\d+)"],
-                "favorites": [r"(\d+)\s*(?:favorit|likes?|saves?)", r"favorites?:\s*(\d+)"],
-                "messages": [r"(\d+)\s*messages?", r"messages?:\s*(\d+)"],
-            }
-
-            for key, patterns_list in patterns.items():
-                for pattern in patterns_list:
-                    match = re.search(pattern, page_text, re.IGNORECASE)
-                    if match:
-                        stats[key] = int(match.group(1))
-                        break
-
-            logger.info("Scraped stats: %s", json.dumps(stats))
-            return stats
-
-        finally:
-            driver.quit()
-    except Exception as e:
-        logger.error("Stats scraping error: %s", e)
-        return {}
-
-
-def calculate_reward(stats: dict, bio_age_days: float) -> float:
-    """Calculate reward score from stats."""
-    reward = 0
-    for key, weight in REWARD_WEIGHTS.items():
-        reward += stats.get(key, 0) * weight
-    reward -= bio_age_days * 0.5  # stale bio penalty
-    return round(reward, 2)
-
-
-def update_rl_state(stats: dict) -> dict:
-    """Update RL state with new stats and calculate reward for current bio."""
-    state = _load_rl_state()
-    current_bio_id = state.get("current_bio_id")
-
-    if not current_bio_id:
-        logger.warning("No current bio ID in RL state — nothing to reward")
-        return state
-
-    bio_entry = state["bios"].get(current_bio_id, {})
-    previous_stats = bio_entry.get("last_stats", {})
-    bio_start = state.get("current_bio_start")
-
-    if bio_start:
-        bio_age = (datetime.now(timezone.utc) - datetime.fromisoformat(bio_start)).total_seconds() / 86400
+            driver = uc.Chrome(options=chrome_options)
+        driver.implicitly_wait(IMPLICIT_WAIT)
+        driver.set_page_load_timeout(PAGE_TIMEOUT)
+        return driver
     else:
-        bio_age = 0
+        chrome_options = Options()
+        if headless:
+            chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option("useAutomationExtension", False)
+        chrome_options.add_argument(
+            "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        )
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        driver.implicitly_wait(IMPLICIT_WAIT)
+        driver.set_page_load_timeout(PAGE_TIMEOUT)
+        return driver
 
-    # Delta stats (new since last check)
-    delta = {key: max(0, stats.get(key, 0) - previous_stats.get(key, 0)) for key in REWARD_WEIGHTS}
-    delta_reward = calculate_reward(delta, bio_age)
 
-    # Update bio entry
-    bio_entry["last_stats"] = stats
-    bio_entry["total_reward"] = bio_entry.get("total_reward", 0) + delta_reward
-    bio_entry["delta_reward"] = delta_reward
-    bio_entry["delta_stats"] = delta
-    bio_entry["last_updated"] = datetime.now(timezone.utc).isoformat()
-    bio_entry["age_days"] = round(bio_age, 2)
-    state["bios"][current_bio_id] = bio_entry
+POPUP_DISMISS_SELECTORS = [
+    # Cookie / GDPR consent
+    "button[id*='cookie']",
+    "button[class*='cookie']",
+    "button[aria-label*='cookie']",
+    "button[aria-label*='Cookie']",
+    "button[aria-label*='Accept']",
+    "button[aria-label*='accept']",
+    "button[data-testid*='cookie']",
+    "button[data-testid*='close']",
+    "a[href*='cookie']",
+    "[class*='cookie-banner'] button",
+    "[class*='cookieConsent'] button",
+    "[class*='gdpr'] button",
+    "[class*='consent'] button",
+    "[id*='onetrust'] button",
+    "[id*='CybotCookiebotDialogBodyButton']",
+    "[class*='banner'] button[aria-label*='close']",
+    "[class*='modal'] button[aria-label*='close']",
+    "[class*='dialog'] button[aria-label*='close']",
+    "[role='dialog'] button",
+    "[role='alert'] button",
+    # Text-based common buttons
+    "//button[contains(text(),'Accept')]",
+    "//button[contains(text(),'OK')]",
+    "//button[contains(text(),'Got it')]",
+    "//button[contains(text(),'Dismiss')]",
+    "//button[contains(text(),'Agree')]",
+    "//button[contains(text(),'Continue')]",
+    "//button[contains(text(),'I understand')]",
+    "//button[contains(text(),'Allow')]",
+    "//button[contains(text(),'Enable')]",
+    "//button[contains(text(),'Maybe later')]",
+    "//button[contains(text(),'Not now')]",
+    "//button[contains(text(),'Close')]",
+    "//button[contains(text(),'×')]",
+    "//a[contains(text(),'Accept')]",
+    "//a[contains(text(),'Dismiss')]",
+]
 
-    # Track best bio
-    if bio_entry["total_reward"] > state.get("best_reward", 0):
-        state["best_bio_id"] = current_bio_id
-        state["best_reward"] = bio_entry["total_reward"]
 
-    # Log to history
-    history = _load_history()
-    history.append({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "bio_id": current_bio_id,
-        "delta_stats": delta,
-        "delta_reward": delta_reward,
-        "total_reward": bio_entry["total_reward"],
-        "bio_age_days": round(bio_age, 2),
-    })
-    _save_history(history)
+def dismiss_popups(driver: webdriver.Chrome) -> None:
+    """Dismiss cookie banners, GDPR dialogs, and other popups that block interaction."""
+    clicked = 0
+    # Try CSS selectors first via JS (fastest)
+    for selector in POPUP_DISMISS_SELECTORS:
+        if not selector.startswith("//"):
+            try:
+                elements = driver.execute_script(
+                    "return Array.from(document.querySelectorAll(arguments[0])).filter(el => el.offsetParent !== null);",
+                    selector,
+                )
+                for el in elements:
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", el)
+                        clicked += 1
+                        time.sleep(0.3)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    # Try XPath selectors
+    for xpath in POPUP_DISMISS_SELECTORS:
+        if xpath.startswith("//"):
+            try:
+                elements = driver.find_elements(By.XPATH, xpath)
+                for el in elements:
+                    try:
+                        if el.is_displayed():
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", el)
+                            clicked += 1
+                            time.sleep(0.3)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    # Generic overlay / modal close via JS: try to click anything with 'close' or 'dismiss' aria-label
+    try:
+        driver.execute_script("""
+            const closeBtns = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+                .filter(b => b.offsetParent !== null &&
+                    (/close|dismiss|reject|deny|skip|cancel/i.test((b.getAttribute('aria-label')||'') + ' ' + (b.innerText||''))));
+            closeBtns.forEach(b => { try { b.click(); } catch(e) {} });
+        """)
+    except Exception:
+        pass
+    if clicked:
+        logger.info("Dismissed %d popup/banner elements", clicked)
+
+
+def _find_element(driver, by, value, timeout=5):
+    """Helper to find an element with a short timeout."""
+    try:
+        return WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, value)))
+    except TimeoutException:
+        return None
+
+
+def scan_page(driver: webdriver.Chrome) -> None:
+    """Brute-force scan: dump every interactive element with its selector hash."""
+    logger.info("=== DOM SCAN START ===")
+    elements = driver.execute_script("""
+        const data = [];
+        const inputs = document.querySelectorAll('input, textarea, select');
+        const buttons = document.querySelectorAll('button, [role="button"]');
+        
+        function shortId(el) {
+            const id = el.id ? '#' + el.id : '';
+            const cls = (el.className && typeof el.className === 'string')
+                ? '.' + el.className.split(' ').filter(Boolean).join('.')
+                : '';
+            const name = el.name ? '[name=' + el.name + ']' : '';
+            const type = el.type ? '[type=' + el.type + ']' : '';
+            return el.tagName.toLowerCase() + id + name + type;
+        }
+        
+        function xpath(el) {
+            const idx = (s, n) => {
+                let c = 1;
+                for (const p of n.parentNode.children) {
+                    if (p === n) return c;
+                    if (p.nodeName === n.nodeName) c++;
+                }
+                return 1;
+            };
+            let p = el, path = '';
+            while (p && p.nodeType === 1) {
+                const name = p.nodeName.toLowerCase();
+                const i = idx(name, p);
+                path = '/' + name + '[' + i + ']' + path;
+                p = p.parentNode;
+            }
+            return path;
+        }
+        
+        for (const el of inputs) {
+            data.push({
+                tag: el.tagName.toLowerCase(),
+                type: el.type || '',
+                name: el.name || '',
+                id: el.id || '',
+                placeholder: el.placeholder || '',
+                selector: shortId(el),
+                xpath: xpath(el),
+                text: (el.value || el.textContent || '').slice(0, 50),
+            });
+        }
+        for (const el of buttons) {
+            data.push({
+                tag: el.tagName.toLowerCase(),
+                type: el.type || '',
+                name: el.name || '',
+                id: el.id || '',
+                selector: shortId(el),
+                xpath: xpath(el),
+                text: (el.textContent || el.innerText || '').trim().slice(0, 50),
+            });
+        }
+        return data;
+    """)
+    for el in elements:
+        logger.info("SCAN | %-12s | %-20s | xpath=%s", el['selector'], el['text'][:20], el['xpath'])
+    logger.info("=== DOM SCAN END (%d elements) ===", len(elements))
+
+
+def _is_captcha_page(driver: webdriver.Chrome) -> bool:
+    """Check if the current page is a CrowdSec captcha or anti-bot challenge."""
+    try:
+        page_text = driver.execute_script("return document.body ? document.body.innerText.slice(0, 2000) : '';") or ""
+        page_src = driver.execute_script("return document.documentElement ? document.documentElement.outerHTML.slice(0, 3000) : '';") or ""
+        indicators = [
+            "crowdsec", "captcha", "checking your browser", "please wait",
+            "ddos protection", "access denied", "are you human", "verify you are",
+            "challenge", "cloudflare", "just a moment", "enable javascript",
+        ]
+        text_lower = page_text.lower() + page_src.lower()
+        return any(ind in text_lower for ind in indicators)
+    except Exception:
+        return False
+
+
+def brute_force_login(driver: webdriver.Chrome, max_retries: int = 5) -> bool:
+    """Log in using brute-force DOM discovery via JavaScript with retry logic."""
+    if not RENTMASSEUR_USERNAME or not RENTMASSEUR_PASSWORD:
+        logger.error("Missing credentials")
+        return False
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info("Login attempt %d/%d — navigating to %s", attempt, max_retries, LOGIN_URL)
+            driver.set_page_load_timeout(90)
+            driver.get(LOGIN_URL)
+
+            # Wait for SPA hydration with increasing delays
+            wait_time = 5 + (attempt * 3)
+            logger.info("Waiting %ds for page to render...", wait_time)
+            time.sleep(wait_time)
+
+            # Check for captcha / anti-bot page
+            if _is_captcha_page(driver):
+                logger.warning("Captcha/anti-bot page detected on attempt %d — refreshing", attempt)
+                if attempt < max_retries:
+                    time.sleep(10)
+                    driver.refresh()
+                    time.sleep(10)
+                    continue
+                else:
+                    logger.error("Captcha blocking login after %d attempts", max_retries)
+                    _dump_debug(driver, "login_captcha_final")
+                    return False
+
+            # Dismiss cookie/GPS banners and other popups
+            dismiss_popups(driver)
+            time.sleep(2)
+
+            # Wait for password field to appear (SPA may still be hydrating)
+            pwd_field = _find_element(driver, By.CSS_SELECTOR, 'input[type="password"]', timeout=15)
+            if not pwd_field:
+                logger.warning("No password field found on attempt %d — page may still be loading", attempt)
+                # Check if page has any inputs at all
+                input_count = driver.execute_script("return document.querySelectorAll('input').length;") or 0
+                logger.info("Page has %d input elements", input_count)
+                if input_count == 0:
+                    logger.warning("Page has 0 inputs — likely blocked or not rendered")
+                    _dump_debug(driver, f"login_no_inputs_attempt{attempt}")
+                    if attempt < max_retries:
+                        time.sleep(15)
+                        continue
+                else:
+                    _dump_debug(driver, f"login_no_password_attempt{attempt}")
+                    if attempt < max_retries:
+                        time.sleep(10)
+                        continue
+
+            # Brute-force: ask the browser to find login fields for us
+            result = driver.execute_script("""
+                const pwd = document.querySelector('input[type=\"password\"]');
+                if (!pwd) return {error: 'no_password'};
+                
+                // Scan ALL inputs on the page, then find text/email ones that precede the password
+                const allInputs = Array.from(document.querySelectorAll('input'));
+                const candidates = allInputs.filter(i => 
+                    i !== pwd && (i.type === 'text' || i.type === 'email' || i.type === 'tel')
+                );
+                
+                // Prefer the candidate that is closest (preceding) in DOM order
+                let user = null;
+                let bestDist = Infinity;
+                for (const cand of candidates) {
+                    const pos = pwd.compareDocumentPosition(cand);
+                    if (pos & Node.DOCUMENT_POSITION_PRECEDING) {
+                        // Heuristic: measure "distance" by counting elements between them
+                        let dist = 0;
+                        let el = cand;
+                        while (el && el !== pwd) {
+                            el = el.nextElementSibling || el.parentElement;
+                            dist++;
+                            if (dist > 100) break;
+                        }
+                        if (dist < bestDist) {
+                            bestDist = dist;
+                            user = cand;
+                        }
+                    }
+                }
+                if (!user && candidates.length > 0) user = candidates[0];
+                if (!user) return {error: 'no_username'};
+                
+                // Find submit button: search form first, then ancestor chain, then whole doc
+                let btn = null;
+                const form = pwd.closest('form');
+                if (form) {
+                    btn = form.querySelector('button[type=\"submit\"]') || form.querySelector('input[type=\"submit\"]');
+                    if (!btn) {
+                        const fb = Array.from(form.querySelectorAll('button'));
+                        btn = fb.find(b => /login|sign.in|submit/i.test(b.innerText)) || fb[0];
+                    }
+                }
+                if (!btn) {
+                    // Walk up ancestors looking for a button
+                    let ancestor = pwd.parentElement;
+                    for (let i = 0; i < 5 && ancestor && !btn; i++) {
+                        const ab = Array.from(ancestor.querySelectorAll('button'));
+                        btn = ab.find(b => /login|sign.in|submit/i.test(b.innerText)) || ab[0];
+                        ancestor = ancestor.parentElement;
+                    }
+                }
+                if (!btn) {
+                    // Last resort: any button on page that looks like login
+                    const allBtns = Array.from(document.querySelectorAll('button, [role=\"button\"]'));
+                    btn = allBtns.find(b => /login|sign.in|submit/i.test(b.innerText));
+                }
+                if (!btn) return {error: 'no_button'};
+                
+                // Return identifying attributes so Selenium can locate them
+                function attrs(el) {
+                    const id = el.id ? '#' + el.id : '';
+                    const cls = (el.className && typeof el.className === 'string')
+                        ? '.' + el.className.split(' ').filter(Boolean).join('.')
+                        : '';
+                    const name = el.name ? '[name=' + el.name + ']' : '';
+                    const type = el.type ? '[type=' + el.type + ']' : '';
+                    return {
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || '',
+                        name: el.name || '',
+                        type: el.type || '',
+                        class: (el.className && typeof el.className === 'string') 
+                            ? el.className.split(' ').filter(Boolean).join(' ') 
+                            : '',
+                        placeholder: el.placeholder || '',
+                        selector: el.tagName.toLowerCase() + id + name + type + cls.split('.')[0],
+                    };
+                }
+                return {
+                    user: attrs(user),
+                    pwd: attrs(pwd),
+                    btn: attrs(btn),
+                };
+            """)
+            
+            if isinstance(result, dict) and 'error' in result:
+                logger.warning("Login discovery failed on attempt %d: %s", attempt, result['error'])
+                scan_page(driver)
+                _dump_debug(driver, f"login_brute_force_{result['error']}_attempt{attempt}")
+                if attempt < max_retries:
+                    time.sleep(10)
+                    continue
+                return False
+            
+            logger.info("Discovered login form: user=%s, pwd=%s, btn=%s", 
+                        result['user']['selector'], result['pwd']['selector'], result['btn']['selector'])
+            
+            # Build Selenium selectors from discovered attributes
+            def build_selector(info: dict) -> str:
+                tag = info['tag']
+                if info['id']: return f"#{info['id']}"
+                if info['name']: return f"{tag}[name='{info['name']}']"
+                if info['placeholder']: return f"{tag}[placeholder='{info['placeholder']}']"
+                if info['class']: return f"{tag}.{info['class'].split()[0]}"
+                return tag
+            
+            user_sel = build_selector(result['user'])
+            pwd_sel  = build_selector(result['pwd'])
+            btn_sel  = build_selector(result['btn'])
+            
+            username_field = driver.find_element(By.CSS_SELECTOR, user_sel)
+            password_field = driver.find_element(By.CSS_SELECTOR, pwd_sel)
+            submit_btn     = driver.find_element(By.CSS_SELECTOR, btn_sel)
+            
+            username_field.clear()
+            username_field.send_keys(RENTMASSEUR_USERNAME)
+            password_field.clear()
+            password_field.send_keys(RENTMASSEUR_PASSWORD)
+            logger.info("Filled credentials into %s / %s", user_sel, pwd_sel)
+            
+            driver.execute_script("arguments[0].click();", submit_btn)
+            logger.info("Clicked submit: %s", btn_sel)
+            time.sleep(5)
+            
+            # Verify login success
+            dismiss_popups(driver)
+            current_url = driver.current_url
+            if LOGIN_URL not in current_url:
+                logger.info("Login successful (redirected to %s)", current_url)
+                return True
+            
+            # Check for error messages
+            error_text = driver.execute_script("""
+                const el = document.querySelector('[role=alert], .error, .form-error, .notification');
+                return el ? el.innerText : '';
+            """)
+            if error_text:
+                logger.error("Login page shows error: %s", error_text.strip())
+            
+            logger.warning("Still on login page after submit (attempt %d)", attempt)
+            scan_page(driver)
+            _dump_debug(driver, f"login_still_on_page_attempt{attempt}")
+            if attempt < max_retries:
+                time.sleep(10)
+                continue
+            
+        except TimeoutException:
+            logger.warning("Login page load timed out on attempt %d", attempt)
+            _dump_debug(driver, f"login_timeout_attempt{attempt}")
+            if attempt < max_retries:
+                time.sleep(15)
+                continue
+        except WebDriverException as e:
+            logger.warning("WebDriver error on attempt %d: %s", attempt, e)
+            _dump_debug(driver, f"login_webdriver_error_attempt{attempt}")
+            if attempt < max_retries:
+                time.sleep(15)
+                continue
+        except Exception as e:
+            logger.warning("Unexpected error on attempt %d: %s", attempt, e)
+            if attempt < max_retries:
+                time.sleep(15)
+                continue
+    
+    logger.error("Login failed after %d attempts", max_retries)
+    return False
+
+
+def login(driver: webdriver.Chrome) -> bool:
+    """Login using native input setter + Enter key (works with Next.js/React SPAs)."""
+    if not RENTMASSEUR_USERNAME or not RENTMASSEUR_PASSWORD:
+        logger.error("Missing credentials")
+        return False
+
+    for attempt in range(1, 4):
+        logger.info("Login attempt %d/3 — navigating to %s", attempt, LOGIN_URL)
+        driver.set_page_load_timeout(90)
+        driver.get(LOGIN_URL)
+        time.sleep(6)
+
+        # Check for CAPTCHA
+        captcha = driver.execute_script("""
+            return !!document.querySelector('.g-recaptcha, #captcha, iframe[src*="recaptcha"]');
+        """)
+        if captcha:
+            logger.warning("CAPTCHA detected on attempt %d — waiting", attempt)
+            time.sleep(10)
+            captcha = driver.execute_script("""
+                return !!document.querySelector('.g-recaptcha, #captcha, iframe[src*="recaptcha"]');
+            """)
+            if captcha:
+                logger.error("CAPTCHA still present after wait")
+                _dump_debug(driver, f"login_captcha_attempt{attempt}")
+                if attempt < 3:
+                    time.sleep(10)
+                    continue
+                return False
+
+        # Dismiss popups
+        dismiss_popups(driver)
+        time.sleep(2)
+
+        # Fill login form using native setter
+        result = driver.execute_script("""
+            const pwd = document.querySelector('input[type="password"]');
+            const user = document.querySelector('input[type="text"], input[type="email"]');
+            if (!pwd) return {error: 'no_password'};
+            if (!user) return {error: 'no_username'};
+            const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            ns.call(user, arguments[0]);
+            user.dispatchEvent(new Event('input', {bubbles: true}));
+            ns.call(pwd, arguments[1]);
+            pwd.dispatchEvent(new Event('input', {bubbles: true}));
+            return {ok: true, user_id: user.id, pwd_id: pwd.id};
+        """, RENTMASSEUR_USERNAME, RENTMASSEUR_PASSWORD)
+
+        if isinstance(result, dict) and 'error' in result:
+            logger.warning("Login form error on attempt %d: %s", attempt, result['error'])
+            _dump_debug(driver, f"login_{result['error']}_attempt{attempt}")
+            if attempt < 3:
+                time.sleep(10)
+                continue
+            return False
+
+        time.sleep(1)
+
+        # Submit via Enter key on password field
+        try:
+            pwd_el = driver.find_element(By.CSS_SELECTOR, 'input[type="password"]')
+            pwd_el.send_keys(Keys.ENTER)
+        except Exception:
+            driver.execute_script("""
+                const btn = document.querySelector('button[type="submit"]') ||
+                            Array.from(document.querySelectorAll('button')).find(b => /login|sign|submit/i.test(b.innerText));
+                if (btn) btn.click();
+            """)
+
+        time.sleep(5)
+
+        if LOGIN_URL not in driver.current_url:
+            logger.info("Login successful (redirected to %s)", driver.current_url)
+            return True
+
+        logger.warning("Still on login page after submit (attempt %d)", attempt)
+        _dump_debug(driver, f"login_still_on_page_attempt{attempt}")
+        if attempt < 3:
+            time.sleep(10)
+            continue
+
+    logger.error("Login failed after 3 attempts")
+    return False
+
+
+def _dump_debug(driver: webdriver.Chrome, label: str) -> None:
+    """Save screenshot and page source for debugging."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+    os.makedirs(debug_dir, exist_ok=True)
+    prefix = os.path.join(debug_dir, f"debug_{label}_{ts}")
+    try:
+        driver.save_screenshot(f"{prefix}.png")
+        logger.info("Screenshot saved: %s.png", prefix)
+    except Exception as e:
+        logger.error("Failed to save screenshot: %s", e)
+    try:
+        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        logger.info("Page source saved: %s.html", prefix)
+    except Exception as e:
+        logger.error("Failed to save page source: %s", e)
+
+
+def set_availability_24_7(driver: webdriver.Chrome) -> bool:
+    """Navigate to availability settings and enable 24/7 availability."""
+    try:
+        logger.info("Navigating to availability settings: %s", AVAILABILITY_URL)
+        driver.get(AVAILABILITY_URL)
+        time.sleep(3)  # Let page render
+
+        # Dismiss any popups that could block the availability controls
+        dismiss_popups(driver)
+
+        # Do everything in JS since the two selects share identical classes
+        ok = driver.execute_script("""
+            const selects = Array.from(document.querySelectorAll('select'));
+            const buttons = Array.from(document.querySelectorAll('button'));
+            
+            // Find availability status select (options contain 'Available' / 'Not Set')
+            const statusSelect = selects.find(s => {
+                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
+                return opts.includes('available') || opts.includes('not set');
+            });
+            if (!statusSelect) return {error: 'no_status_select'};
+            
+            // Select 'Available' (skip 'Not Available')
+            const availOpt = Array.from(statusSelect.options).find(
+                o => o.text.toLowerCase().includes('available') && !o.text.toLowerCase().includes('not')
+            );
+            if (availOpt) {
+                statusSelect.value = availOpt.value;
+                statusSelect.dispatchEvent(new Event('change', {bubbles: true}));
+            }
+            
+            // Find time select (options contain 'Hour' or 'Minutes')
+            const timeSelect = selects.find(s => {
+                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
+                return opts.some(t => t.includes('hour') || t.includes('minute'));
+            });
+            if (timeSelect) {
+                // Pick the longest duration (last option that contains a number)
+                const durationOpts = Array.from(timeSelect.options).filter(
+                    o => /\\d/.test(o.text)
+                );
+                if (durationOpts.length > 0) {
+                    const longest = durationOpts[durationOpts.length - 1];
+                    timeSelect.value = longest.value;
+                    timeSelect.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+            }
+            
+            // Find and click SET button
+            const setBtn = buttons.find(b => /set|save|apply/i.test(b.innerText));
+            if (!setBtn) return {error: 'no_set_button'};
+            setBtn.click();
+            
+            return {ok: true};
+        """)
+        
+        if isinstance(ok, dict) and ok.get('error'):
+            logger.error("Availability JS automation failed: %s", ok['error'])
+            scan_page(driver)
+            _dump_debug(driver, f"availability_{ok['error']}")
+            return False
+        
+        logger.info("Availability set via JS automation")
+        time.sleep(2)
+        return True
+        
+    except TimeoutException:
+        logger.error("Availability page timed out")
+        return False
+    except WebDriverException as e:
+        logger.error("WebDriver error setting availability: %s", e)
+        return False
+
+
+def run_once(headless: bool = True) -> bool:
+    """Execute a single availability check-and-set cycle."""
+    driver: Optional[webdriver.Chrome] = None
+    try:
+        driver = setup_driver(headless=headless)
+        if not login(driver):
+            return False
+        return set_availability_24_7(driver)
+    except Exception as e:
+        logger.error("Unexpected error: %s", e)
+        return False
+    finally:
+        if driver:
+            driver.quit()
+
+
+def main() -> None:
+    """Run the availability keeper in a loop or once for CI/CD."""
+    parser = argparse.ArgumentParser(description="Keep RentMasseur availability set to 24/7")
+    parser.add_argument("--once", action="store_true", help="Run a single check and exit (for CI/CD)")
+    parser.add_argument("--headless", default="true", help="Run headless (true/false)")
+    parser.add_argument("--interval", type=int, default=CHECK_INTERVAL_MINUTES, help="Loop interval in minutes")
+    args = parser.parse_args()
+
+    headless = args.headless.lower() != "false"
+
+    if args.once:
+        logger.info("Running single availability check")
+        success = run_once(headless=headless)
+        sys.exit(0 if success else 1)
+
+    run_count = 0
+    logger.info("Starting RentMasseur 24/7 availability keeper")
+    logger.info("Check interval: %d minutes", args.interval)
+
+    while True:
+        run_count += 1
+        logger.info("--- Run #%d at %s ---", run_count, datetime.now().isoformat())
+        success = run_once(headless=headless)
+        if success:
+            logger.info("Run #%d completed successfully", run_count)
+        else:
+            logger.error("Run #%d failed", run_count)
+
+        sleep_seconds = args.interval * 60
+        logger.info("Sleeping for %d minutes...", args.interval)
+        time.sleep(sleep_seconds)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+bio_ab_tester.py:
+```
+#!/usr/bin/env python3
+"""Bio A/B testing engine — generates multiple bio variants, scores them
+against competitors, and only uploads the verified winner.
+
+Process:
+1. Scrape top competitor bios from RentMasseur
+2. Generate 30 bio variants via Groq

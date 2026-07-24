@@ -1,45 +1,296 @@
-    lines = ["=" * 60, "PHOTO ROTATION REPORT", "=" * 60]
-    lines.append(f"Total photos: {len(state.get('photos', []))}")
-    lines.append(f"Total rotations: {state.get('rotation_count', 0)}")
-    for p in state.get("photos", []):
-        reward = state.get("photo_rewards", {}).get(p["id"], 0)
-        lines.append(f"  {p['id']}: used={p.get('times_used', 0)}, reward={reward}")
-    return "\n".join(lines)
+    """, (contact, limit)).fetchall()
+    conn.close()
 
+    results = []
+    for r in rows:
+        d = dict(r)
+        d["date_iso"] = apple_epoch_to_iso(d.get("date", 0))
+        results.append(d)
+    return results
+
+
+def check_rm_related(contact: str) -> bool:
+    """Check if a contact identifier appears in the RM visitor DB."""
+    if not ENGAGEMENT_DB.exists():
+        return False
+    try:
+        conn = sqlite3.connect(str(ENGAGEMENT_DB))
+        # Check if contact matches any visitor username
+        row = conn.execute(
+            "SELECT username FROM visitors WHERE username LIKE ? OR username LIKE ?",
+            (f"%{contact}%", f"%{contact.replace('+', '')}%")
+        ).fetchone()
+        conn.close()
+        return row is not None
+    except Exception:
+        return False
+
+
+def get_rm_related_conversations() -> list:
+    """Get conversations that are likely RM-related (by keyword or contact match)."""
+    convs = get_conversations(200)
+    rm_convs = []
+
+    for c in convs:
+        if c.get("is_rm_related"):
+            rm_convs.append(c)
+            continue
+
+        # Check message content for RM keywords
+        messages = get_conversation_messages(c["contact"], limit=10)
+        for msg in messages:
+            text_lower = (msg.get("text") or "").lower()
+            if any(kw in text_lower for kw in RM_KEYWORDS):
+                c["is_rm_related"] = True
+                c["matched_keyword"] = next(
+                    (kw for kw in RM_KEYWORDS if kw in text_lower), None
+                )
+                break
+
+        if c.get("is_rm_related"):
+            rm_convs.append(c)
+
+    return rm_convs
+
+
+# ─── Sync to Engagement DB ───────────────────────────────────────────
+
+def init_imessage_table():
+    if not ENGAGEMENT_DB.exists():
+        return
+    conn = sqlite3.connect(str(ENGAGEMENT_DB))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS imessage_sync (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact TEXT NOT NULL,
+            msg_id INTEGER,
+            text TEXT,
+            date_iso TEXT,
+            is_from_me INTEGER,
+            synced_at TEXT NOT NULL,
+            is_rm_related INTEGER DEFAULT 0,
+            matched_visitor TEXT,
+            UNIQUE(msg_id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def sync_messages(limit: int = 500):
+    """Sync recent iMessages to the engagement DB."""
+    init_imessage_table()
+
+    conn = get_imessage_conn()
+    if not conn:
+        return 0
+
+    rows = conn.execute("""
+        SELECT
+            message.ROWID as msg_id,
+            message.text as text,
+            message.date as date,
+            message.is_from_me as is_from_me,
+            handle.id as contact
+        FROM message
+        LEFT JOIN handle ON message.handle_id = handle.ROWID
+        WHERE message.text IS NOT NULL
+        ORDER BY message.date DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+
+    eng_conn = sqlite3.connect(str(ENGAGEMENT_DB))
+    synced = 0
+    for r in rows:
+        d = dict(r)
+        date_iso = apple_epoch_to_iso(d.get("date", 0))
+        is_rm = 1 if check_rm_related(d["contact"]) else 0
+
+        # Check message content for RM keywords
+        text_lower = (d.get("text") or "").lower()
+        matched_kw = None
+        if not is_rm:
+            for kw in RM_KEYWORDS:
+                if kw in text_lower:
+                    is_rm = 1
+                    matched_kw = kw
+                    break
+
+        try:
+            eng_conn.execute(
+                "INSERT OR IGNORE INTO imessage_sync "
+                "(contact, msg_id, text, date_iso, is_from_me, synced_at, is_rm_related) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (d["contact"], d["msg_id"], d["text"], date_iso,
+                 d["is_from_me"], now_iso(), is_rm)
+            )
+            synced += eng_conn.total_changes > 0
+        except Exception:
+            pass
+
+    eng_conn.commit()
+
+    # Count RM-related
+    rm_count = eng_conn.execute(
+        "SELECT COUNT(*) FROM imessage_sync WHERE is_rm_related=1"
+    ).fetchone()[0]
+    total_synced = eng_conn.execute("SELECT COUNT(*) FROM imessage_sync").fetchone()[0]
+    eng_conn.close()
+
+    log(f"Synced {len(rows)} messages ({synced} new). Total: {total_synced}, RM-related: {rm_count}")
+    return synced
+
+
+# ─── Reply Drafting with Ollama ──────────────────────────────────────
+
+def draft_reply(contact: str, context_messages: int = 20) -> str:
+    """Generate a reply draft for a contact using Ollama."""
+    messages = get_conversation_messages(contact, limit=context_messages)
+    if not messages:
+        return "(no messages found for this contact)"
+
+    # Build conversation context
+    messages.reverse()  # chronological order
+    conversation = ""
+    for msg in messages:
+        sender = "Me" if msg["is_from_me"] else "Client"
+        conversation += f"{sender}: {msg['text']}\n"
+
+    prompt = f"""You are a professional massage therapist on RentMasseur.com responding to a client via iMessage.
+Based on the conversation below, draft a short, friendly, professional reply.
+
+Conversation:
+{conversation}
+
+Rules:
+- Keep it under 200 characters
+- Be warm but professional
+- If they're asking about booking, mention availability
+- If they're asking about location, mention Manhattan incall
+- Do not use emoji
+- Write only the reply message, nothing else
+
+Reply:"""
+
+    import requests
+    try:
+        resp = requests.post(OLLAMA_URL, json={
+            "model": "llama3.1",
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.7, "num_predict": 150}
+        }, timeout=60)
+        resp.raise_for_status()
+        draft = resp.json().get("response", "").strip()
+        return draft
+    except Exception as e:
+        log(f"Ollama error: {e}", "ERROR")
+        return f"(draft generation failed: {e})"
+
+
+# ─── Match Visitors to iMessage Contacts ─────────────────────────────
+
+def match_visitors_to_contacts() -> list:
+    """Try to match RM visitor usernames to iMessage contacts."""
+    if not ENGAGEMENT_DB.exists():
+        return []
+
+    eng_conn = sqlite3.connect(str(ENGAGEMENT_DB))
+    visitors = eng_conn.execute("SELECT username FROM visitors").fetchall()
+    eng_conn.close()
+
+    im_conn = get_imessage_conn()
+    if not im_conn:
+        return []
+
+    # Get all iMessage contacts
+    contacts = im_conn.execute("SELECT DISTINCT id FROM handle").fetchall()
+    im_conn.close()
+
+    matches = []
+    visitor_names = [v[0].lower() for v in visitors]
+    contact_list = [c[0] for c in contacts]
+
+    for vname in visitor_names:
+        for contact in contact_list:
+            # Match by partial phone number or email
+            contact_clean = contact.replace("+", "").replace("-", "").replace(" ", "").lower()
+            if vname in contact_clean or contact_clean in vname:
+                matches.append({"visitor": vname, "contact": contact})
+            # Also check if contact email contains username
+            elif "@" in contact and vname in contact.lower():
+                matches.append({"visitor": vname, "contact": contact})
+
+    log(f"Matched {len(matches)} visitors to iMessage contacts")
+    return matches
+
+
+# ─── Main ────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Photo rotator for RentMasseur")
-    parser.add_argument("--add", help="Add photo to pool")
-    parser.add_argument("--label", default="", help="Label for added photo")
-    parser.add_argument("--list", action="store_true", help="List photo pool")
-    parser.add_argument("--report", action="store_true", help="Show photo report")
-    parser.add_argument("--dry-run", action="store_true", help="Don't upload, just pick next")
+    parser = argparse.ArgumentParser(description="RM iMessage Bridge")
+    parser.add_argument("--sync", action="store_true", help="Sync recent messages to DB")
+    parser.add_argument("--conversations", action="store_true", help="List all conversations")
+    parser.add_argument("--rm-conversations", action="store_true", help="List RM-related conversations only")
+    parser.add_argument("--draft", action="store_true", help="Draft a reply for a contact")
+    parser.add_argument("--contact", help="Contact ID for drafting")
+    parser.add_argument("--match-visitors", action="store_true", help="Match visitors to iMessage contacts")
+    parser.add_argument("--limit", type=int, default=50, help="Max results")
     args = parser.parse_args()
 
-    if args.add:
-        add_photo_to_pool(args.add, args.label)
-        return
-
-    if args.list:
-        list_photos()
-        return
-
-    if args.report:
-        print(photo_report())
-        return
-
-    # Default: rotate
-    photo = get_next_photo()
-    if not photo:
+    if not IMESSAGE_DB.exists():
+        log(f"iMessage DB not found: {IMESSAGE_DB}", "ERROR")
+        log("This script only works on macOS with iMessage enabled.", "ERROR")
         sys.exit(1)
 
-    print(f"Next photo: {photo['id']} ({photo['path']})")
-    if args.dry_run:
-        logger.info("Dry run — not uploading")
+    if args.sync:
+        sync_messages(limit=args.limit * 10)
         return
 
-    success = rotate_photo_on_profile(photo["path"])
-    sys.exit(0 if success else 1)
+    if args.conversations:
+        convs = get_conversations(args.limit)
+        print(f"\n{'Contact':30s} {'Msgs':>5s} {'Sent':>5s} {'Recv':>5s} {'Last Message':20s} {'RM':>3s}")
+        print("-" * 80)
+        for c in convs:
+            print(f"{c['contact']:30s} {c['msg_count']:5d} {c['sent_by_me']:5d} "
+                  f"{c['sent_by_them']:5d} {c['last_msg_iso'][:19]:20s} {'✓' if c['is_rm_related'] else '—':3s}")
+        return
+
+    if args.rm_conversations:
+        convs = get_rm_related_conversations()
+        print(f"\nRM-related conversations ({len(convs)}):")
+        for c in convs:
+            print(f"\n  {c['contact']} ({c['msg_count']} msgs, last: {c['last_msg_iso'][:19]})")
+            if c.get("matched_keyword"):
+                print(f"    Matched keyword: {c['matched_keyword']}")
+            # Show last 3 messages
+            msgs = get_conversation_messages(c["contact"], limit=3)
+            for m in reversed(msgs):
+                sender = "Me" if m["is_from_me"] else "Them"
+                print(f"    [{m['date_iso'][:19]}] {sender}: {m['text'][:80]}")
+        return
+
+    if args.draft:
+        if not args.contact:
+            log("--contact required for --draft", "ERROR")
+            sys.exit(1)
+        draft = draft_reply(args.contact)
+        print(f"\nDraft reply for {args.contact}:")
+        print(f"  \"{draft}\"")
+        return
+
+    if args.match_visitors:
+        matches = match_visitors_to_contacts()
+        if matches:
+            print(f"\nVisitor → iMessage contact matches:")
+            for m in matches:
+                print(f"  {m['visitor']} → {m['contact']}")
+        else:
+            print("\nNo matches found")
+        return
+
+    parser.print_help()
 
 
 if __name__ == "__main__":
@@ -47,754 +298,503 @@ if __name__ == "__main__":
 
 ```
 
-app.py:
-```
-#!/usr/bin/env python3
-"""Entry point for HuggingFace Space — runs the military-grade server."""
-from server import app
-import uvicorn
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=7860)
-
-```
-
-_find_edit_page.py:
-```
-#!/usr/bin/env python3
-"""Login + find the actual profile edit page."""
-import time, os
-import undetected_chromedriver as uc
-from dotenv import load_dotenv
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv()
-
-USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
-
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,900")
-
-driver = uc.Chrome(options=options, version_main=149)
-
-try:
-    print("[1] Login...")
-    driver.get("https://rentmasseur.com/login")
-    time.sleep(6)
-    driver.execute_script("""
-        const pwd = document.querySelector('input[type="password"]');
-        const user = document.querySelector('input[type="text"], input[type="email"]');
-        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
-        if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
-    """, USERNAME, PASSWORD)
-    time.sleep(1)
-    driver.find_element(By.CSS_SELECTOR, 'input[type="password"]').send_keys(Keys.ENTER)
-    time.sleep(5)
-    print(f"  URL: {driver.current_url}")
-    
-    # Go to our own profile
-    print("\n[2] Going to own profile...")
-    driver.get(f"https://rentmasseur.com/{USERNAME}")
-    time.sleep(5)
-    print(f"  URL: {driver.current_url}")
-    print(f"  Title: {driver.title}")
-    
-    # Get all links and buttons
-    links = driver.execute_script("""
-        return Array.from(document.querySelectorAll('a')).map(a => ({
-            text: a.innerText.trim().substring(0,40), href: a.href, 
-            onclick: a.getAttribute('onclick') || ''
-        })).filter(a => a.text || a.onclick);
-    """)
-    print(f"\nLinks ({len(links)}):")
-    for l in links[:40]:
-        print(f"  {l['text'][:40]} -> {l['href']}")
-    
-    # Look for edit-related links
-    edit_links = [l for l in links if any(w in (l['text'] + l['href']).lower() for w in ['edit', 'update', 'bio', 'about', 'profile', 'setting', 'account'])]
-    print(f"\nEdit-related links ({len(edit_links)}):")
-    for l in edit_links:
-        print(f"  {l['text']} -> {l['href']}")
-    
-    # Check for buttons
-    buttons = driver.execute_script("""
-        return Array.from(document.querySelectorAll('button, [role="button"]')).map(b => ({
-            text: (b.innerText||'').trim().substring(0,40), type: b.type, id: b.id,
-            onclick: b.getAttribute('onclick') || ''
-        })).filter(b => b.text);
-    """)
-    print(f"\nButtons ({len(buttons)}):")
-    for b in buttons:
-        print(f"  {b['text']} type={b['type']} onclick={b['onclick'][:40]}")
-    
-    # Check for textareas or contenteditable on profile page
-    textareas = driver.find_elements(By.CSS_SELECTOR, 'textarea')
-    editables = driver.find_elements(By.CSS_SELECTOR, '[contenteditable]')
-    print(f"\nTextareas: {len(textareas)}, Contenteditable: {len(editables)}")
-    
-    # Screenshot
-    driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/profile_page.png")
-    print("Screenshot saved")
-    
-    # Try the Next.js __NEXT_DATA__ for clues
-    next_data = driver.execute_script("""
-        try {
-            const el = document.getElementById('__NEXT_DATA__');
-            if (el) return JSON.parse(el.textContent.substring(0, 2000));
-        } catch(e) {}
-        return null;
-    """)
-    if next_data:
-        print(f"\nNext.js data keys: {list(next_data.keys())}")
-        if 'props' in next_data:
-            props = next_data['props']
-            print(f"  props keys: {list(props.keys()) if isinstance(props, dict) else type(props)}")
-        if 'page' in next_data:
-            print(f"  page: {next_data['page']}")
-
-finally:
-    driver.quit()
-    print("\nDone.")
-
-```
-
-requirements-prod.txt:
-```
-# Hugging Face Space — Production Requirements
-# Runtime only. No browser automation. No dev tools.
-# Browser automation (Selenium/Playwright/pyppeteer) belongs in requirements_dev.txt
-
-fastapi>=0.104
-uvicorn>=0.24
-requests>=2.31
-httpx>=0.25
-aiohttp>=3.9
-python-multipart>=0.0.6
-pydantic>=2.0.0
-beautifulsoup4>=4.12
-urllib3>=2.0
-
-```
-
-requirements-cartman.txt:
-```
-flask>=3.0.0
-flask-cors>=4.0.0
-scikit-learn>=1.3.0
-numpy>=1.24.0
-gunicorn>=21.0.0
-
-```
-
-rm_engagement_engine.py:
+daily_evidence.py:
 ```
 #!/usr/bin/env python3
 """
-RM Engagement Engine — 24/7 visitor engagement automation.
+Daily Evidence Packet — joins bio version → traffic → contact clicks → booking/revenue.
 
-Features:
-  - Scrapes ALL visitors by clicking "Load More" until exhausted
-  - Tracks visit counts per visitor across sessions (SQLite)
-  - Extracts profile metadata: last online, last visit to your page
-  - Auto-messages visitors who visited 3+ times (with human approval gate)
-  - Generates message pool from templates with personalization
-  - Visit-back all unique visitors with human-like delays
-  - Anti-bot: undetected ChromeDriver, randomized UA, human typing
-  - Full receipt + screenshot attribution for every action
+This is the single joined revenue loop. One packet per day. No theater.
 
-Usage:
-  python3 rm_engagement_engine.py --headed --login --full-run
-  python3 rm_engagement_engine.py --headed --login --scrape-only
-  python3 rm_engagement_engine.py --headed --login --message-repeat --threshold 3
-  python3 rm_engagement_engine.py --headed --login --visit-back --limit 0  # 0 = all
+Flow:
+1. Snapshot live profile (dashboard stats + about/bio)
+2. Load current bio variant ID from experiment ledger
+3. Compute deltas from last snapshot
+4. Apply decision rules (KEEP_CURRENT, TEST_NEXT_BIO, BLOCK_NO_SIGNAL, etc.)
+5. Write daily evidence packet JSON
+6. Write receipt
+
+Decision labels:
+  KEEP_CURRENT       — bio has conversion signal, keep it
+  TEST_NEXT_BIO      — bio has 0 signals after min exposure, rotate
+  BLOCK_NO_SIGNAL    — not enough data (<100 views or <24h)
+  BLOCK_LOW_EXPOSURE — profile hidden or unavailable
+  WINNER_FOUND       — bio significantly outperforms baseline
+  NEEDS_HUMAN_REVIEW — ambiguous result, manual decision needed
+
+Minimum sample rules:
+  - Do not judge before 100 profile views OR 24 hours, whichever comes later
+  - If traffic is low, extend to 48 hours
+  - If contact clicks drop hard (>50% decline), revert early
 """
 
-from __future__ import annotations
-
-import argparse
-import base64
-import hashlib
-import io
 import json
 import os
-import random
 import sqlite3
-import time
-import traceback
-from datetime import datetime, timezone
+import sys
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
-BASE_URL = "https://rentmasseur.com"
-ARTIFACTS = Path("artifacts/engagement")
-SCREENSHOTS = ARTIFACTS / "screenshots"
-RECEIPTS = ARTIFACTS / "receipts"
-DB_PATH = ARTIFACTS / "engagement.db"
+sys.path.insert(0, str(Path("/Users/alep/Downloads/rentmasseur-optimizer/rm_pri/py")))
+from api_client import RentMasseurAPI
 
-THUMBNAILS = ARTIFACTS / "thumbnails"
+from dotenv import load_dotenv
 
-for d in (ARTIFACTS, SCREENSHOTS, RECEIPTS, THUMBNAILS):
-    d.mkdir(parents=True, exist_ok=True)
+# Paths
+EXT_DIR = Path(__file__).parent
+CONTENT_DIR = EXT_DIR / "content"
+BIOS_DIR = CONTENT_DIR / "bios"
+RECEIPTS_DIR = EXT_DIR / "receipts"
+LEDGER_PATH = CONTENT_DIR / "experiment_ledger.json"
+EVIDENCE_DIR = CONTENT_DIR / "evidence"
+TRAFFIC_DB = Path("/Users/alep/Downloads/windsurf-smoke/rm_traffic/traffic.db")
+SNAPSHOTS_DIR = Path("/Users/alep/Downloads/windsurf-smoke/rm_traffic/data/profile_snapshots")
 
-SESSION_ID = hashlib.sha256(f"{time.time()}{random.random()}".encode()).hexdigest()[:12]
-START_TIME = time.time()
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-]
-
-MESSAGE_TEMPLATES = [
-    "Hey {name}, noticed you stopped by again! Always great to see familiar faces. What brings you back? 😊",
-    "Hi {name}! I see you've been checking out my profile — happy to answer any questions you might have about scheduling.",
-    "Hey there {name}, thanks for the repeat visits! If you're thinking about booking, I have some availability this week. Let me know!",
-    "Hi {name}! You've visited a few times — I'm guessing you're interested in a session? I'm in Manhattan, easy to schedule. Shoot me a message!",
-    "Hey {name}, returning visitor! That's awesome. I offer a great rate for repeat clients. Want to set something up?",
-    "Hi {name}! I noticed you've been back a few times. I'm available today if you want to stop by — Manhattan incall, very clean and professional.",
-    "Hey {name}! Thanks for the continued interest. I'm taking bookings for this week — morning and afternoon slots open. What works for you?",
-    "Hi {name}, you're becoming a regular visitor! 😄 I'd love to meet you — any particular day or time you're thinking about?",
-]
-
-EXCLUDE_USERNAMES = {
-    'settings', 'gay-massage', 'stream', 'masseurcams', 'advertise',
-    'about', 'login', 'sitemap', 'topics', 'robots', 'api', 'blog',
-    'blogs', 'reviews', 'interviews', 'find-massage', 'live-cams',
-    'available', 'static', '_next', 'images', 'mailbox', 'compose',
+# 3 approved test variants only
+TEST_VARIANTS = {
+    "A_clinical": {
+        "id": "bio_A_clinical_recovery",
+        "file": "bio_A_clinical_recovery.md",
+        "strategy": "clinical_recovery",
+        "headline": "KARPATHIAN WOLF — Professional Therapeutic Massage",
+    },
+    "B_wolf": {
+        "id": "bio_W_winning_production",
+        "file": "bio_W_winning_production.md",
+        "strategy": "controlled_wolf",
+        "headline": "KARPATHIAN WOLF — Targeted Recovery in Manhattan",
+    },
+    "C_luxury": {
+        "id": "bio_C_luxury_concierge",
+        "file": "bio_C_luxury_concierge.md",
+        "strategy": "luxury_concierge",
+        "headline": "KARPATHIAN WOLF — Manhattan's Private Recovery Specialist",
+    },
 }
+
+REBRANDLY_LINK = "rebrand.ly/carpathianwolf"
+
+# Minimum sample rules
+MIN_VIEWS = 100
+MIN_HOURS = 24
+LOW_TRAFFIC_EXTEND_HOURS = 48
+HARD_DROP_THRESHOLD = 0.50  # 50% decline in contact clicks = revert
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def elapsed() -> float:
-    return round(time.time() - START_TIME, 2)
-
-
-def log(msg: str, level: str = "INFO"):
-    print(f"[ENGINE] [{elapsed():>7.1f}s] [{level:<5}] {msg}")
-
-
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
-
-
-def write_receipt(action: str, status: str, data: dict) -> Path:
-    receipt = {
-        "session_id": SESSION_ID,
-        "action": action,
-        "status": status,
-        "timestamp": now_iso(),
-        "elapsed_s": elapsed(),
-        **data,
-    }
-    content = json.dumps(receipt, sort_keys=True, indent=2)
-    rhash = sha256_text(content)[:16]
-    receipt["receipt_hash"] = rhash
-    fname = f"{action}_{receipt['timestamp'].replace(':', '-')}.json"
-    rpath = RECEIPTS / fname
-    rpath.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
-    log(f"Receipt: {action} → {status} (hash={rhash})")
-    return rpath
-
-
-def human_delay(min_s: float = 0.8, max_s: float = 2.5):
-    time.sleep(random.uniform(min_s, max_s))
-
-
-# ─── Organic Visit Patterns ───────────────────────────────────────────
-
-def organic_visit_delay():
-    """Vary delays to mimic human browsing patterns — not robotic fixed intervals."""
-    # Sometimes quick, sometimes slow, occasionally pause like reading
-    roll = random.random()
-    if roll < 0.6:
-        # Normal browsing: 2-5s
-        time.sleep(random.uniform(2.0, 5.0))
-    elif roll < 0.85:
-        # Reading profile: 5-12s
-        time.sleep(random.uniform(5.0, 12.0))
-    else:
-        # Distracted / long pause: 10-25s
-        time.sleep(random.uniform(10.0, 25.0))
-
-
-def organic_batch_pause(batch_num: int):
-    """Every N visits, take a longer break like a human stepping away."""
-    if batch_num > 0 and batch_num % random.choice([15, 20, 25]) == 0:
-        pause = random.uniform(30, 90)
-        log(f"  Organic batch pause: {pause:.0f}s (after {batch_num} visits)")
-        time.sleep(pause)
-
-
-def organic_shuffle(visitors: list[dict]) -> list[dict]:
-    """Shuffle visit order — never visit in the same sequence twice."""
-    shuffled = visitors.copy()
-    random.shuffle(shuffled)
-    return shuffled
-
-
-def organic_session_size(total: int) -> int:
-    """Don't visit all 450 in one robotic batch — visit a natural subset per session."""
-    if total <= 20:
-        return total
-    # Visit 30-70% of remaining, leaving organic gaps
-    return max(20, int(total * random.uniform(0.3, 0.7)))
-
-
-def human_type(element, text: str, min_delay: float = 0.05, max_delay: float = 0.15):
-    for char in text:
-        element.send_keys(char)
-        time.sleep(random.uniform(min_delay, max_delay))
-
-
-def pick_message(username: str) -> str:
-    name = username.capitalize()
-    template = random.choice(MESSAGE_TEMPLATES)
-    return template.format(name=name)
-
-
-# ─── Screenshot Compression ───────────────────────────────────────────
-
-def compress_screenshot(png_path: Path, max_width: int = 400, quality: int = 50) -> tuple[str, int]:
-    """Compress a PNG screenshot to a small JPEG thumbnail, return base64 + size in KB.
-    Original PNG is deleted after compression."""
-    try:
-        from PIL import Image
-        img = Image.open(str(png_path))
-        ratio = max_width / img.width
-        new_size = (max_width, int(img.height * ratio))
-        img = img.resize(new_size, Image.LANCZOS)
-        img = img.convert("RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality, optimize=True)
-        thumb_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        thumb_kb = round(len(buf.getvalue()) / 1024, 1)
-        # Save thumbnail file
-        thumb_path = THUMBNAILS / (png_path.stem + ".jpg")
-        thumb_path.write_bytes(buf.getvalue())
-        # Delete original PNG
-        png_path.unlink(missing_ok=True)
-        return thumb_b64, thumb_kb
-    except Exception as e:
-        log(f"Screenshot compression failed: {e}", "WARN")
-        return "", 0
-
-
-def already_visited_today(username: str) -> bool:
-    """Check if we already visited this profile today."""
-    conn = sqlite3.connect(str(DB_PATH))
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    row = conn.execute(
-        "SELECT visited_at FROM visit_log WHERE username=? AND status='ok' ORDER BY visited_at DESC LIMIT 1",
-        (username,)
-    ).fetchone()
-    conn.close()
-    if not row:
-        return False
-    try:
-        last_visit = row[0][:10]  # YYYY-MM-DD
-        return last_visit == today
-    except Exception:
-        return False
-
-
-# ─── SQLite Persistence ──────────────────────────────────────────────
-
-def init_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS visitors (
-            username TEXT PRIMARY KEY,
-            visit_count INTEGER DEFAULT 0,
-            first_seen TEXT,
-            last_seen TEXT,
-            last_online TEXT,
-            last_visited_my_page TEXT,
-            last_messaged TEXT,
-            message_count INTEGER DEFAULT 0,
-            profile_url TEXT,
-            last_profile_hash TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS visit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            session_id TEXT,
-            visited_at TEXT,
-            status TEXT,
-            content_hash TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS message_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            session_id TEXT,
-            sent_at TEXT,
-            message_text TEXT,
-            status TEXT,
-            template_index INTEGER
-        )
-    """)
-    conn.commit()
-    conn.close()
-    log(f"DB initialized: {DB_PATH}")
-
-
-def record_visitor_seen(username: str, profile_url: str):
-    conn = sqlite3.connect(str(DB_PATH))
-    now = now_iso()
-    existing = conn.execute("SELECT visit_count FROM visitors WHERE username=?", (username,)).fetchone()
-    if existing:
-        conn.execute(
-            "UPDATE visitors SET visit_count=visit_count+1, last_seen=?, profile_url=? WHERE username=?",
-            (now, profile_url, username)
-        )
-    else:
-        conn.execute(
-            "INSERT INTO visitors (username, visit_count, first_seen, last_seen, profile_url) VALUES (?, 1, ?, ?, ?)",
-            (username, now, now, profile_url)
-        )
-    conn.execute(
-        "INSERT INTO visit_log (username, session_id, visited_at, status, content_hash) VALUES (?, ?, ?, 'seen', NULL)",
-        (username, SESSION_ID, now)
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_visitor_stats(username: str) -> dict:
-    conn = sqlite3.connect(str(DB_PATH))
-    row = conn.execute(
-        "SELECT visit_count, first_seen, last_seen, last_online, last_visited_my_page, last_messaged, message_count FROM visitors WHERE username=?",
-        (username,)
-    ).fetchone()
-    conn.close()
-    if not row:
-        return {"visit_count": 0}
+def load_ledger() -> dict:
+    if LEDGER_PATH.exists():
+        return json.loads(LEDGER_PATH.read_text())
     return {
-        "visit_count": row[0],
-        "first_seen": row[1],
-        "last_seen": row[2],
-        "last_online": row[3],
-        "last_visited_my_page": row[4],
-        "last_messaged": row[5],
-        "message_count": row[6],
+        "current_bio_id": None,
+        "current_bio_started_at": None,
+        "current_bio_start_views": 0,
+        "current_bio_start_clicks": 0,
+        "history": [],
+        "baseline_ctr": None,
     }
 
 
-def update_visitor_meta(username: str, last_online: str = None, last_visited_my_page: str = None, profile_hash: str = None):
-    conn = sqlite3.connect(str(DB_PATH))
-    fields = []
-    vals = []
-    if last_online:
-        fields.append("last_online=?")
-        vals.append(last_online)
-    if last_visited_my_page:
-        fields.append("last_visited_my_page=?")
-        vals.append(last_visited_my_page)
-    if profile_hash:
-        fields.append("last_profile_hash=?")
-        vals.append(profile_hash)
-    if fields:
-        vals.append(username)
-        conn.execute(f"UPDATE visitors SET {', '.join(fields)} WHERE username=?", vals)
-        conn.commit()
-    conn.close()
+def save_ledger(ledger: dict):
+    LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LEDGER_PATH.write_text(json.dumps(ledger, indent=2))
 
 
-def record_message(username: str, message_text: str, status: str, template_index: int):
-    conn = sqlite3.connect(str(DB_PATH))
-    now = now_iso()
-    conn.execute(
-        "INSERT INTO message_log (username, session_id, sent_at, message_text, status, template_index) VALUES (?, ?, ?, ?, ?, ?)",
-        (username, SESSION_ID, now, message_text, status, template_index)
+def snapshot_profile(api: RentMasseurAPI) -> dict:
+    """Capture live profile state."""
+    dash = api.get_dashboard()
+    stats = api.get_ad_statistics()
+    about = api.get_about()
+    keep = api.get_keeponline()
+
+    # Extract key metrics
+    profile_stats = stats.get("profileStatistics", {}) if isinstance(stats, dict) else {}
+    user_settings = dash.get("userSetting", {}) if isinstance(dash, dict) else {}
+
+    total_views = profile_stats.get("totalPageViews", 0)
+    total_clicks = profile_stats.get("totalContactClicks", 0)
+    new_visits = keep.get("newVisits", 0) if isinstance(keep, dict) else 0
+    new_emails = keep.get("newEmails", 0) if isinstance(keep, dict) else 0
+
+    visibility = user_settings.get("visibility", 0)
+    availability = user_settings.get("availability", {})
+    is_available = availability.get("available", 0) if isinstance(availability, dict) else 0
+    avail_message = availability.get("message", "") if isinstance(availability, dict) else ""
+
+    # Current bio
+    assets = about.get("userProps", {}).get("assets", {}) if isinstance(about, dict) else {}
+    headline = assets.get("headline", "")
+    description = assets.get("description", "")
+    rebrandly_present = REBRANDLY_LINK in description
+
+    return {
+        "timestamp": now_iso(),
+        "total_page_views": total_views,
+        "total_contact_clicks": total_clicks,
+        "new_visits": new_visits,
+        "new_emails": new_emails,
+        "visibility": visibility,
+        "is_available": is_available,
+        "availability_message": avail_message,
+        "headline": headline,
+        "bio_length": len(description),
+        "rebrandly_present": rebrandly_present,
+        "bio_preview": description[:300],
+    }
+
+
+def compute_deltas(snapshot: dict, ledger: dict) -> dict:
+    """Compute deltas since current bio started."""
+    start_views = ledger.get("current_bio_start_views", 0)
+    start_clicks = ledger.get("current_bio_start_clicks", 0)
+
+    delta_views = snapshot["total_page_views"] - start_views
+    delta_clicks = snapshot["total_contact_clicks"] - start_clicks
+    delta_ctr = (delta_clicks / delta_views * 100) if delta_views > 0 else 0.0
+
+    started_at = ledger.get("current_bio_start_started_at")
+    hours_exposed = 0
+    if started_at:
+        try:
+            started = datetime.fromisoformat(started_at)
+            hours_exposed = (datetime.now(timezone.utc) - started).total_seconds() / 3600
+        except Exception:
+            pass
+
+    return {
+        "delta_views": delta_views,
+        "delta_clicks": delta_clicks,
+        "delta_ctr": round(delta_ctr, 2),
+        "hours_exposed": round(hours_exposed, 1),
+    }
+
+
+def decide(snapshot: dict, deltas: dict, ledger: dict) -> str:
+    """Apply decision rules. Returns one of the 6 labels."""
+    # Rule 1: Profile hidden or unavailable → block
+    if snapshot["visibility"] != 1:
+        return "BLOCK_LOW_EXPOSURE"
+    if snapshot["is_available"] != 1:
+        return "BLOCK_LOW_EXPOSURE"
+
+    # Rule 2: Not enough data yet
+    if deltas["delta_views"] < MIN_VIEWS and deltas["hours_exposed"] < MIN_HOURS:
+        return "BLOCK_NO_SIGNAL"
+
+    # Rule 3: Enough time but low traffic → extend
+    if deltas["delta_views"] < MIN_VIEWS and deltas["hours_exposed"] < LOW_TRAFFIC_EXTEND_HOURS:
+        return "BLOCK_NO_SIGNAL"
+
+    # Rule 4: Has signals (contact clicks) → keep
+    if deltas["delta_clicks"] > 0:
+        baseline_ctr = ledger.get("baseline_ctr")
+        if baseline_ctr and deltas["delta_ctr"] > baseline_ctr * 1.5:
+            return "WINNER_FOUND"
+        if baseline_ctr and deltas["delta_ctr"] < baseline_ctr * HARD_DROP_THRESHOLD:
+            return "TEST_NEXT_BIO"
+        return "KEEP_CURRENT"
+
+    # Rule 5: Enough views but zero clicks → test next
+    if deltas["delta_views"] >= MIN_VIEWS and deltas["delta_clicks"] == 0:
+        return "TEST_NEXT_BIO"
+
+    # Rule 6: Ambiguous
+    return "NEEDS_HUMAN_REVIEW"
+
+
+def build_evidence_packet(snapshot: dict, deltas: dict, decision: str, ledger: dict) -> dict:
+    """Build the daily evidence packet."""
+    return {
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "timestamp": now_iso(),
+        "bio_id": ledger.get("current_bio_id", "unknown"),
+        "bio_started_at": ledger.get("current_bio_started_at"),
+        "metrics": {
+            "total_page_views": snapshot["total_page_views"],
+            "total_contact_clicks": snapshot["total_contact_clicks"],
+            "new_visits": snapshot["new_visits"],
+            "new_emails": snapshot["new_emails"],
+            "delta_views": deltas["delta_views"],
+            "delta_clicks": deltas["delta_clicks"],
+            "delta_ctr": deltas["delta_ctr"],
+            "hours_exposed": deltas["hours_exposed"],
+        },
+        "profile_state": {
+            "visibility": snapshot["visibility"],
+            "is_available": snapshot["is_available"],
+            "availability_message": snapshot["availability_message"],
+            "rebrandly_present": snapshot["rebrandly_present"],
+        },
+        "current_headline": snapshot["headline"],
+        "bio_length": snapshot["bio_length"],
+        "decision": decision,
+        "baseline_ctr": ledger.get("baseline_ctr"),
+        "min_sample_rules": {
+            "min_views": MIN_VIEWS,
+            "min_hours": MIN_HOURS,
+            "low_traffic_extend_hours": LOW_TRAFFIC_EXTEND_HOURS,
+            "hard_drop_threshold": HARD_DROP_THRESHOLD,
+        },
+    }
+
+
+def write_evidence_packet(packet: dict):
+    """Write daily evidence packet."""
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    date_str = packet["date"]
+    path = EVIDENCE_DIR / f"daily_{date_str}.json"
+    path.write_text(json.dumps(packet, indent=2))
+    print(f"Evidence packet written: {path}")
+
+    # Also write latest.json for HF/GitHub promotion
+    latest = EVIDENCE_DIR / "latest.json"
+    latest.write_text(json.dumps(packet, indent=2))
+    print(f"Latest evidence: {latest}")
+
+
+def write_receipt(packet: dict, decision: str):
+    """Write receipt for the evidence cycle."""
+    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    receipt = {
+        "action": "daily_evidence_packet",
+        "timestamp": now_iso(),
+        "decision": decision,
+        "bio_id": packet["bio_id"],
+        "delta_views": packet["metrics"]["delta_views"],
+        "delta_clicks": packet["metrics"]["delta_clicks"],
+        "delta_ctr": packet["metrics"]["delta_ctr"],
+        "hours_exposed": packet["metrics"]["hours_exposed"],
+    }
+    path = RECEIPTS_DIR / f"evidence_{ts}.json"
+    path.write_text(json.dumps(receipt, indent=2))
+    print(f"Receipt: {path}")
+
+
+def main():
+    print("=" * 60)
+    print("DAILY EVIDENCE PACKET")
+    print("bio_id → traffic → contact_clicks → decision")
+    print("=" * 60)
+
+    load_dotenv(EXT_DIR / ".env")
+    username = os.environ.get("RENTMASSEUR_USERNAME")
+    password = os.environ.get("RENTMASSEUR_PASSWORD")
+
+    if not username or not password or username == "REDACTED_ROTATE_ME":
+        print("ERROR: No valid credentials in .env")
+        sys.exit(1)
+
+    # Login
+    print(f"\nLogging in as {username}...")
+    api = RentMasseurAPI(min_request_interval=2.0)
+    if not api.login(username, password):
+        print("ERROR: Login failed")
+        sys.exit(1)
+    print("Login successful")
+
+    # Snapshot
+    print("\nSnapshotting live profile...")
+    snapshot = snapshot_profile(api)
+    print(f"  Total views: {snapshot['total_page_views']}")
+    print(f"  Total clicks: {snapshot['total_contact_clicks']}")
+    print(f"  New visits: {snapshot['new_visits']}")
+    print(f"  New emails: {snapshot['new_emails']}")
+    print(f"  Visibility: {snapshot['visibility']}")
+    print(f"  Available: {snapshot['is_available']} ({snapshot['availability_message']})")
+    print(f"  Headline: {snapshot['headline']}")
+    print(f"  Rebrandly: {'YES' if snapshot['rebrandly_present'] else 'NO'}")
+    print(f"  Bio length: {snapshot['bio_length']} chars")
+
+    # Load ledger
+    ledger = load_ledger()
+    print(f"\nCurrent bio: {ledger.get('current_bio_id', 'none')}")
+    print(f"Started at: {ledger.get('current_bio_started_at', 'none')}")
+
+    # Compute deltas
+    deltas = compute_deltas(snapshot, ledger)
+    print(f"\nDeltas:")
+    print(f"  Views since bio start: {deltas['delta_views']}")
+    print(f"  Clicks since bio start: {deltas['delta_clicks']}")
+    print(f"  CTR since bio start: {deltas['delta_ctr']}%")
+    print(f"  Hours exposed: {deltas['hours_exposed']}")
+
+    # Decide
+    decision = decide(snapshot, deltas, ledger)
+    print(f"\nDECISION: {decision}")
+
+    # Build packet
+    packet = build_evidence_packet(snapshot, deltas, decision, ledger)
+
+    # Write
+    write_evidence_packet(packet)
+    write_receipt(packet, decision)
+
+    # If baseline CTR not set, set it from first snapshot
+    if ledger.get("baseline_ctr") is None and snapshot["total_page_views"] > 0:
+        baseline = (snapshot["total_contact_clicks"] / snapshot["total_page_views"]) * 100
+        ledger["baseline_ctr"] = round(baseline, 2)
+        print(f"\nBaseline CTR set: {ledger['baseline_ctr']}%")
+        save_ledger(ledger)
+
+    print("\n" + "=" * 60)
+    print("EVIDENCE PACKET COMPLETE")
+    print(f"Decision: {decision}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+checker.py:
+```
+#!/usr/bin/env python3
+"""RentMasseur availability checker.
+
+This script fetches provider profile pages and records whether each provider
+appears to be available. It is designed to run in CI/CD on a schedule.
+
+Usage:
+    python3 checker.py                    # live scrape
+    python3 checker.py --mock           # demo with synthetic data
+    python3 checker.py --output data/availability.json
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from urllib.parse import urljoin
+
+import requests
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+    PlaywrightTimeoutError = TimeoutError
+
+DEFAULT_PROVIDERS = "providers.json"
+DEFAULT_OUTPUT = "availability.json"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+
+
+def load_providers(path):
+    with open(path, "r") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "providers" in data:
+        return data["providers"]
+    return data
+
+
+def fetch_profile(url, timeout=20):
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://rentmasseur.com/",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    time.sleep(random.uniform(1.5, 3.5))
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp.text
+
+
+def extract_availability(html):
+    text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.S | re.I)
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    body_lower = text.lower()
+    is_available = bool(
+        re.search(r"available now|available today|open now", body_lower)
     )
-    conn.execute(
-        "UPDATE visitors SET last_messaged=?, message_count=message_count+1 WHERE username=?",
-        (now, username)
+
+    rate_match = re.search(r"\$\d+(?:/hr| per hour|\.\d{2})", text)
+    rate = rate_match.group(0) if rate_match else ""
+
+    location_match = re.search(
+        r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)?,\s*(?:NY|NJ|CA|TX|FL|IL|PA|OH|GA|NC|MI))",
+        text,
     )
-    conn.commit()
-    conn.close()
+    location = location_match.group(1) if location_match else ""
+
+    name = ""
+    title_match = re.search(r"<title>([^<]+)</title>", html, flags=re.I)
+    if title_match:
+        title = title_match.group(1).strip()
+        name_match = re.match(r"^(.+?)\s*[-|]", title)
+        name = name_match.group(1).strip() if name_match else title
+
+    status = "available" if is_available else "unknown"
+    return {
+        "name": name,
+        "status": status,
+        "rate": rate,
+        "location": location,
+        "sample_text": text[:200],
+    }
 
 
-def get_all_visitors() -> list[dict]:
-    conn = sqlite3.connect(str(DB_PATH))
-    rows = conn.execute(
-        "SELECT username, visit_count, last_seen, last_online, last_visited_my_page, last_messaged, message_count FROM visitors ORDER BY visit_count DESC"
-    ).fetchall()
-    conn.close()
-    return [
-        {
-            "username": r[0], "visit_count": r[1], "last_seen": r[2],
-            "last_online": r[3], "last_visited_my_page": r[4],
-            "last_messaged": r[5], "message_count": r[6],
+def check_provider(provider, mock=False):
+    url = provider.get("url")
+    slug = provider.get("slug") or url.rstrip("/").split("/")[-1]
+    if not url:
+        raise ValueError(f"Provider missing URL: {provider}")
+
+    if mock:
+        return {
+            "slug": slug,
+            "url": url,
+            "name": provider.get("name", "Mock Provider"),
+            "status": provider.get("mock_status", "available"),
+            "rate": provider.get("rate", "$150/hr"),
+            "location": provider.get("location", "New York, NY"),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "mock",
         }
-        for r in rows
-    ]
+
+    html = fetch_profile(url)
+    result = extract_availability(html)
+    result["slug"] = slug
+    result["url"] = url
+    result["checked_at"] = datetime.now(timezone.utc).isoformat()
+    result["mode"] = "live"
+    return result
 
 
-def get_repeat_visitors(threshold: int = 3) -> list[dict]:
-    conn = sqlite3.connect(str(DB_PATH))
-    rows = conn.execute(
-        "SELECT username, visit_count, last_messaged, message_count FROM visitors WHERE visit_count >= ? ORDER BY visit_count DESC",
-        (threshold,)
-    ).fetchall()
-    conn.close()
-    return [
-        {"username": r[0], "visit_count": r[1], "last_messaged": r[2], "message_count": r[3]}
-        for r in rows
-    ]
-
-
-# ─── Browser Engine ──────────────────────────────────────────────────
-
-BLOCK_NEEDLES = [
-    ("captcha", "captcha_detected"),
-    ("crowdsec", "crowdsec_detected"),
-    ("access forbidden", "access_forbidden"),
-    ("verify you are human", "human_verification"),
-    ("unusual traffic", "traffic_challenge"),
-    ("too many requests", "rate_limited"),
-    ("cloudflare", "cloudflare_challenge"),
-]
-
-
-def detect_block_text(text: str, url: str) -> Optional[str]:
-    text_lower = text.lower()
-    url_lower = url.lower()
-    for needle, reason in BLOCK_NEEDLES:
-        if needle in text_lower or needle in url_lower:
-            return reason
-    return None
-
-
-class EngagementEngine:
-    def __init__(self, headed: bool):
-        self.headed = headed
-        self.driver = None
-        self.logged_in = False
-        self.ua = random.choice(USER_AGENTS)
-        log(f"Engine: Selenium (undetected) | UA: {self.ua[:40]}...")
-
-    def start(self):
-        import undetected_chromedriver as uc
-
-        options = uc.ChromeOptions()
-        if not self.headed:
-            options.add_argument("--headless=new")
-        options.add_argument("--window-size=1440,900")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument(f"--user-agent={self.ua}")
-
-        chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if os.path.exists(chrome_path):
-            options.binary_location = chrome_path
-
+def run_check(providers_path, output_path, mock=False):
+    providers = load_providers(providers_path)
+    results = []
+    errors = []
+    for provider in providers:
         try:
-            import subprocess, re
-            ver_out = subprocess.check_output(
-                [chrome_path, "--version"], stderr=subprocess.DEVNULL
-            ).decode().strip()
-            chrome_major = int(re.search(r'(\d+)\.', ver_out).group(1))
-            self.driver = uc.Chrome(options=options, version_main=chrome_major)
-        except Exception:
-            self.driver = uc.Chrome(options=options)
-
-        self.driver.set_page_load_timeout(45)
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                window.chrome = { runtime: {} };
-            """
-        })
-        log("Browser started (Selenium/undetected)")
-
-    def stop(self):
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-        log("Browser closed")
-
-    def screenshot(self, name: str) -> str:
-        ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-        fname = f"{ts}_{SESSION_ID}_{name}.png"
-        path = SCREENSHOTS / fname
-        try:
-            self.driver.save_screenshot(str(path))
-        except Exception:
-            return ""
-        return str(path)
-
-    def screenshot_compressed(self, name: str) -> dict:
-        """Take screenshot, compress to thumbnail, delete original PNG.
-        Returns dict with thumbnail_base64, thumbnail_kb, original_size_kb."""
-        ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-        fname = f"{ts}_{SESSION_ID}_{name}"
-        path = SCREENSHOTS / f"{fname}.png"
-        try:
-            self.driver.save_screenshot(str(path))
-            orig_kb = round(path.stat().st_size / 1024, 1)
-            thumb_b64, thumb_kb = compress_screenshot(path)
-            return {
-                "thumbnail_b64": thumb_b64[:500] if thumb_b64 else "",  # truncated for receipt
-                "thumbnail_file": f"{fname}.jpg",
-                "thumbnail_kb": thumb_kb,
-                "original_kb": orig_kb,
-                "compression_ratio": round(thumb_kb / orig_kb, 3) if orig_kb > 0 else 0,
-            }
+            result = check_provider(provider, mock=mock)
+            results.append(result)
         except Exception as e:
-            return {"error": str(e)}
+            errors.append({"provider": provider, "error": str(e)})
 
-    def page_text(self) -> str:
-        try:
-            return self.driver.execute_script(
-                "return document.body ? document.body.innerText : ''"
-            )[:8000]
-        except Exception:
-            return ""
-
-    def detect_block(self) -> Optional[str]:
-        return detect_block_text(self.page_text(), self.driver.current_url)
-
-    def login(self, username: str, password: str) -> bool:
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.common.keys import Keys
-
-        log("=== LOGIN ===")
-        try:
-            self.driver.get(f"{BASE_URL}/login")
-            human_delay(3, 5)
-            self.screenshot("01_login_page")
-
-            block = self.detect_block()
-            if block:
-                log(f"BLOCKED: {block}", "ERROR")
-                write_receipt("login", "blocked", {"reason": block})
-                return False
-
-            inputs = self.driver.find_elements(By.CSS_SELECTOR, "input")
-            email_el = pass_el = None
-            for inp in inputs:
-                if not inp.is_displayed():
-                    continue
-                itype = (inp.get_attribute("type") or "").lower()
-                iname = (inp.get_attribute("name") or "").lower()
-                if itype == "password":
-                    pass_el = inp
-                elif "email" in iname or "user" in iname or itype in ("email", "text"):
-                    email_el = inp
-
-            if not email_el or not pass_el:
-                log("Login form not found", "ERROR")
-                write_receipt("login", "fail", {"reason": "form_not_found"})
-                return False
-
-            log("Typing credentials (human-like)...")
-            email_el.click()
-            human_delay(0.3, 0.8)
-            human_type(email_el, username)
-            human_delay(0.5, 1.2)
-            pass_el.click()
-            human_delay(0.3, 0.6)
-            human_type(pass_el, password)
-            human_delay(0.8, 1.5)
-
-            self.screenshot("02_login_filled")
-            pass_el.send_keys(Keys.ENTER)
-            human_delay(4, 7)
-
-            current_url = self.driver.current_url
-            if "/login" in current_url.lower():
-                log("Login failed", "ERROR")
-                self.screenshot("03_login_failed")
-                write_receipt("login", "fail", {"reason": "still_on_login_page", "url": current_url})
-                return False
-
-            self.logged_in = True
-            self.screenshot("03_login_success")
-            log(f"Login OK — URL: {current_url}")
-            write_receipt("login", "pass", {"url": current_url, "ua": self.ua})
-            return True
-
-        except Exception as e:
-            log(f"Login error: {e}", "ERROR")
-            write_receipt("login", "error", {"error": str(e)})
-            return False
-
-    # ── Scrape ALL visitors with Load More ───────────────────────────
-
-    def scrape_all_visitors(self, max_load_more: int = 50) -> list[dict]:
-        from selenium.webdriver.common.by import By
-
-        log("=== SCRAPE ALL VISITORS (with Load More) ===")
-        self.driver.get(f"{BASE_URL}/settings/whosawme")
-        human_delay(4, 6)
-        self.screenshot("04_whosawme_initial")
-
-        block = self.detect_block()
-        if block:
-            log(f"BLOCKED: {block}", "ERROR")
-            write_receipt("scrape_visitors", "blocked", {"reason": block})
-            return []
-
-        all_visitors = []
-        load_more_count = 0
-
-        while load_more_count < max_load_more:
-            # Scrape current page state
-            current_visitors = self.driver.execute_script("""
-                const result = [];
-                const seen = new Set();
-                const profileImgs = document.querySelectorAll('img[alt="Profile photo"], img[alt="profile-picture"]');
-                for (const img of profileImgs) {
-                    const a = img.closest('a');
-                    if (a && a.href) {
-                        const path = new URL(a.href).pathname;
-                        const username = path.replace('/', '');
-                        if (username && !seen.has(username) && !username.includes('settings') && !username.includes('gay-massage')) {
-                            seen.add(username);
-                            result.push({username: username, url: a.href, name: username});
-                        }
-                    }
-                }
-                const links = Array.from(document.querySelectorAll('a[href]'));
-                for (const a of links) {
-                    const href = a.href;
-                    if (!href.startsWith('https://rentmasseur.com/')) continue;
-                    const path = new URL(href).pathname;
-                    if (path && path !== '/' && path.split('/').length === 2 && path.split('/')[1] !== '') {
-                        const username = path.replace('/', '');
-                        if (!seen.has(username) && !username.startsWith('_') && username.length > 2) {
-                            seen.add(username);
-                            result.push({username: username, url: href, name: username});
-                        }
-                    }
-                }
-                return result;
-            """)
-
-            # Merge with existing
-            existing_names = {v["username"] for v in all_visitors}
-            new_count = 0
-            for v in current_visitors:
-                if v["username"] not in existing_names and v["username"] not in EXCLUDE_USERNAMES:
-                    all_visitors.append(v)
-                    new_count += 1
-
-            log(f"  Load More #{load_more_count}: found {len(current_visitors)} on page, {new_count} new, total {len(all_visitors)}")
-
-            # Try to find and click "Load More" button
+    record = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "mock" if mock else "live",
+        "count": len(results),
+        "providers": results,

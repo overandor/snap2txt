@@ -1,800 +1,800 @@
-    _HAS_LLM = False
+    def login(self, force=False):
+        if self.logged_in and not force and (time.time() - self.last_login < 3600):
+            return True
+        if not self.driver:
+            self.start()
 
-log = logging.getLogger("reply_drafter")
+        log.info("Logging in as %s...", USERNAME)
+        self.driver.get(f"{BASE_URL}/login")
+        time.sleep(4)
+        self._dismiss_popups()
 
-# Reply classes
-REPLY_BOOKING_NOW = "booking_now_reply"
-REPLY_PRICE_QUESTION = "price_question_reply"
-REPLY_LOCATION_QUESTION = "location_question_reply"
-REPLY_REPEAT_CLIENT = "repeat_client_reply"
-REPLY_INQUIRY = "inquiry_reply"
-REPLY_FOLLOW_UP = "follow_up_reply"
-REPLY_CLOSE_LOOP = "close_loop_reply"
-REPLY_AVAILABILITY_QUESTION = "availability_reply"
-REPLY_HIGH_VALUE_REPEAT = "high_value_repeat_reply"
-REPLY_NONE = "none"
+        # Find login fields
+        email = None
+        pwd = None
+        for inp in self.driver.find_elements(By.CSS_SELECTOR, "input"):
+            itype = (inp.get_attribute("type") or "").lower()
+            iname = (inp.get_attribute("name") or "").lower()
+            if itype == "email" or "email" in iname or "user" in iname:
+                if inp.is_displayed():
+                    email = inp
+            if itype == "password" and inp.is_displayed():
+                pwd = inp
 
-# Risk levels
-RISK_SAFE = "safe"
-RISK_REVIEW = "review"
-RISK_BLOCKED = "blocked"
+        if not email or not pwd:
+            log.error("Login fields not found")
+            log_availability("login", success=False, detail="fields not found")
+            return False
 
+        email.clear()
+        email.send_keys(USERNAME)
+        pwd.clear()
+        pwd.send_keys(PASSWORD)
+        time.sleep(0.3)
 
-@dataclass
-class DraftReply:
-    username: str = ""
-    intent_class: str = ""
-    confidence: float = 0.0
-    booking_probability: float = 0.0
-    reply_text: str = ""
-    reply_class: str = ""
-    risk_level: str = RISK_SAFE
-    needs_human_approval: bool = True
-    reason: str = ""
-    suggested_time_slots: List[str] = field(default_factory=list)
-    error: str = ""
+        # Click login button
+        clicked = False
+        for by, sel in [
+            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.XPATH, "//button[contains(text(),'LOG')]"),
+            (By.XPATH, "//button[contains(text(),'Log')]"),
+            (By.CSS_SELECTOR, "form button"),
+        ]:
+            for el in self.driver.find_elements(by, sel):
+                if el.is_displayed():
+                    el.click()
+                    clicked = True
+                    break
+            if clicked:
+                break
 
+        if not clicked:
+            log.error("Login button not found")
+            return False
 
-def _build_polish_prompt(template_text: str, message: str, intent: IntentResult, context: Dict) -> str:
-    """Build LLM prompt for polishing an existing template draft.
-    The model rewrites the template for clarity — it does NOT generate from scratch."""
-    username = context.get("username", "")
-    is_repeat = intent.classification in ("repeat_client", "high_value_repeat")
+        time.sleep(6)
+        self._dismiss_popups()
 
-    prompt = f"""Rewrite this existing draft only for clarity. Do not add facts. Do not change rates, location, session length, phone, or availability. Return one reply only.
+        # Verify login
+        url = self.driver.current_url
+        if "/login" in url:
+            log.error("Login failed — still on login page")
+            log_availability("login", success=False, detail="redirected back to login")
+            return False
 
-Existing draft:
-"{template_text}"
+        self.logged_in = True
+        self.last_login = time.time()
+        log.info("Login successful. URL: %s", url)
+        log_availability("login", success=True, detail=url)
+        return True
 
-Client message: "{message[:300]}"
-Client username: {username}
-Intent: {intent.classification}
-Is repeat client: {is_repeat}
-
-Rules:
-- Rewrite the existing draft for clarity and warmth only
-- Do NOT add new facts, rates, locations, or availability not in the existing draft
-- Do NOT change the rate, location, session length, or phone number
-- Keep it under 80 words
-- End with exactly ONE next-step question
-- Professional tone, first person singular (I/my, not we/us/our)
-- No sexual language, no innuendo
-- Return only the rewritten reply text, nothing else
-
-Rewritten reply:"""
-
-    return prompt
-
-
-def _clean_llm_output(text: str) -> str:
-    """Clean LLM output — remove quotes, markdown, extra whitespace."""
-    if not text:
-        return ""
-    text = text.strip()
-    # Remove surrounding quotes
-    if text.startswith('"') and text.endswith('"'):
-        text = text[1:-1]
-    # Remove markdown
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'\*(.+?)\*', r'\1', text)
-    # Remove any "Reply:" prefix
-    text = re.sub(r'^(Reply|Response|Message):\s*', '', text, flags=re.IGNORECASE)
-    # Normalize whitespace
-    text = ' '.join(text.split())
-    return text.strip()
-
-
-def _template_fallback(intent: IntentResult, context: Dict) -> str:
-    """Fixed template fallback when LLM is unavailable."""
-    rate = context.get("rate", "$200")
-    phone = context.get("phone", "")
-    cls = intent.classification
-
-    if cls == "booking_now":
-        return (
-            f"Yes — I'm available today. I have openings at 7:30 or 9 PM. "
-            f"Manhattan incall, {rate} for 60 min. "
-            f"Which time works for you? Text {phone} to confirm."
-        )
-
-    if cls == "price_question":
-        return (
-            f"Rate is {rate} for 60 min, $280 for 90 min, $360 for 120 min. "
-            f"Manhattan incall. What duration and time work for you? "
-            f"Text {phone} to book."
-        )
-
-    if cls == "availability_question":
-        return (
-            f"I'm available today and this week. "
-            f"Manhattan incall, {rate} for 60 min. "
-            f"What day and time work for you? Text {phone} to schedule."
-        )
-
-    if cls == "location_question":
-        return (
-            f"I'm based in Manhattan — private incall space. "
-            f"Outcall available within Manhattan for additional travel fee. "
-            f"Rate is {rate}. Text {phone} for faster booking."
-        )
-
-    if cls in ("repeat_client", "high_value_repeat"):
-        return (
-            f"Great to hear from you again! "
-            f"I have openings today. Same location in Manhattan. "
-            f"Text {phone} to confirm your time."
-        )
-
-    if cls == "ghosted_lead":
-        return (
-            f"Hi — following up. I'm available this week if you'd like to book. "
-            f"Manhattan incall, {rate} for 60 min. "
-            f"Text {phone} to schedule."
-        )
-
-    return (
-        f"Hi! Thanks for your interest. "
-        f"I offer deep tissue and sports recovery massage in Manhattan. "
-        f"Rate is {rate} for 60 min. "
-        f"What questions can I answer? Text {phone} for faster response."
-    )
-
-
-def _determine_reply_class(intent: IntentResult) -> str:
-    """Map intent classification to reply class."""
-    mapping = {
-        "booking_now": REPLY_BOOKING_NOW,
-        "price_question": REPLY_PRICE_QUESTION,
-        "availability_question": REPLY_AVAILABILITY_QUESTION,
-        "location_question": REPLY_LOCATION_QUESTION,
-        "repeat_client": REPLY_REPEAT_CLIENT,
-        "high_value_repeat": REPLY_HIGH_VALUE_REPEAT,
-        "ghosted_lead": REPLY_FOLLOW_UP,
-        "do_not_contact": REPLY_NONE,
-        "spam": REPLY_NONE,
-        "unknown": REPLY_INQUIRY,
-    }
-    return mapping.get(intent.classification, REPLY_INQUIRY)
-
-
-def _determine_risk(intent: IntentResult, is_first_contact: bool = True) -> str:
-    """Determine risk level for the reply."""
-    if intent.classification in ("do_not_contact", "spam"):
-        return RISK_BLOCKED
-    if "unsafe" in (intent.risk_flags or []):
-        return RISK_BLOCKED
-    if "opt_out" in (intent.risk_flags or []):
-        return RISK_BLOCKED
-    if is_first_contact:
-        return RISK_REVIEW
-    return RISK_SAFE
-
-
-def validate_reply_text(text: str, context: Dict = None) -> Tuple[bool, str]:
-    """Validate reply text against quality and safety rules.
-    Returns (is_valid, reason)."""
-    if not text or not text.strip():
-        return False, "empty_text"
-
-    if context is None:
-        context = {}
-
-    text_lower = text.lower()
-    word_count = len(text.split())
-
-    # ─── Reject: bad pronouns (first person plural = wrong voice) ───
-    if re.search(r'\b(we|us|our)\b', text_lower):
-        return False, "first_person_plural_detected"
-
-    # ─── Reject: "app" reference ───
-    if re.search(r'\bapp\b', text_lower):
-        return False, "app_reference_detected"
-
-    # ─── Reject: known bad phrases ───
-    bad_phrases = ["sorry to hear", "reaching out to us", "last-minute app",
-                   "thank you for reaching out"]
-    if any(p in text_lower for p in bad_phrases):
-        return False, f"bad_phrase_detected"
-
-    # ─── Reject: sexual/innuendo terms ───
-    sexual_kw = ["sexual", "erotic", "sensual", "nude", "naked", "happy ending",
-                 "full service", "extras", "menu", "gfe", "bb", "bareback"]
-    if any(kw in text_lower for kw in sexual_kw):
-        return False, "sexual_innuendo_detected"
-
-    # ─── Reject: phone number when not allowed ───
-    allow_phone = os.environ.get("ALLOW_PHONE_IN_DRAFT", "false").lower() == "true"
-    if not allow_phone:
-        phone_in_context = context.get("phone", "")
-        # Check for raw phone numbers (not the word "text")
-        if re.search(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', text):
-            return False, "raw_phone_in_draft_not_allowed"
-        if phone_in_context and phone_in_context in text and not allow_phone:
-            return False, "phone_in_draft_not_allowed"
-
-    # ─── Reject: over 80 words ───
-    if word_count > 80:
-        return False, f"too_many_words ({word_count})"
-
-    # ─── Reject: no question mark (no next-step question) ───
-    if "?" not in text:
-        return False, "no_next_step_question"
-
-    # ─── Reject: multiple questions (rule is one next-step question) ───
-    question_count = text.count("?")
-    if question_count > 2:  # allow up to 2 for compound questions like "What time and duration?"
-        return False, f"too_many_questions ({question_count})"
-
-    # ─── Reject: missing rate (for booking/price/location intents) ───
-    rate = context.get("rate", "$200")
-    intent_class = context.get("intent_class", "")
-    if intent_class in ("booking_now", "price_question", "location_question", "availability_question"):
-        if rate and rate not in text:
-            return False, "missing_rate"
-
-    # ─── Reject: missing location ───
-    location = context.get("location", "Manhattan")
-    if location and location.lower() not in text_lower and "manhattan" not in text_lower:
-        return False, "missing_location"
-
-    # ─── Reject: missing session length ───
-    if intent_class in ("booking_now", "price_question"):
-        if not re.search(r'\b(60|90|120)\s*min', text_lower) and "min" not in text_lower:
-            return False, "missing_session_length"
-
-    return True, "valid"
-
-
-def _try_local_llm_polish(template_text: str, message: str, intent: IntentResult,
-                            context: Dict, timeout_seconds: int = 8) -> Optional[str]:
-    """Try local-only LLM (Ollama or Transformers.js) for light polish.
-    Rewrites the existing template — does NOT generate from scratch.
-    NO cloud providers. Returns None if unavailable or too slow."""
-    if not _HAS_LLM:
-        return None
-
-    import threading
-
-    prompt = _build_polish_prompt(template_text, message, intent, context)
-
-    result = [None]
-    def _call():
+    def ensure_session(self):
+        """Check if session is still valid, re-login if not."""
+        if not self.driver:
+            return self.login()
         try:
-            # Try Ollama only (local), then Transformers.js (local)
-            # NO Groq, NO OpenRouter — private client text stays local
-            for provider, model in [("ollama", "llama3.2"), ("transformers", None)]:
-                try:
-                    client = LLMClient(provider=provider, model=model)
-                    resp = client.generate(prompt, max_tokens=150)
-                    if resp and len(resp) > 20:
-                        result[0] = resp
-                        return
-                except Exception:
-                    continue
+            self.driver.get(f"{BASE_URL}/settings")
+            time.sleep(3)
+            if "/login" in self.driver.current_url:
+                log.info("Session expired, re-logging in...")
+                return self.login(force=True)
+            return True
+        except WebDriverException as e:
+            log.warning("Session check failed: %s", e)
+            return self.login(force=True)
+
+    def get_settings_data(self):
+        """Fetch settings page and extract all profile data."""
+        if not self.ensure_session():
+            return None
+        self.driver.get(f"{BASE_URL}/settings")
+        time.sleep(5)
+        self._dismiss_popups()
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body").text
         except Exception:
+            return None
+        return body
+
+    def set_available(self, duration=1):
+        """Set availability to 'Available' with given duration (hours)."""
+        if not self.ensure_session():
+            return False
+
+        log.info("Setting availability: Available, %dh", duration)
+        self.driver.get(f"{BASE_URL}/settings?availability=1")
+        time.sleep(5)
+        self._dismiss_popups()
+
+        # Check current status first
+        body = self.driver.find_element(By.TAG_NAME, "body").text
+        match = re.search(r'Status:\s*Available\s*(\d+)h\s*:\s*(\d+)m', body)
+        if match:
+            hours = int(match.group(1))
+            mins = int(match.group(2))
+            total_mins = hours * 60 + mins
+            if total_mins > 10:
+                log.info("Already available (%dh:%dm remaining), skipping", hours, mins)
+                log_availability("skip", status="Available", hours=hours,
+                                 minutes=mins, success=True, detail="sufficient time remaining")
+                return True
+
+        # Click the availability panel to open modal
+        try:
+            avail_panel = self.driver.find_element(By.CSS_SELECTOR, ".AvailabilityPanel")
+            avail_panel.click()
+            time.sleep(2)
+        except (NoSuchElementException, StaleElementReferenceException):
+            log.warning("Could not click availability panel")
+            log_availability("set", success=False, detail="panel not found")
+            return False
+
+        # Wait for modal and find "Available" option
+        time.sleep(1)
+        clicked_available = False
+        for by, sel in [
+            (By.XPATH, "//label[contains(text(),'Available')]"),
+            (By.XPATH, "//*[contains(text(),'Available') and not(contains(text(),'Not')) and not(contains(text(),'Status'))]"),
+            (By.CSS_SELECTOR, "input[type='radio'][value='1']"),
+            (By.CSS_SELECTOR, "input[type='radio']"),
+        ]:
+            try:
+                els = self.driver.find_elements(by, sel)
+                for el in els:
+                    if el.is_displayed():
+                        el.click()
+                        clicked_available = True
+                        log.info("Selected 'Available'")
+                        break
+            except Exception:
+                pass
+            if clicked_available:
+                break
+
+        if not clicked_available:
+            log.warning("Could not select 'Available' option")
+            log_availability("set", success=False, detail="could not select Available")
+            return False
+
+        # Select duration
+        time.sleep(0.5)
+        for sel_el in self.driver.find_elements(By.CSS_SELECTOR, "select"):
+            try:
+                from selenium.webdriver.support.ui import Select
+                sel = Select(sel_el)
+                options = [o.text for o in sel.options]
+                target = f"{duration} Hour" if duration == 1 else f"{duration} Hours"
+                if target in options:
+                    sel.select_by_visible_text(target)
+                    log.info("Selected duration: %s", target)
+                    break
+            except Exception:
+                pass
+
+        # Click SET button
+        time.sleep(0.5)
+        set_clicked = False
+        for by, sel in [
+            (By.XPATH, "//button[contains(text(),'SET')]"),
+            (By.XPATH, "//button[contains(text(),'Set')]"),
+        ]:
+            try:
+                els = self.driver.find_elements(by, sel)
+                for el in els:
+                    if el.is_displayed():
+                        el.click()
+                        set_clicked = True
+                        log.info("Clicked SET")
+                        break
+            except Exception:
+                pass
+            if set_clicked:
+                break
+
+        if not set_clicked:
+            log.warning("SET button not found")
+            log_availability("set", success=False, detail="SET button not found")
+            return False
+
+        time.sleep(3)
+        # Verify
+        body = self.driver.find_element(By.TAG_NAME, "body").text
+        if "Status: Available" in body:
+            match = re.search(r'Status:\s*Available\s*(\d+)h\s*:\s*(\d+)m', body)
+            if match:
+                h, m = int(match.group(1)), int(match.group(2))
+                log.info("Availability confirmed: %dh:%dm", h, m)
+                log_availability("set", status="Available", hours=h, minutes=m,
+                                 duration_set=duration, success=True)
+                return True
+
+        log.warning("Availability set but could not verify")
+        log_availability("set", success=True, detail="could not verify")
+        return True
+
+    def get_stats(self):
+        """Extract profile statistics from settings page."""
+        body = self.get_settings_data()
+        if not body:
+            return None
+
+        stats = {
+            "profile_views": None,
+            "contact_clicks": None,
+            "online_bookmarks": None,
+            "who_saw_me": None,
+            "membership_status": None,
+            "visibility": None,
+            "availability_status": None,
+            "availability_remaining": None,
+        }
+
+        # Profile Views: 77999
+        m = re.search(r'Profile Views:\s*([\d,]+)', body)
+        if m:
+            stats["profile_views"] = int(m.group(1).replace(",", ""))
+
+        # Who Saw Me: 30
+        m = re.search(r'Who Saw Me\s*(\d+)', body)
+        if m:
+            stats["who_saw_me"] = int(m.group(1))
+
+        # Online bookmarks
+        m = re.search(r'(\d+)\s*online', body)
+        if m:
+            stats["online_bookmarks"] = int(m.group(1))
+
+        # Membership
+        m = re.search(r'Profile Status:\s*(\w+)', body)
+        if m:
+            stats["membership_status"] = m.group(1)
+
+        # Visibility
+        if "Profile hidden" in body:
+            stats["visibility"] = "hidden"
+        elif "Profile shown" in body:
+            stats["visibility"] = "shown"
+
+        # Availability
+        m = re.search(r'Status:\s*(Available|Not Available|Not Set)\s*(\d+h\s*:\s*\d+m)?', body)
+        if m:
+            stats["availability_status"] = m.group(1)
+            stats["availability_remaining"] = m.group(2) or ""
+
+        # Contact clicks from ad statistics
+        m = re.search(r'Contact Me\s*clicks\s*([\d,]+)', body)
+        if m:
+            stats["contact_clicks"] = int(m.group(1).replace(",", ""))
+
+        return stats
+
+    def check_search_position(self, city="Manhattan, NY"):
+        """Check profile position in search results for a city."""
+        if not self.ensure_session():
+            return None
+
+        city_slug = city.lower().replace(", ", "-").replace(" ", "-")
+        url = f"{BASE_URL}/gay-massage/{city_slug}/"
+        log.info("Checking search position at %s", url)
+        self.driver.get(url)
+        time.sleep(5)
+        self._dismiss_popups()
+
+        # Find all masseur profile links
+        body = self.driver.find_element(By.TAG_NAME, "body").text
+
+        # Find profile cards/links
+        profile_links = []
+        for el in self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/']"):
+            href = el.get_attribute("href") or ""
+            text = el.text.strip().lower()
+            # Profile links are like /Username
+            if href.startswith(f"{BASE_URL}/") and not any(x in href for x in [
+                "login", "settings", "search", "blog", "reviews", "interviews",
+                "available", "find-massage", "live-cams", "sitemap", "advertise",
+                "mailbox", "static", "_next", "images",
+            ]):
+                parts = href.replace(f"{BASE_URL}/", "").split("/")
+                if parts and parts[0] and len(parts) == 1:
+                    profile_links.append((parts[0].lower(), href))
+
+        # Find our position
+        username_lower = USERNAME.lower()
+        position = None
+        for i, (uname, href) in enumerate(profile_links):
+            if uname == username_lower:
+                position = i + 1
+                break
+
+        # Check available now filter
+        avail_url = f"{url}?available=1"
+        self.driver.get(avail_url)
+        time.sleep(4)
+        self._dismiss_popups()
+
+        avail_links = []
+        for el in self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/']"):
+            href = el.get_attribute("href") or ""
+            if href.startswith(f"{BASE_URL}/") and not any(x in href for x in [
+                "login", "settings", "search", "blog", "reviews", "interviews",
+                "available", "find-massage", "live-cams", "sitemap", "advertise",
+                "mailbox", "static", "_next", "images",
+            ]):
+                parts = href.replace(f"{BASE_URL}/", "").split("/")
+                if parts and parts[0] and len(parts) == 1:
+                    avail_links.append(parts[0].lower())
+
+        avail_position = None
+        for i, uname in enumerate(avail_links):
+            if uname == username_lower:
+                avail_position = i + 1
+                break
+
+        total = len(profile_links)
+        total_avail = len(avail_links)
+
+        result = {
+            "city": city,
+            "position": position,
+            "total": total,
+            "available_position": avail_position,
+            "available_total": total_avail,
+        }
+
+        log.info("Search position: #%d/%d (available: #%s/%d) in %s",
+                 position or -1, total,
+                 avail_position or "N/A", total_avail, city)
+
+        log_search_position(city, position or 0, total, total_avail, USERNAME)
+
+        if position and position > 20:
+            log_alert("ranking_drop", "warning",
+                      f"Position dropped to #{position} in {city}")
+
+        return result
+
+# ---------------------------------------------------------------------------
+# Daemon
+# ---------------------------------------------------------------------------
+
+class TrafficEngine:
+    """Main daemon loop."""
+
+    def __init__(self, watch_city=None):
+        self.browser = Browser()
+        self.watch_city = watch_city
+        self.running = True
+        self.last_refresh = 0
+        self.last_stats = 0
+        self.last_search = 0
+        self.prev_stats = None
+
+    def cycle(self):
+        """One daemon cycle — check what needs doing."""
+        now = time.time()
+
+        # Availability refresh
+        if now - self.last_refresh >= REFRESH_INTERVAL:
+            try:
+                self.browser.set_available(duration=1)
+                self.last_refresh = now
+            except Exception as e:
+                log.error("Availability refresh failed: %s", e)
+                log_availability("set", success=False, detail=str(e))
+                # Reset browser on error
+                self.browser.stop()
+                time.sleep(5)
+
+        # Stats collection
+        if now - self.last_stats >= STAT_INTERVAL:
+            try:
+                stats = self.browser.get_stats()
+                if stats:
+                    log_stats(
+                        stats["profile_views"],
+                        stats["contact_clicks"],
+                        stats["online_bookmarks"],
+                        stats["who_saw_me"],
+                        stats["membership_status"],
+                        stats["visibility"],
+                        stats["availability_status"],
+                        stats["availability_remaining"],
+                    )
+                    log.info("Stats: views=%s contacts=%s bookmarks=%s who_saw=%s | %s | vis=%s | avail=%s %s",
+                             stats["profile_views"],
+                             stats["contact_clicks"],
+                             stats["online_bookmarks"],
+                             stats["who_saw_me"],
+                             stats["membership_status"],
+                             stats["visibility"],
+                             stats["availability_status"],
+                             stats["availability_remaining"])
+
+                    # Alert on changes
+                    if self.prev_stats:
+                        if stats["visibility"] == "hidden" and self.prev_stats.get("visibility") != "hidden":
+                            log_alert("visibility_hidden", "critical",
+                                      "Profile is HIDDEN — traffic will drop to zero")
+                        if stats["availability_status"] != "Available":
+                            log_alert("not_available", "warning",
+                                      f"Availability is {stats['availability_status']}")
+
+                    self.prev_stats = stats
+                self.last_stats = now
+            except Exception as e:
+                log.error("Stats collection failed: %s", e)
+
+        # Search position check
+        if self.watch_city and (now - self.last_search >= SEARCH_CHECK_INTERVAL):
+            try:
+                self.browser.check_search_position(self.watch_city)
+                self.last_search = now
+            except Exception as e:
+                log.error("Search position check failed: %s", e)
+
+    def run_once(self):
+        """Single cycle — for --once mode."""
+        log.info("=== Single cycle ===")
+        if not self.browser.login():
+            log.error("Login failed, aborting")
             return
+        self.last_refresh = 0
+        self.last_stats = 0
+        self.last_search = 0
+        self.cycle()
+        self.browser.stop()
 
-    t = threading.Thread(target=_call, daemon=True)
-    t.start()
-    t.join(timeout=timeout_seconds)
+    def run_daemon(self):
+        """Main daemon loop."""
+        log.info("=== Traffic Engine starting (daemon mode) ===")
+        log.info("Refresh interval: %d min | Stats: %d min | Search: %d min",
+                 REFRESH_INTERVAL // 60, STAT_INTERVAL // 60, SEARCH_CHECK_INTERVAL // 60)
+        if self.watch_city:
+            log.info("Watching search position in: %s", self.watch_city)
 
-    if t.is_alive():
-        log.info(f"  ⟁ Local LLM timed out ({timeout_seconds}s) — using template")
-        return None
+        if not self.browser.login():
+            log.error("Initial login failed, retrying in 60s...")
+            time.sleep(60)
+            if not self.browser.login():
+                log.error("Login failed twice, exiting")
+                return
 
-    return result[0]
+        self.last_refresh = time.time() - REFRESH_INTERVAL + 10  # refresh soon
+        self.last_stats = time.time() - STAT_INTERVAL + 10
+        if self.watch_city:
+            self.last_search = time.time() - SEARCH_CHECK_INTERVAL + 10
 
+        while self.running:
+            try:
+                self.cycle()
+            except KeyboardInterrupt:
+                log.info("Shutdown requested")
+                self.running = False
+                break
+            except Exception as e:
+                log.error("Cycle error: %s", e)
+                self.browser.stop()
+                time.sleep(30)
+                self.browser.login()
 
-def draft_reply(message: str, context: Dict = None) -> DraftReply:
-    """
-    Generate a template-first draft reply for a client message.
+            time.sleep(30)  # check every 30s
 
-    Template is canonical. LLM is optional polish only (local, 8s timeout).
-    No cloud providers ever called on private client text.
-    All first-contact drafts are approval-gated.
+        self.browser.stop()
+        log.info("Engine stopped")
 
-    Args:
-        message: The client's message text
-        context: Dict with username, is_premium, rate, phone, location, is_first_contact
+# ---------------------------------------------------------------------------
+# Stats Report
+# ---------------------------------------------------------------------------
 
-    Returns:
-        DraftReply with reply_text, risk_level, needs_human_approval
-    """
-    if context is None:
-        context = {}
+def print_stats():
+    conn = db()
+    print("\n=== TRAFFIC STATS SUMMARY ===\n")
 
-    # Classify intent
-    intent = classify(message, context.get("username", ""))
+    # Availability history
+    rows = conn.execute(
+        "SELECT * FROM availability_log ORDER BY ts DESC LIMIT 20"
+    ).fetchall()
+    print(f"--- Availability (last {len(rows)} events) ---")
+    for r in rows:
+        print(f"  {r['ts'][:19]} | {r['action']:6s} | status={r['status'] or '-':12s} "
+              f"remaining={r['hours'] or 0}h{r['minutes'] or 0}m | success={bool(r['success'])}")
 
-    # Build draft
-    draft = DraftReply(
-        username=context.get("username", ""),
-        intent_class=intent.classification,
-        confidence=intent.confidence,
-        booking_probability=intent.booking_probability,
-        reply_class=_determine_reply_class(intent),
-        risk_level=_determine_risk(intent, context.get("is_first_contact", True)),
-        reason=f"Intent: {intent.classification} (conf={intent.confidence:.2f})",
-    )
+    # Stats history
+    rows = conn.execute(
+        "SELECT * FROM stats_log ORDER BY ts DESC LIMIT 20"
+    ).fetchall()
+    print(f"\n--- Profile Stats (last {len(rows)} samples) ---")
+    for r in rows:
+        print(f"  {r['ts'][:19]} | views={r['profile_views'] or '-':6} "
+              f"contacts={r['contact_clicks'] or '-':4} "
+              f"bookmarks={r['online_bookmarks'] or '-':3} "
+              f"who_saw={r['who_saw_me'] or '-':3} "
+              f"| {r['availability_status'] or '-':12s} {r['availability_remaining'] or ''} "
+              f"| vis={r['visibility'] or '-'}")
 
-    # Blocked — no reply
-    if draft.risk_level == RISK_BLOCKED:
-        draft.reply_text = ""
-        draft.needs_human_approval = False
-        draft.reason = f"BLOCKED: {intent.classification} with risk flags {intent.risk_flags}"
-        return draft
+    # Search positions
+    rows = conn.execute(
+        "SELECT * FROM search_position ORDER BY ts DESC LIMIT 20"
+    ).fetchall()
+    if rows:
+        print(f"\n--- Search Positions (last {len(rows)} checks) ---")
+        for r in rows:
+            print(f"  {r['ts'][:19]} | {r['city']:20s} | "
+                  f"position=#{r['position']}/{r['total_results']} "
+                  f"| available=#{r['available_now'] or 'N/A'}")
 
-    # ─── Template first (canonical) ───
-    draft.reply_text = _template_fallback(intent, context)
-    draft.reason += " | template-canonical"
-    log.info(f"  ◉ Template reply for {draft.username}: {draft.reply_text[:80]}...")
+    # Alerts
+    rows = conn.execute(
+        "SELECT * FROM alerts WHERE acknowledged=0 ORDER BY ts DESC LIMIT 10"
+    ).fetchall()
+    if rows:
+        print(f"\n--- Active Alerts ({len(rows)}) ---")
+        for r in rows:
+            print(f"  {r['ts'][:19]} | [{r['severity']:8s}] {r['type']:20s} | {r['message']}")
 
-    # ─── Optional local LLM polish (8s timeout, no cloud) ───
-    polished = _try_local_llm_polish(draft.reply_text, message, intent, context, timeout_seconds=8)
-    if polished:
-        cleaned = _clean_llm_output(polished)
-        # Validate polished output against strict quality rules
-        validation_context = {**context, "intent_class": intent.classification}
-        is_valid, reject_reason = validate_reply_text(cleaned, validation_context)
-        if is_valid:
-            draft.reply_text = cleaned
-            draft.reason += " | llm-polished"
-            log.info(f"  ◉ Polished reply for {draft.username}: {draft.reply_text[:80]}...")
-        else:
-            draft.reason += f" | llm-polish-rejected:{reject_reason}"
-            log.info(f"  ⟁ LLM polish rejected ({reject_reason}) — keeping template")
+    # Trend: views over time
+    rows = conn.execute(
+        "SELECT ts, profile_views FROM stats_log "
+        "WHERE profile_views IS NOT NULL ORDER BY ts ASC LIMIT 50"
+    ).fetchall()
+    if len(rows) >= 2:
+        first = rows[0]
+        last = rows[-1]
+        delta = (last["profile_views"] or 0) - (first["profile_views"] or 0)
+        print(f"\n--- View Trend ---")
+        print(f"  {first['ts'][:19]}: {first['profile_views']} views")
+        print(f"  {last['ts'][:19]}: {last['profile_views']} views")
+        print(f"  Delta: +{delta} views over {len(rows)} samples")
 
-    # Approval gate — all first contact needs approval
-    is_repeat = intent.classification in ("repeat_client", "high_value_repeat")
-    if is_repeat and not context.get("is_first_contact", True):
-        draft.needs_human_approval = False
+    conn.close()
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="RentMasseur Traffic Engine")
+    parser.add_argument("--once", action="store_true", help="Run single cycle and exit")
+    parser.add_argument("--stats", action="store_true", help="Print stats summary and exit")
+    parser.add_argument("--watch", metavar="CITY", help="Track search position in city (e.g. 'Manhattan, NY')")
+    parser.add_argument("--duration", type=int, default=1, help="Availability duration in hours (default: 1)")
+    args = parser.parse_args()
+
+    init_db()
+
+    if args.stats:
+        print_stats()
+        return
+
+    engine = TrafficEngine(watch_city=args.watch)
+
+    if args.once:
+        engine.run_once()
     else:
-        draft.needs_human_approval = True
+        engine.run_daemon()
 
-    # Suggested time slots for booking intent
-    if intent.classification in ("booking_now", "high_value_repeat"):
-        draft.suggested_time_slots = ["7:30 PM", "9:00 PM", "Tomorrow 12:00 PM"]
-
-    return draft
-
-
-def draft_mailbox_replies(emails: List[Dict], context: Dict = None) -> List[DraftReply]:
-    """
-    Generate draft replies for all mailbox conversations.
-
-    Args:
-        emails: List of email dicts from api.get_mailbox()
-        context: Base context (rate, phone, location)
-
-    Returns:
-        List of DraftReply objects
-    """
-    if context is None:
-        context = {}
-
-    drafts = []
-    for email in emails:
-        uc = email.get("userCard", {})
-        msg = email.get("lastMessage", "")
-        username = uc.get("username", "")
-
-        email_context = {
-            **context,
-            "username": username,
-            "is_premium": bool(uc.get("isPremium", 0)),
-            "is_first_contact": not bool(email.get("lastMessage", "")),
-        }
-
-        draft = draft_reply(msg, email_context)
-        drafts.append(draft)
-
-    return drafts
-
-
-def format_drafts_summary(drafts: List[DraftReply]) -> str:
-    """Format drafts for display."""
-    lines = [f"\n{'='*60}", f"  REPLY DRAFT QUEUE — {len(drafts)} drafts", f"{'='*60}\n"]
-
-    for d in drafts:
-        if d.risk_level == RISK_BLOCKED:
-            lines.append(f"  🚫 {d.username} [{d.intent_class}] — BLOCKED")
-            lines.append(f"     {d.reason}")
-            continue
-
-        approval = "🔒 approval" if d.needs_human_approval else "⚡ ready_for_fast_approval"
-        lines.append(f"  ◉ {d.username} [{d.intent_class}] conf={d.confidence:.2f} {approval}")
-        lines.append(f"    Reply: \"{d.reply_text[:120]}\"")
-        if d.suggested_time_slots:
-            lines.append(f"    Slots: {', '.join(d.suggested_time_slots)}")
-        lines.append("")
-
-    return "\n".join(lines)
+if __name__ == "__main__":
+    main()
 
 ```
 
-bio_generator.cpp:
-```
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <random>
-#include <chrono>
-#include <sstream>
-
-std::vector<std::string> headlines = {
-    "Deep Tissue & {thing} — Manhattan",
-    "{adjective} Bodywork in Manhattan",
-    "{name} Does {thing} — Manhattan",
-    "The Wolf's {thing} — Manhattan",
-    "{thing} for {person} — Manhattan",
-    "Manhattan's {adjective} {thing}",
-    "Not Your Average {thing} — Manhattan",
-    "Real {thing} for {person}",
-    "{thing}: No Fluff, Just Pressure",
-    "Bring the {body_part}, Bring the Wolf — Manhattan",
-    "{adjective} {thing} in Manhattan, NYC",
-    "The {person}'s {thing} — Manhattan",
-    "Wolf-Level {thing} — Manhattan",
-    "{body_part} Rescue in Manhattan",
-    "From {city} Stress to {thing}",
-};
-
-std::vector<std::string> hooks = {
-    "Your shoulders called. They want out of this meeting.",
-    "I don't do feathers. I do fixes.",
-    "You bring the stress, I bring the Wolf.",
-    "If your body were a group chat, your hips would be the one screaming.",
-    "Some people meditate. I prefer pressure.",
-    "Desk life: 1. Your posture: 0. I can fix that.",
-    "Your back is not a storage unit for stress.",
-    "I work on humans, not mannequins.",
-    "The gym builds muscle. I build recovery.",
-    "Tight neck? Tight shoulders? Tight everything? Same.",
-    "Wolf knows where the knots hide.",
-    "You can't out-train bad recovery, but you can out-massage it.",
-    "Manhattan is stressful. Your body doesn't have to be.",
-    "My hands are GPS for tension.",
-    "If your muscles wrote a Yelp review, it would not be five stars.",
-    "I find the thing that hurts and make it stop hurting.",
-    "Your body is a resume. Let's edit it.",
-    "Squats gave you glutes. I give them back their range of motion.",
-    "The only thing I ghost is tension.",
-    "I've got strong hands and zero patience for bad posture.",
-};
-
-std::vector<std::string> specialties = {
-    "I specialize in deep tissue, sports recovery, and targeted relief for shoulders, neck, back, and hips.",
-    "My focus is pressure-forward work: slow, deliberate, and built around the muscle groups that actually need it.",
-    "I do deep tissue, recovery bodywork, and the kind of pressure that actually changes how you move.",
-    "Sports recovery, deep tissue, and hip/glute work are my main zones.",
-    "I work on the tension that builds from training, travel, and ten-hour desk days.",
-};
-
-std::vector<std::string> clients = {
-    "Best for lifters, runners, desk workers, and anyone who treats their body like a rental.",
-    "Great if you sit all day, train hard, or fly too much.",
-    "If your neck feels like a phone cord from 1997, you're my people.",
-    "For clients who want real pressure, clear communication, and a clean space.",
-    "You don't need to be an athlete. You need to be tight.",
-};
-
-std::vector<std::string> styles = {
-    "My style is direct. I find the tension, apply pressure, and stay there until it releases.",
-    "No spa music required. No fluffy rituals. Just focused work.",
-    "I adjust pressure to your body, not a script.",
-    "Strong hands, calm presence, zero attitude.",
-    "I work with intention. Every minute has a target.",
-};
-
-std::vector<std::string> proofs = {
-    "Clients usually leave looser, taller, and less hostile toward their desk.",
-    "The feedback I get most: 'I should have done this months ago.'",
-    "One session won't fix ten years of bad posture, but it's a solid opening argument.",
-    "I don't promise magic. I promise real pressure in the right places.",
-};
-
-std::vector<std::string> ctas = {
-    "Message me with your focus areas and we'll get you sorted.",
-    "Manhattan incall. Text or email to book.",
-    "Clean private space in Manhattan. DM me to set something up.",
-    "If your body is ready, so am I. Message for availability.",
-    "Book a session and let's make your muscles less dramatic.",
-};
-
-std::vector<std::string> things = {
-    "Sports Recovery", "Deep Tissue", "Bodywork", "Knot Removal", "Recovery",
-    "Shoulder Rescue", "Hip Relief", "Back Therapy", "Desk Detox", "Stress Reset",
-};
-
-std::vector<std::string> adjectives = {
-    "Serious", "Pressure-Forward", "Wolf-Approved", "No-Nonsense", "Focused",
-    "Real", "Direct", "Professional", "High-Octane", "Tension-Finding",
-};
-
-std::vector<std::string> persons = {
-    "Desk Workers", "Athletes", "Gym Rats", "Frequent Flyers", "Tired Humans",
-    "Shoulders", "Hips", "Runners", "Lifters", "Stressed New Yorkers",
-};
-
-std::vector<std::string> body_parts = {
-    "Shoulders", "Back", "Hips", "Neck", "Glutes",
-};
-
-std::vector<std::string> cities = {
-    "Manhattan", "Midtown", "Chelsea", "Hell's Kitchen", "NYC",
-};
-
-std::vector<std::string> names = {
-    "The Wolf", "Karpathian Wolf", "Wolf", "This Guy",
-};
-
-std::string replace_all(std::string str, const std::string& from, const std::string& to) {
-    size_t start_pos = 0;
-    while((start_pos = str.find(from, start_pos)) != std::string::npos) {
-        str.replace(start_pos, from.length(), to);
-        start_pos += to.length();
-    }
-    return str;
-}
-
-std::string generate_headline(std::mt19937& rng) {
-    std::uniform_int_distribution<int> dist(0, headlines.size() - 1);
-    std::string h = headlines[dist(rng)];
-    h = replace_all(h, "{thing}", things[std::uniform_int_distribution<int>(0, things.size()-1)(rng)]);
-    h = replace_all(h, "{adjective}", adjectives[std::uniform_int_distribution<int>(0, adjectives.size()-1)(rng)]);
-    h = replace_all(h, "{name}", names[std::uniform_int_distribution<int>(0, names.size()-1)(rng)]);
-    h = replace_all(h, "{person}", persons[std::uniform_int_distribution<int>(0, persons.size()-1)(rng)]);
-    h = replace_all(h, "{body_part}", body_parts[std::uniform_int_distribution<int>(0, body_parts.size()-1)(rng)]);
-    h = replace_all(h, "{city}", cities[std::uniform_int_distribution<int>(0, cities.size()-1)(rng)]);
-    return h;
-}
-
-std::string generate_description(std::mt19937& rng) {
-    std::string hook = hooks[std::uniform_int_distribution<int>(0, hooks.size()-1)(rng)];
-    std::string specialty = specialties[std::uniform_int_distribution<int>(0, specialties.size()-1)(rng)];
-    std::string client = clients[std::uniform_int_distribution<int>(0, clients.size()-1)(rng)];
-    std::string style = styles[std::uniform_int_distribution<int>(0, styles.size()-1)(rng)];
-    std::string proof = proofs[std::uniform_int_distribution<int>(0, proofs.size()-1)(rng)];
-    std::string cta = ctas[std::uniform_int_distribution<int>(0, ctas.size()-1)(rng)];
-
-    std::uniform_int_distribution<int> template_dist(0, 1);
-    if (template_dist(rng) == 0) {
-        return hook + "\n\n" + specialty + "\n\n" + client + "\n\n" + style + "\n\n" + cta;
-    }
-    return hook + "\n\n" + style + "\n\n" + specialty + "\n\n" + proof + "\n\n" + cta;
-}
-
-std::string json_escape(const std::string& s) {
-    std::string out;
-    for (char c : s) {
-        switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default: out += c;
-        }
-    }
-    return out;
-}
-
-int main(int argc, char* argv[]) {
-    int count = 1000;
-    if (argc > 1) count = std::stoi(argv[1]);
-
-    std::string output_path = "rm_traffic/data/bios_generated.jsonl";
-    if (argc > 2) output_path = argv[2];
-
-    std::random_device rd;
-    std::mt19937 rng(rd());
-
-    std::ofstream out(output_path);
-    if (!out) {
-        std::cerr << "Cannot open " << output_path << std::endl;
-        return 1;
-    }
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    for (int i = 0; i < count; i++) {
-        std::string h = generate_headline(rng);
-        std::string d = generate_description(rng);
-        out << "{\"id\":\"cpp_" << i << "\",\"headline\":\"" << json_escape(h)
-            << "\",\"description\":\"" << json_escape(d) << "\"}\n";
-    }
-
-    out.close();
-    auto end = std::chrono::high_resolution_clock::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-
-    std::cout << "Generated " << count << " bios in " << ms << " ms" << std::endl;
-    std::cout << "Rate: " << (count * 60000.0 / ms) << " bios/minute" << std::endl;
-    std::cout << "Saved to: " << output_path << std::endl;
-    return 0;
-}
-
-```
-
-probe4.py:
-```
-import requests, re, json
-
-s = requests.Session()
-s.headers.update({
-    'User-Agent': 'Mozilla/5.0',
-    'Accept': 'application/json',
-    'Referer': 'https://rentmasseur.com/settings',
-    'Origin': 'https://rentmasseur.com',
-})
-s.get('https://rentmasseur.com/login')
-m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', s.get('https://rentmasseur.com/login').text)
-csrf = m.group(1) if m else ''
-r = s.post('https://rentmasseur.com/api/v1/login', json={
-    'email': 'karpathianwolf', 'password': 'os.environ.get("RM_PASSWORD", "")', 'csrf': csrf, 'remember': True
-})
-s.headers['Authorization'] = 'Bearer ' + r.json()['accessToken']
-print('Login OK')
-
-# Exhaustive probe
-paths = [
-    # Interview variations
-    '/api/v1/account/interview',
-    '/api/v1/account/interviews',
-    '/api/v1/settings/interview',
-    '/api/v1/interview',
-    '/api/v1/account/dashboard/interview',
-    '/api/v1/account/dashboard/interviews',
-    '/api/v1/account/feature-interview',
-    '/api/v1/account/featureInterview',
-    '/api/v1/settings/feature-interview',
-    '/api/v1/settings/featureInterview',
-    # Blog variations
-    '/api/v1/account/blog',
-    '/api/v1/account/blogs',
-    '/api/v1/account/blog/list',
-    '/api/v1/settings/blog',
-    '/api/v1/settings/blog/list',
-    '/api/v1/blog',
-    '/api/v1/blogs',
-    '/api/v1/account/dashboard/blog',
-    '/api/v1/account/dashboard/blogs',
-    # Profile/bio variations
-    '/api/v1/account/profile',
-    '/api/v1/account/bio',
-    '/api/v1/account/about',
-    '/api/v1/settings/profile',
-    '/api/v1/settings/bio',
-    '/api/v1/settings/about',
-    '/api/v1/profile',
-    '/api/v1/account/dashboard/profile',
-    '/api/v1/account/dashboard/bio',
-    '/api/v1/account/dashboard/about',
-    # Travels
-    '/api/v1/account/travels',
-    '/api/v1/settings/travels',
-    '/api/v1/account/dashboard/travels',
-    # Photos
-    '/api/v1/account/photos',
-    '/api/v1/settings/photos',
-    '/api/v1/account/dashboard/photos',
-    # Reviews
-    '/api/v1/account/reviews',
-    '/api/v1/settings/reviews',
-    # Membership
-    '/api/v1/account/membership',
-    '/api/v1/settings/membership',
-    '/api/v1/account/dashboard/membership',
-    # Sponsor
-    '/api/v1/account/sponsor',
-    '/api/v1/settings/sponsor',
-    '/api/v1/account/dashboard/sponsor',
-    # Advertise
-    '/api/v1/account/advertise',
-    '/api/v1/settings/advertise',
-    '/api/v1/account/dashboard/advertise',
-    # Certificates
-    '/api/v1/account/certificates',
-    '/api/v1/settings/certificates',
-    # Massages/rates
-    '/api/v1/account/massages',
-    '/api/v1/settings/massages',
-    '/api/v1/account/dashboard/massages',
-    '/api/v1/account/services',
-    '/api/v1/settings/services',
-    '/api/v1/account/rates',
-    '/api/v1/settings/rates',
-]
-
-for path in paths:
-    try:
-        r = s.get(f'https://rentmasseur.com{path}', timeout=5)
-        if r.status_code != 404:
-            body = r.text[:200].replace('\n', ' ')
-            print(f'GET {r.status_code} {path:55s} {body}')
-    except:
-        pass
-
-```
-
-bio_view_scraper.py:
+cdp_discovery.py:
 ```
 """
-Scrape real bios with view counts and member-since dates.
-Calculates views/day for ranking.
+CDP Discovery — use Selenium + Chrome DevTools Protocol to capture unknown endpoints.
+
+Targets:
+    - availability update (set availability)
+    - blog create/edit
+    - interview edit
+
+The captured endpoint is stored in the registry only after replay verification.
 """
 
 import json
 import logging
-import re
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
+from urllib.parse import urljoin
 
-import requests
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
 
-from .api_client import RentMasseurAPI
-from .bio_scraper import CITIES, extract_bios_from_results, search_city
+from .endpoint_registry import EndpointRegistry
 
-log = logging.getLogger("profileops.view_scraper")
+log = logging.getLogger("profileops.discovery")
 
-OUTPUT_PATH = Path(__file__).parent / "data" / "real_bios_with_views.jsonl"
-RANKED_PATH = Path(__file__).parent / "data" / "real_bios_ranked.txt"
-
-WEB_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-}
+BASE = "https://rentmasseur.com"
 
 
-def parse_member_since(text: str) -> str:
-    """Extract Member Since date from profile page HTML."""
-    match = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', text)
-    return match.group(1).strip() if match else ""
+def _get_driver(profile: str = "/tmp/rm_action_api"):
+    opts = Options()
+    opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument(f"--user-data-dir={profile}")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    return webdriver.Chrome(options=opts)
 
 
-def parse_visits(text: str) -> int:
-    """Extract visits count from profile page HTML."""
-    matches = re.findall(r'"visits":(\d+)', text)
-    # Filter out 0 (own profile stat), take the max
-    vals = [int(v) for v in matches if v != "0"]
-    return max(vals) if vals else 0
-
-
-def days_since(date_str: str) -> int:
-    """Calculate days since a date string like 'Mar 25, 2014'."""
-    if not date_str:
-        return 0
+def _dismiss_popups(driver):
     try:
-        d = datetime.strptime(date_str, "%b %d, %Y")
-        return max(1, (datetime.now(timezone.utc).replace(tzinfo=None) - d).days)
-    except ValueError:
-        return 0
+        driver.execute_script("document.querySelectorAll('.DialogOverlay,[class*=\"overlay\"]').forEach(e=>e.remove())")
+    except Exception:
+        pass
 
 
-def fetch_profile_views(username: str, delay: float = 0.3) -> Dict:
-    """Fetch view count and member-since from web profile page."""
-    try:
-        url = f"https://rentmasseur.com/{username}"
-        r = requests.get(url, headers=WEB_HEADERS, timeout=15)
-        if r.status_code != 200:
-            return {"visits": 0, "member_since": "", "days_online": 0}
-        member_since = parse_member_since(r.text)
-        visits = parse_visits(r.text)
-        days = days_since(member_since)
-        time.sleep(delay)
-        return {"visits": visits, "member_since": member_since, "days_online": days}
-    except Exception as e:
-        log.error("Error fetching %s: %s", username, e)
-        return {"visits": 0, "member_since": "", "days_online": 0}
+def _find_clickable(driver, texts: List[str]):
+    for text in texts:
+        for el in driver.find_elements(By.XPATH, f"//*[contains(text(),'{text}')]"):
+            if el.is_displayed():
+                return el
+    return None
 
 
-def scrape_with_views(api: RentMasseurAPI, max_pages: int = 10, delay: float = 0.5,
-                      fetch_views: bool = True) -> List[Dict]:
-    """Scrape all bios and fetch view counts."""
-    all_bios = []
-    seen_ids = set()
+def _extract_api_calls(driver) -> List[Dict]:
+    logs = driver.get_log("performance")
+    reqs = {}
+    for entry in logs:
+        try:
+            msg = json.loads(entry["message"])["message"]
+            if msg["method"] == "Network.requestWillBeSent":
+                p = msg["params"]
+                r = p["request"]
+                rid = p["requestId"]
+                reqs[rid] = {
+                    "url": r["url"],
+                    "method": r["method"],
+                    "postData": r.get("postData", "")[:2000],
+                }
+            elif msg["method"] == "Network.responseReceived":
+                p = msg["params"]
+                rid = p["requestId"]
+                if rid in reqs:
+                    reqs[rid]["status"] = p["response"]["status"]
+                    try:
+                        body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": rid})
+                        reqs[rid]["response"] = body.get("body", "")[:2000]
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return [v for v in reqs.values() if "/api/v1/" in v["url"]]
 
+
+def _wait_for_react(driver, timeout: int = 10):
+    """Wait for React to render interactive content."""
+    for _ in range(timeout * 2):
+        btns = driver.find_elements(By.TAG_NAME, "button")
+        if btns:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+class CDPDiscoverer:
+    """Discovers unknown endpoints via CDP."""
+
+    def __init__(self, profile: str = "/tmp/rm_action_api"):
+        self.profile = profile
+        self.registry = EndpointRegistry()
+
+    def discover_availability(self) -> Dict:
+        """Capture the availability save endpoint."""
+        log.info("Discovering availability endpoint...")
+        driver = _get_driver(self.profile)
+        try:
+            # Try dashboard first (availability is usually set from dashboard)
+            driver.get(f"{BASE}/account/dashboard")
+            time.sleep(6)
+            _dismiss_popups(driver)
+            _wait_for_react(driver)
+            driver.get_log("performance")
+
+            # Look for availability-related clickable elements
+            candidates = [
+                "Available", "Not Available", "Set Availability", "Available Now",
+                "1 hour", "2 hours", "3 hours", "4 hours", "5 hours", "6 hours",
+                "Set", "Update", "Confirm"
+            ]
+            for text in candidates:
+                btn = _find_clickable(driver, [text])
+                if btn:
+                    log.info("Clicking '%s'...", text)
+                    driver.execute_script("arguments[0].click()", btn)
+                    time.sleep(1)
+
+            # Also try clicking dashboard availability section
+            time.sleep(3)
+            calls = _extract_api_calls(driver)
+            for c in calls:
+                if "availability" in c["url"] and c["method"] in ("POST", "PUT"):
+                    self.registry.register(
+                        "set_availability", c["method"],
+                        c["url"].replace(BASE, ""),
+                        request_schema=c.get("postData"),
+                        response_schema=c.get("response", "")[:500]
+                    )
+                    return {"found": True, "call": c}
+            return {"found": False, "calls": calls}
+        finally:
+            driver.quit()
+
+    def discover_blog(self) -> Dict:
+        """Capture blog create/edit endpoint."""
+        log.info("Discovering blog endpoint...")
+        driver = _get_driver(self.profile)
+        try:
+            driver.get(f"{BASE}/settings?blog=1")
+            time.sleep(5)
+            _dismiss_popups(driver)
+            _wait_for_react(driver)
+            driver.get_log("performance")
+
+            # Try to find create button
+            create_btn = _find_clickable(driver, ["Create", "New", "Add", "Post", "Write"])
+            if create_btn:
+                driver.execute_script("arguments[0].click()", create_btn)
+                time.sleep(3)
+                driver.get_log("performance")
+                save_btn = _find_clickable(driver, ["Save", "Submit", "Publish", "Create"])
+                if save_btn:
+                    driver.execute_script("arguments[0].click()", save_btn)
+                    time.sleep(3)
+                    calls = _extract_api_calls(driver)
+                    for c in calls:
+                        if "blog" in c["url"] and c["method"] in ("POST", "PUT"):
+                            self.registry.register(
+                                "set_blog", c["method"],
+                                c["url"].replace(BASE, ""),
+                                request_schema=c.get("postData"),
+                                response_schema=c.get("response", "")[:500]
+                            )
+                            return {"found": True, "call": c}
+            return {"found": False, "calls": _extract_api_calls(driver)}
+        finally:
+            driver.quit()
+
+    def discover_interview(self) -> Dict:
+        """Capture interview edit endpoint."""
+        log.info("Discovering interview endpoint...")
+        driver = _get_driver(self.profile)
+        try:
+            driver.get(f"{BASE}/settings?interview=1")
+            time.sleep(5)
+            _dismiss_popups(driver)
+            _wait_for_react(driver)
+            driver.get_log("performance")
+
+            save_btn = _find_clickable(driver, ["Save", "Submit", "Update", "Confirm"])
+            if save_btn:
+                driver.execute_script("arguments[0].click()", save_btn)
+                time.sleep(3)
+                calls = _extract_api_calls(driver)
+                for c in calls:
+                    if "interview" in c["url"] and c["method"] in ("POST", "PUT"):
+                        self.registry.register(
+                            "set_interview", c["method"],
+                            c["url"].replace(BASE, ""),
+                            request_schema=c.get("postData"),
+                            response_schema=c.get("response", "")[:500]
+                        )
+                        return {"found": True, "call": c}
+            return {"found": False, "calls": _extract_api_calls(driver)}
+        finally:
+            driver.quit()
+
+
+def run_discovery(target: str) -> Dict:
+    """Discover an endpoint by target name."""
+    d = CDPDiscoverer()
+    if target == "availability":
+        return d.discover_availability()
+    elif target == "blog":
+        return d.discover_blog()

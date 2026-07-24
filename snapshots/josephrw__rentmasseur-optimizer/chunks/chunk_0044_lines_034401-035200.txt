@@ -1,800 +1,800 @@
-            if any(kw in msg for kw in booking_kw):
-                score += 0.5
-            if any(kw in msg for kw in price_kw):
-                score += 0.3
-            if msg.strip():
-                score += 0.2
-            intent_scores.append(min(1.0, score))
+            "protocol": "CAPD/1.0",
+            "description": "Content-Addressed Progressive Disclosure — navigate this file without downloading it",
+            "file": self.file_info,
+            "merkle_root": root,
+            "chunk_size": self.chunk_size,
+            "num_chunks": self.merkle.num_chunks,
+            "endpoints": {
+                "GET /meta": "This response — file metadata + Merkle root",
+                "GET /summary": "First/last 4KB + structure hints (start here)",
+                "GET /head?n=100": "First N lines",
+                "GET /tail?n=100": "Last N lines",
+                "GET /chunk/{i}": "Chunk i (64KB) with Merkle proof header",
+                "GET /range?s=0&e=65536": "Arbitrary byte range [s, e)",
+                "GET /search?q=pattern&context=2": "Server-side grep, returns matching lines + context",
+                "GET /merkle": "Full Merkle tree (all chunk hashes)",
+                "GET /stream": "Full file stream (downloads entire file — use sparingly)",
+                "GET /health": "Health check",
+            },
+            "usage_hint": (
+                "1. Read /meta to understand the file. "
+                "2. Read /summary to see structure. "
+                "3. Use /search?q=... to find relevant sections. "
+                "4. Pull specific /chunk/{i} or /range?s=X&e=Y for detail. "
+                "Never download /stream unless you truly need every byte."
+            ),
+        }
+        if self._wants_json():
+            self._send_json(meta)
+        else:
+            # Human-readable landing page
+            html = self._render_landing(meta)
+            self._send_text(html, content_type="text/html")
 
-        state.mailbox_intent_score = round(
-            sum(intent_scores) / len(intent_scores), 2
-        ) if intent_scores else 0.0
-
-        # Store lead summaries (no raw PII in state)
-        for email in emails:
-            uc = email.get("userCard", {})
-            state.mailbox_leads.append({
-                "username": uc.get("username", ""),
-                "is_premium": bool(uc.get("isPremium", 0)),
-                "unread": bool(email.get("unread", 0)),
-                "created_at": email.get("createdAt", 0),
-                "intent_score": min(1.0, (
-                    0.5 if any(kw in (email.get("lastMessage", "") or "").lower() for kw in booking_kw) else 0.0
-                ) + (0.3 if any(kw in (email.get("lastMessage", "") or "").lower() for kw in price_kw) else 0.0)
-                + (0.2 if (email.get("lastMessage", "") or "").strip() else 0.0)),
-            })
-
-        log.info(f"  ◉ Mailbox: {state.mailbox_count} conversations, intent={state.mailbox_intent_score}")
-    except Exception as e:
-        err = str(e)
-        state.endpoint_errors.append(f"mailbox:{err[:60]}")
-        log.warning(f"  ⟁ mailbox error: {e}")
-
-    # 7. Search rank (optional — can be slow)
-    try:
-        results = api.search_masseurs(city="manhattan-ny", page=1)
-        users = results.get("users", [])
-        state.search_total = len(users)
-        # Find our position
-        my_username = ""
-        try:
-            my_username = api.session.headers.get("X-RM-Username", "")
-        except Exception:
-            pass
-        for i, user in enumerate(users):
-            if user.get("username") == my_username:
-                state.search_rank = i + 1
-                break
-        log.info(f"  ◉ Search: rank=#{state.search_rank} of {state.search_total}")
-    except Exception as e:
-        err = str(e)
-        state.endpoint_errors.append(f"search:{err[:60]}")
-        log.warning(f"  ⟁ search error: {e}")
-
-    # Determine measurement validity — 3+ endpoint errors = invalid
-    state.endpoint_error_count = len(state.endpoint_errors)
-    critical_endpoints = {"dashboard", "ad_statistics", "keeponline", "availability", "mailbox"}
-    critical_failures = sum(1 for e in state.endpoint_errors if any(c in e for c in critical_endpoints))
-    if critical_failures >= 3:
-        state.measurement_valid = False
-        log.warning(f"  ⟁ MEASUREMENT INVALID: {critical_failures} critical endpoint failures")
-
-    # Compute revenue pressure
-    compute_revenue_pressure(state)
-
-    # Compute state hash
-    state.compute_hash()
-
-    return state
-
-
-def compute_revenue_pressure(state: TrafficState) -> None:
-    """
-    Revenue Pressure Engine — scores how urgently the account needs action.
-
-    revenue_pressure =
-      0.30 * contact_rate_gap      (low CTR = high pressure to fix profile)
-    + 0.20 * availability_risk     (not available = high pressure)
-    + 0.20 * rank_decay            (low rank = high pressure)
-    + 0.15 * unanswered_intent     (mailbox with intent but no replies)
-    + 0.10 * profile_fatigue       (hidden or stale)
-    + 0.05 * traffic_drop          (low views)
-    """
-    # Contact rate gap: target 5%, below that = pressure
-    contact_rate_gap = max(0, (5.0 - state.contact_rate) / 5.0) if state.views > 0 else 0.5
-
-    # Availability risk: not available = 1.0, available with <1h left = 0.5
-    if state.available_status != "Available":
-        availability_risk = 1.0
-    elif state.availability_seconds_left < 3600:
-        availability_risk = 0.5
-    else:
-        availability_risk = 0.0
-
-    # Rank decay: rank > 20 = high pressure, rank 1-5 = low
-    if state.search_rank == 0:
-        rank_decay = 0.3  # unknown
-    elif state.search_rank > 20:
-        rank_decay = 0.8
-    elif state.search_rank > 10:
-        rank_decay = 0.5
-    else:
-        rank_decay = 0.1
-
-    # Unanswered intent: mailbox with high intent but no recent replies
-    unanswered = state.mailbox_intent_score if state.mailbox_count > 0 else 0.0
-
-    # Profile fatigue: hidden or no headline
-    profile_fatigue = 0.0
-    if state.profile_hidden:
-        profile_fatigue += 0.5
-    if not state.headline:
-        profile_fatigue += 0.3
-
-    # Traffic drop: very low views
-    traffic_drop = 0.3 if state.views < 100 else 0.0
-
-    state.pressure_components = {
-        "contact_rate_gap": round(contact_rate_gap, 3),
-        "availability_risk": round(availability_risk, 3),
-        "rank_decay": round(rank_decay, 3),
-        "unanswered_intent": round(unanswered, 3),
-        "profile_fatigue": round(profile_fatigue, 3),
-        "traffic_drop": round(traffic_drop, 3),
-    }
-
-    state.revenue_pressure = round(
-        0.30 * contact_rate_gap
-        + 0.20 * availability_risk
-        + 0.20 * rank_decay
-        + 0.15 * unanswered
-        + 0.10 * profile_fatigue
-        + 0.05 * traffic_drop,
-        3
-    )
-
-```
-
-stats_dashboard.py:
-```
-"""
-Stats Dashboard — generate a simple HTML stats page for the ProfileOps engine.
-"""
-
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-
-from .db import get_conn
-from .traffic_analyzer import conversion_rate, analyze_trend
-
-
-def _get_latest_state():
-    conn = get_conn()
-    snap = conn.execute("SELECT * FROM traffic_snapshots ORDER BY created_at DESC LIMIT 1").fetchone()
-    conn.close()
-    return dict(snap) if snap else {}
-
-
-def _get_experiment_count():
-    conn = get_conn()
-    total = conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
-    open_ = conn.execute("SELECT COUNT(*) FROM experiments WHERE ended_at IS NULL").fetchone()[0]
-    conn.close()
-    return {"total": total, "open": open_}
-
-
-def _get_draft_count():
-    conn = get_conn()
-    bio = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='bio' AND status='draft'").fetchone()[0]
-    blog = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='blog' AND status='draft'").fetchone()[0]
-    interview = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='interview' AND status='draft'").fetchone()[0]
-    conn.close()
-    return {"bio": bio, "blog": blog, "interview": interview}
-
-
-def _get_receipt_count():
-    conn = get_conn()
-    total = conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0]
-    verified = conn.execute("SELECT COUNT(*) FROM receipts WHERE verified=1").fetchone()[0]
-    conn.close()
-    return {"total": total, "verified": verified}
-
-
-def _get_recent_receipts(limit: int = 10):
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM receipts ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def generate_html(state: dict = None, output_path: Path = None) -> Path:
-    if state is None:
-        state = _get_latest_state()
-    trend = analyze_trend(hours=24)
-    experiments = _get_experiment_count()
-    drafts = _get_draft_count()
-    receipts = _get_receipt_count()
-    recent = _get_recent_receipts(10)
-
-    views = state.get("profile_views") or 0
-    contacts = state.get("contact_clicks") or 0
-    rate = conversion_rate(views, contacts)
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RM ProfileOps Stats Dashboard</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f7; color: #1d1d1f; }}
-        h1 {{ font-size: 32px; margin-bottom: 8px; }}
-        .timestamp {{ color: #86868b; font-size: 14px; margin-bottom: 24px; }}
-        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }}
-        .card {{ background: white; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-        .card h2 {{ font-size: 14px; color: #86868b; margin: 0 0 8px 0; text-transform: uppercase; letter-spacing: 0.5px; }}
-        .card .value {{ font-size: 32px; font-weight: 600; margin: 0; }}
-        .card .sub {{ font-size: 14px; color: #86868b; margin-top: 4px; }}
-        .section {{ background: white; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-        .section h2 {{ font-size: 18px; margin-top: 0; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-        th, td {{ text-align: left; padding: 10px; border-bottom: 1px solid #eee; }}
-        th {{ color: #86868b; font-weight: 500; }}
-        .ok {{ color: #34c759; }}
-        .warn {{ color: #ff9500; }}
-        .bad {{ color: #ff3b30; }}
-    </style>
+    def _render_landing(self, meta: dict) -> str:
+        f = meta["file"]
+        return f"""<!DOCTYPE html>
+<html>
+<head><title>LLM File Proxy — {f['filename']}</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; color: #333; }}
+  h1 {{ color: #2563eb; }}
+  .meta {{ background: #f8fafc; padding: 16px; border-radius: 8px; margin: 16px 0; }}
+  .endpoint {{ font-family: monospace; background: #1e293b; color: #93c5fd; padding: 2px 8px; border-radius: 4px; }}
+  .hint {{ background: #fef3c7; padding: 12px; border-radius: 8px; margin: 16px 0; }}
+  code {{ background: #f1f5f9; padding: 2px 6px; border-radius: 3px; }}
+</style>
 </head>
 <body>
-    <h1>RM ProfileOps Stats Dashboard</h1>
-    <div class="timestamp">Generated: {datetime.now(timezone.utc).isoformat()} UTC</div>
-
-    <div class="grid">
-        <div class="card">
-            <h2>Profile Views</h2>
-            <p class="value">{views}</p>
-        </div>
-        <div class="card">
-            <h2>Contact Clicks</h2>
-            <p class="value">{contacts}</p>
-        </div>
-        <div class="card">
-            <h2>Contact Rate</h2>
-            <p class="value">{rate:.2%}</p>
-        </div>
-        <div class="card">
-            <h2>Receipts</h2>
-            <p class="value">{receipts['total']}</p>
-            <p class="sub">{receipts['verified']} verified</p>
-        </div>
-        <div class="card">
-            <h2>Experiments</h2>
-            <p class="value">{experiments['total']}</p>
-            <p class="sub">{experiments['open']} open</p>
-        </div>
-        <div class="card">
-            <h2>Drafts</h2>
-            <p class="value">{drafts['bio'] + drafts['blog'] + drafts['interview']}</p>
-            <p class="sub">bio {drafts['bio']} | blog {drafts['blog']} | interview {drafts['interview']}</p>
-        </div>
-    </div>
-
-    <div class="section">
-        <h2>24h Trend</h2>
-        <p><strong>Status:</strong> {trend.get('status', 'N/A')}</p>
-        <p><strong>Delta views:</strong> {trend.get('comparison', {}).get('delta_views', 'N/A')}</p>
-        <p><strong>Delta contacts:</strong> {trend.get('comparison', {}).get('delta_clicks', 'N/A')}</p>
-        <p><strong>Rate change:</strong> {trend.get('comparison', {}).get('rate_delta', 'N/A')}</p>
-        <p><strong>Alert:</strong> <span class="{'bad' if trend.get('alert') else 'ok'}">{'YES' if trend.get('alert') else 'NO'}</span></p>
-    </div>
-
-    <div class="section">
-        <h2>Recent Receipts</h2>
-        <table>
-            <tr><th>Time</th><th>Action</th><th>Verified</th></tr>
-            {''.join(f'<tr><td>{r["created_at"]}</td><td>{r["action"]}</td><td class="{"ok" if r["verified"] else "bad"}">{"YES" if r["verified"] else "NO"}</td></tr>' for r in recent)}
-        </table>
-    </div>
+<h1>LLM File Proxy</h1>
+<p><strong>{f['filename']}</strong> — {f['size_human']} ({f['mime_type']})</p>
+<div class="meta">
+  <p><strong>Protocol:</strong> CAPD/1.0 — Content-Addressed Progressive Disclosure</p>
+  <p><strong>Merkle Root:</strong> <code>{meta['merkle_root']}</code></p>
+  <p><strong>Chunks:</strong> {meta['num_chunks']} × {self.chunk_size // 1024}KB</p>
+  <p><strong>Format:</strong> {f.get('format', 'unknown')}</p>
+</div>
+<div class="hint">
+  <strong>For LLMs:</strong> Send the base URL to your LLM. It can navigate this file
+  using the endpoints below without downloading the full {f['size_human']}.
+</div>
+<h2>Endpoints</h2>
+<ul>
+  <li><span class="endpoint">GET /meta</span> — File metadata + Merkle root</li>
+  <li><span class="endpoint">GET /summary</span> — First/last 4KB + structure</li>
+  <li><span class="endpoint">GET /head?n=100</span> — First N lines</li>
+  <li><span class="endpoint">GET /tail?n=100</span> — Last N lines</li>
+  <li><span class="endpoint">GET /chunk/&#123;i&#125;</span> — Chunk i (64KB) with Merkle proof</li>
+  <li><span class="endpoint">GET /range?s=0&e=65536</span> — Byte range</li>
+  <li><span class="endpoint">GET /search?q=pattern</span> — Server-side grep + context</li>
+  <li><span class="endpoint">GET /merkle</span> — Full Merkle tree</li>
+  <li><span class="endpoint">GET /stream</span> — Full file (use sparingly)</li>
+</ul>
 </body>
-</html>
-"""
+</html>"""
 
-    output_path = output_path or Path(__file__).parent / "data" / "dashboard" / "index.html"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html)
-    return output_path
+    def handle_summary(self):
+        """First/last 4KB + line count + structure."""
+        size = self.file_info["size_bytes"]
+        head_bytes = min(4096, size)
+        tail_start = max(0, size - 4096)
+        tail_bytes = size - tail_start
 
+        with open(self.filepath, "rb") as f:
+            head = f.read(head_bytes)
+            f.seek(tail_start)
+            tail = f.read(tail_bytes)
 
-def generate_dashboard() -> Path:
-    return generate_html()
+        # Count total lines (streaming, no full load)
+        line_count = 0
+        with open(self.filepath, "rb") as f:
+            for _ in f:
+                line_count += 1
 
-```
-
-content_optimizer.py:
-```
-"""
-Content Optimizer — conservative bio A/B testing.
-
-Rules:
-- One bio change per 24 hours max.
-- Only rotate through known, hypothesis-driven variants.
-- Store before/after metrics and receipt.
-- Never auto-generate random spam.
-"""
-
-import logging
-import random
-import time
-from datetime import datetime, timezone
-
-from .db import (
-    write_receipt,
-    upsert_content_variant,
-    set_variant_status,
-    get_active_variant,
-    get_variant_history,
-    start_experiment,
-    end_experiment,
-    get_open_experiments,
-    get_latest_traffic_snapshot,
-)
-from .api_client import RentMasseurAPI
-from .bio_variants import get_variant, list_variant_ids
-from .bio_variants_library import get_variant as get_library_variant, list_all as list_all_library_variants, count as library_count
-from .llm_bio_writer import generate_bio_with_llm
-from .content_policy import check_bio_risk
-
-log = logging.getLogger("profileops.content")
-
-MIN_SECONDS_BETWEEN_BIO_CHANGES = 24 * 60 * 60
-
-
-def _last_bio_change_time() -> float:
-    """Return timestamp of last applied bio variant, or 0."""
-    history = get_variant_history("bio", limit=1)
-    if not history:
-        return 0
-    row = history[0]
-    if row.get("status") == "active" and row.get("applied_at"):
-        dt = datetime.fromisoformat(row["applied_at"])
-        return dt.timestamp()
-    return 0
-
-
-def _can_change_bio() -> bool:
-    last = _last_bio_change_time()
-    if not last:
-        return True
-    return (time.time() - last) >= MIN_SECONDS_BETWEEN_BIO_CHANGES
-
-
-def _pick_next_variant(current_id: str) -> dict:
-    """Pick a different variant than the current one."""
-    candidates = [vid for vid in list_variant_ids() if vid != current_id]
-    if not candidates:
-        return None
-    return get_variant(random.choice(candidates))
-
-
-def draft_bio_variant(api: RentMasseurAPI, use_llm: bool = True) -> dict:
-    """
-    Draft a new bio variant. Uses LLM if configured, otherwise library.
-    Does NOT apply it.
-    """
-    about = api.get_about()
-    assets = about.get("userProps", {}).get("assets", {})
-    current_headline = assets.get("headline", "")
-    current_description = assets.get("description", "")
-
-    raw_history = get_latest_traffic_snapshot(7)
-    history = [
-        {"ts": r["created_at"], "views": r["profile_views"], "contact_clicks": r["contact_clicks"], "visits": r["new_visits"]}
-        for r in raw_history
-    ]
-    suggestion = None
-    if use_llm:
-        import os
-        suggestion = generate_bio_with_llm(
-            {"about": about, "stats": {}}, history,
-            current_headline, current_description,
-            city="Manhattan, NYC", provider=os.environ.get("LLM_PROVIDER"),
-            model=os.environ.get("LLM_MODEL")
-        )
-
-    if suggestion:
-        variant_id = f"llm_{int(time.time())}"
-        variant = {
-            "variant_id": variant_id,
-            "headline": suggestion["headline"],
-            "description": suggestion["bio"],
-            "hypothesis": "LLM-generated variant based on profile and recent traffic.",
+        summary = {
+            "file": self.file_info["filename"],
+            "size_bytes": size,
+            "total_lines": line_count,
+            "head_4kb": head.decode("utf-8", errors="replace"),
+            "tail_4kb": tail.decode("utf-8", errors="replace"),
+            "head_bytes": head_bytes,
+            "tail_start_byte": tail_start,
+            "tail_bytes": tail_bytes,
+            "format": self.file_info.get("format", "text"),
+            "is_binary": self.file_info.get("is_binary", False),
         }
-    else:
-        active = get_active_variant("bio")
-        current_idx = -1
-        if active:
-            try:
-                current_idx = int(active["variant_id"].replace("module_", ""))
-            except Exception:
-                pass
-        # Pick next from 30-module library
-        next_idx = (current_idx + 1) % library_count()
-        variant = get_library_variant(next_idx)
-        if not variant:
-            log.warning("No alternative variant found")
-            return None
+        self._send_json(summary)
 
-    # Policy check
-    risk = check_bio_risk(variant["headline"] + " " + variant["description"])
-    variant["risk_score"] = risk
-    if risk > 0.7:
-        log.error("Draft rejected by policy: risk=%.2f", risk)
-        return None
+    def handle_head(self, n: int):
+        """First N lines."""
+        lines = []
+        with open(self.filepath, "r", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= n:
+                    break
+                lines.append(line.rstrip("\n"))
+        self._send_json({
+            "lines": lines,
+            "count": len(lines),
+            "requested": n,
+        })
 
-    upsert_content_variant(
-        variant["variant_id"], "bio",
-        variant["headline"], variant["description"],
-        hypothesis=variant["hypothesis"],
-        status="draft"
-    )
-    write_receipt(
-        "bio_draft_created_v1",
-        "draft_bio_variant",
-        {"current_headline": current_headline},
-        variant,
-        verified=True,
-    )
-    log.info("Bio draft created: %s", variant["variant_id"])
-    return variant
+    def handle_tail(self, n: int):
+        """Last N lines (efficient via seek from end)."""
+        # Read last 64KB chunk, split into lines, take last N
+        size = self.file_info["size_bytes"]
+        read_size = min(size, n * 512 + 4096)  # generous estimate
+        with open(self.filepath, "rb") as f:
+            f.seek(max(0, size - read_size))
+            data = f.read()
+        all_lines = data.decode("utf-8", errors="replace").splitlines()
+        lines = all_lines[-n:] if len(all_lines) >= n else all_lines
+        self._send_json({
+            "lines": lines,
+            "count": len(lines),
+            "requested": n,
+        })
 
+    def handle_chunk(self, index: int):
+        """Chunk i with Merkle proof in headers."""
+        if index < 0 or index >= self.merkle.num_chunks:
+            self._send_json({"error": f"chunk index out of range [0, {self.merkle.num_chunks})"}, 400)
+            return
 
-def apply_bio_variant(api: RentMasseurAPI, variant_id: str) -> bool:
-    """
-    Apply a drafted bio variant. Enforces 24-hour cooldown and policy.
-    """
-    if not _can_change_bio():
-        log.warning("Bio change blocked: within 24-hour cooldown")
-        return False
+        with open(self.filepath, "rb") as f:
+            f.seek(index * self.chunk_size)
+            data = f.read(self.chunk_size)
 
-    from .db import get_conn
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM content_variants WHERE variant_id=?", (variant_id,)).fetchone()
-    conn.close()
-    if not row:
-        log.error("Variant not found: %s", variant_id)
-        return False
+        chunk_hash = self.merkle.get_chunk_hash(index)
+        proof = self.merkle.get_proof(index)
 
-    variant = dict(row)
-
-    about = api.get_about()
-    assets = about.get("userProps", {}).get("assets", {})
-    before = {
-        "headline": assets.get("headline"),
-        "description": assets.get("description"),
-    }
-
-    api.set_about(variant["headline"], variant["description"])
-
-    # Verify
-    about = api.get_about()
-    assets = about.get("userProps", {}).get("assets", {})
-    after = {
-        "headline": assets.get("headline"),
-        "description": assets.get("description"),
-    }
-    verified = (after["headline"] == variant["headline"] and after["description"] == variant["description"])
-
-    # Mark old active as removed
-    old = get_active_variant("bio")
-    if old:
-        set_variant_status(old["variant_id"], "archived", "removed_at")
-    set_variant_status(variant_id, "active", "applied_at")
-
-    # Start experiment
-    baseline = get_latest_traffic_snapshot(1)
-    baseline_views = baseline[0]["profile_views"] if baseline else 0
-    baseline_clicks = baseline[0]["contact_clicks"] if baseline else 0
-    start_experiment(f"exp_{variant_id}_{int(time.time())}", variant_id, baseline_views, baseline_clicks)
-
-    write_receipt(
-        "bio_applied_v1",
-        "apply_bio_variant",
-        before,
-        after,
-        verified=verified,
-    )
-
-    if verified:
-        log.info("Bio applied: %s", variant_id)
-    else:
-        log.error("Bio apply verification failed: %s", variant_id)
-    return verified
-
-
-def evaluate_open_experiments(api: RentMasseurAPI) -> list:
-    """End any open experiments that have run for 24+ hours."""
-    results = []
-    open_exps = get_open_experiments()
-    now = time.time()
-    for exp in open_exps:
-        started = datetime.fromisoformat(exp["started_at"]).timestamp()
-        if now - started < 24 * 60 * 60:
-            continue
-        current = get_latest_traffic_snapshot(1)
-        final_views = current[0]["profile_views"] if current else 0
-        final_clicks = current[0]["contact_clicks"] if current else 0
-        delta_views = final_views - (exp["baseline_views"] or 0)
-        delta_clicks = final_clicks - (exp["baseline_clicks"] or 0)
-        result = {
-            "experiment_id": exp["experiment_id"],
-            "variant_id": exp["variant_id"],
-            "delta_views": delta_views,
-            "delta_clicks": delta_clicks,
-            "baseline_views": exp["baseline_views"],
-            "baseline_clicks": exp["baseline_clicks"],
-            "final_views": final_views,
-            "final_clicks": final_clicks,
-        }
-        end_experiment(exp["experiment_id"], final_views, final_clicks, result)
-        results.append(result)
-        log.info("Experiment ended: %s", result)
-    return results
-
-
-def run_daily_draft_cycle(api: RentMasseurAPI) -> dict:
-    """Generate bio and headline drafts. Do not apply."""
-    bio = draft_bio_variant(api)
-    return {
-        "bio_draft": bio,
-        "experiments_evaluated": evaluate_open_experiments(api),
-    }
-
-```
-
-bio_generator_v2:
-```
-Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
-```
-
-llm_bio_writer.py:
-```
-"""
-LLM Bio Writer — generates a real bio based on actual profile and traffic analysis.
-
-Uses local Ollama (llama3.2) by default. The prompt includes:
-- Current profile data (services, rates, headline, description)
-- Last 7 days of views and contact clicks
-- Best performing day
-- Weaknesses and opportunities
-- City/location
-
-Output: a new headline + bio, grounded in real data. No fake claims.
-"""
-
-import json
-import logging
-import time
-from typing import Dict, Any, Optional
-
-from rm_traffic.llm_client import LLMClient, generate_with_fallback
-
-log = logging.getLogger("llm_bio")
-
-DEFAULT_MODEL = "llama3.2"
-
-
-def build_prompt(profile_data: Dict[str, Any], stats_history: list, current_headline: str,
-                 current_description: str, city: str = "Manhattan, NYC") -> str:
-    """Build a grounded prompt for the LLM bio writer."""
-
-    dash = profile_data.get("dashboard", {})
-    stats = profile_data.get("stats", {})
-    prof_stats = stats.get("profileStatistics", {}) or {}
-    services = dash.get("service", {})
-    bookmarks = dash.get("onlineBookmarks", 0)
-
-    # Format services
-    services_text = []
-    for key, svc in services.items():
-        if isinstance(svc, dict) and svc.get("activated"):
-            incall = svc.get("price", {}).get("incall", "")
-            outcall = svc.get("price", {}).get("outcall", "")
-            services_text.append(f"- {svc.get('label', key)}: incall ${incall}, outcall ${outcall}")
-
-    # Format 7-day traffic
-    visits = prof_stats.get("visits", [])
-    traffic_lines = []
-    best_day = None
-    best_views = 0
-    total_views = 0
-    for v in visits:
-        if isinstance(v, dict):
-            day = v.get("day", "")
-            count = v.get("count", 0)
-            total_views += count
-            traffic_lines.append(f"- {day}: {count} views")
-            if count > best_views:
-                best_views = count
-                best_day = day
-
-    # Recent stats from DB
-    recent = stats_history[-3:] if stats_history else []
-    recent_lines = []
-    for r in recent:
-        recent_lines.append(
-            f"- {r['ts'][:10]}: {r['views'] or 'N/A'} views, {r['contact_clicks'] or 'N/A'} contact clicks, "
-            f"{r['visits'] or 'N/A'} new visits"
-        )
-
-    prompt = f"""You are a professional profile copywriter for an independent massage therapist in Manhattan.
-
-Your job: rewrite the headline and bio for this RentMasseur profile based ONLY on the real data below.
-
-Rules:
-- Do NOT invent fake credentials, fake reviews, or fake client testimonials.
-- Do NOT claim specific results unless they are in the data.
-- Keep the tone confident, masculine, direct, and professional.
-- Use the location and services from the data.
-- Mention the therapist's username "KARPATHIAN WOLF" and the Wolf persona.
-- Make the bio 1500-2000 characters.
-- The headline should be punchy and memorable, under 80 characters.
-- The bio should explain who he is, what he offers, where, and what makes him different.
-
-PROFILE DATA:
-Username: Karpathianwolf
-Current headline: {current_headline}
-Current bio (first 300 chars): {current_description[:300]}
-Location: {city}
-Services:
-{chr(10).join(services_text) if services_text else "- Therapeutic and sensual massage"}
-
-TRAFFIC DATA:
-Total profile views: {prof_stats.get('totalPageViews', 'N/A')}
-Total contact clicks: {prof_stats.get('totalContactClicks', 'N/A')}
-Online bookmarks: {bookmarks}
-
-Last 7 days:
-{chr(10).join(traffic_lines) if traffic_lines else "No daily data"}
-Best performing day: {best_day} ({best_views} views)
-
-Recent stats:
-{chr(10).join(recent_lines) if recent_lines else "No recent data"}
-
-INSIGHTS:
-- The profile gets {prof_stats.get('totalPageViews', 0)} lifetime views.
-- The best recent day was {best_day} with {best_views} views.
-- Keep the profile focused, confident, and trustworthy.
-
-OUTPUT FORMAT:
-Return ONLY a JSON object with exactly two keys:
-{{"headline": "...", "bio": "..."}}
-
-Do not include any markdown, explanation, or extra text. Just the JSON object.
-"""
-    return prompt
-
-
-def parse_llm_output(text: str) -> Optional[Dict[str, str]]:
-    """Parse JSON output from LLM. Clean up common formatting issues."""
-    if not text:
-        return None
-
-    # Find JSON block
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1] if text.count("```") >= 2 else text
-        text = text.strip()
-        if text.startswith("json"):
-            text = text[4:].strip()
-
-    # Find first { and last }
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    text = text[start:end+1]
-
-    try:
-        data = json.loads(text)
-        if "headline" in data and "bio" in data:
-            return {
-                "headline": str(data["headline"]).strip(),
-                "bio": str(data["bio"]).strip(),
+        self._send_bytes(
+            data,
+            content_type=self.file_info.get("mime_type", "application/octet-stream"),
+            extra_headers={
+                "X-Merkle-Root": self.merkle.get_root(),
+                "X-Chunk-Index": str(index),
+                "X-Chunk-Hash": chunk_hash,
+                "X-Chunk-Proof": json.dumps(proof),
+                "X-Total-Chunks": str(self.merkle.num_chunks),
+                "X-Chunk-Size": str(len(data)),
             }
-    except json.JSONDecodeError:
-        log.error("Failed to parse LLM output as JSON")
-        return None
-    return None
+        )
+
+    def handle_range(self, start: int, end: int):
+        """Arbitrary byte range [start, end)."""
+        size = self.file_info["size_bytes"]
+        start = max(0, start)
+        end = min(size, end)
+        if start >= end:
+            self._send_json({"error": "invalid range", "start": start, "end": end}, 400)
+            return
+
+        with open(self.filepath, "rb") as f:
+            f.seek(start)
+            data = f.read(end - start)
+
+        range_hash = hashlib.sha256(data).hexdigest()
+        self._send_bytes(
+            data,
+            content_type=self.file_info.get("mime_type", "application/octet-stream"),
+            extra_headers={
+                "Content-Range": f"bytes {start}-{end-1}/{size}",
+                "X-Range-Hash": range_hash,
+                "X-Range-Start": str(start),
+                "X-Range-End": str(end),
+            }
+        )
+
+    def handle_search(self, query: str, context: int, max_results: int):
+        """Server-side grep — stream file, return matching lines + context."""
+        if not query:
+            self._send_json({"error": "missing q parameter", "usage": "/search?q=pattern&context=2&max=50"}, 400)
+            return
+
+        results = []
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
+        buffer: list[tuple[int, str]] = []  # (line_num, line_text) for context
+        match_count = 0
+
+        with open(self.filepath, "r", errors="replace") as f:
+            for line_num, line in enumerate(f):
+                line_text = line.rstrip("\n")
+                buffer.append((line_num, line_text))
+                if len(buffer) > context + 1:
+                    buffer.pop(0)
+
+                if pattern.search(line_text):
+                    # Include context lines
+                    ctx_start = max(0, len(buffer) - context - 1)
+                    ctx_lines = buffer[ctx_start:]
+                    results.append({
+                        "line": line_num,
+                        "match": line_text,
+                        "context_before": [l for n, l in ctx_lines[:-1]],
+                        "context_after": [],  # filled below
+                    })
+                    match_count += 1
+
+                    # Read context after
+                    if context > 0:
+                        after = []
+                        for _ in range(context):
+                            try:
+                                next_line = next(f)
+                                after.append(next_line.rstrip("\n"))
+                            except StopIteration:
+                                break
+                        results[-1]["context_after"] = after
+
+                    if match_count >= max_results:
+                        break
+
+        self._send_json({
+            "query": query,
+            "matches": match_count,
+            "truncated": match_count >= max_results,
+            "max_results": max_results,
+            "results": results,
+        })
+
+    def handle_merkle(self):
+        """Full Merkle tree — all leaf hashes + root."""
+        leaves = self.merkle.get_all_leaves()
+        self._send_json({
+            "root": self.merkle.get_root(),
+            "chunk_size": self.chunk_size,
+            "num_chunks": self.merkle.num_chunks,
+            "leaves": leaves,
+        })
+
+    def handle_stream(self):
+        """Full file stream — only if explicitly requested."""
+        size = self.file_info["size_bytes"]
+        self.send_response(200)
+        self.send_header("Content-Type", self.file_info.get("mime_type", "application/octet-stream"))
+        self.send_header("Content-Length", str(size))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Merkle-Root", self.merkle.get_root())
+        self.end_headers()
+        with open(self.filepath, "rb") as f:
+            while True:
+                chunk = f.read(self.chunk_size)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
 
-def generate_bio_with_llm(profile_data: Dict[str, Any], stats_history: list,
-                          current_headline: str, current_description: str,
-                          city: str = "Manhattan, NYC", model: str = DEFAULT_MODEL,
-                          provider: str = None, max_tokens: int = 1200) -> Optional[Dict[str, str]]:
-    """Generate a new bio using the LLM based on real data."""
-    prompt = build_prompt(profile_data, stats_history, current_headline, current_description, city)
-    log.info("Calling LLM for bio generation...")
-    start = time.time()
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-    if provider:
-        client = LLMClient(provider, model)
-        response = client.generate(prompt, max_tokens)
-    else:
-        response = generate_with_fallback(prompt, max_tokens)
+def main():
+    parser = argparse.ArgumentParser(
+        description="LLM File Proxy — Content-Addressed Progressive Disclosure"
+    )
+    parser.add_argument("file", help="Path to file to serve")
+    parser.add_argument("--port", type=int, default=8765, help="Port (default 8765)")
+    parser.add_argument("--chunk-size", type=int, default=65536, help="Chunk size in bytes (default 65536 = 64KB)")
+    args = parser.parse_args()
 
-    elapsed = time.time() - start
-    log.info("LLM response received in %.1fs", elapsed)
+    filepath = os.path.abspath(args.file)
+    if not os.path.isfile(filepath):
+        print(f"Error: {filepath} is not a file", file=sys.stderr)
+        sys.exit(1)
 
-    if not response:
-        return None
+    file_info = detect_file_type(filepath)
+    merkle = MerkleTree(filepath, args.chunk_size)
 
-    parsed = parse_llm_output(response)
-    if parsed:
-        log.info("Generated headline: %s", parsed["headline"])
-        return parsed
-    else:
-        log.error("Could not parse LLM bio output")
-        return None
+    # Inject config into handler class
+    CAPDHandler.filepath = filepath
+    CAPDHandler.chunk_size = args.chunk_size
+    CAPDHandler.merkle = merkle
+    CAPDHandler.file_info = file_info
+    CAPDHandler.start_time = time.time()
 
-
-# Fallback: if Ollama is not available, return a template variant
-def generate_fallback_bio(current_headline: str = "", current_description: str = "") -> Dict[str, str]:
-    from rm_traffic.profileops import suggest_bio
-    return suggest_bio(current_headline, current_description)
+    server = HTTPServer(("127.0.0.1", args.port), CAPDHandler)
+    print(f"LLM File Proxy serving: {file_info['filename']} ({file_info['size_human']})", file=sys.stderr)
+    print(f"Listening on http://127.0.0.1:{args.port}", file=sys.stderr)
+    print(f"Chunks: {merkle.num_chunks} × {args.chunk_size // 1024}KB", file=sys.stderr)
+    print(f"Endpoints: /meta /summary /head /tail /chunk/{{i}} /range /search /merkle /stream", file=sys.stderr)
+    print(f"READY", file=sys.stderr)
+    server.serve_forever()
 
 
 if __name__ == "__main__":
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    # Test
-    sample = {
-        "dashboard": {
-            "onlineBookmarks": 2,
-            "service": {
-                "therapeutic": {"activated": True, "price": {"incall": 199, "outcall": 269}, "label": "Therapeutic"},
-            }
-        },
-        "stats": {
-            "profileStatistics": {
-                "totalPageViews": 2808,
-                "totalContactClicks": 135,
-                "visits": [
-                    {"day": "Today", "count": 0, "percent": 0},
-                    {"day": "Yesterday", "count": 76, "percent": 85},
-                ]
-            }
-        }
-    }
-    result = generate_bio_with_llm(sample, [], "Old headline", "Old bio text", "Manhattan, NYC")
-    print(json.dumps(result, indent=2) if result else "No result")
+    main()
 
 ```
 
-intent_engine.py:
+Dockerfile:
+```
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY hf_space.py .
+
+# Persistent storage mount point
+RUN mkdir -p /data/indexes
+
+ENV PORT=7860
+EXPOSE 7860
+
+CMD ["python", "hf_space.py"]
+
+```
+
+hf_space.py:
 ```
 """
-Intent Engine — classifies inbound messages using local Ollama.
+JORKI — AI File Gateway
+HF Space server v2.0: persistent storage, auth, chunk retrieval, MCP, compression.
 
-Classifies each message into:
-  booking_now       — asking for time/date/session today or tomorrow
-  price_question    — asking about rates
-  availability_question — asking when available
-  location_question — asking about incall/outcall/area
-  repeat_client     — references prior sessions
-  ghosted_lead      — reappearing after silence
-  high_value_repeat — repeat client with booking language
-  do_not_contact    — STOP / opt-out / unsafe
-  spam              — promotional, irrelevant
-  unknown           — can't classify
-
-Falls back to keyword-based classification if Ollama is not running.
+Fixes:
+1. Persistent storage (/data mount) + SQLite registry — survives restarts
+2. Bearer token auth on upload
+3. GET /chunk/{file_id}/{idx} — returns semantic chunk content
+4. GET /mcp — MCP-compatible endpoint for AI tools
+5. Index compression (gzip) on upload, decompress on query
 """
 
-import json
-import logging
 import os
-import urllib.request
-import urllib.error
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+import json
+import sqlite3
+import shutil
+import gzip
+import time
+import hashlib
+import struct
+import base64
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Query, Body
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
-log = logging.getLogger("intent_engine")
+# Google OAuth client ID (set as HF Space secret, no credentials.json needed)
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:latest")
+app = FastAPI(title="JORKI — AI File Gateway", version="2.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Keyword fallback
-BOOKING_KW = ["book", "appointment", "schedule", "session", "available", "today", "tonight", "tomorrow", "when can", "how soon", "fit me in"]
-PRICE_KW = ["price", "rate", "cost", "how much", "fee", "charge", "donation", "pricing"]
-AVAIL_KW = ["available", "when are you", "what time", "open", "slots", "free"]
-LOCATION_KW = ["where", "location", "incall", "outcall", "hotel", "address", "area", "neighborhood", "come to", "travel to"]
-REPEAT_KW = ["again", "last time", "saw you before", "was here before", "repeat", "second time", "regular", "missed you", "been a while"]
-STOP_KW = ["stop", "unsubscribe", "remove", "do not text", "don't text", "not interested", "wrong number", "stop texting", "opt out", "don't contact", "do not contact", "take me off", "no more"]
-SPAM_KW = ["promo", "discount", "offer", "deal", "click here", "visit my", "check out my", "follow me", "subscribe", "free", "bonus"]
-UNSAFE_KW = ["raw", "bb", "bareback", "unsafe", "no condom", "bare"]
+# --- Fix 1: Persistent storage ---
+# HF Space mounts /data as persistent volume. Fallback to /tmp if not available.
+DATA_DIR = Path(os.environ.get("JORKI_DATA_DIR", "/data" if Path("/data").exists() else "/tmp/jorki"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+STORAGE_DIR = DATA_DIR / "indexes"
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+REGISTRY_DB = DATA_DIR / "registry.sqlite3"
+
+# Auth token (set as HF Space secret)
+AUTH_TOKEN = os.environ.get("JORKI_AUTH_TOKEN", "")
+
+def init_registry_db():
+    """SQLite-backed registry — survives restarts."""
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.execute("""CREATE TABLE IF NOT EXISTS files (
+        file_id TEXT PRIMARY KEY,
+        filename TEXT,
+        path TEXT,
+        size_human TEXT,
+        merkle_root TEXT,
+        format TEXT,
+        total_lines TEXT,
+        uploaded_at REAL,
+        meta_json TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS query_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id TEXT,
+        query_type TEXT,
+        query_text TEXT,
+        timestamp REAL,
+        client_ip TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        file_id TEXT,
+        user_email TEXT,
+        created_at REAL,
+        status TEXT DEFAULT 'active'
+    )""")
+    conn.commit()
+    conn.close()
+
+init_registry_db()
+
+def load_registry() -> dict:
+    """Load registry from SQLite into memory."""
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.row_factory = sqlite3.Row
+    reg = {}
+    for row in conn.execute("SELECT * FROM files"):
+        reg[row["file_id"]] = {
+            "path": row["path"],
+            "filename": row["filename"],
+            "meta": json.loads(row["meta_json"]) if row["meta_json"] else {},
+            "uploaded_at": row["uploaded_at"],
+        }
+    conn.close()
+    return reg
+
+def save_file_entry(file_id: str, meta: dict, path: str):
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.execute(
+        "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?,?,?)",
+        (file_id, meta.get("filename", "unknown"), path,
+         meta.get("size_human", "?"), meta.get("merkle_root", "?"),
+         meta.get("format", "?"), meta.get("total_lines", "?"),
+         time.time(), json.dumps(meta))
+    )
+    conn.commit()
+    conn.close()
+
+def log_query(file_id: str, query_type: str, query_text: str, client_ip: str = ""):
+    try:
+        conn = sqlite3.connect(str(REGISTRY_DB))
+        conn.execute(
+            "INSERT INTO query_log (file_id, query_type, query_text, timestamp, client_ip) VALUES (?,?,?,?,?)",
+            (file_id, query_type, query_text[:500], time.time(), client_ip)
+        )
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
+def get_file_path(file_id: str) -> str:
+    """Resolve file_id to index path, checking DB."""
+    reg = load_registry()
+    if file_id not in reg:
+        raise HTTPException(404, {
+            "status": "session_not_found",
+            "file_id": file_id,
+            "message": "This Jorki session is expired, revoked, or unavailable.",
+            "possible_causes": ["session expired", "session revoked", "Space restarted and local disk was lost", "index was never uploaded", "persistent storage not attached"],
+            "next": "Create a new Jorki session."
+        })
+    path = reg[file_id]["path"]
+    if not Path(path).exists():
+        raise HTTPException(410, {
+            "status": "session_expired",
+            "file_id": file_id,
+            "message": "This Jorki session's index is gone. Re-upload required.",
+            "next": "Create a new Jorki session."
+        })
+    return path
+
+def check_auth(authorization: str = None):
+    """Auth token validation — fail-closed in production."""
+    if not AUTH_TOKEN:
+        raise HTTPException(403, {
+            "status": "not_configured",
+            "message": "Server not configured for uploads. Set JORKI_AUTH_TOKEN secret."
+        })
+    if not authorization:
+        raise HTTPException(401, "Missing Authorization header. Use: Bearer <token>")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Use Bearer token auth")
+    token = authorization[7:]
+    if token != AUTH_TOKEN:
+        raise HTTPException(403, "Invalid auth token")
 
 
-@dataclass
-class IntentResult:
-    classification: str = "unknown"
+# --- Google OAuth token verification ---
+def verify_google_token(token: str) -> dict:
+    """Verify Google ID token using Google's public keys (no credentials.json)."""
+    import urllib.request
+    # Fetch Google's public certs
+    url = "https://www.googleapis.com/oauth2/v3/tokeninfo?id_token=" + token
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        if GOOGLE_CLIENT_ID and data.get("aud") != GOOGLE_CLIENT_ID:
+            raise HTTPException(401, "Token audience mismatch")
+        return {"email": data.get("email", ""), "name": data.get("name", ""), "picture": data.get("picture", "")}
+    except Exception as e:
+        raise HTTPException(401, f"Invalid Google token: {e}")
+
+
+@app.post("/auth/google")
+async def auth_google(body: dict = None):
+    """Verify Google ID token and create a session."""
+    params = body or {}
+    token = params.get("token", "")
+    if not token:
+        raise HTTPException(400, "Missing 'token' in request body")
+    user = verify_google_token(token)
+    session_id = hashlib.sha256((user["email"] + str(time.time())).encode()).hexdigest()[:12]
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    conn.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?)",
+                 (session_id, "", user["email"], time.time(), "active"))
+    conn.commit()
+    conn.close()
+    return {"session_id": session_id, "user": user, "status": "authenticated"}
+
+
+@app.get("/auth/status")
+async def auth_status():
+    """Check if Google OAuth is configured."""
+    return {"google_oauth": bool(GOOGLE_CLIENT_ID), "client_id": GOOGLE_CLIENT_ID}
+
+
+# --- Landing page ---
+@app.get("/", response_class=HTMLResponse)
+async def landing():
+    reg = load_registry()
+    file_count = len(reg)
+    files_list = "\n".join([
+        f'<div class="file-item" data-id="{fid}"><span class="file-icon">📄</span><span class="file-name">{info["filename"]}</span><span class="file-id">{fid}</span><button class="file-action" onclick="copyUrl(\'{fid}\')">Copy URL</button><button class="file-action danger" onclick="revokeFile(\'{fid}\')">Revoke</button></div>'
+        for fid, info in reg.items()
+    ])
+    return LANDING_HTML.replace("__FILE_COUNT__", str(file_count)).replace("__FILES_LIST__", files_list).replace("__GOOGLE_CLIENT_ID__", GOOGLE_CLIENT_ID)
+
+
+LANDING_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jorki — The Operating System for AI File Access</title>
+<meta name="description" content="Files don't move. Context does. Jorki turns any local file into a live AI-readable session.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>
+  :root {
+    --bg: #09090B; --surface: #111114;
+    --primary: #4F7CFF; --accent: #8B5CFF;
+    --glass: rgba(255,255,255,0.03); --glass-border: rgba(255,255,255,0.08);
+    --text: #FAFAFA; --text-dim: rgba(250,250,250,0.5); --text-faint: rgba(250,250,250,0.2);
+    --success: #22C55E; --danger: #EF4444;
+    --radius: 20px; --radius-sm: 12px;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'Inter',-apple-system,system-ui,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; -webkit-font-smoothing:antialiased; overflow-x:hidden; }
+  .glow { position:fixed; top:-300px; left:50%; transform:translateX(-50%); width:900px; height:500px; background:radial-gradient(ellipse at center,rgba(79,124,255,0.06) 0%,transparent 70%); pointer-events:none; z-index:0; }
+  .wrap { max-width:720px; margin:0 auto; padding:0 24px; position:relative; z-index:1; }
+  .hero { text-align:center; padding:140px 0 80px; }
+  .hero h1 { font-size:3.5rem; font-weight:800; letter-spacing:-0.04em; background:linear-gradient(135deg,var(--primary) 0%,var(--accent) 100%); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:20px; line-height:1; }
+  .hero .tagline { font-size:1.1rem; color:var(--text-dim); margin-bottom:8px; }
+  .hero .killer { font-size:1.6rem; color:var(--text); font-weight:600; letter-spacing:-0.02em; margin-bottom:12px; }
+  .hero .desc { font-size:0.95rem; color:var(--text-dim); max-width:480px; margin:0 auto 40px; line-height:1.6; }
+  .hero-btns { display:flex; gap:12px; justify-content:center; }
+  .btn { padding:14px 32px; border-radius:100px; font-size:0.9rem; font-weight:600; border:none; cursor:pointer; transition:all 0.2s; text-decoration:none; display:inline-flex; align-items:center; gap:8px; font-family:inherit; }
+  .btn-primary { background:var(--primary); color:#fff; }
+  .btn-primary:hover { background:#6B91FF; transform:scale(1.03); box-shadow:0 0 40px rgba(79,124,255,0.3); }
+  .btn-ghost { background:var(--glass); color:var(--text); border:1px solid var(--glass-border); }
+  .btn-ghost:hover { background:rgba(255,255,255,0.06); transform:scale(1.02); }
+  .google-login { display:flex; justify-content:center; margin-top:28px; }
+  .user-badge { display:inline-flex; align-items:center; gap:8px; padding:6px 14px; background:var(--glass); border:1px solid var(--glass-border); border-radius:100px; font-size:0.8rem; color:var(--text-dim); }
+  .user-badge img { width:22px; height:22px; border-radius:50%; }
+  .panel { background:var(--glass); backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px); border:1px solid var(--glass-border); border-radius:var(--radius); padding:28px; margin-bottom:16px; }
+  .panel-title { font-size:0.78rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-dim); margin-bottom:20px; display:flex; align-items:center; gap:8px; }
+  .session-row { display:flex; justify-content:space-between; align-items:center; padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.04); }
+  .session-row:last-child { border-bottom:none; }
+  .session-label { font-size:0.82rem; color:var(--text-dim); }
+  .session-val { font-size:0.82rem; color:var(--text); font-weight:500; font-variant-numeric:tabular-nums; }
+  .session-dot { width:8px; height:8px; border-radius:50%; background:var(--success); display:inline-block; box-shadow:0 0 8px var(--success); }
+  .session-status { display:flex; align-items:center; gap:8px; font-size:0.78rem; color:var(--success); font-weight:600; }
+  .file-item { display:flex; align-items:center; gap:10px; padding:12px 14px; border-radius:var(--radius-sm); background:var(--surface); margin-bottom:8px; transition:all 0.15s; }
+  .file-item:hover { background:rgba(255,255,255,0.04); }
+  .file-icon { font-size:1.1rem; }
+  .file-name { flex:1; font-size:0.85rem; color:var(--text); font-weight:500; }
+  .file-id { font-family:'SF Mono',monospace; font-size:0.72rem; color:var(--text-faint); }
+  .file-action { padding:5px 12px; border-radius:8px; font-size:0.72rem; font-weight:500; border:1px solid var(--glass-border); background:transparent; color:var(--text-dim); cursor:pointer; transition:all 0.15s; font-family:inherit; }
+  .file-action:hover { background:rgba(79,124,255,0.1); color:var(--primary); border-color:var(--primary); }
+  .file-action.danger:hover { background:rgba(239,68,68,0.1); color:var(--danger); border-color:var(--danger); }
+  .chat-demo { font-family:'SF Mono',monospace; font-size:0.82rem; line-height:1.8; }
+  .chat-user { color:var(--text); }
+  .chat-user::before { content:'> '; color:var(--primary); }
+  .chat-ai { color:var(--text-dim); padding-left:20px; }
+  .chat-ai::before { content:'\25C6 '; color:var(--accent); }
+  .chat-time { color:var(--text-faint); font-size:0.7rem; float:right; }
+  .console-input { width:100%; padding:14px 16px; border-radius:var(--radius-sm); background:var(--surface); border:1px solid var(--glass-border); color:var(--text); font-size:0.85rem; font-family:inherit; outline:none; transition:border-color 0.2s; }
+  .console-input:focus { border-color:var(--primary); }
+  .console-input::placeholder { color:var(--text-faint); }
+  .console-output { margin-top:12px; }
+  .console-line { padding:6px 0; font-size:0.78rem; color:var(--text-dim); font-family:'SF Mono',monospace; }
+  .console-check { color:var(--success); margin-right:6px; }
+  .console-time { color:var(--text-faint); margin-left:12px; }
+  .arch { text-align:center; font-family:'SF Mono',monospace; font-size:0.78rem; color:var(--text-dim); line-height:2.2; }
+  .arch .step { color:var(--text); }
+  .arch .arrow { color:var(--text-faint); }
+  .arch .highlight { color:var(--primary); }
+  .arch .result { color:var(--success); }
+  .api-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .api-item { padding:10px 14px; border-radius:var(--radius-sm); background:var(--surface); font-family:'SF Mono',monospace; font-size:0.75rem; color:var(--text-dim); display:flex; align-items:center; gap:8px; }
+  .api-item .method { font-weight:700; font-size:0.68rem; padding:2px 6px; border-radius:4px; }
+  .api-item .get { background:rgba(79,124,255,0.15); color:var(--primary); }
+  .api-item .post { background:rgba(34,197,94,0.15); color:var(--success); }
+  .api-item .del { background:rgba(239,68,68,0.15); color:var(--danger); }
+  .sec-item { display:flex; align-items:flex-start; gap:10px; padding:10px 0; }
+  .sec-check { color:var(--success); font-size:0.9rem; flex-shrink:0; }
+  .sec-text { font-size:0.82rem; color:var(--text-dim); line-height:1.5; }
+  .mac-mock { background:var(--surface); border-radius:var(--radius-sm); padding:20px; font-family:'SF Mono',monospace; font-size:0.78rem; line-height:1.8; }
+  .mac-mock .mac-title { color:var(--primary); font-weight:600; margin-bottom:8px; }
+  .mac-mock .mac-item { color:var(--text-dim); }
+  .mac-mock .mac-accent { color:var(--accent); }
+  .footer { text-align:center; padding:60px 0 40px; }
+  .footer-text { font-size:0.75rem; color:var(--text-faint); }
+  .footer-text span { color:var(--text-dim); }
+  .usecase { padding:14px 0; border-bottom:1px solid rgba(255,255,255,0.04); }
+  .usecase:last-child { border-bottom:none; }
+  .usecase-text { font-size:0.85rem; color:var(--text); }
+  .mini-btn { padding:6px 14px; border-radius:8px; font-size:0.75rem; font-weight:500; border:1px solid var(--glass-border); background:transparent; color:var(--text-dim); cursor:pointer; transition:all 0.15s; font-family:inherit; }
+  .mini-btn:hover { background:rgba(79,124,255,0.1); color:var(--primary); }
+  .mini-btn.danger { color:var(--danger); }
+  .mini-btn.danger:hover { background:rgba(239,68,68,0.1); }
+  .before-after { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .ba-card { padding:16px; border-radius:var(--radius-sm); background:var(--surface); font-size:0.78rem; line-height:1.6; }
+  .ba-card .ba-label { font-size:0.7rem; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:8px; }
+  .ba-before .ba-label { color:var(--danger); }
+  .ba-after .ba-label { color:var(--success); }
+  .ba-before { color:var(--text-dim); }
+  .ba-after { color:var(--text); }
+</style>
+</head>
+<body>
+<div class="glow"></div>
+<div class="wrap">
+  <div class="hero">
+    <h1>Jorki</h1>
+    <p class="tagline">The Operating System for AI File Access</p>
+    <p class="killer">Files don't move. Context does.</p>
+    <p class="desc">AI doesn't need your whole file. It needs a live way to ask it questions. Create a secure session, copy one URL, let ChatGPT/Claude/Cursor/Gemini query exactly what they need.</p>
+    <div class="hero-btns">
+      <a href="#session" class="btn btn-primary">Create Session</a>
+      <a href="#api" class="btn btn-ghost">Read Docs</a>
+    </div>
+    <div class="google-login" id="google-login-zone"></div>
+    <div id="user-info" style="display:none;margin-top:16px">
+      <div class="user-badge"><img id="user-avatar" src=""><span id="user-name"></span></div>
+    </div>
+  </div>
+  <div class="panel" style="padding:20px">
+    <div class="before-after">
+      <div class="ba-card ba-before">
+        <div class="ba-label">Before Jorki</div>
+        Upload giant file &rarr; wait &rarr; model truncates &rarr; context lost
+      </div>
+      <div class="ba-card ba-after">
+        <div class="ba-label">After Jorki</div>
+        Create session &rarr; share URL &rarr; model queries exactly what it needs
+      </div>
+    </div>
+  </div>
+  <div class="panel" id="session">
+    <div class="panel-title"><span class="session-dot"></span> Live Session</div>
+    <div class="session-row"><span class="session-label">File</span><span class="session-val" id="session-file">&mdash;</span></div>
+    <div class="session-row"><span class="session-label">Size</span><span class="session-val" id="session-size">&mdash;</span></div>
+    <div class="session-row"><span class="session-label">Uploaded bytes</span><span class="session-val">0 B</span></div>
+    <div class="session-row"><span class="session-label">Queries</span><span class="session-val" id="session-queries">0</span></div>
+    <div class="session-row"><span class="session-label">Bytes returned</span><span class="session-val" id="session-bytes">0 B</span></div>
+    <div class="session-row"><span class="session-label">Data movement avoided</span><span class="session-val" style="color:var(--success)" id="session-saved">&mdash;</span></div>
+    <div class="session-row"><span class="session-label">Status</span><span class="session-status"><span class="session-dot"></span><span id="session-state">No active session</span></span></div>
+    <div style="margin-top:16px;display:flex;gap:8px">
+      <button class="mini-btn" onclick="navigator.clipboard.writeText(sessionUrl)">Copy URL</button>
+      <button class="mini-btn" onclick="alert('Pause is a Pro feature')">Pause</button>
+      <button class="mini-btn danger" onclick="revokeCurrent()">Revoke</button>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Active Sessions <span style="margin-left:auto;font-size:0.7rem;color:var(--text-faint)">__FILE_COUNT__ total</span></div>
+    <div id="files-list">__FILES_LIST__</div>
+    <div id="no-files" style="text-align:center;padding:20px;color:var(--text-faint);font-size:0.82rem">No active sessions. Right-click a file in Finder &rarr; Jorki &rarr; Copy AI URL to start.</div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">AI Explorer</div>
+    <div class="chat-demo" style="margin-bottom:16px">
+      <div class="chat-user">What tables exist?</div>
+      <div class="chat-ai">users, orders, payments, subscriptions, inventory<span class="chat-time">142ms</span></div>
+      <div class="chat-user">Search for "revenue"</div>
+      <div class="chat-ai">13 matches across headers, functions, and chunks<span class="chat-time">38ms</span></div>
+      <div class="chat-user">Get chunk 0</div>
+      <div class="chat-ai">Lines 0-20, 716B, type=paragraph<span class="chat-time">12ms</span></div>
+    </div>
+    <input class="console-input" placeholder="Ask your file..." onkeydown="if(event.key==='Enter'){askFile(this)}">
+    <div class="console-output" id="console-out">
+      <div class="console-line"><span class="console-check">&#10003;</span>Ready &mdash; type a query and press Enter</div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Architecture</div>
+    <div class="arch">
+      <span class="step">Local File</span> <span class="arrow">&rarr;</span>
+      <span class="highlight">Local Index</span> <span class="arrow">&rarr;</span>
+      <span class="highlight">Secure Session URL</span> <span class="arrow">&rarr;</span>
+      <span class="step">AI Query</span> <span class="arrow">&rarr;</span>
+      <span class="result">Minimal Context Returned</span>
+    </div>
+  </div>
+  <div class="panel" id="api">
+    <div class="panel-title">API Surface</div>
+    <div class="api-grid">
+      <div class="api-item"><span class="method post">POST</span>/upload</div>
+      <div class="api-item"><span class="method get">GET</span>/meta/{id}</div>
+      <div class="api-item"><span class="method get">GET</span>/summary/{id}</div>
+      <div class="api-item"><span class="method get">GET</span>/chunk/{id}/{n}</div>
+      <div class="api-item"><span class="method get">GET</span>/chunks/{id}</div>
+      <div class="api-item"><span class="method get">GET</span>/search/{id}</div>
+      <div class="api-item"><span class="method post">POST</span>/query/sql/{id}</div>
+      <div class="api-item"><span class="method post">POST</span>/query/nosql/{id}</div>
+      <div class="api-item"><span class="method get">GET</span>/stats/{id}</div>
+      <div class="api-item"><span class="method del">DEL</span>/revoke/{id}</div>
+      <div class="api-item"><span class="method get">GET</span>/mcp</div>
+      <div class="api-item"><span class="method post">POST</span>/mcp/query</div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Security</div>
+    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">Session-scoped access &mdash; each URL is a temporary, revocable session</span></div>
+    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">Minimal data movement &mdash; AI receives only metadata, chunks, and query results</span></div>
+    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">Local-first indexing &mdash; your file is indexed locally, only the compact index is shared</span></div>
+    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">No raw tokens in repo &mdash; auth via environment variables only</span></div>
+    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">Full audit trail &mdash; every query is logged with timestamp and type</span></div>
+    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">Instant revocation &mdash; destroy a session and all access is gone immediately</span></div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Premium Use Cases</div>
+    <div class="usecase"><div class="usecase-text">&ldquo;Ask this 1GB SQLite database anything.&rdquo;</div></div>
+    <div class="usecase"><div class="usecase-text">&ldquo;Let ChatGPT inspect this repo without uploading the whole ZIP.&rdquo;</div></div>
+    <div class="usecase"><div class="usecase-text">&ldquo;Give Claude temporary access to a file session.&rdquo;</div></div>
+    <div class="usecase"><div class="usecase-text">&ldquo;Expose only metadata and chunks, not the full file.&rdquo;</div></div>
+    <div class="usecase"><div class="usecase-text">&ldquo;Revoke the AI URL when the task is done.&rdquo;</div></div>
+    <div class="usecase"><div class="usecase-text">&ldquo;Turn local files into MCP-style tools.&rdquo;</div></div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">macOS Integration</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div class="mac-mock">
+        <div class="mac-title">Finder Right-Click</div>
+        <div class="mac-item"><span class="mac-accent">&#11088; Jorki</span></div>
+        <div class="mac-item">&#9654; Copy AI URL</div>
+        <div class="mac-item">&#9654; Create Session</div>
+        <div class="mac-item">&#9654; Open Dashboard</div>
+        <div class="mac-item">&#9654; View Queries</div>
+        <div class="mac-item">&#9654; Revoke Access</div>
+      </div>
+      <div class="mac-mock">
+        <div class="mac-title">Menu Bar</div>
+        <div class="mac-item"><span class="mac-accent">&#9679; Jorki</span></div>
+        <div class="mac-item">Active Sessions: 4</div>
+        <div class="mac-item">AI Connected: Yes</div>
+        <div class="mac-item">Queries/sec: 218</div>
+        <div class="mac-item">Bytes saved: 1.01 GB</div>
+        <div class="mac-item">Dashboard &#9654;</div>
+      </div>
+    </div>
+  </div>
+  <div class="panel" style="text-align:center">
+    <div style="font-size:1.1rem;font-weight:600;color:var(--text);margin-bottom:12px">Jorki is not Dropbox for AI.</div>
+    <div style="font-size:1.1rem;font-weight:600;color:var(--text);margin-bottom:12px">Jorki is not WeTransfer for AI.</div>
+    <div style="font-size:1.1rem;font-weight:600;color:var(--text);margin-bottom:12px">Jorki is not another RAG demo.</div>
+    <div style="font-size:1.3rem;font-weight:700;color:var(--primary);margin-top:20px">Jorki is a live file interface for AI agents.</div>
+  </div>
+  <div class="footer">
+    <p class="footer-text">Jorki &mdash; <span>Files don't move. Context does.</span> &mdash; __FILE_COUNT__ sessions active</p>
+  </div>
+</div>
+<script>
+let sessionUrl = '';
+let currentFileId = '';
+
+async function copyUrl(fid) {
+  const url = 'https://josephrw-llm-file-proxy.hf.space/meta/' + fid;
+  await navigator.clipboard.writeText(url);
+  alert('URL copied: ' + url);
+}
+
