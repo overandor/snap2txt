@@ -1,283 +1,370 @@
-    conn.commit()
+        masseur_signals = ["book now", "available now", "massage", "rates", "incall", "outcall",
+                          "modalities", "session", "booking", "schedule"]
+        masseur_score = sum(1 for s in masseur_signals if s in body_text.lower())
+        result["is_masseur"] = masseur_score >= 3
 
-
-def get_visitor_stats(conn, username: str) -> dict:
-    cursor = conn.execute("SELECT * FROM visitor_stats WHERE username = ?", (username,))
-    row = cursor.fetchone()
-    if row:
-        cols = [d[0] for d in cursor.description]
-        return dict(zip(cols, row))
-    return {"total_sightings": 0}
-
-
-def get_all_visitor_stats(conn) -> list[dict]:
-    cursor = conn.execute("SELECT * FROM visitor_stats ORDER BY total_sightings DESC")
-    rows = cursor.fetchall()
-    cols = [d[0] for d in cursor.description]
-    return [dict(zip(cols, r)) for r in rows]
-
-
-def record_message_sent(conn, username: str, message_text: str):
-    now = now_iso()
-    conn.execute("UPDATE visitor_stats SET messaged_count = messaged_count + 1, last_messaged_at = ? WHERE username = ?", (now, username))
-    conn.execute(
-        "UPDATE visitor_history SET messaged = 1, message_text = ?, messaged_at = ? "
-        "WHERE rowid = (SELECT rowid FROM visitor_history WHERE username = ? AND messaged = 0 ORDER BY seen_at DESC LIMIT 1)",
-        (message_text, now, username)
-    )
-    cur = conn.execute("SELECT changes()")
-    if cur.fetchone()[0] == 0:
-        conn.execute(
-            "INSERT INTO visitor_history (username, seen_at, visit_count, messaged, message_text, messaged_at, session_id) VALUES (?, ?, 0, 1, ?, ?, ?)",
-            (username, now, message_text, now, SESSION_ID)
-        )
-    conn.commit()
-
-
-def pick_message(username: str) -> str:
-    template = random.choice(MESSAGE_TEMPLATES)
-    return template.format(name=username)
-
-
-def should_message_visitor(conn, username: str, threshold: int, cooldown_days: int = 3) -> tuple[bool, str]:
-    stats = get_visitor_stats(conn, username)
-    sightings = stats.get("total_sightings", 0)
-    if sightings < threshold:
-        return False, f"only {sightings} sightings (threshold={threshold})"
-    if stats.get("last_messaged_at"):
+        # Extract location
         try:
-            last = datetime.fromisoformat(stats["last_messaged_at"])
-            if (datetime.now(timezone.utc) - last).days < cooldown_days:
-                return False, f"already messaged {stats['last_messaged_at']} (cooldown {cooldown_days}d)"
+            nd_text = page.evaluate("() => { const el = document.getElementById('__NEXT_DATA__'); return el ? el.textContent : null; }")
+            if nd_text:
+                nd = json.loads(nd_text)
+                props = nd.get("props", {}).get("pageProps", {})
+                user = props.get("user", props.get("masseur", props.get("profile", {})))
+                if isinstance(user, dict):
+                    location = user.get("location") or user.get("city") or ""
+                    state = user.get("state") or ""
+                    country = user.get("country") or ""
+                    search_city = user.get("searchCity") or ""
+                    result["location"] = f"{location}, {state} {country}".strip(", ")
+                    result["is_ny"] = is_ny_location(result["location"]) or is_ny_location(search_city)
+                    # Check isMasseur flag if present
+                    if "isMasseur" in user:
+                        result["is_masseur"] = bool(user["isMasseur"])
+                    elif "role" in user:
+                        result["is_masseur"] = user.get("role") == "masseur"
         except Exception:
             pass
-    if stats.get("messaged_count", 0) >= 3:
-        return False, f"already messaged {stats['messaged_count']} times (max 3)"
-    return True, "eligible"
+
+        # Fallback: check location from page text
+        if not result["location"]:
+            for line in body_text.split("\n"):
+                if any(kw in line.lower() for kw in NY_KEYWORDS):
+                    result["location"] = line.strip()[:100]
+                    result["is_ny"] = True
+                    break
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
 
 
-# ─── Persuasion-Provenance Ledger ────────────────────────────────────
-# Every adaptive message records: what signal triggered it, what template
-# was selected, what objection it addresses, what evidence was used, and
-# what behavioral effect followed. Makes personalized persuasion inspectable.
+def main():
+    username = os.getenv("RM_USER") or os.getenv("RENTMASSEUR_USER") or ""
+    password = os.getenv("RM_PASS") or os.getenv("RENTMASSEUR_PASS") or ""
 
-PROVENANCE_SIGNALS = {
-    "repeat_visit": "Visitor has returned to profile 3+ times (inferred interest)",
-    "high_visit_count": "Visitor card shows 5+ visits (strong interest signal)",
-    "recent_online": "Visitor was online within 24h (active user)",
-    "location_match": "Visitor is in same metro area (reduced friction)",
-    "first_message": "No prior messages sent to this visitor",
-    "cooldown_expired": "Previous message sent >3 days ago (re-engagement)",
-}
+    if not username or not password:
+        print("!! Set RM_USER and RM_PASS env vars")
+        return
 
-OBJECTION_MAP = {
-    0: "hesitation — visitor returns but hasn't booked (reduce friction)",
-    1: "uncertainty — visitor may have questions (offer information)",
-    2: "timing — visitor may be waiting for right moment (create urgency)",
-    3: "logistics — visitor may not know location/availability (reduce search cost)",
-    4: "trust — visitor may be evaluating credibility (establish legitimacy)",
-    5: "price — visitor may be comparing options (signal value)",
-    6: "social — visitor may need low-pressure nudge (reduce commitment)",
-    7: "general — visitor has shown interest, open-ended invitation",
-}
+    print(f"\n=== RM NY Client Profile Mining ===")
+    print(f"  Account: {username}")
+    print(f"  Target: NY non-masseur client profiles")
 
+    all_visitors = []
+    ny_clients = []
 
-def init_provenance_tables(conn):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS persuasion_provenance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            sent_at TEXT NOT NULL,
-            template_index INTEGER NOT NULL,
-            template_text TEXT NOT NULL,
-            trigger_signal TEXT NOT NULL,
-            trigger_detail TEXT,
-            objection_addressed TEXT,
-            visitor_sightings INTEGER,
-            visitor_visit_count INTEGER,
-            visitor_location TEXT,
-            visitor_last_online TEXT,
-            consent_basis TEXT DEFAULT 'implicit_visit_behavior',
-            message_status TEXT,
-            follow_up_response TEXT,
-            follow_up_responded_at TEXT,
-            follow_up_booked INTEGER DEFAULT 0,
-            follow_up_cancelled INTEGER DEFAULT 0,
-            follow_up_complaint TEXT
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=False,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS autonomy_metrics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            message_id INTEGER,
-            metric_type TEXT NOT NULL,
-            metric_value TEXT,
-            recorded_at TEXT NOT NULL,
-            session_id TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS acucertainty_claims (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            claim_text TEXT NOT NULL,
-            claim_source TEXT,
-            domain TEXT,
-            state TEXT NOT NULL DEFAULT 'unresolved',
-            evidence_summary TEXT,
-            contradicted_by TEXT,
-            verified_at TEXT,
-            domain_limit TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
 
+        storage_state = Path(".rm_storage_state.json")
+        ctx_kwargs = {
+            "viewport": {"width": 1440, "height": 1200},
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        }
 
-def record_provenance(conn, username: str, template_index: int, template_text: str,
-                      trigger_signal: str, trigger_detail: str,
-                      visitor_sightings: int, visitor_visit_count: int,
-                      visitor_location: str = None, visitor_last_online: str = None,
-                      message_status: str = "sent"):
-    now = now_iso()
-    objection = OBJECTION_MAP.get(template_index, "general")
-    conn.execute("""
-        INSERT INTO persuasion_provenance
-        (username, session_id, sent_at, template_index, template_text,
-         trigger_signal, trigger_detail, objection_addressed,
-         visitor_sightings, visitor_visit_count, visitor_location,
-         visitor_last_online, message_status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (username, SESSION_ID, now, template_index, template_text,
-          trigger_signal, trigger_detail, objection,
-          visitor_sightings, visitor_visit_count, visitor_location,
-          visitor_last_online, message_status))
-    conn.commit()
-    cursor = conn.execute("SELECT last_insert_rowid()")
-    return cursor.fetchone()[0]
+        # Try to reuse saved session
+        if storage_state.exists():
+            ctx_kwargs["storage_state"] = str(storage_state)
+            print("  Using saved storage state")
 
+        context = browser.new_context(**ctx_kwargs)
+        page = context.new_page()
 
-def record_follow_up(conn, provenance_id: int, responded: bool = False,
-                     booked: bool = False, cancelled: bool = False,
-                     complaint: str = None):
-    now = now_iso()
-    response_text = "responded" if responded else "no_response"
-    if booked:
-        response_text += "+booked"
-    if cancelled:
-        response_text += "+cancelled"
-    conn.execute("""
-        UPDATE persuasion_provenance
-        SET follow_up_response = ?, follow_up_responded_at = ?,
-            follow_up_booked = ?, follow_up_cancelled = ?, follow_up_complaint = ?
-        WHERE id = ?
-    """, (response_text, now if responded else None,
-          1 if booked else 0, 1 if cancelled else 0, complaint, provenance_id))
-    conn.commit()
+        # Check if session is still valid
+        page.goto(f"{BASE_URL}/settings", wait_until="networkidle", timeout=30000)
+        time.sleep(2)
 
+        if "/login" in page.url:
+            print("  Session expired — re-logging in")
+            logged_in = attempt_login(page, context, username, password)
+            if not logged_in:
+                print("!! Login failed — aborting")
+                browser.close()
+                return
+        else:
+            print("  Session valid — already logged in")
 
-def record_autonomy_metric(conn, username: str, metric_type: str,
-                           metric_value: str, message_id: int = None):
-    now = now_iso()
-    conn.execute("""
-        INSERT INTO autonomy_metrics (username, message_id, metric_type, metric_value, recorded_at, session_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (username, message_id, metric_type, metric_value, now, SESSION_ID))
-    conn.commit()
+        # Step 1: Scrape "Who Saw Me" visitors
+        print(f"\n--- Step 1: Scraping Who Saw Me ---")
+        visitors = scrape_who_saw_me(page)
+        all_visitors.extend(visitors)
+        print(f"\n  Total visitors found: {len(visitors)}")
 
+        # Step 2: Also check dashboard API for visitor data
+        print(f"\n--- Step 2: Checking dashboard API ---")
+        try:
+            # Intercept API responses
+            api_responses = []
 
-def get_autonomy_report(conn) -> dict:
-    total = conn.execute("SELECT COUNT(*) FROM persuasion_provenance").fetchone()[0]
-    responded = conn.execute("SELECT COUNT(*) FROM persuasion_provenance WHERE follow_up_response LIKE '%responded%'").fetchone()[0]
-    booked = conn.execute("SELECT COUNT(*) FROM persuasion_provenance WHERE follow_up_booked = 1").fetchone()[0]
-    cancelled = conn.execute("SELECT COUNT(*) FROM persuasion_provenance WHERE follow_up_cancelled = 1").fetchone()[0]
-    complaints = conn.execute("SELECT COUNT(*) FROM persuasion_provenance WHERE follow_up_complaint IS NOT NULL").fetchone()[0]
-    no_response = total - responded
-    return {
-        "total_messages": total,
-        "responded": responded,
-        "no_response": no_response,
-        "booked": booked,
-        "cancelled": cancelled,
-        "complaints": complaints,
-        "response_rate": round(responded / total, 3) if total else 0,
-        "booking_rate": round(booked / total, 3) if total else 0,
-        "cancellation_rate": round(cancelled / booked, 3) if booked else 0,
-        "complaint_rate": round(complaints / total, 3) if total else 0,
-        "regret_proxy": round((cancelled + complaints) / max(total, 1), 3),
+            def on_response(response):
+                url = response.url
+                if "rentmasseur.com/api" in url:
+                    try:
+                        body = response.text()
+                        api_responses.append({
+                            "url": url.replace(BASE_URL, ""),
+                            "status": response.status,
+                            "body_preview": body[:1000],
+                            "body_len": len(body),
+                        })
+                    except Exception:
+                        pass
+
+            page.on("response", on_response)
+
+            page.goto(f"{BASE_URL}/settings", wait_until="networkidle", timeout=30000)
+            time.sleep(3)
+
+            # Save API responses
+            api_path = ARTIFACTS / "dashboard_api_responses.json"
+            api_path.write_text(json.dumps(api_responses, indent=2, default=str), encoding="utf-8")
+            print(f"  Captured {len(api_responses)} API responses → {api_path}")
+
+            # Check __NEXT_DATA__ on dashboard for visitor info
+            try:
+                nd_text = page.evaluate("() => { const el = document.getElementById('__NEXT_DATA__'); return el ? el.textContent : null; }")
+                if nd_text:
+                    nd = json.loads(nd_text)
+                    props = nd.get("props", {}).get("pageProps", {})
+                    nd_path = ARTIFACTS / "dashboard_next_data.json"
+                    # Save full next data for analysis
+                    nd_path.write_text(json.dumps(props, indent=2, default=str)[:50000], encoding="utf-8")
+                    print(f"  Dashboard __NEXT_DATA__ keys: {list(props.keys())}")
+                    print(f"  Saved to: {nd_path}")
+
+                    # Look for visitor-related data
+                    for key in props:
+                        val = props[key]
+                        if isinstance(val, dict):
+                            for subkey in ["visitors", "whoSawMe", "whoViewed", "views", "recentVisitors", "profileViews"]:
+                                if subkey in val:
+                                    print(f"  Found {key}.{subkey}!")
+                                    data = val[subkey]
+                                    if isinstance(data, list):
+                                        for item in data:
+                                            uname = item.get("username") or item.get("user") or ""
+                                            if uname and uname not in {v["username"] for v in all_visitors}:
+                                                all_visitors.append({
+                                                    "username": uname,
+                                                    "location": item.get("location", ""),
+                                                    "source": f"dashboard.{key}.{subkey}",
+                                                    "raw": item,
+                                                })
+            except Exception as e:
+                print(f"  Dashboard __NEXT_DATA__ error: {e}")
+
+        except Exception as e:
+            print(f"  Dashboard API error: {e}")
+
+        # Step 3: Visit each visitor profile to check if masseur or client + NY
+        print(f"\n--- Step 3: Checking {len(all_visitors)} visitor profiles ---")
+        checked = []
+        for i, visitor in enumerate(all_visitors):
+            uname = visitor["username"]
+            print(f"\n  [{i+1}/{len(all_visitors)}] Checking: {uname}")
+
+            profile_info = check_profile_is_masseur(page, uname)
+            profile_info["source"] = visitor.get("source", "")
+            checked.append(profile_info)
+
+            if profile_info["is_masseur"]:
+                print(f"    → MASSEUR (skipping)")
+            else:
+                print(f"    → CLIENT")
+                if profile_info["is_ny"]:
+                    print(f"    → NY CLIENT ✓")
+                    ny_clients.append(profile_info)
+                else:
+                    print(f"    → Location: {profile_info['location']}")
+
+            if profile_info.get("error"):
+                print(f"    → Error: {profile_info['error']}")
+
+            # Rate limit
+            time.sleep(2)
+
+        browser.close()
+
+    # Step 4: Save results
+    print(f"\n=== Results ===")
+    print(f"  Total visitors found: {len(all_visitors)}")
+    print(f"  Profiles checked: {len(checked)}")
+    print(f"  Masseurs: {sum(1 for c in checked if c['is_masseur'])}")
+    print(f"  Clients: {sum(1 for c in checked if not c['is_masseur'])}")
+    print(f"  NY clients: {len(ny_clients)}")
+
+    # Save all results
+    results = {
+        "timestamp": now_iso(),
+        "account": username,
+        "summary": {
+            "total_visitors": len(all_visitors),
+            "profiles_checked": len(checked),
+            "masseurs": sum(1 for c in checked if c["is_masseur"]),
+            "clients": sum(1 for c in checked if not c["is_masseur"]),
+            "ny_clients": len(ny_clients),
+        },
+        "all_visitors": all_visitors,
+        "checked_profiles": checked,
+        "ny_clients": ny_clients,
     }
 
+    results_path = ARTIFACTS / "ny_client_mining_results.json"
+    results_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+    print(f"\n  Results: {results_path}")
+    print(f"  Screenshots: {SCREENSHOTS}/")
 
-# ─── Acucertainty State Tracking ─────────────────────────────────────
-# Every commercial hypothesis carries a state: verified, contradicted,
-# unresolved, or domain_limited. No ledger means no accountability.
+    # Print NY clients
+    if ny_clients:
+        print(f"\n--- NY Client Profiles ---")
+        for c in ny_clients:
+            print(f"  {c['username']:25s} | {c['location'][:50]}")
+    else:
+        print(f"\n  No NY clients found — may need to check more visitors or different pages")
 
-ACUCERTAINTY_STATES = {"verified", "contradicted", "unresolved", "domain_limited"}
 
-DEFAULT_CLAIMS = [
-    ("Repeat visitors who are messaged are more likely to book than non-messaged repeat visitors", "engagement", "unresolved", "No A/B test conducted; observational only"),
-    ("Personalized messages outperform generic templates", "messaging", "unresolved", "No controlled comparison; templates use name only"),
-    ("Faster reply times increase booking conversion", "response_time", "unresolved", "No response time tracking implemented"),
-    ("Visitors who see 3+ visits are ready to book", "threshold", "unresolved", "Threshold is heuristic, not empirically derived"),
-    ("Location-matched visitors convert better", "targeting", "unresolved", "No location-based conversion analysis"),
-    ("30-second message delay prevents rate limiting", "anti_spam", "domain_limited", "Empirically observed on rentmasseur.com; may not generalize"),
+if __name__ == "__main__":
+    main()
+
+```
+
+rm_playwright_probe.py:
+```
+#!/usr/bin/env python3
+"""
+RM Playwright Probe v2 — hardened, secret-redacting, authenticated read-only.
+
+Pipeline:
+  public probe → authenticated read-only probe → selector registry →
+  endpoint registry (redacted) → function registry (generated) → receipts
+
+Safety:
+  - Never stores cookies/tokens in artifacts
+  - Redacts all secrets from API endpoint logs
+  - Stops on CAPTCHA/CrowdSec/rate limit/2FA — no bypass
+  - Never submits forms, never clicks save, never sends messages
+  - storageState saved locally only, never uploaded as artifact
+
+Usage:
+  # Public probe (safe, no creds)
+  python probes/rm_playwright_probe.py --mode public
+
+  # Authenticated read-only (creds from shell env)
+  export RM_USER="your_email"
+  export RM_PASS="your_password"
+  python probes/rm_playwright_probe.py --mode authenticated-readonly --login
+
+  # Single page
+  python probes/rm_playwright_probe.py --mode authenticated-readonly --login --page dashboard
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from playwright.sync_api import sync_playwright, Page, BrowserContext
+
+
+BASE_URL = "https://rentmasseur.com"
+ARTIFACTS = Path("artifacts/probe")
+SCREENSHOTS = ARTIFACTS / "screenshots"
+API_DIR = ARTIFACTS / "api_calls"
+STORAGE_STATE = Path(".rm_storage_state.json")  # local only, gitignored, never uploaded
+
+for d in (ARTIFACTS, SCREENSHOTS, API_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+
+# ── Pages ─────────────────────────────────────────────────────────────
+
+PAGES_PUBLIC = {
+    "login_page_probe": {"url": f"{BASE_URL}/login", "needs_login": False},
+    "public_profile_probe": {"url": f"{BASE_URL}/karpathianwolf", "needs_login": False},
+    "search_probe": {"url": f"{BASE_URL}/search/manhattan-ny", "needs_login": False},
+}
+
+PAGES_AUTHENTICATED = {
+    "dashboard_read": {"url": f"{BASE_URL}/settings", "needs_login": True},
+    "availability_read": {"url": f"{BASE_URL}/settings?availability=1", "needs_login": True},
+    "about_profile_read": {"url": f"{BASE_URL}/settings/about", "needs_login": True},
+    "bio_field_detect": {"url": f"{BASE_URL}/settings/about", "needs_login": True},
+    "stats_read": {"url": f"{BASE_URL}/settings/stats", "needs_login": True},
+    "mailbox_page_detect": {"url": f"{BASE_URL}/mailbox", "needs_login": True},
+    "compose_form_detect": {"url": f"{BASE_URL}/mailbox/compose", "needs_login": True},
+    "settings_page_detect": {"url": f"{BASE_URL}/settings/profile", "needs_login": True},
+    "logout_detect": {"url": f"{BASE_URL}/settings", "needs_login": True, "find_logout": True},
+}
+
+
+# ── Secret redaction ─────────────────────────────────────────────────
+
+REDACT_HEADER_KEYS = {
+    "cookie", "set-cookie", "authorization", "bearer",
+    "x-csrf-token", "x-csrf", "csrf",
+}
+
+REDACT_BODY_KEYS = {
+    "csrf", "password", "email", "session", "token",
+    "accesstoken", "refreshtoken", "auth",
+}
+
+REDACT_BODY_PATTERNS = [
+    (re.compile(r'"csrf"\s*:\s*"[^"]*"'), '"csrf":"[REDACTED]"'),
+    (re.compile(r'"password"\s*:\s*"[^"]*"'), '"password":"[REDACTED]"'),
+    (re.compile(r'"email"\s*:\s*"[^"]*"'), '"email":"[REDACTED]"'),
+    (re.compile(r'"token"\s*:\s*"[^"]*"'), '"token":"[REDACTED]"'),
+    (re.compile(r'"accessToken"\s*:\s*"[^"]*"'), '"accessToken":"[REDACTED]"'),
+    (re.compile(r'"refreshToken"\s*:\s*"[^"]*"'), '"refreshToken":"[REDACTED]"'),
+    (re.compile(r'"session"\s*:\s*"[^"]*"'), '"session":"[REDACTED]"'),
 ]
 
 
-def init_acucertainty_claims(conn):
-    existing = conn.execute("SELECT COUNT(*) FROM acucertainty_claims").fetchone()[0]
-    if existing == 0:
-        now = now_iso()
-        for claim, domain, state, evidence in DEFAULT_CLAIMS:
-            conn.execute("""
-                INSERT INTO acucertainty_claims (claim_text, domain, state, evidence_summary, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (claim, domain, state, evidence, now, now))
-        conn.commit()
+def redact_headers(headers: dict) -> dict:
+    out = {}
+    for k, v in headers.items():
+        if k.lower() in REDACT_HEADER_KEYS:
+            out[k] = "[REDACTED]"
+        else:
+            out[k] = v
+    return out
 
 
-def update_claim_state(conn, claim_id: int, new_state: str, evidence: str = None,
-                       contradicted_by: str = None, domain_limit: str = None):
-    if new_state not in ACUCERTAINTY_STATES:
-        raise ValueError(f"Invalid Acucertainty state: {new_state}")
-    now = now_iso()
-    conn.execute("""
-        UPDATE acucertainty_claims
-        SET state = ?, evidence_summary = COALESCE(?, evidence_summary),
-            contradicted_by = COALESCE(?, contradicted_by),
-            domain_limit = COALESCE(?, domain_limit),
-            verified_at = ?, updated_at = ?
-        WHERE id = ?
-    """, (new_state, evidence, contradicted_by, domain_limit,
-          now if new_state in ("verified", "contradicted") else None,
-          now, claim_id))
-    conn.commit()
+def redact_body(text: str) -> str:
+    for pattern, replacement in REDACT_BODY_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
-def get_claims_report(conn) -> list[dict]:
-    cursor = conn.execute("SELECT * FROM acucertainty_claims ORDER BY domain, state")
-    rows = cursor.fetchall()
-    cols = [d[0] for d in cursor.description]
-    return [dict(zip(cols, r)) for r in rows]
+def body_keys(text: str) -> list[str]:
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return list(data.keys())
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return list(data[0].keys())
+    except Exception:
+        pass
+    return []
 
 
-def determine_trigger_signal(stats: dict, visit_count: int) -> tuple[str, str]:
-    if stats.get("messaged_count", 0) == 0:
-        signal = "first_message"
-        detail = f"First message to visitor with {stats.get('total_sightings', 0)} sightings"
-    elif stats.get("last_messaged_at"):
-        signal = "cooldown_expired"
-        detail = f"Re-engagement after cooldown (last messaged {stats['last_messaged_at']})"
-    elif visit_count >= 5:
-        signal = "high_visit_count"
-        detail = f"High visit count ({visit_count}) indicates strong interest"
-    else:
-        signal = "repeat_visit"
-        detail = f"Repeat visitor with {stats.get('total_sightings', 0)} sightings"
-    return signal, detail
+def sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
+
+# ── Block detection ──────────────────────────────────────────────────
 
 BLOCK_NEEDLES = [
     ("captcha", "captcha_detected"),
@@ -286,515 +373,428 @@ BLOCK_NEEDLES = [
     ("verify you are human", "human_verification"),
     ("unusual traffic", "traffic_challenge"),
     ("too many requests", "rate_limited"),
-    ("cloudflare", "cloudflare_challenge"),
-    ("please verify", "verification_required"),
+    ("two-factor", "two_factor_required"),
+    ("2fa", "two_factor_required"),
+    ("suspicious login", "suspicious_login"),
+    ("password reset", "password_reset_prompt"),
 ]
 
 
-def detect_block_text(text: str, url: str) -> Optional[str]:
-    text_lower = text.lower()
-    url_lower = url.lower()
+def detect_block(page: Page) -> Optional[str]:
+    try:
+        txt = page.inner_text("body")[:3000].lower()
+    except Exception:
+        txt = ""
+    url = (page.url or "").lower()
     for needle, reason in BLOCK_NEEDLES:
-        if needle in text_lower or needle in url_lower:
+        if needle in txt or needle in url:
             return reason
     return None
 
 
-# ─── Playwright Engine ───────────────────────────────────────────────
+# ── XPath discovery ──────────────────────────────────────────────────
 
-class PlaywrightAgent:
-    def __init__(self, headed: bool):
-        self.headed = headed
-        self.page = None
-        self.context = None
-        self.browser = None
-        self.playwright = None
-        self.logged_in = False
-        self.ua = random.choice(USER_AGENTS)
-        self.viewport = random.choice(VIEWPORTS)
-        self.api_calls: list[dict] = []
-        log(f"Engine: Playwright | UA: {self.ua[:40]}... | Viewport: {self.viewport}")
+def discover_xpaths(page: Page) -> dict:
+    findings = {
+        "inputs": [],
+        "textareas": [],
+        "buttons": [],
+        "selects": [],
+        "contenteditable": [],
+        "links_profile": [],
+    }
 
-    def start(self):
-        from playwright.sync_api import sync_playwright
-        self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(
-            headless=not self.headed,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-        )
-        self.context = self.browser.new_context(
-            viewport=self.viewport,
-            user_agent=self.ua,
-            locale=random.choice(LANGUAGES),
-            timezone_id="America/New_York",
-        )
+    for el in page.query_selector_all("input"):
+        try:
+            if not el.is_visible():
+                continue
+            itype = el.get_attribute("type") or ""
+            iname = el.get_attribute("name") or ""
+            iid = el.get_attribute("id") or ""
+            iph = el.get_attribute("placeholder") or ""
+            iaria = el.get_attribute("aria-label") or ""
+            parts = []
+            if iid: parts.append(f"@id='{iid}'")
+            if iname: parts.append(f"@name='{iname}'")
+            if itype: parts.append(f"@type='{itype}'")
+            xpath = f"//input[{ ' and '.join(parts) }]" if parts else "//input"
+            findings["inputs"].append({
+                "xpath": xpath, "type": itype, "name": iname,
+                "id": iid, "placeholder": iph, "aria_label": iaria,
+            })
+        except Exception:
+            continue
 
-        # Stealth: remove webdriver property
-        self.context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            window.chrome = { runtime: {} };
-        """)
+    for el in page.query_selector_all("textarea"):
+        try:
+            if not el.is_visible():
+                continue
+            iname = el.get_attribute("name") or ""
+            iid = el.get_attribute("id") or ""
+            iph = el.get_attribute("placeholder") or ""
+            iaria = el.get_attribute("aria-label") or ""
+            xpath = f"//textarea[@name='{iname}']" if iname else "//textarea"
+            findings["textareas"].append({
+                "xpath": xpath, "name": iname, "id": iid,
+                "placeholder": iph, "aria_label": iaria,
+            })
+        except Exception:
+            continue
 
-        # API interception
-        def on_request(req):
-            if "rentmasseur.com/api" in req.url or "/api/" in req.url:
-                self.api_calls.append({
-                    "method": req.method,
-                    "url": req.url,
-                    "ts": now_iso(),
-                    "post_data": req.post_data[:500] if req.post_data else None,
-                })
+    for el in page.query_selector_all("button"):
+        try:
+            if not el.is_visible():
+                continue
+            text = (el.inner_text() or "").strip()[:80]
+            btype = el.get_attribute("type") or ""
+            bclass = el.get_attribute("class") or ""
+            baria = el.get_attribute("aria-label") or ""
+            # Skip cookie consent buttons
+            if "ACCEPT ALL" in text:
+                continue
+            xpath = f"//button[contains(text(),'{text}')]" if text else "//button"
+            findings["buttons"].append({
+                "xpath": xpath, "text": text, "type": btype,
+                "class": bclass[:100], "aria_label": baria,
+            })
+        except Exception:
+            continue
 
-        def on_response(resp):
-            if "rentmasseur.com/api" in resp.url or "/api/" in resp.url:
-                for call in reversed(self.api_calls):
-                    if call["url"] == resp.url and "status" not in call:
-                        call["status"] = resp.status
+    for el in page.query_selector_all("select"):
+        try:
+            if not el.is_visible():
+                continue
+            iname = el.get_attribute("name") or ""
+            iid = el.get_attribute("id") or ""
+            xpath = f"//select[@name='{iname}']" if iname else "//select"
+            findings["selects"].append({"xpath": xpath, "name": iname, "id": iid})
+        except Exception:
+            continue
+
+    for el in page.query_selector_all("[contenteditable='true']"):
+        try:
+            if not el.is_visible():
+                continue
+            cclass = el.get_attribute("class") or ""
+            crole = el.get_attribute("role") or ""
+            findings["contenteditable"].append({
+                "xpath": "//*[@contenteditable='true']",
+                "class": cclass[:100], "role": crole,
+            })
+        except Exception:
+            continue
+
+    for el in page.query_selector_all("a[href]"):
+        try:
+            href = el.get_attribute("href") or ""
+            if href.startswith("/") and not any(x in href for x in [
+                "login", "settings", "search", "blog", "reviews", "interviews",
+                "available", "find-massage", "live-cams", "sitemap", "advertise",
+                "mailbox", "static", "_next", "images", "api", "blogs", "404",
+            ]):
+                parts = href.strip("/").split("/")
+                if parts and parts[0] and len(parts) == 1:
+                    findings["links_profile"].append({
+                        "href": href,
+                        "text": (el.inner_text() or "").strip()[:60],
+                    })
+        except Exception:
+            continue
+
+    return findings
+
+
+# ── API interceptor with redaction ───────────────────────────────────
+
+class APIInterceptor:
+    def __init__(self, redact: bool = True):
+        self.calls: list[dict] = []
+        self.redact = redact
+
+    def on_request(self, request):
+        url = request.url
+        if "rentmasseur.com/api" not in url and "/api/" not in url:
+            return
+        entry = {
+            "method": request.method,
+            "url": url,
+            "url_path": url.replace(BASE_URL, ""),
+            "request_headers_redacted": self.redact,
+            "post_data": None,
+        }
+        if self.redact:
+            entry["request_headers"] = redact_headers(dict(request.headers))
+            pd = request.post_data
+            if pd:
+                entry["post_data"] = redact_body(pd)
+        else:
+            entry["request_headers"] = dict(request.headers)
+            entry["post_data"] = request.post_data
+        self.calls.append(entry)
+
+    def on_response(self, response):
+        url = response.url
+        if "rentmasseur.com/api" not in url and "/api/" not in url:
+            return
+        for call in reversed(self.calls):
+            if call["url"] == url and "status" not in call:
+                call["status"] = response.status
+                call["status_text"] = response.status_text
+                try:
+                    body = response.text()
+                    call["response_body_hash"] = f"sha256:{sha256(body)}"
+                    call["response_body_len"] = len(body)
+                    if self.redact:
+                        redacted = redact_body(body[:2000])
+                        call["response_preview"] = redacted
+                        call["response_keys"] = body_keys(body)
+                    else:
+                        call["response_preview"] = body[:2000]
+                        call["response_keys"] = body_keys(body)
+                except Exception:
+                    call["response_body_hash"] = None
+                    call["response_preview"] = None
+                break
+
+    def save(self, page_name: str) -> Path:
+        safe = re.sub(r'[^A-Za-z0-9_-]', '_', page_name)[:60]
+        path = API_DIR / f"{safe}_api.json"
+        path.write_text(json.dumps(self.calls, indent=2, default=str), encoding="utf-8")
+        return path
+
+
+# ── Login ────────────────────────────────────────────────────────────
+
+def attempt_login(page: Page, context: BrowserContext, username: str, password: str) -> tuple[bool, Optional[str]]:
+    """Attempt login. Returns (success, block_reason)."""
+    try:
+        page.goto(f"{BASE_URL}/login", wait_until="networkidle", timeout=30000)
+        time.sleep(2)
+
+        block = detect_block(page)
+        if block:
+            return False, block
+
+        email_el = page.query_selector("input#email") or page.query_selector("input[name='email']")
+        pass_el = page.query_selector("input#password") or page.query_selector("input[type='password']")
+
+        if not email_el or not pass_el:
+            return False, "login_form_not_found"
+
+        email_el.fill(username)
+        pass_el.fill(password)
+        time.sleep(0.5)
+
+        # Click LOGIN button
+        login_btn = page.query_selector("button:has-text('LOGIN')")
+        if not login_btn:
+            login_btn = page.query_selector("button[type='submit']")
+        if login_btn and login_btn.is_visible():
+            login_btn.click()
+        else:
+            pass_el.press("Enter")
+
+        page.wait_for_load_state("networkidle", timeout=15000)
+        time.sleep(3)
+
+        # Check for blocks post-login
+        block = detect_block(page)
+        if block:
+            return False, block
+
+        if "/login" in page.url:
+            return False, "login_failed_still_on_login_page"
+
+        # Save storage state locally (never uploaded as artifact)
+        context.storage_state(path=str(STORAGE_STATE))
+        return True, None
+
+    except Exception as e:
+        return False, f"login_error: {e}"
+
+
+# ── Function registry generator ──────────────────────────────────────
+
+def generate_function_registry(probe_results: list[dict]) -> dict:
+    """Generate function_registry.generated.yml from probe results."""
+    functions = {}
+
+    for r in probe_results:
+        name = r["page"]
+        status = r.get("status", "unknown")
+        xpaths = r.get("xpaths", {})
+        api_calls = r.get("api_calls", [])
+
+        if r.get("needs_login"):
+            mode = "authenticated"
+            allowed_in_ci = "manual_only"
+        else:
+            mode = "public"
+            allowed_in_ci = True
+
+        ftype = "read"
+        requires_approval = False
+
+        # Detect if page has form fields that could be mutated
+        has_form = bool(xpaths.get("textareas") or xpaths.get("contenteditable"))
+        has_submit = any("save" in b.get("text", "").lower() or "submit" in b.get("text", "").lower()
+                        for b in xpaths.get("buttons", []))
+
+        if has_form and has_submit and r.get("needs_login"):
+            ftype = "read"  # still read — we're detecting, not submitting
+            # Add a corresponding _save_live mutation function
+            mutation_name = name.replace("_detect", "_save_live").replace("_read", "_save_live")
+            if mutation_name != name:
+                functions[mutation_name] = {
+                    "mode": "authenticated",
+                    "type": "mutation",
+                    "allowed_in_ci": False,
+                    "requires_manual_approval": True,
+                    "discovered_on": name,
+                }
+
+        # Detect mailbox compose
+        if "compose" in name:
+            functions["mailbox_send"] = {
+                "mode": "authenticated",
+                "type": "mutation",
+                "allowed_in_ci": False,
+                "disabled": True,
+            }
+
+        functions[name] = {
+            "mode": mode,
+            "type": ftype,
+            "allowed_in_ci": allowed_in_ci,
+            "url": r.get("final_url", r["url"]),
+            "selectors_found": {
+                "inputs": len(xpaths.get("inputs", [])),
+                "textareas": len(xpaths.get("textareas", [])),
+                "buttons": len(xpaths.get("buttons", [])),
+                "selects": len(xpaths.get("selects", [])),
+                "contenteditable": len(xpaths.get("contenteditable", [])),
+            },
+            "api_endpoints": len(api_calls),
+            "screenshot": bool(r.get("screenshot")),
+            "status": status,
+        }
+
+    # Always include blocked functions
+    functions["captcha_bypass"] = {"mode": "blocked", "type": "blocked", "allowed_in_ci": False, "disabled": True}
+    functions["anti_bot_bypass"] = {"mode": "blocked", "type": "blocked", "allowed_in_ci": False, "disabled": True}
+    functions["mass_message"] = {"mode": "blocked", "type": "blocked", "allowed_in_ci": False, "disabled": True}
+    functions["fake_availability_loop"] = {"mode": "blocked", "type": "blocked", "allowed_in_ci": False, "disabled": True}
+
+    return {"functions": functions}
+
+
+def write_yaml(data: dict, path: Path):
+    """Write dict as YAML (simple serializer, no external dep needed)."""
+    lines = []
+    lines.append("# Auto-generated from Playwright probe — do not edit manually.")
+    lines.append(f"# Generated: {now_iso()}")
+    lines.append("")
+    lines.append("functions:")
+    for name, cfg in data.get("functions", {}).items():
+        lines.append(f"  {name}:")
+        for k, v in cfg.items():
+            if isinstance(v, bool):
+                lines.append(f"    {k}: {str(v).lower()}")
+            elif isinstance(v, (int, float)):
+                lines.append(f"    {k}: {v}")
+            elif isinstance(v, str):
+                lines.append(f'    {k}: "{v}"')
+            elif isinstance(v, dict):
+                lines.append(f"    {k}:")
+                for kk, vv in v.items():
+                    if isinstance(vv, bool):
+                        lines.append(f"      {kk}: {str(vv).lower()}")
+                    else:
+                        lines.append(f"      {kk}: {vv}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ── Utility ──────────────────────────────────────────────────────────
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_name(s: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_-]', '_', s)[:60]
+
+
+# ── Probe page ───────────────────────────────────────────────────────
+
+def probe_page(page: Page, page_name: str, page_cfg: dict, logged_in: bool,
+               interceptor: APIInterceptor) -> dict:
+    print(f"\n── Probing: {page_name} ──")
+    print(f"  URL: {page_cfg['url']}")
+
+    result = {
+        "page": page_name,
+        "url": page_cfg["url"],
+        "timestamp": now_iso(),
+        "needs_login": page_cfg["needs_login"],
+        "logged_in": logged_in,
+    }
+
+    interceptor.calls = []
+
+    try:
+        page.goto(page_cfg["url"], wait_until="networkidle", timeout=30000)
+        time.sleep(3)
+
+        # Dismiss cookie consent if present
+        try:
+            accept_btn = page.query_selector("button:has-text('ACCEPT ALL')")
+            if accept_btn and accept_btn.is_visible():
+                accept_btn.click()
+                time.sleep(1)
+        except Exception:
+            pass
+
+        block = detect_block(page)
+        if block:
+            result["status"] = "blocked"
+            result["block_reason"] = block
+            result["mutation_attempted"] = False
+            result["action_taken"] = "stopped_without_bypass"
+            print(f"  BLOCKED: {block}")
+        else:
+            result["status"] = "ok"
+            result["title"] = page.title()
+            result["final_url"] = page.url
+
+            if page_cfg["needs_login"] and "/login" in page.url:
+                result["status"] = "redirected_to_login"
+                result["note"] = "Page requires login — not authenticated"
+                print(f"  Redirected to login")
+            elif page_cfg["needs_login"] and "/404" in page.url:
+                result["status"] = "not_found"
+                result["note"] = "Page returned 404 — may require different URL or session"
+                print(f"  404 — page not found")
+            else:
+                xpaths = discover_xpaths(page)
+                result["xpaths"] = xpaths
+                print(f"  Found: {len(xpaths['inputs'])} inputs, {len(xpaths['textareas'])} textareas, "
+                      f"{len(xpaths['buttons'])} buttons, {len(xpaths['links_profile'])} profile links")
+
+                # Capture __NEXT_DATA__
+                try:
+                    nd = page.evaluate("() => { const el = document.getElementById('__NEXT_DATA__'); return el ? el.textContent : null; }")
+                    if nd:
+                        result["next_data_len"] = len(nd)
+                        result["next_data_hash"] = f"sha256:{sha256(nd)}"
+                        # Try to extract page props keys
                         try:
-                            body = resp.text()
-                            call["response_len"] = len(body)
-                            call["response_preview"] = body[:300]
+                            nd_json = json.loads(nd)
+                            props = nd_json.get("props", {}).get("pageProps", {})
+                            result["next_data_keys"] = list(props.keys())[:20]
                         except Exception:
                             pass
-                        break
+                        print(f"  __NEXT_DATA__: {len(nd)} chars")
+                except Exception:
+                    pass
 
-        self.context.on("request", on_request)
-        self.context.on("response", on_response)
-        self.page = self.context.new_page()
-        log("Browser started (Playwright)")
-
-    def stop(self):
-        if self.browser:
-            self.browser.close()
-        if self.playwright:
-            self.playwright.stop()
-        log("Browser closed (Playwright)")
-
-    def screenshot(self, name: str) -> str:
-        ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-        fname = f"{ts}_{SESSION_ID}_{name}.png"
-        path = SCREENSHOTS / fname
-        try:
-            self.page.screenshot(path=str(path), full_page=False)
-            log(f"Screenshot: {fname}")
-        except Exception as e:
-            log(f"Screenshot failed: {e}", "WARN")
-            return ""
-        return str(path)
-
-    def page_text(self) -> str:
-        try:
-            return self.page.inner_text("body")[:5000]
-        except Exception:
-            return ""
-
-    def detect_block(self) -> Optional[str]:
-        return detect_block_text(self.page_text(), self.page.url)
-
-    def login(self, username: str, password: str) -> bool:
-        log("=== LOGIN ===")
-        try:
-            self.page.goto(f"{BASE_URL}/login", wait_until="networkidle", timeout=30000)
-            human_delay(2, 4)
-            self.screenshot("01_login_page")
-
-            block = self.detect_block()
-            if block:
-                log(f"BLOCKED: {block}", "ERROR")
-                write_receipt("login", "blocked", {"reason": block})
-                return False
-
-            email_el = None
-            for sel in ["input[type='email']", "input[name*='email' i]", "input[name*='user' i]", "input[type='text']"]:
-                email_el = self.page.query_selector(sel)
-                if email_el and email_el.is_visible():
-                    break
-                email_el = None
-
-            pass_el = self.page.query_selector("input[type='password']")
-
-            if not email_el or not pass_el:
-                log("Login form not found", "ERROR")
-                write_receipt("login", "fail", {"reason": "form_not_found"})
-                return False
-
-            log("Found login form — typing credentials (human-like)...")
-            email_el.click()
-            human_delay(0.3, 0.8)
-            email_el.fill(username)
-            human_delay(0.5, 1.2)
-            pass_el.click()
-            human_delay(0.3, 0.6)
-            pass_el.fill(password)
-            human_delay(0.8, 1.5)
-
-            self.screenshot("02_login_filled")
-
-            for sel in ["button[type='submit']", "button:has-text('LOG')", "button:has-text('Log')", "form button"]:
-                btn = self.page.query_selector(sel)
-                if btn and btn.is_visible():
-                    btn.click()
-                    break
-
-            self.page.wait_for_load_state("networkidle", timeout=15000)
-            human_delay(3, 5)
-
-            current_url = self.page.url
-            log(f"  Post-login URL: {current_url}")
-
-            if "/login" in current_url:
-                log("Login failed — still on login page", "ERROR")
-                self.screenshot("03_login_failed")
-                write_receipt("login", "fail", {"reason": "still_on_login_page", "url": current_url})
-                return False
-
-            self.logged_in = True
-            self.screenshot("03_login_success")
-            log(f"Login OK — URL: {current_url}")
-            write_receipt("login", "pass", {
-                "url": current_url,
-                "screenshot": str(SCREENSHOTS / "03_login_success.png"),
-                "ua": self.ua,
-            })
-            return True
-
-        except Exception as e:
-            log(f"Login error: {e}", "ERROR")
-            write_receipt("login", "error", {"error": str(e)})
-            return False
-
-    def scrape_visitors(self, max_load_more: int = 50) -> list[dict]:
-        log("=== SCRAPE VISITORS ===")
-        self.page.goto(f"{BASE_URL}/settings/whosawme", wait_until="networkidle", timeout=30000)
-        human_delay(3, 5)
-        self.screenshot("04_whosawme")
-
-        block = self.detect_block()
-        if block:
-            log(f"BLOCKED: {block}", "ERROR")
-            write_receipt("scrape_visitors", "blocked", {"reason": block})
-            return []
-
-        load_more_count = 0
-        for _ in range(max_load_more):
-            try:
-                load_btn = self.page.query_selector("button:has-text('Load More'), a:has-text('Load More'), button:has-text('load more'), a:has-text('load more'), button:has-text('Show More'), a:has-text('Show More')")
-                if not load_btn or not load_btn.is_visible():
-                    break
-                log(f"  Clicking Load More ({load_more_count + 1})...")
-                load_btn.click()
-                human_delay(2, 4)
-                self.page.wait_for_load_state("networkidle", timeout=10000)
-                load_more_count += 1
-            except Exception:
-                break
-        log(f"  Load More clicked {load_more_count} times")
-
-        visitors = self.page.evaluate("""
-            () => {
-                const result = [];
-                const seen = new Set();
-                const skip = ['settings','gay-massage','stream','masseurcams','advertise','about','login','sitemap','topics','robots','api'];
-                const cards = document.querySelectorAll('.visitor-card, .visitor-row, .who-saw-me-item, [class*="visitor"], [class*="who-saw"]');
-                for (const card of cards) {
-                    const a = card.querySelector('a[href]');
-                    if (!a) continue;
-                    const href = a.href;
-                    if (!href.startsWith('https://rentmasseur.com/')) continue;
-                    const path = new URL(href).pathname;
-                    if (!path || path === '/' || path.split('/').length !== 2) continue;
-                    const username = path.replace('/', '');
-                    if (!username || seen.has(username) || skip.includes(username) || username.startsWith('_') || username.length <= 2) continue;
-                    seen.add(username);
-                    const text = card.innerText || '';
-                    const vMatch = text.match(/(\\d+)\\s*(?:visits?|views?|times?)/i);
-                    const oMatch = text.match(/(?:last\\s*online|online)\\s*[:\\s]*(.+)/i);
-                    const dMatch = text.match(/(?:last\\s*visit|visited)\\s*[:\\s]*(.+)/i);
-                    const lMatch = text.match(/(?:location|from|city)\\s*[:\\s]*(.+)/i);
-                    result.push({username, url: href, name: username, visit_count: vMatch?parseInt(vMatch[1]):1, last_online: oMatch?oMatch[1].trim():null, last_visit_my_page: dMatch?dMatch[1].trim():null, location: lMatch?lMatch[1].trim():null, card_text: text.substring(0,300)});
-                }
-                const profileImgs = document.querySelectorAll('img[alt="Profile photo"], img[alt="profile-picture"]');
-                for (const img of profileImgs) {
-                    const a = img.closest('a');
-                    if (a && a.href) {
-                        const path = new URL(a.href).pathname;
-                        const username = path.replace('/', '');
-                        if (username && !seen.has(username) && !username.includes('settings') && !username.includes('gay-massage')) {
-                            seen.add(username);
-                            result.push({username, url: a.href, name: username, visit_count: 1});
-                        }
-                    }
-                }
-                const links = Array.from(document.querySelectorAll('a[href]'));
-                for (const a of links) {
-                    const href = a.href;
-                    if (!href.startsWith('https://rentmasseur.com/')) continue;
-                    const path = new URL(href).pathname;
-                    if (path && path !== '/' && path.split('/').length === 2 && path.split('/')[1] !== '') {
-                        const username = path.replace('/', '');
-                        if (!seen.has(username) && !skip.includes(username) && !username.startsWith('_') && username.length > 2) {
-                            seen.add(username);
-                            result.push({username, url: href, name: username, visit_count: 1});
-                        }
-                    }
-                }
-                return result;
-            }
-        """)
-
-        log(f"Found {len(visitors)} visitors (after {load_more_count} Load More clicks)")
-        for v in visitors[:15]:
-            extra = f" visits={v.get('visit_count', 1)}"
-            if v.get('last_online'): extra += f" online={v['last_online']}"
-            if v.get('location'): extra += f" loc={v['location']}"
-            log(f"  {v['name']}{extra}")
-
-        write_receipt("scrape_visitors", "pass", {"count": len(visitors), "load_more_clicks": load_more_count, "visitors": visitors[:30], "screenshot": self.screenshot("04_whosawme_full")})
-        return visitors
-
-    def extract_profile_metadata(self, uname: str) -> dict:
-        try:
-            return self.page.evaluate("""
-                () => {
-                    const text = document.body ? document.body.innerText : '';
-                    const oMatch = text.match(/(?:last\\s*online|online|active)\\s*[:\\s]*(.+)/i);
-                    const lMatch = text.match(/(?:location|from|city|area)\\s*[:\\s]*(.+)/i);
-                    const sMatch = text.match(/(\\d+)\\s*(?:visits?|views?|profile\\s*views?)/i);
-                    return {last_online: oMatch?oMatch[1].trim():null, location: lMatch?lMatch[1].trim():null, profile_views: sMatch?parseInt(sMatch[1]):null};
-                }
-            """)
-        except Exception:
-            return {}
-
-    def visit_profile(self, visitor: dict, idx: int, total: int) -> dict:
-        uname = visitor["username"]
-        url = visitor["url"]
-        log(f"  [{idx+1}/{total}] Visiting {uname}...")
-        try:
-            self.page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            human_delay(2, 4)
-            block = self.detect_block()
-            if block:
-                log(f"  BLOCKED on {uname}: {block}", "WARN")
-                return {"username": uname, "status": "blocked", "reason": block}
-            ss_name = f"visit_{idx+1:03d}_{uname}"
-            self.screenshot(ss_name)
-            page_text = self.page_text()[:1000]
-            meta = self.extract_profile_metadata(uname)
-            result = {"username": uname, "url": self.page.url, "status": "ok", "page_title": self.page.title(), "content_hash": sha256_text(page_text), "screenshot": ss_name, "visited_at": now_iso(), "last_online": meta.get("last_online"), "location": meta.get("location"), "profile_views": meta.get("profile_views")}
-            write_receipt("visit_profile", "pass", result)
-            return result
-        except Exception as e:
-            log(f"  ERROR visiting {uname}: {e}", "WARN")
-            return {"username": uname, "status": "error", "error": str(e)}
-
-    def send_message(self, username: str, message: str) -> dict:
-        log(f"  -> Messaging {username}...")
-        try:
-            compose_url = f"{BASE_URL}/mailbox/compose?to={username}"
-            self.page.goto(compose_url, wait_until="domcontentloaded", timeout=20000)
-            human_delay(2, 3)
-            self.screenshot(f"message_{username}_compose")
-            textarea = None
-            for sel in ["textarea[name*='message' i]", "textarea[name*='body' i]", "textarea[name*='content' i]", "textarea", "div[contenteditable='true']"]:
-                textarea = self.page.query_selector(sel)
-                if textarea and textarea.is_visible(): break
-                textarea = None
-            if not textarea:
-                log(f"  No textarea on compose — trying profile fallback", "WARN")
-                self.page.goto(f"{BASE_URL}/{username}", wait_until="domcontentloaded", timeout=20000)
-                human_delay(2, 3)
-                for sel in ["a:has-text('Message')", "button:has-text('Message')", "a:has-text('Contact')", "button:has-text('Contact')", "a[href*='message']", "a[href*='mail']"]:
-                    msg_btn = self.page.query_selector(sel)
-                    if msg_btn and msg_btn.is_visible():
-                        msg_btn.click()
-                        human_delay(2, 4)
-                        break
-                for sel in ["textarea", "textarea[name*='message']", "div[contenteditable='true']"]:
-                    textarea = self.page.query_selector(sel)
-                    if textarea and textarea.is_visible(): break
-                    textarea = None
-            if not textarea:
-                log(f"  No textarea for {username}", "WARN")
-                return {"username": username, "status": "no_textarea"}
-            textarea.click()
-            human_delay(0.5, 1)
-            textarea.fill(message)
-            human_delay(1, 2)
-            self.screenshot(f"message_{username}_composed")
-            send_btn = None
-            for sel in ["button:has-text('Send')", "button[type='submit']", "button:has-text('send')", "input[type='submit']"]:
-                send_btn = self.page.query_selector(sel)
-                if send_btn and send_btn.is_visible(): break
-                send_btn = None
-            if send_btn:
-                send_btn.click()
-                human_delay(3, 5)
-                self.screenshot(f"message_{username}_sent")
-                log(f"  Message sent to {username}")
-                write_receipt("send_message", "pass", {"username": username, "message": message[:100]})
-                return {"username": username, "status": "sent", "message": message}
-            else:
-                log(f"  No send button for {username}", "WARN")
-                return {"username": username, "status": "no_send_button"}
-        except Exception as e:
-            log(f"  ERROR messaging {username}: {e}", "WARN")
-            write_receipt("send_message", "error", {"username": username, "error": str(e)})
-            return {"username": username, "status": "error", "error": str(e)}
-
-    def probe_page(self, page_name: str) -> dict:
-        cfg = PAGES.get(page_name)
-        if not cfg:
-            log(f"Unknown page: {page_name}", "WARN")
-            return {}
-
-        log(f"=== PROBE: {page_name} ===")
-        log(f"  URL: {cfg['url']}")
-
-        try:
-            self.page.goto(cfg["url"], wait_until="networkidle", timeout=30000)
-            human_delay(2, 4)
-
-            block = self.detect_block()
-            ss = self.screenshot(f"probe_{page_name}")
-
-            if block:
-                log(f"  BLOCKED: {block}", "ERROR")
-                write_receipt("probe", "blocked", {"page": page_name, "reason": block, "screenshot": ss})
-                return {"page": page_name, "status": "blocked", "reason": block}
-
-            if cfg["needs_login"] and not self.logged_in and "/login" in self.page.url:
-                log("  Redirected to login (not authenticated)")
-                write_receipt("probe", "redirected", {"page": page_name, "url": self.page.url})
-                return {"page": page_name, "status": "redirected_to_login"}
-
-            title = self.page.title()
-            text = self.page_text()[:2000]
-            result = {
-                "page": page_name,
-                "url": self.page.url,
-                "status": "ok",
-                "title": title,
-                "content_hash": sha256_text(text),
-                "text_len": len(text),
-                "screenshot": ss,
-            }
-            log(f"  OK: title='{title}' text_len={len(text)}")
-            write_receipt("probe", "pass", result)
-            return result
-
-        except Exception as e:
-            log(f"  ERROR: {e}", "ERROR")
-            write_receipt("probe", "error", {"page": page_name, "error": str(e)})
-            return {"page": page_name, "status": "error", "error": str(e)}
-
-    def save_api_log(self):
-        if self.api_calls:
-            path = LOGS / f"api_calls_{SESSION_ID}.json"
-            path.write_text(json.dumps(self.api_calls, indent=2), encoding="utf-8")
-            log(f"API calls log: {len(self.api_calls)} calls → {path.name}")
-
-
-# ─── Selenium Engine (Undetected ChromeDriver) ──────────────────────
-
-class SeleniumAgent:
-    def __init__(self, headed: bool):
-        self.headed = headed
-        self.driver = None
-        self.logged_in = False
-        self.ua = random.choice(USER_AGENTS)
-        log(f"Engine: Selenium (undetected) | UA: {self.ua[:40]}...")
-
-    def start(self):
-        import undetected_chromedriver as uc
-
-        options = uc.ChromeOptions()
-        if not self.headed:
-            options.add_argument("--headless=new")
-        options.add_argument("--window-size=1440,900")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument(f"--user-agent={self.ua}")
-
-        chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if os.path.exists(chrome_path):
-            options.binary_location = chrome_path
-
-        try:
-            import subprocess
-            ver_out = subprocess.check_output(
-                [chrome_path, "--version"], stderr=subprocess.DEVNULL
-            ).decode().strip()
-            chrome_major = int(re.search(r'(\d+)\.', ver_out).group(1))
-            self.driver = uc.Chrome(options=options, version_main=chrome_major)
-        except Exception:
-            self.driver = uc.Chrome(options=options)
-
-        self.driver.set_page_load_timeout(45)
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                window.chrome = { runtime: {} };
-            """
-        })
-        log("Browser started (Selenium/undetected)")
-
-    def stop(self):
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-        log("Browser closed (Selenium)")
-
-    def screenshot(self, name: str) -> str:
-        ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-        fname = f"{ts}_{SESSION_ID}_{name}.png"
-        path = SCREENSHOTS / fname
-        try:
-            self.driver.save_screenshot(str(path))
-            log(f"Screenshot: {fname}")
-        except Exception as e:
-            log(f"Screenshot failed: {e}", "WARN")
-            return ""
-        return str(path)
-
-    def page_text(self) -> str:
-        try:
-            return self.driver.execute_script(
-                "return document.body ? document.body.innerText : ''"
-            )[:5000]
-        except Exception:
-            return ""
-
-    def detect_block(self) -> Optional[str]:
-        return detect_block_text(self.page_text(), self.driver.current_url)
-
-    def login(self, username: str, password: str) -> bool:
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.common.keys import Keys
-
-        log("=== LOGIN ===")
-        try:
-            self.driver.get(f"{BASE_URL}/login")
-            human_delay(3, 5)
-            self.screenshot("01_login_page")
-
-            block = self.detect_block()
-            if block:
-                log(f"BLOCKED: {block}", "ERROR")
-                write_receipt("login", "blocked", {"reason": block})
-                return False
-
-            inputs = self.driver.find_elements(By.CSS_SELECTOR, "input")
-            email_el = None
-            pass_el = None
-            for inp in inputs:
-                if not inp.is_displayed():
-                    continue
-                itype = (inp.get_attribute("type") or "").lower()
+                # Find logout link/button if requested

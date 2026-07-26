@@ -1,231 +1,519 @@
-        now = time.time()
-        log.info("")
-        log.info("━" * 50)
-        log.info("Cycle %d | Uptime: %s | Actions: %d | Receipts: %d",
-                 self.cycle_count, self._uptime(), self.total_actions, self.total_receipts)
-        log.info("━" * 50)
+    def detect_block(self) -> Optional[str]:
+        txt = self.page_text().lower()
+        url = (self.driver.current_url or "").lower()
+        needles = [
+            ("captcha", "captcha_detected"),
+            ("crowdsec", "crowdsec_detected"),
+            ("access forbidden", "access_forbidden"),
+            ("verify you are human", "human_verification"),
+            ("unusual traffic", "traffic_challenge"),
+            ("too many requests", "rate_limited"),
+        ]
+        for needle, reason in needles:
+            if needle in txt or needle in url:
+                return reason
+        return None
 
-        # Re-auth if needed (with timeout)
+    # ── Handlers ──────────────────────────────────────────────────────
+
+    def run_health_check(self):
         try:
-            authed = self.auth.is_authenticated()
-        except Exception:
-            authed = False
-        if not authed:
-            log.info("Session expired. Re-authenticating...")
-            self.login()
-
-        # 1. Visibility guard (every cycle)
-        if self.auth.api.logged_in:
-            try:
-                visible_ok = ensure_visible(self.api)
-                self.total_actions += 1
-                self.total_receipts += 1
-                if visible_ok:
-                    log.info("◉ Visibility: OK")
-                else:
-                    log.warning("⟁ Visibility: REPAIRING")
-            except Exception as e:
-                log.warning("Visibility check failed: %s", e)
-
-        # 2. Availability guard (every cycle)
-        if self.auth.api.logged_in and (now - self.last_avail_check >= 5 * 60):
-            self.last_avail_check = now
-            try:
-                avail = check_availability(self.api)
-                self.total_receipts += 1
-                if avail.get("needs_refresh"):
-                    log.info("⌁ Refreshing availability...")
-                    refresh_availability(self.api)
-                    self.total_actions += 1
-                    self.total_receipts += 1
-                    log.info("◆ Availability refreshed")
-                else:
-                    remaining = avail.get("remaining_seconds", 0)
-                    log.info("◉ Availability: %s (%d min left)",
-                             avail.get("selected"), remaining // 60)
-            except Exception as e:
-                log.warning("Availability check failed: %s", e)
-
-        # 3. Stats collection (every 15 min)
-        if self.auth.api.logged_in and (now - self.last_stats >= STATS_INTERVAL):
-            self.last_stats = now
-            try:
-                snapshot = collect_snapshot(self.api)
-                self.current_stats = snapshot
-                self.total_receipts += 1
-                views = snapshot.get("profile_views", 0)
-                clicks = snapshot.get("contact_clicks", 0)
-                visits = snapshot.get("new_visits", 0)
-                emails = snapshot.get("new_emails", 0)
-                ctr = (clicks / views * 100) if views else 0
-                log.info("◍ Stats: views=%s contacts=%s visits=%s emails=%s ctr=%.2f%%",
-                         views, clicks, visits, emails, ctr)
-                if visits or emails:
-                    self.total_revenue_signals += visits + emails
-                    log.info("▲ Revenue signals: +%d (total: %d)",
-                             visits + emails, self.total_revenue_signals)
-            except Exception as e:
-                log.warning("Stats collection failed: %s", e)
-
-        # 4. Search rank (every 60 min)
-        if self.auth.api.logged_in and (now - self.last_search_rank >= SEARCH_RANK_INTERVAL):
-            self.last_search_rank = now
-            try:
-                rank = check_search_rank(self.api, "karpathianwolf", city="manhattan-ny")
-                self.search_position = rank.get("position")
-                self.total_receipts += 1
-                if rank.get("found"):
-                    log.info("◆ Search rank: #%d/%d in Manhattan",
-                             rank["position"], rank.get("total", 0))
-                else:
-                    log.warning("⟁ Not found in search results")
-            except Exception as e:
-                log.warning("Search rank check failed: %s", e)
-
-        # 5. ML retraining (every 6 hours)
-        if now - self.last_ml_retrain >= ML_RETRAIN_INTERVAL:
-            self._retrain_ml()
-
-        # 6. Bio A/B test (every 24 hours)
-        if self.auth.api.logged_in and (now - self.last_bio_test >= BIO_TEST_INTERVAL):
-            self.last_bio_test = now
-            try:
-                log.info("⌁ Running daily bio A/B test cycle...")
-                result = run_daily_draft_cycle(self.api)
-                self.total_actions += 1
-                self.total_receipts += 1
-                draft = result.get("bio_draft")
-                if draft:
-                    log.info("◆ Bio draft created: %s (score: %s)",
-                             draft.get("variant_id"),
-                             draft.get("hypothesis", "")[:60])
-                else:
-                    log.info("No bio change needed (too soon or no better variant)")
-            except Exception as e:
-                log.warning("Bio A/B test failed: %s", e)
-
-        # 7. Selenium verification (every 30 min)
-        if now - self.last_selenium >= SELENIUM_INTERVAL:
-            self.last_selenium = now
-            try:
-                log.info("◉ Selenium verification...")
-                sel = selenium_verify_search()
-                self.selenium_status = sel.get("selenium_status", "unknown")
-                cards = sel.get("total_found", 0)
-                links = sel.get("total_profile_links", 0)
-                log.info("◆ Selenium: %s (%d cards, %d links, %.1fs)",
-                         self.selenium_status, cards, links,
-                         sel.get("page_load_time", 0))
-            except Exception as e:
-                log.warning("Selenium verification failed: %s", e)
-                self.selenium_status = "fail"
-
-        # 8. Update dashboard
-        self._update_dashboard()
-
-        # Print mini dashboard
-        self._print_mini_dashboard()
-
-    def _retrain_ml(self):
-        self.last_ml_retrain = time.time()
-        try:
-            log.info("⟡ ML retraining: 30 epochs on bio dataset...")
-            from .money_training_selenium import train_money_model
-            bios = load_bios(BIOS_PATH, limit=5000)
-            if bios:
-                model, summary = train_money_model(bios, epochs=30)
-                self.ml_model = model
-                self.ml_summary = summary
-                self.top_bios = predict_top_bios(model, bios, top_n=10)
-                self.total_receipts += 1
-                log.info("◆ ML retrained: R²=%.4f MAE=%.6f reward=%.2f",
-                         summary["final_r2"], summary["final_mae"],
-                         summary["money_reward_final"])
-                if self.top_bios:
-                    log.info("  Top bio: %s (ctr=%.4f score=%.2f)",
-                             self.top_bios[0]["username"],
-                             self.top_bios[0]["predicted_ctr"],
-                             self.top_bios[0]["money_score"])
+            r = requests.get(f"{LOCAL_CP_URL}/api/health", timeout=10)
+            self.receipts.write("health_check", "pass", {
+                "status_code": r.status_code,
+                "body_hash": sha256_text(r.text),
+                "body_preview": r.text[:500],
+            })
         except Exception as e:
-            log.warning("ML retraining failed: %s", e)
+            self.receipts.write("health_check", "fail", {"error": str(e)})
 
-    def _uptime(self) -> str:
-        secs = int(time.time() - self.start_time)
-        h = secs // 3600
-        m = (secs % 3600) // 60
-        s = secs % 60
-        return f"{h}h{m}m{s}s"
-
-    def _update_dashboard(self):
-        dashboard = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "uptime_seconds": int(time.time() - self.start_time),
-            "cycle_count": self.cycle_count,
-            "authenticated": self.auth.api.logged_in,
-            "current_stats": self.current_stats,
-            "search_position": self.search_position,
-            "selenium_status": self.selenium_status,
-            "ml_summary": {
-                "r2": self.ml_summary.get("final_r2"),
-                "mae": self.ml_summary.get("final_mae"),
-                "money_reward": self.ml_summary.get("money_reward_final"),
-            } if self.ml_summary else None,
-            "top_bios": self.top_bios[:3],
-            "total_revenue_signals": self.total_revenue_signals,
-            "total_actions": self.total_actions,
-            "total_receipts": self.total_receipts,
-            "errors": self.errors,
-            "last_error": self.last_error,
+    def run_metrics_ingest(self):
+        payload = {
+            "source": "ci_selenium",
+            "event": "proof_metric",
+            "ts": int(time.time()),
+            "value": 1,
         }
-        DASHBOARD_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(DASHBOARD_PATH, "w") as f:
-            json.dump(dashboard, f, indent=2, default=str)
+        try:
+            r = requests.post(f"{LOCAL_CP_URL}/api/metrics/ingest", json=payload, timeout=10)
+            self.receipts.write("metrics_ingest", "pass", {
+                "status_code": r.status_code,
+                "response_hash": sha256_text(r.text),
+            })
+        except Exception as e:
+            self.receipts.write("metrics_ingest", "fail", {"error": str(e)})
 
-    def _print_mini_dashboard(self):
-        views = self.current_stats.get("profile_views", "—")
-        clicks = self.current_stats.get("contact_clicks", "—")
-        visits = self.current_stats.get("new_visits", "—")
-        emails = self.current_stats.get("new_emails", "—")
-        pos = self.search_position or "—"
-        r2 = self.ml_summary.get("final_r2", "—") if self.ml_summary else "—"
+    def run_local_dashboard_snapshot(self):
+        self._ensure_driver()
+        try:
+            self.driver.get(LOCAL_CP_URL)
+            time.sleep(2)
+            shot = self.screenshot("local_dashboard")
+            title = self.driver.title
+            body = self.page_text()[:2000]
+            self.receipts.write("local_dashboard_snapshot", "pass", {
+                "title": title,
+                "body_hash": sha256_text(body),
+                "screenshot": shot,
+            })
+        except Exception as e:
+            self.receipts.write("local_dashboard_snapshot", "fail", {"error": str(e)})
 
-        log.info("")
-        log.info("┌─────────────────────────────────────────────┐")
-        log.info("│  ◉◆⌁  MONEY DASHBOARD — Cycle %d  │", self.cycle_count)
-        log.info("├─────────────────────────────────────────────┤")
-        log.info("│  Uptime:     %s", self._uptime())
-        log.info("│  Auth:       %s", "◉ logged in" if self.auth.api.logged_in else "◌ offline")
-        log.info("│  Views:      %s", views)
-        log.info("│  Contacts:   %s", clicks)
-        log.info("│  New visits: %s", visits)
-        log.info("│  New emails: %s", emails)
-        log.info("│  Search pos: #%s in Manhattan", pos)
-        log.info("│  Selenium:   %s", self.selenium_status)
-        log.info("│  ML R²:      %s", f"{r2:.4f}" if isinstance(r2, float) else r2)
-        log.info("│  Rev signals: %d", self.total_revenue_signals)
-        log.info("│  Actions:    %d | Receipts: %d | Errors: %d",
-                 self.total_actions, self.total_receipts, self.errors)
-        log.info("└─────────────────────────────────────────────┘")
+    def run_bio_candidate_generate(self):
+        try:
+            r = requests.post(
+                f"{LOCAL_CP_URL}/api/run/ga-rl",
+                headers={"Authorization": f"Bearer {os.getenv('ADMIN_TOKEN', '')}"},
+                timeout=120,
+            )
+            self.receipts.write("bio_candidate_generate", "pass", {
+                "status_code": r.status_code,
+                "response_hash": sha256_text(r.text),
+                "response_preview": r.text[:1000],
+            })
+        except Exception as e:
+            self.receipts.write("bio_candidate_generate", "fail", {"error": str(e)})
 
-    def _print_final_report(self):
-        log.info("")
-        log.info("=" * 60)
-        log.info("FINAL REPORT")
-        log.info("=" * 60)
-        log.info("Uptime:          %s", self._uptime())
-        log.info("Cycles:          %d", self.cycle_count)
-        log.info("Total actions:   %d", self.total_actions)
-        log.info("Total receipts:  %d", self.total_receipts)
-        log.info("Revenue signals: %d", self.total_revenue_signals)
-        log.info("Errors:          %d", self.errors)
-        log.info("ML R²:           %s", self.ml_summary.get("final_r2", "—"))
-        log.info("Dashboard:       %s", DASHBOARD_PATH)
-        log.info("=" * 60)
+    def run_bio_candidate_preview(self):
+        try:
+            r = requests.get(f"{LOCAL_CP_URL}/api/candidates", timeout=10)
+            self.receipts.write("bio_candidate_preview", "pass", {
+                "status_code": r.status_code,
+                "candidate_count": len(r.json()) if r.headers.get("content-type", "").startswith("application/json") else 0,
+                "response_hash": sha256_text(r.text),
+            })
+        except Exception as e:
+            self.receipts.write("bio_candidate_preview", "fail", {"error": str(e)})
+
+    def run_live_login_readonly(self):
+        self._ensure_driver()
+        username = os.getenv("RM_USERNAME") or os.getenv("RM_USER")
+        password = os.getenv("RM_PASSWORD") or os.getenv("RM_PASS")
+
+        if not username or not password:
+            self.receipts.write("live_login_readonly", "skipped", {
+                "reason": "missing_credentials"
+            })
+            return
+
+        try:
+            self.driver.get(f"{BASE_URL}/login")
+            time.sleep(3)
+            shot = self.screenshot("login_page")
+
+            block = self.detect_block()
+            if block:
+                self.receipts.write("live_login_readonly", "blocked", {
+                    "reason": block,
+                    "screenshot": shot,
+                })
+                return
+
+            self.receipts.write("live_login_readonly", "manual_required", {
+                "reason": "login selectors must be confirmed manually before CI login is enabled",
+                "screenshot": shot,
+            })
+        except Exception as e:
+            self.receipts.write("live_login_readonly", "fail", {"error": str(e)})
+
+    def run_dashboard_snapshot(self):
+        self._ensure_driver()
+        try:
+            self.driver.get(f"{BASE_URL}/settings")
+            time.sleep(4)
+            shot = self.screenshot("dashboard")
+            block = self.detect_block()
+            if block:
+                self.receipts.write("dashboard_snapshot", "blocked", {
+                    "reason": block, "screenshot": shot,
+                })
+                return
+            txt = self.page_text()
+            self.receipts.write("dashboard_snapshot", "pass", {
+                "title": self.driver.title,
+                "text_len": len(txt),
+                "body_hash": sha256_text(txt[:2000]),
+                "screenshot": shot,
+                "signals": {
+                    "availability": "availability" in txt.lower(),
+                    "profile": "profile" in txt.lower(),
+                    "statistics": "statistics" in txt.lower() or "views" in txt.lower(),
+                    "messages": "messages" in txt.lower() or "mailbox" in txt.lower(),
+                },
+            })
+        except Exception as e:
+            self.receipts.write("dashboard_snapshot", "fail", {"error": str(e)})
+
+    def run_availability_read(self):
+        self._ensure_driver()
+        try:
+            self.driver.get(f"{BASE_URL}/settings?availability=1")
+            time.sleep(4)
+            shot = self.screenshot("availability")
+            block = self.detect_block()
+            if block:
+                self.receipts.write("availability_read", "blocked", {
+                    "reason": block, "screenshot": shot,
+                })
+                return
+            txt = self.page_text()
+            self.receipts.write("availability_read", "pass", {
+                "text_len": len(txt),
+                "available_present": "available" in txt.lower(),
+                "screenshot": shot,
+            })
+        except Exception as e:
+            self.receipts.write("availability_read", "fail", {"error": str(e)})
+
+    def run_bio_field_detect(self):
+        self._ensure_driver()
+        try:
+            self.driver.get(f"{BASE_URL}/settings/about")
+            time.sleep(4)
+            shot = self.screenshot("bio_field_detect")
+            block = self.detect_block()
+            if block:
+                self.receipts.write("bio_field_detect", "blocked", {
+                    "reason": block, "screenshot": shot,
+                })
+                return
+
+            selectors_found = {}
+            for label, sels in {
+                "textarea": ["textarea[name*='description' i]", "textarea[name*='bio' i]", "textarea"],
+                "contenteditable": ["[contenteditable='true']"],
+                "save_button": ["button[type='submit']"],
+            }.items():
+                for sel in sels:
+                    try:
+                        els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                        if els and any(e.is_displayed() for e in els):
+                            selectors_found[label] = sel
+                            break
+                    except Exception:
+                        continue
+
+            # Save selector proof for approved_mutation mode
+            debug_dir = Path("debug")
+            debug_dir.mkdir(exist_ok=True)
+            proof_path = debug_dir / "bio_apply_live_selectors.json"
+            proof_path.write_text(json.dumps(selectors_found, indent=2), encoding="utf-8")
+
+            self.receipts.write("bio_field_detect", "pass", {
+                "screenshot": shot,
+                "selectors_found": selectors_found,
+                "selector_proof": str(proof_path),
+            })
+        except Exception as e:
+            self.receipts.write("bio_field_detect", "fail", {"error": str(e)})
+
+    def run_extension_popup_smoke(self):
+        self._ensure_driver()
+        try:
+            popup_path = Path("popup.html").resolve()
+            self.driver.get(f"file://{popup_path}")
+            time.sleep(2)
+            shot = self.screenshot("extension_popup")
+            title = self.driver.title
+            self.receipts.write("extension_popup_smoke", "pass", {
+                "title": title,
+                "screenshot": shot,
+            })
+        except Exception as e:
+            self.receipts.write("extension_popup_smoke", "fail", {"error": str(e)})
+
+    def run_extension_content_script_smoke(self):
+        self._ensure_driver()
+        try:
+            self.driver.get(BASE_URL)
+            time.sleep(3)
+            shot = self.screenshot("extension_content_script")
+            self.receipts.write("extension_content_script_smoke", "pass", {
+                "url": self.driver.current_url,
+                "screenshot": shot,
+            })
+        except Exception as e:
+            self.receipts.write("extension_content_script_smoke", "fail", {"error": str(e)})
+
+    # ── Approved mutation handlers ────────────────────────────────────
+
+    def run_bio_apply_live(self, candidate_file: str = "", approval_token: str = ""):
+        if not self.gate.verify_approval_token(approval_token):
+            self.receipts.write("bio_apply_live", "blocked", {
+                "reason": "approval_token_mismatch_or_missing"
+            })
+            return
+        if not self.gate.check_selector_proof("bio_apply_live"):
+            self.receipts.write("bio_apply_live", "blocked", {
+                "reason": "no_selector_proof_run_bio_field_detect_first"
+            })
+            return
+        candidate = self.gate.load_candidate(candidate_file)
+        if not candidate:
+            self.receipts.write("bio_apply_live", "blocked", {
+                "reason": "no_candidate_file"
+            })
+            return
+
+        bio_text = candidate.get("bio", "")
+        if len(bio_text) < 40 or len(bio_text) > 3000:
+            self.receipts.write("bio_apply_live", "blocked", {
+                "reason": "bio_length_out_of_bounds",
+                "length": len(bio_text),
+            })
+            return
+
+        risky = ["escort", "happy ending", "nude", "naked", "sex", "guaranteed cure"]
+        if any(x in bio_text.lower() for x in risky):
+            self.receipts.write("bio_apply_live", "blocked", {
+                "reason": "bio_failed_local_policy_filter"
+            })
+            return
+
+        self._ensure_driver()
+        try:
+            self.driver.get(f"{BASE_URL}/settings/about")
+            time.sleep(4)
+            before_shot = self.screenshot("bio_before")
+
+            block = self.detect_block()
+            if block:
+                self.receipts.write("bio_apply_live", "blocked", {
+                    "reason": block, "screenshot": before_shot,
+                })
+                return
+
+            field = None
+            for sel in ["textarea[name*='description' i]", "textarea[name*='bio' i]", "textarea", "[contenteditable='true']"]:
+                try:
+                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                    for el in els:
+                        if el.is_displayed():
+                            field = el
+                            break
+                except Exception:
+                    continue
+                if field:
+                    break
+
+            if not field:
+                self.receipts.write("bio_apply_live", "fail", {
+                    "reason": "bio_field_not_found",
+                    "screenshot": before_shot,
+                })
+                return
+
+            tag = field.tag_name.lower()
+            if tag == "textarea":
+                field.clear()
+                field.send_keys(bio_text)
+            else:
+                self.driver.execute_script(
+                    "arguments[0].innerText = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles:true}));",
+                    field, bio_text,
+                )
+
+            time.sleep(1)
+            after_fill_shot = self.screenshot("bio_after_fill")
+
+            saved = False
+            for sel in ["button[type='submit']"]:
+                try:
+                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                    for el in els:
+                        if el.is_displayed() and el.is_enabled():
+                            self.driver.execute_script("arguments[0].click();", el)
+                            saved = True
+                            break
+                except Exception:
+                    continue
+                if saved:
+                    break
+
+            time.sleep(4)
+            after_shot = self.screenshot("bio_after_save")
+            block = self.detect_block()
+
+            self.receipts.write("bio_apply_live", "pass" if saved and not block else "fail", {
+                "clicked_save": saved,
+                "bio_chars": len(bio_text),
+                "before_screenshot": before_shot,
+                "after_fill_screenshot": after_fill_shot,
+                "after_screenshot": after_shot,
+                "block_detected": block,
+            })
+        except Exception as e:
+            self.receipts.write("bio_apply_live", "fail", {"error": str(e)})
+
+    def run_availability_set_live(self, candidate_file: str = "", approval_token: str = ""):
+        if not self.gate.verify_approval_token(approval_token):
+            self.receipts.write("availability_set_live", "blocked", {
+                "reason": "approval_token_mismatch_or_missing"
+            })
+            return
+
+        self._ensure_driver()
+        try:
+            self.driver.get(f"{BASE_URL}/settings?availability=1")
+            time.sleep(4)
+            before_shot = self.screenshot("availability_before")
+
+            block = self.detect_block()
+            if block:
+                self.receipts.write("availability_set_live", "blocked", {
+                    "reason": block, "screenshot": before_shot,
+                })
+                return
+
+            clicked = False
+            for sel in ["label", "button"]:
+                try:
+                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                    for el in els:
+                        txt = (el.text or "").lower()
+                        if "available" in txt and el.is_displayed():
+                            self.driver.execute_script("arguments[0].click();", el)
+                            clicked = True
+                            break
+                except Exception:
+                    continue
+                if clicked:
+                    break
+
+            time.sleep(1)
+            saved = False
+            for sel in ["button[type='submit']"]:
+                try:
+                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                    for el in els:
+                        if el.is_displayed() and el.is_enabled():
+                            self.driver.execute_script("arguments[0].click();", el)
+                            saved = True
+                            break
+                except Exception:
+                    continue
+                if saved:
+                    break
+
+            time.sleep(3)
+            after_shot = self.screenshot("availability_after")
+            block = self.detect_block()
+
+            self.receipts.write("availability_set_live", "pass" if clicked and saved and not block else "fail", {
+                "clicked_available": clicked,
+                "clicked_save": saved,
+                "before_screenshot": before_shot,
+                "after_screenshot": after_shot,
+                "block_detected": block,
+            })
+        except Exception as e:
+            self.receipts.write("availability_set_live", "fail", {"error": str(e)})
+
+    # ── Dispatcher ────────────────────────────────────────────────────
+
+    HANDLERS = {
+        "health_check": "run_health_check",
+        "metrics_ingest": "run_metrics_ingest",
+        "local_dashboard_snapshot": "run_local_dashboard_snapshot",
+        "bio_candidate_generate": "run_bio_candidate_generate",
+        "bio_candidate_preview": "run_bio_candidate_preview",
+        "live_login_readonly": "run_live_login_readonly",
+        "dashboard_snapshot": "run_dashboard_snapshot",
+        "availability_read": "run_availability_read",
+        "bio_field_detect": "run_bio_field_detect",
+        "extension_popup_smoke": "run_extension_popup_smoke",
+        "extension_content_script_smoke": "run_extension_content_script_smoke",
+        "bio_apply_live": "run_bio_apply_live",
+        "availability_set_live": "run_availability_set_live",
+    }
+
+    def run_function(self, name: str, cfg: dict, candidate_file: str = "", approval_token: str = ""):
+        self.functions_run.append(name)
+
+        block_reason = self.gate.is_blocked(name, cfg)
+        if block_reason:
+            self.receipts.write(name, "blocked", {"reason": block_reason})
+            return
+
+        handler_name = self.HANDLERS.get(name)
+        if not handler_name:
+            self.receipts.write(name, "skipped", {"reason": "no_handler_implemented"})
+            return
+
+        handler = getattr(self, handler_name)
+        try:
+            if name in ("bio_apply_live", "availability_set_live"):
+                handler(candidate_file=candidate_file, approval_token=approval_token)
+            else:
+                handler()
+        except Exception as e:
+            self.receipts.write(name, "fail", {"error": str(e)})
+
+        time.sleep(float(os.getenv("RM_ACTION_PAUSE_SECONDS", "2.0")))
+
+    def close(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
 
 
 def main():
-    daemon = MoneyDaemon()
-    daemon.run()
+    parser = argparse.ArgumentParser(description="RM CI/CD Selenium Automator")
+    parser.add_argument("--registry", required=True, help="Path to function_registry.yml")
+    parser.add_argument("--mode", default="proof", choices=["proof", "live_readonly", "approved_mutation"])
+    parser.add_argument("--artifacts", default="artifacts")
+    parser.add_argument("--function", default="all_safe", help="Function name or 'all_safe'")
+    parser.add_argument("--candidate-file", default="", help="Approved candidate JSON for mutations")
+    parser.add_argument("--approval-token", default="", help="ADMIN_TOKEN for approved_mutation mode")
+    args = parser.parse_args()
+
+    artifacts = Path(args.artifacts)
+    artifacts.mkdir(parents=True, exist_ok=True)
+    registry_path = Path(args.registry)
+
+    automator = RMSeleniumAutomator(args.mode, artifacts, registry_path)
+
+    try:
+        functions = automator.registry.get("functions", {})
+
+        if args.function == "all_safe":
+            run_list = [(name, cfg) for name, cfg in functions.items() if cfg.get("allowed_in_ci", False)]
+        else:
+            cfg = functions.get(args.function)
+            if not cfg:
+                print(json.dumps({"error": f"unknown_function: {args.function}"}), file=sys.stderr)
+                sys.exit(2)
+            run_list = [(args.function, cfg)]
+
+        for name, cfg in run_list:
+            automator.run_function(
+                name, cfg,
+                candidate_file=args.candidate_file,
+                approval_token=args.approval_token,
+            )
+
+    finally:
+        automator.close()
+
+    # Build report
+    report_path = build_report(
+        artifacts / "receipts", artifacts, args.mode, automator.functions_run
+    )
+
+    # Print summary
+    ledger_valid = automator.receipts.verify()
+    print(json.dumps({
+        "mode": args.mode,
+        "functions_run": automator.functions_run,
+        "ledger_valid": ledger_valid,
+        "report": str(report_path),
+        "artifacts": str(artifacts),
+    }, indent=2))
+
+    sys.exit(0 if ledger_valid else 1)
 
 
 if __name__ == "__main__":
@@ -233,568 +521,280 @@ if __name__ == "__main__":
 
 ```
 
-stats_dashboard.py:
+imac_relay.py:
 ```
-"""
-Stats Dashboard — generate a simple HTML stats page for the ProfileOps engine.
+"""iMac manual relay helpers.
+
+This module prepares reviewable local handoffs for the operator. It does not
+transmit messages. Use it to copy approved drafts into the Mac workflow after
+human review.
 """
 
-import json
+from __future__ import annotations
+
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from .db import get_conn
-from .traffic_analyzer import conversion_rate, analyze_trend
-
-
-def _get_latest_state():
-    conn = get_conn()
-    snap = conn.execute("SELECT * FROM traffic_snapshots ORDER BY created_at DESC LIMIT 1").fetchone()
-    conn.close()
-    return dict(snap) if snap else {}
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
 
 
-def _get_experiment_count():
-    conn = get_conn()
-    total = conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
-    open_ = conn.execute("SELECT COUNT(*) FROM experiments WHERE ended_at IS NULL").fetchone()[0]
-    conn.close()
-    return {"total": total, "open": open_}
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _get_draft_count():
-    conn = get_conn()
-    bio = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='bio' AND status='draft'").fetchone()[0]
-    blog = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='blog' AND status='draft'").fetchone()[0]
-    interview = conn.execute("SELECT COUNT(*) FROM content_variants WHERE kind='interview' AND status='draft'").fetchone()[0]
-    conn.close()
-    return {"bio": bio, "blog": blog, "interview": interview}
+def handle_hash(handle: str) -> str:
+    return hashlib.sha256(handle.strip().lower().encode("utf-8")).hexdigest()
 
 
-def _get_receipt_count():
-    conn = get_conn()
-    total = conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0]
-    verified = conn.execute("SELECT COUNT(*) FROM receipts WHERE verified=1").fetchone()[0]
-    conn.close()
-    return {"total": total, "verified": verified}
-
-
-def _get_recent_receipts(limit: int = 10):
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM receipts ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def generate_html(state: dict = None, output_path: Path = None) -> Path:
-    if state is None:
-        state = _get_latest_state()
-    trend = analyze_trend(hours=24)
-    experiments = _get_experiment_count()
-    drafts = _get_draft_count()
-    receipts = _get_receipt_count()
-    recent = _get_recent_receipts(10)
-
-    views = state.get("profile_views") or 0
-    contacts = state.get("contact_clicks") or 0
-    rate = conversion_rate(views, contacts)
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RM ProfileOps Stats Dashboard</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f7; color: #1d1d1f; }}
-        h1 {{ font-size: 32px; margin-bottom: 8px; }}
-        .timestamp {{ color: #86868b; font-size: 14px; margin-bottom: 24px; }}
-        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }}
-        .card {{ background: white; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-        .card h2 {{ font-size: 14px; color: #86868b; margin: 0 0 8px 0; text-transform: uppercase; letter-spacing: 0.5px; }}
-        .card .value {{ font-size: 32px; font-weight: 600; margin: 0; }}
-        .card .sub {{ font-size: 14px; color: #86868b; margin-top: 4px; }}
-        .section {{ background: white; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-        .section h2 {{ font-size: 18px; margin-top: 0; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-        th, td {{ text-align: left; padding: 10px; border-bottom: 1px solid #eee; }}
-        th {{ color: #86868b; font-weight: 500; }}
-        .ok {{ color: #34c759; }}
-        .warn {{ color: #ff9500; }}
-        .bad {{ color: #ff3b30; }}
-    </style>
-</head>
-<body>
-    <h1>RM ProfileOps Stats Dashboard</h1>
-    <div class="timestamp">Generated: {datetime.now(timezone.utc).isoformat()} UTC</div>
-
-    <div class="grid">
-        <div class="card">
-            <h2>Profile Views</h2>
-            <p class="value">{views}</p>
-        </div>
-        <div class="card">
-            <h2>Contact Clicks</h2>
-            <p class="value">{contacts}</p>
-        </div>
-        <div class="card">
-            <h2>Contact Rate</h2>
-            <p class="value">{rate:.2%}</p>
-        </div>
-        <div class="card">
-            <h2>Receipts</h2>
-            <p class="value">{receipts['total']}</p>
-            <p class="sub">{receipts['verified']} verified</p>
-        </div>
-        <div class="card">
-            <h2>Experiments</h2>
-            <p class="value">{experiments['total']}</p>
-            <p class="sub">{experiments['open']} open</p>
-        </div>
-        <div class="card">
-            <h2>Drafts</h2>
-            <p class="value">{drafts['bio'] + drafts['blog'] + drafts['interview']}</p>
-            <p class="sub">bio {drafts['bio']} | blog {drafts['blog']} | interview {drafts['interview']}</p>
-        </div>
-    </div>
-
-    <div class="section">
-        <h2>24h Trend</h2>
-        <p><strong>Status:</strong> {trend.get('status', 'N/A')}</p>
-        <p><strong>Delta views:</strong> {trend.get('comparison', {}).get('delta_views', 'N/A')}</p>
-        <p><strong>Delta contacts:</strong> {trend.get('comparison', {}).get('delta_clicks', 'N/A')}</p>
-        <p><strong>Rate change:</strong> {trend.get('comparison', {}).get('rate_delta', 'N/A')}</p>
-        <p><strong>Alert:</strong> <span class="{'bad' if trend.get('alert') else 'ok'}">{'YES' if trend.get('alert') else 'NO'}</span></p>
-    </div>
-
-    <div class="section">
-        <h2>Recent Receipts</h2>
-        <table>
-            <tr><th>Time</th><th>Action</th><th>Verified</th></tr>
-            {''.join(f'<tr><td>{r["created_at"]}</td><td>{r["action"]}</td><td class="{"ok" if r["verified"] else "bad"}">{"YES" if r["verified"] else "NO"}</td></tr>' for r in recent)}
-        </table>
-    </div>
-</body>
-</html>
-"""
-
-    output_path = output_path or Path(__file__).parent / "data" / "dashboard" / "index.html"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html)
-    return output_path
-
-
-def generate_dashboard() -> Path:
-    return generate_html()
-
-```
-
-money_loop.py:
-```
-"""
-RentMasseur Money Loop — closed-loop revenue optimization algorithm.
-
-DISCOVERED ELEMENTS (live API data):
-  - Ad stats: totalPageViews, totalContactClicks, daily view counts
-  - Mailbox: client emails with username, timestamp, message preview, premium status
-  - Services/rates: incall $199, outcall $269, 5 service types
-  - Search rank: position in search results per city
-  - Availability: option + countdown timer
-  - Bio: headline + description (editable via PUT /settings/about)
-  - Engagement: reciprocal visits, LLM messages, visitor tracking
-
-MONEY LOOP ALGORITHM:
-
-  ┌─────────────────────────────────────────────────────────────┐
-  │  REVENUE SIGNAL COLLECTION                                  │
-  │  1. Scan mailbox for booking inquiries (new emails)         │
-  │  2. Classify each email: booking / inquiry / spam / reply   │
-  │  3. Count unread = new revenue opportunities               │
-  │  4. Track premium/gold senders = higher conversion value    │
-  │  5. Pull ad stats: views → contact_clicks → emails funnel   │
-  └────────────────────────┬────────────────────────────────────┘
-                           ▼
-  ┌─────────────────────────────────────────────────────────────┐
-  │  CONVERSION FUNNEL                                          │
-  │  views → contact_clicks → emails → bookings                │
-  │  CTR = contact_clicks / views                               │
-  │  Email rate = emails / contact_clicks                       │
-  │  Booking rate = bookings / emails                           │
-  │  Revenue = bookings × avg_rate                              │
-  └────────────────────────┬────────────────────────────────────┘
-                           ▼
-  ┌─────────────────────────────────────────────────────────────┐
-  │  ATTRIBUTION                                                │
-  │  - Current bio headline → attributed views/contacts         │
-  │  - Last message sent → attributed reply/booking             │
-  │  - Last visit batch → attributed new visitors               │
-  │  - Search rank → attributed organic discovery               │
-  │  - Availability status → attributed "available now" filter  │
-  └────────────────────────┬────────────────────────────────────┘
-                           ▼
-  ┌─────────────────────────────────────────────────────────────┐
-  │  LLM REVENUE OPTIMIZER                                      │
-  │  Input: funnel metrics, attribution, last cycle delta       │
-  │  LLM decides:                                               │
-  │    - Which action has highest expected revenue impact?      │
-  │    - Should bio change? (if CTR dropping)                   │
-  │    - Should rates change? (if booking rate high but views   │
-  │      low → raise rates; if views high but bookings low →    │
-  │      lower rates)                                           │
-  │    - Which visitors to message first? (premium + recent)    │
-  │    - Should availability extend? (if inquiries coming in)   │
-  │  Output: ranked action list with priority scores             │
-  └────────────────────────┬────────────────────────────────────┘
-                           ▼
-  ┌─────────────────────────────────────────────────────────────┐
-  │  EXECUTE + MEASURE                                          │
-  │  Execute top-ranked actions                                 │
-  │  Take after-snapshot                                        │
-  │  Calculate real deltas: views, contacts, emails, CTR        │
-  │  Store attribution: action → real impact metrics            │
-  │  Feed delta into next cycle's LLM prompt                    │
-  └────────────────────────┬────────────────────────────────────┘
-                           ▼
-  ┌─────────────────────────────────────────────────────────────┐
-  │  CONTINUOUS IMPROVEMENT                                     │
-  │  Each cycle:                                                │
-  │    - Compare funnel metrics to last cycle                   │
-  │    - Track real metric deltas (views, contacts, CTR)        │
-  │    - Update action weightings (actions that produced        │
-  │      metric improvements get higher priority next cycle)    │
-  │    - Train MLP on (bio_features → funnel_metrics)           │
-  │    - Adjust LLM prompt with cumulative learnings            │
-  └─────────────────────────────────────────────────────────────┘
-
-Usage:
-    python3 -m rm_traffic.money_loop --once       # single money cycle
-    python3 -m rm_traffic.money_loop --daemon     # continuous
-    python3 -m rm_traffic.money_loop --stats      # show money metrics
-"""
-
-import argparse
-import hashlib
-import json
-import logging
-import os
-import sqlite3
-import sys
-import time
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
-
-ENV_PATH = Path(__file__).parent.parent / ".env"
-if ENV_PATH.exists():
-    for line in open(ENV_PATH):
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
-
-os.environ.setdefault("RM_USER", os.environ.get("RENTMASSEUR_USER", ""))
-os.environ.setdefault("RM_PASS", os.environ.get("RENTMASSEUR_PASS", ""))
-
-from .api_client import RentMasseurAPI
-from .auth import AuthSession
-from .llm_client import generate_with_fallback
-
-log = logging.getLogger("money_loop")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-MONEY_DB = Path(__file__).parent / "money_loop.db"
-STATE_DIR = Path(__file__).parent.parent / "shadowshard_mforge" / "data" / "devin_controller"
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-MONEY_STATE = STATE_DIR / "money_loop_state.json"
-
-# Known rates from API (read live, fallback to these)
-AVG_INCALL = 199
-AVG_OUTCALL = 269
-AVG_RATE = (AVG_INCALL + AVG_OUTCALL) / 2  # $234 avg session
-
-# Valid action names — LLM output is validated against this list
-VALID_ACTIONS = {"refresh_availability", "update_bio", "send_messages", "visit_profiles", "adjust_rates", "extend_availability"}
-
-# ---------------------------------------------------------------------------
-# DB
-# ---------------------------------------------------------------------------
-
-def mdb():
-    conn = sqlite3.connect(str(MONEY_DB))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-def init_db():
-    conn = mdb()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS money_cycles (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        cycle_num INTEGER,
-        views INTEGER,
-        contact_clicks INTEGER,
-        emails_count INTEGER,
-        unread_emails INTEGER,
-        premium_senders INTEGER,
-        ctr REAL,
-        email_rate REAL,
-        booking_rate REAL,
-        estimated_revenue REAL,
-        revenue_delta REAL,
-        llm_cost_tokens INTEGER,
-        roi REAL,
-        actions_executed INTEGER,
-        top_action TEXT,
-        llm_decision TEXT,
-        bio_headline TEXT,
-        search_rank INTEGER,
-        availability_option INTEGER,
-        receipt_hash TEXT
-    );
-    CREATE TABLE IF NOT EXISTS email_signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        cycle_num INTEGER,
-        email_id INTEGER,
-        username TEXT,
-        created_at INTEGER,
-        message_preview TEXT,
-        is_unread INTEGER,
-        is_premium INTEGER,
-        classification TEXT,
-        estimated_value REAL,
-        attributed_action TEXT
-    );
-    CREATE TABLE IF NOT EXISTS action_attribution (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        cycle_num INTEGER,
-        action_name TEXT,
-        funnel_before TEXT,
-        funnel_after TEXT,
-        views_delta INTEGER,
-        contacts_delta INTEGER,
-        emails_delta INTEGER,
-        estimated_revenue_impact REAL,
-        llm_weight REAL
-    );
-    CREATE TABLE IF NOT EXISTS llm_revenue_decisions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        cycle_num INTEGER,
-        prompt TEXT,
-        response TEXT,
-        ranked_actions TEXT,
-        provider TEXT,
-        tokens INTEGER
-    );
-    """)
-    conn.commit()
-    conn.close()
-    # Ensure engagement DB has visitors table
-    try:
-        from .engagement_engine import init_db as eng_init_db
-        eng_init_db()
-    except Exception:
-        pass
-
-# ---------------------------------------------------------------------------
-# Revenue Signal Collection
-# ---------------------------------------------------------------------------
-
-def collect_revenue_signals(api: RentMasseurAPI, cycle_num: int) -> Dict:
-    """Collect all revenue signals from live API."""
-    signals: Dict = {"ts": datetime.now(timezone.utc).isoformat()}
-
-    # 1. Ad stats — the funnel
-    stats = api.get_ad_statistics()
-    prof = stats.get("profileStatistics", {}) or {}
-    visits = prof.get("visits", []) or []
-    total_views = prof.get("totalPageViews", 0)
-    total_contacts = prof.get("totalContactClicks", 0)
-    daily_views = {v.get("day", ""): v.get("count", 0) for v in visits}
-    today_views = daily_views.get("Today", 0)
-
-    signals["total_views"] = total_views
-    signals["total_contacts"] = total_contacts
-    signals["today_views"] = today_views
-    signals["daily_views"] = daily_views
-
-    # 2. Mailbox — booking inquiries
-    mb = api.get_mailbox(page=1, folder=1, sort=1)
-    emails = mb.get("emails", []) or []
-    unread = sum(1 for e in emails if e.get("unread"))
-    premium_senders = sum(1 for e in emails if e.get("userCard", {}).get("isGold") or e.get("userCard", {}).get("isPremium"))
-
-    signals["emails_count"] = len(emails)
-    signals["unread_emails"] = unread
-    signals["premium_senders"] = premium_senders
-
-    # 3. Store email signals with attribution
-    conn = mdb()
-    for e in emails:
-        eid = e.get("id", 0)
-        uname = e.get("userCard", {}).get("username", "")
-        created = e.get("createdAt", 0)
-        preview = (e.get("lastMessage", "") or "")[:200]
-        is_unread = int(e.get("unread", 0))
-        is_premium = int(bool(e.get("userCard", {}).get("isGold") or e.get("userCard", {}).get("isPremium")))
-        classification = classify_email(preview)
-        est_value = estimate_email_value(classification, is_premium)
-        conn.execute(
-            "INSERT OR REPLACE INTO email_signals (ts, cycle_num, email_id, username, created_at, message_preview, is_unread, is_premium, classification, estimated_value, attributed_action) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (signals["ts"], cycle_num, eid, uname, created, preview, is_unread, is_premium, classification, est_value, "")
+def open_conversation_record(record_key: str, client_handle: str | None = None, channel: str = "imessage", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    h = handle_hash(client_handle) if client_handle else None
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO client_conversations(visitor_key, channel, client_handle_hash, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (record_key, channel, h),
         )
-    conn.commit()
-    conn.close()
-
-    # 4. Bio + search rank + availability
-    about = api.get_about()
-    assets = about.get("userProps", {}).get("assets", {})
-    signals["headline"] = assets.get("headline", "")
-    signals["description_len"] = len(assets.get("description", ""))
-
-    avail = api.get_availability()
-    signals["availability_option"] = avail.get("option", 0)
-
-    try:
-        search = api.search(city="manhattan-ny", available_only=False, page=1)
-        results = search.get("results", []) or search.get("data", []) or search.get("users", []) or []
-        signals["search_rank"] = _find_rank(results)
-        signals["search_total"] = len(results)
-    except Exception:
-        signals["search_rank"] = 0
-        signals["search_total"] = 0
-
-    # 5. Services/rates
-    dash = api.get_dashboard()
-    services = dash.get("service", {})
-    active_rates = []
-    for key, svc in services.items():
-        if isinstance(svc, dict) and svc.get("activated"):
-            p = svc.get("price", {})
-            incall = p.get("incall")
-            outcall = p.get("outcall")
-            if isinstance(incall, int) and isinstance(outcall, int):
-                active_rates.append({"service": key, "incall": incall, "outcall": outcall})
-    signals["rates"] = active_rates
-    signals["avg_rate"] = sum((r["incall"] + r["outcall"]) / 2 for r in active_rates) / len(active_rates) if active_rates else AVG_RATE
-
-    return signals
-
-def classify_email(preview: str) -> str:
-    """Classify email by message content."""
-    p = preview.lower()
-    booking_words = ["book", "appointment", "session", "today", "tomorrow", "available", "schedule", "time", "hour"]
-    inquiry_words = ["price", "rate", "how much", "where", "location", "incall", "outcall", "service", "what"]
-    spam_words = ["click here", "visit my", "check out", "promo", "discount"]
-
-    if any(w in p for w in booking_words):
-        return "booking"
-    if any(w in p for w in inquiry_words):
-        return "inquiry"
-    if any(w in p for w in spam_words):
-        return "spam"
-    return "reply"
-
-def estimate_email_value(classification: str, is_premium: int) -> float:
-    """Classify email priority — 1=booking 2=inquiry 3=reply 0=spam. Not a dollar amount."""
-    priority = {"booking": 3, "inquiry": 2, "reply": 1, "spam": 0}
-    val = float(priority.get(classification, 0))
-    if is_premium:
-        val += 1.0
-    return val
-
-def _find_rank(results: List) -> int:
-    username = os.environ.get("RM_USER", "").lower()
-    for i, r in enumerate(results):
-        name = (r.get("username") or r.get("name") or "").lower()
-        if username and (username in name or name in username):
-            return i + 1
-    return 0
+        conversation_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("conversation_opened", "conversation", str(conversation_id), {"record_key": record_key, "channel": channel, "has_handle": bool(client_handle), "opened_at": now}, db_path=db_path)
+    return {"conversation_id": conversation_id, "record_key": record_key, "channel": channel, "receipt_hash": receipt["payload_hash"]}
 
 
-# ---------------------------------------------------------------------------
-# Conversion Funnel
-# ---------------------------------------------------------------------------
-
-def calculate_funnel(signals: Dict) -> Dict:
-    """Calculate conversion funnel metrics from real API data only."""
-    views = signals.get("total_views", 0)
-    contacts = signals.get("total_contacts", 0)
-    emails = signals.get("emails_count", 0)
-    unread = signals.get("unread_emails", 0)
-    premium = signals.get("premium_senders", 0)
-    avg_rate = signals.get("avg_rate", AVG_RATE)
-
-    ctr = (contacts / views * 100) if views > 0 else 0.0
-    email_rate = (emails / contacts * 100) if contacts > 0 else 0.0
-
-    # Count booking-classified emails from this cycle (real data, not estimates)
-    conn = mdb()
-    rows = conn.execute("SELECT classification, is_premium FROM email_signals WHERE cycle_num = (SELECT MAX(cycle_num) FROM email_signals)").fetchall()
-    conn.close()
-    booking_inquiries = sum(1 for r in rows if r["classification"] == "booking")
-    inquiry_count = sum(1 for r in rows if r["classification"] == "inquiry")
-
-    return {
-        "views": views, "contacts": contacts, "emails": emails,
-        "unread": unread, "premium_senders": premium,
-        "ctr": round(ctr, 2), "email_rate": round(email_rate, 2),
-        "booking_inquiries": booking_inquiries,
-        "inquiry_count": inquiry_count,
-        "avg_rate": avg_rate,
-    }
+def log_conversation_event(conversation_id: int, direction: str, body: str, event_at: str | None = None, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    if direction not in {"inbound", "outbound", "note"}:
+        raise ValueError("direction must be inbound, outbound, or note")
+    init_db(db_path)
+    now = event_at or utc_now()
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    preview = body[:120]
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversation_events(conversation_id, direction, body_hash, body_preview, event_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (conversation_id, direction, body_hash, preview, now),
+        )
+        if direction == "inbound":
+            conn.execute("UPDATE client_conversations SET last_inbound_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (now, conversation_id))
+        elif direction == "outbound":
+            conn.execute("UPDATE client_conversations SET last_outbound_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (now, conversation_id))
+        conn.commit()
+    receipt = write_receipt("conversation_event", "conversation", str(conversation_id), {"direction": direction, "body_hash": body_hash, "event_at": now}, db_path=db_path)
+    return {"conversation_id": conversation_id, "direction": direction, "body_hash": body_hash, "receipt_hash": receipt["payload_hash"]}
 
 
-# ---------------------------------------------------------------------------
-# LLM Revenue Optimizer
-# ---------------------------------------------------------------------------
+def export_manual_handoff(draft_id: int, output_dir: str = "data/imac_handoffs", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    """Export an approved draft as a local text file for manual Mac review."""
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+    if not row:
+        raise ValueError(f"draft not found: {draft_id}")
+    if row["status"] != "approved":
+        raise ValueError("draft must be approved before handoff export")
 
-def llm_revenue_optimize(signals: Dict, funnel: Dict, last_cycle: Optional[Dict]) -> Tuple[str, List[Dict]]:
-    """Call LLM to prioritize actions by expected revenue impact."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"draft_{draft_id}.txt"
+    path.write_text(row["body"], encoding="utf-8")
+    receipt = write_receipt("manual_handoff_exported", "draft", str(draft_id), {"path": str(path), "channel": row["channel"]}, db_path=db_path)
+    return {"draft_id": draft_id, "path": str(path), "receipt_hash": receipt["payload_hash"]}
 
-    last_delta = ""
-    if last_cycle:
-        last_delta = f"""
-LAST CYCLE RESULTS:
-  Views: {last_cycle.get('views', 0)} → now {funnel['views']}
-  CTR: {last_cycle.get('ctr', 0)}% → now {funnel['ctr']}%
-  Emails: {last_cycle.get('emails_count', 0)} → now {funnel['emails']}
-  Booking inquiries: {last_cycle.get('booking_inquiries', 0)}
-  Top action last cycle: {last_cycle.get('top_action', 'none')}
+
+def list_conversations(status: str = "active", db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM client_conversations WHERE status = ? ORDER BY updated_at DESC", (status,)).fetchall()
+    return rows_to_dicts(rows)
+
+```
+
+__init__.py:
+```
+"""Provider Growth CRM for owner-operated profile workflows.
+
+Compliance boundary: this package stores local engagement records, content
+versions, manual draft queue items, policy decisions, outbox states, KPI events,
+conversation receipts, and audit receipts for accounts the operator owns or is
+authorized to manage. It does not bypass access controls or transmit messages
+without explicit human approval.
 """
 
-    prompt = f"""You are a revenue optimization engine for a massage therapist on RentMasseur.com.
+__all__ = [
+    "db",
+    "receipts",
+    "engagement",
+    "drafts",
+    "policy",
+    "outbox",
+    "kpi",
+    "profile_content",
+    "experiments",
+    "imac_relay",
+]
 
-CURRENT FUNNEL:
-  Total views: {funnel['views']}
-  Contact clicks: {funnel['contacts']} (CTR: {funnel['ctr']}%)
-  Emails: {funnel['emails']} ({funnel['unread']} unread, {funnel['premium_senders']} premium senders)
-  Email rate: {funnel['email_rate']}%
-  Booking inquiries: {funnel['booking_inquiries']}
-  General inquiries: {funnel['inquiry_count']}
-  Average session rate: ${funnel['avg_rate']}
+```
 
-CURRENT STATE:
-  Bio headline: "{signals.get('headline', '')}"
-  Search rank: #{signals.get('search_rank', 0)} of {signals.get('search_total', 0)}
-  Availability: {signals.get('availability_option', 0)} (1=Available)
-  Active rates: {json.dumps(signals.get('rates', []), default=str)[:300]}
-{last_delta}
+drafts.py:
+```
+"""Manual draft queue.
 
-AVAILABLE ACTIONS (rank by expected impact on views/contacts/emails):
-  1. refresh_availability — stay in "Available Now" filter
-  2. update_bio — change headline to improve CTR
-  3. send_messages — message unread/potential clients
-  4. visit_profiles — reciprocal visits for visibility
-  5. adjust_rates — raise/lower rates based on demand
-  6. extend_availability — longer availability window
+Drafts are suggestions for human review. This module never transmits outbound
+content. The operator must approve and perform any outbound action separately.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
+
+TEMPLATES: dict[str, str] = {
+    "soft_checkin": "Hi {name}, thanks for checking in. I have a little availability coming up. Want me to send the current window?",
+    "same_day": "Hi {name}, I may have same-day availability. Send me your preferred time window and I will confirm what is realistic.",
+    "weekend": "Hi {name}, I am organizing the weekend schedule now. If you are considering a session, send your ideal day and time window.",
+    "content_followup": "Hi {name}, I updated my profile notes with a little more detail. Happy to answer any question before you book.",
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def render_template(template_name: str, name: str = "there") -> str:
+    if template_name not in TEMPLATES:
+        raise ValueError(f"unknown template: {template_name}")
+    return TEMPLATES[template_name].format(name=name or "there")
+
+
+def create_draft(record_key: str, template_name: str, name: str = "there", channel: str = "manual", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    body = render_template(template_name, name=name)
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO message_drafts(visitor_key, template_name, body, channel, status, approval_required)
+            VALUES (?, ?, ?, ?, 'draft', 1)
+            """,
+            (record_key, template_name, body, channel),
+        )
+        draft_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("draft_created", "draft", str(draft_id), {"record_key": record_key, "template": template_name, "channel": channel}, db_path=db_path)
+    return {"draft_id": draft_id, "body": body, "status": "draft", "approval_required": True, "receipt_hash": receipt["payload_hash"]}
+
+
+def approve_draft(draft_id: int, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    with connect(db_path) as conn:
+        conn.execute("UPDATE message_drafts SET status = 'approved', approved_at = ? WHERE id = ? AND status = 'draft'", (now, draft_id))
+        row = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        conn.commit()
+    receipt = write_receipt("draft_approved", "draft", str(draft_id), {"approved_at": now}, db_path=db_path)
+    return {"draft": dict(row) if row else None, "receipt_hash": receipt["payload_hash"]}
+
+
+def list_drafts(status: str = "draft", db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM message_drafts WHERE status = ? ORDER BY created_at DESC", (status,)).fetchall()
+    return rows_to_dicts(rows)
+
+```
+
+db.py:
+```
+"""SQLite schema and helpers for the provider growth CRM."""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import Iterable
+
+DEFAULT_DB_PATH = "data/provider_growth.sqlite3"
+
+SCHEMA: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS visitors (
+        visitor_key TEXT PRIMARY KEY,
+        display_name TEXT,
+        profile_url TEXT,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        visit_count INTEGER NOT NULL DEFAULT 1,
+        lead_score INTEGER NOT NULL DEFAULT 0,
+        notes TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'new',
+        do_not_contact INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS visitor_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        visitor_key TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'manual',
+        event_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(visitor_key) REFERENCES visitors(visitor_key)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS message_drafts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        visitor_key TEXT NOT NULL,
+        template_name TEXT NOT NULL,
+        body TEXT NOT NULL,
+        channel TEXT NOT NULL DEFAULT 'platform',
+        status TEXT NOT NULL DEFAULT 'draft',
+        approval_required INTEGER NOT NULL DEFAULT 1,
+        approved_at TEXT,
+        sent_at TEXT,
+        skipped_reason TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(visitor_key) REFERENCES visitors(visitor_key)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS client_conversations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        visitor_key TEXT NOT NULL,
+        channel TEXT NOT NULL DEFAULT 'imessage',
+        client_handle_hash TEXT,
+        last_inbound_at TEXT,
+        last_outbound_at TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        interest_stage TEXT NOT NULL DEFAULT 'new',
+        revenue_stage TEXT NOT NULL DEFAULT 'unknown',
+        do_not_contact INTEGER NOT NULL DEFAULT 0,
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(visitor_key) REFERENCES visitors(visitor_key)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS conversation_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL,
+        direction TEXT NOT NULL,
+        body_hash TEXT NOT NULL,
+        body_preview TEXT NOT NULL DEFAULT '',
+        event_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

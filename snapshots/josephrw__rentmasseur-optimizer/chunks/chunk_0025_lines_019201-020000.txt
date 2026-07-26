@@ -1,524 +1,221 @@
-        
-        # Try to detect objects in each cell
-        # Simple approach: look for distinct visual features
-        h, w = img.shape[:2]
-        grid_size = int(np.sqrt(len(grid_cells)))
-        cell_h, cell_w = h // grid_size, w // grid_size
-        
-        # For each cell, compute edge density and color variance
-        # This is a heuristic - real solution would use a trained classifier
-        clicked = 0
-        for i, cell in enumerate(grid_cells):
-            row, col = i // grid_size, i % grid_size
-            cell_img = img[row*cell_h:(row+1)*cell_h, col*cell_w:(col+1)*cell_w]
-            
-            # Compute features
-            gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY)
-            edges = cv2.Canny(gray, 50, 150)
-            edge_density = np.mean(edges > 0)
-            
-            # Color variance (objects tend to have more color variation)
-            color_std = np.std(cell_img)
-            
-            print(f"    Cell [{row},{col}]: edge_density={edge_density:.3f} color_std={color_std:.1f}")
-            
-            # Heuristic: click cells with high visual activity
-            # This is NOT reliable - real solution needs YOLO/CNN
-            if edge_density > 0.05 and color_std > 30:
-                try:
-                    cell.click()
-                    clicked += 1
-                    time.sleep(0.5)
-                except:
-                    pass
-        
-        print(f"  Clicked {clicked} cells")
-        driver.switch_to.default_content()
-        
-        # Click verify button
-        if clicked > 0:
-            time.sleep(2)
-            driver.switch_to.frame(frames[0])
-            try:
-                verify_btn = driver.find_element(By.CSS_SELECTOR, '#recaptcha-verify-button')
-                verify_btn.click()
-                print("  Clicked verify button")
-            except:
-                pass
-            driver.switch_to.default_content()
-            time.sleep(3)
-            return True
-        return False
-    except Exception as e:
-        print(f"  Error solving challenge: {e}")
-        driver.switch_to.default_content()
-        return False
 
 
-def check_captcha_solved(driver):
-    """Check if reCAPTCHA has been solved."""
+def _load_bio_history() -> list:
+    if os.path.exists(BIO_HISTORY_FILE):
+        try:
+            with open(BIO_HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def _save_bio_history(history: list) -> None:
     try:
-        result = driver.execute_script("""
-            try {
-                return grecaptcha && grecaptcha.getResponse().length > 0;
-            } catch(e) {
-                return false;
+        with open(BIO_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history[-50:], f, indent=2)
+    except Exception as e:
+        logger.warning("Failed to save bio history: %s", e)
+
+
+def _bio_hash(bio: str) -> str:
+    return hashlib.md5(bio.strip().lower().encode()).hexdigest()[:12]
+
+
+def groq_generate_bio(strategy_name: str, strategy_prompt: str, current_bio: Optional[str]) -> Optional[str]:
+    if not GROQ_API_KEY:
+        logger.error("No GROQ_API_KEY")
+        return None
+    history = _load_bio_history()
+    used_hashes = {entry.get("hash", "") for entry in history}
+    system_base = (
+        "You are an elite copywriter for massage therapy profiles. "
+        "Each bio must be under 300 words, magnetic, SEO-friendly, and conversion-optimized. "
+        "Avoid explicit content. Include keywords: massage, therapeutic, deep tissue, relaxation, session, Manhattan. "
+        "Always end with a subtle call-to-action."
+    )
+    context = f"\nCurrent bio:\n---\n{current_bio}\n---\n" if current_bio and current_bio.strip() else ""
+    user_prompt = (
+        f"{context}"
+        f"Strategy: {strategy_name}\n"
+        f"Instructions: {strategy_prompt}\n"
+        f"Now write ONLY the bio text. No labels, no quotes, no explanation. Just the bio."
+    )
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_base},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.9,
+                "max_tokens": 600,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        bio = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
+        h = _bio_hash(bio)
+        if h in used_hashes:
+            logger.info("Skipping duplicate bio strategy=%s", strategy_name)
+            return None
+        history.append({
+            "timestamp": datetime.now().isoformat(),
+            "strategy": strategy_name,
+            "hash": h,
+            "chars": len(bio),
+            "bio_preview": bio[:120],
+        })
+        _save_bio_history(history)
+        _save_bio_to_file(strategy_name, bio)
+        logger.info("Generated bio: strategy=%s chars=%d", strategy_name, len(bio))
+        return bio
+    except Exception as e:
+        logger.error("Groq API error for %s: %s", strategy_name, e)
+        return None
+
+
+def _save_bio_to_file(strategy_name: str, bio: str) -> None:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"bio_{strategy_name}_{ts}.txt"
+    filepath = os.path.join(BIOS_DIR, filename)
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(bio)
+        logger.info("Bio saved to file: %s", filepath)
+    except Exception as e:
+        logger.warning("Failed to save bio to file: %s", e)
+
+
+def update_bio(driver: webdriver.Chrome, new_bio: str) -> bool:
+    try:
+        urls_to_try = [
+            "https://rentmasseur.com/settings/about",
+            PROFILE_URL,
+            "https://rentmasseur.com/settings?bio=1",
+            "https://rentmasseur.com/settings",
+            "https://rentmasseur.com/profile/edit",
+            f"https://rentmasseur.com/{RENTMASSEUR_USERNAME}/edit",
+        ]
+        for url in urls_to_try:
+            logger.info("Trying profile settings: %s", url)
+            driver.get(url)
+            time.sleep(3)
+            result = driver.execute_script("""
+                const textareas = Array.from(document.querySelectorAll('textarea'));
+                const editables = Array.from(document.querySelectorAll('[contenteditable=\"true\"]'));
+                const inputs = Array.from(document.querySelectorAll('input[type=\"text\"]'));
+                function scoreBio(el, isTextarea) {
+                    const clues = ['bio','about','description','profile','intro','summary'];
+                    const text = (el.placeholder+' '+el.name+' '+(el.id||'')+' '+(el.getAttribute('aria-label')||'')).toLowerCase();
+                    let score=0;
+                    for (const c of clues) if (text.includes(c)) score+=3;
+                    if (isTextarea) score+=5;
+                    const val=el.value||el.innerText||'';
+                    if (val.length>30) score+=2; if (val.length>100) score+=3;
+                    return score;
+                }
+                let best=null, bestScore=-1;
+                for (const el of textareas) { const s=scoreBio(el,true); if (s>bestScore){bestScore=s; best=el;} }
+                for (const el of editables) { const s=scoreBio(el,false); if (s>bestScore){bestScore=s; best=el;} }
+                if (!best && inputs.length>0) { for (const el of inputs){const s=scoreBio(el,false); if(s>bestScore){bestScore=s;best=el;}} }
+                if (!best) return {error:'no_bio_field'};
+                const current=best.value||best.innerText||'';
+                return {
+                    tag:best.tagName.toLowerCase(), id:best.id||'', name:best.name||'',
+                    class:(best.className&&typeof best.className==='string')?best.className.split(' ').filter(Boolean).join(' '):'',
+                    placeholder:best.placeholder||'', contenteditable:best.getAttribute('contenteditable')||'',
+                    current:current.slice(0,500),
+                    selector:best.tagName.toLowerCase()+(best.id?'#'+best.id:'')+(best.name?'[name=\"'+best.name+'\"]':''),
+                };
+            """)
+            if isinstance(result, dict) and result.get('error'):
+                logger.info("No bio field at %s, trying next...", url)
+                continue
+            logger.info("Found bio field: %s", result.get('selector'))
+            current_bio = result.get('current', '')
+            logger.info("Current bio preview: %s...", current_bio[:80])
+            return result, current_bio
+        logger.error("Bio field not found on any settings page")
+        _dump_debug(driver, "bio_not_found")
+        return None
+    except Exception as e:
+        logger.error("Bio update exception: %s", e)
+        _dump_debug(driver, "bio_exception")
+        return None
+
+
+def save_bio_field(driver: webdriver.Chrome, result: dict, new_bio: str) -> bool:
+    try:
+        sel = result['selector']
+        if result.get('contenteditable') == 'true':
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            driver.execute_script("arguments[0].innerText = arguments[1];", el, new_bio)
+            driver.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles: true}));", el)
+        else:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            el.clear()
+            el.send_keys(new_bio)
+        save_ok = driver.execute_script("""
+            const buttons = Array.from(document.querySelectorAll('button, input[type=\"submit\"], a[role=\"button\"]'));
+            let saveBtn = buttons.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'')+' '+(b.value||'')+' '+(b.textContent||'')));
+            if (!saveBtn) {
+                const form = document.querySelector('textarea')?.closest('form');
+                if (form) { const fb=Array.from(form.querySelectorAll('button, input[type=\"submit\"]')); saveBtn=fb.find(b=>/save|update|submit|apply|confirm/i.test((b.innerText||'')+' '+(b.value||''))); }
             }
+            if (!saveBtn) return {error:'no_save_button'};
+            saveBtn.click();
+            return {ok:true};
         """)
-        return result
-    except:
-        return False
-
-
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,900")
-# Add some stealth options
-options.add_argument("--disable-blink-features=AutomationControlled")
-options.add_argument("--disable-features=IsolateOrigins,site-per-process")
-
-driver = uc.Chrome(options=options, version_main=149)
-
-try:
-    print("\n[1] Navigating to login...")
-    driver.set_page_load_timeout(90)
-    driver.get(LOGIN_URL)
-    time.sleep(8)
-    
-    print(f"  Title: {driver.title}")
-    print(f"  URL: {driver.current_url}")
-    
-    # Step 2: Try to solve CAPTCHA
-    print("\n[2] Attempting CAPTCHA solve...")
-    
-    # First try: click the checkbox
-    solved = click_recaptcha_checkbox(driver)
-    
-    if not solved:
-        # Check if image challenge appeared
-        time.sleep(3)
-        print("  Checkbox didn't pass. Checking for image challenge...")
-        solved = solve_image_challenge(driver)
-    
-    if not solved:
-        # Wait and retry
-        print("  Retrying in 5s...")
-        time.sleep(5)
-        solved = click_recaptcha_checkbox(driver)
-        if not solved:
-            solved = solve_image_challenge(driver)
-    
-    # Final check
-    time.sleep(3)
-    captcha_solved = check_captcha_solved(driver)
-    print(f"  CAPTCHA solved: {captcha_solved}")
-    
-    if not captcha_solved:
-        print("  Could not solve CAPTCHA automatically.")
-        print("  Waiting 60s - solve it manually in the browser window if visible...")
-        for i in range(12):
-            time.sleep(5)
-            if check_captcha_solved(driver):
-                captcha_solved = True
-                print("  CAPTCHA solved (manually or delayed)!")
-                break
-            print(f"  Waiting... ({(i+1)*5}s)")
-    
-    if not captcha_solved:
-        print("  CAPTCHA not solved. Exiting.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/captcha_final.png")
-        sys.exit(1)
-    
-    # Step 3: Wait for login form
-    print("\n[3] Looking for login form...")
-    for attempt in range(10):
-        time.sleep(3)
-        pwd = driver.execute_script("""
-            return document.querySelector('input[type="password"]') ||
-                   document.querySelector('input[name*="pass" i]') ||
-                   document.querySelector('input[placeholder*="pass" i]');
-        """)
-        if pwd:
-            print("  Password field found!")
-            break
-        print(f"  Attempt {attempt+1}: no password field yet...")
-    else:
-        print("  No login form found.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/no_login_form.png")
-        sys.exit(1)
-    
-    # Step 4: Fill and submit login
-    print("\n[4] Filling login form...")
-    driver.execute_script(f"""
-        const pwd = document.querySelector('input[type="password"]') ||
-                    document.querySelector('input[name*="pass" i]');
-        const user = document.querySelector('input[type="text"]') ||
-                     document.querySelector('input[type="email"]') ||
-                     document.querySelector('input[name*="user" i]') ||
-                     document.querySelector('input[name*="email" i]');
-        if (user) {{ user.value = '{USERNAME}'; user.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-        if (pwd) {{ pwd.value = '{PASSWORD}'; pwd.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-    """)
-    time.sleep(2)
-    
-    driver.execute_script("""
-        const btn = document.querySelector('button[type="submit"]') ||
-                    document.querySelector('input[type="submit"]') ||
-                    Array.from(document.querySelectorAll('button')).find(b => /login|sign.in|submit/i.test(b.innerText));
-        if (btn) btn.click();
-    """)
-    time.sleep(8)
-    
-    print(f"  After login URL: {driver.current_url}")
-    if "login" in driver.current_url.lower():
-        print("  Login may have failed.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/login_failed.png")
-        sys.exit(1)
-    
-    print("  Login successful!")
-    
-    # Step 5: Navigate to profile edit and update bio
-    print("\n[5] Navigating to profile edit...")
-    driver.get(BIO_URL)
-    time.sleep(5)
-    
-    bio_field = driver.execute_script("""
-        const textareas = Array.from(document.querySelectorAll('textarea'));
-        let best = null, bestScore = 0;
-        for (const ta of textareas) {
-            const score = (ta.value || '').length;
-            if (score > bestScore) { bestScore = score; best = ta; }
-        }
-        if (!best && textareas.length > 0) best = textareas[0];
-        if (best) {
-            best.value = arguments[0];
-            best.dispatchEvent(new Event('input', {bubbles: true}));
-            best.dispatchEvent(new Event('change', {bubbles: true}));
-            return true;
-        }
-        return false;
-    """, BIO_TEXT)
-    
-    if bio_field:
-        print("  Bio field updated!")
+        if isinstance(save_ok, dict) and save_ok.get('error'):
+            logger.error("Save button not found: %s", save_ok['error'])
+            _dump_debug(driver, "bio_no_save")
+            return False
+        logger.info("Bio updated and saved")
         time.sleep(2)
-        saved = driver.execute_script("""
-            const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-            const saveBtn = buttons.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'') + ' ' + (b.value||'')));
-            if (saveBtn) { saveBtn.click(); return true; }
-            return false;
-        """)
-        print(f"  Save clicked: {saved}")
-        time.sleep(5)
-        print("\n  BIO DEPLOYED SUCCESSFULLY!")
-        
-        # Write receipt
-        import json
-        from datetime import datetime, timezone
-        receipts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
-        os.makedirs(receipts_dir, exist_ok=True)
-        receipt = {
-            "action": "bio_deploy",
-            "bio_id": "controlled_wolf_v1",
-            "experiment_id": "exp_001_targeted_wolf",
-            "success": True,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "notes": "deployed via undetected-chromedriver with captcha solving"
-        }
-        rpath = os.path.join(receipts_dir, f"deploy_controlled_wolf_v1_{receipt['timestamp'].replace(':','-')}.json")
-        with open(rpath, "w") as f:
-            json.dump(receipt, f, indent=2)
-        print(f"  Receipt: {rpath}")
-    else:
-        print("  No textarea found.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/profile_edit.png")
-
-finally:
-    driver.quit()
-    print("\nDone.")
+        return True
+    except Exception as e:
+        logger.error("Save bio exception: %s", e)
+        return False
 
 ```
 
-competitor_scraper.py:
+vercel.json:
+```
+{
+  "name": "rentmasseur-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "RentMasseur OS — Vercel serverless backend proxy",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {},
+  "env": {
+    "HF_SPACE_URL": "https://josephrw-rentmasseur-optimizer.hf.space"
+  },
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api/:path*" }
+  ]
+}
+
+```
+
+post_interview.py:
 ```
 #!/usr/bin/env python3
-"""Competitor scraper — scrapes top RentMasseur profiles for competitive analysis.
-
-Fetches public profile pages and extracts: name, location, rate, bio text,
-availability status, and photo count. Uses Playwright for browser-based scraping
-to bypass anti-bot measures.
+"""
+Post interview answers to RentMasseur profile.
 
 Usage:
-    python3 competitor_scraper.py
-    python3 competitor_scraper.py --urls https://rentmasseur.com/User1 https://rentmasseur.com/User2
-    python3 competitor_scraper.py --output competitor_data.json
+    python3 post_interview.py --answers '{"question":"What is your style?","answer":"Deep tissue focused..."}'
+    python3 post_interview.py --file content/interview/answers.json
 """
-
-import argparse
-import json
-import os
-import sys
-import re
-import time
-import logging
-from datetime import datetime, timezone
-from typing import Optional
-from urllib.parse import urljoin
-
-import requests
-from bs4 import BeautifulSoup
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger(__name__)
-
-DEFAULT_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "competitor_data.json")
-CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
-
-DEFAULT_COMPETITORS = [
-    "https://rentmasseur.com/Preston_Banks",
-    "https://rentmasseur.com/Tonyxxxx",
-    "https://rentmasseur.com/MickeyCuteBoy",
-    "https://rentmasseur.com/ExoticYoungGuy",
-]
-
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
-)
-
-
-def fetch_with_playwright(url: str, timeout: int = 30) -> Optional[str]:
-    """Fetch a page using Playwright browser automation."""
-    try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-    except ImportError:
-        logger.error("Playwright not installed. Run: pip install playwright && playwright install chromium")
-        return None
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=USER_AGENT)
-            page = context.new_page()
-            page.goto(url, timeout=timeout * 1000)
-            page.wait_for_load_state("networkidle", timeout=timeout * 1000)
-            time.sleep(3)
-            html = page.content()
-            browser.close()
-            return html
-    except PlaywrightTimeoutError:
-        logger.warning("Playwright timeout for %s", url)
-        return None
-    except Exception as e:
-        logger.error("Playwright error for %s: %s", url, e)
-        return None
-
-
-def fetch_with_requests(url: str, timeout: int = 20) -> Optional[str]:
-    """Fetch a page using requests with browser-like headers."""
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://rentmasseur.com/",
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        return resp.text
-    except Exception as e:
-        logger.warning("requests failed for %s: %s", url, e)
-        return None
-
-
-def extract_profile_data(html: str, url: str) -> dict:
-    """Extract profile data from HTML."""
-    soup = BeautifulSoup(html, "html.parser")
-    data = {
-        "url": url,
-        "scraped_at": datetime.now(timezone.utc).isoformat(),
-        "name": None,
-        "location": None,
-        "rate": None,
-        "availability": None,
-        "bio_text": None,
-        "photo_count": 0,
-        "services": [],
-        "phone": None,
-    }
-
-    # Try to extract name from h1 or title
-    h1 = soup.find("h1")
-    if h1:
-        data["name"] = h1.get_text(strip=True)
-    if not data["name"]:
-        title = soup.find("title")
-        if title:
-            name_match = re.search(r"^(.+?)\s*[-|]", title.get_text())
-            if name_match:
-                data["name"] = name_match.group(1).strip()
-
-    # Extract location
-    for selector in [".location", ".profile-location", "[data-field='location']"]:
-        el = soup.select_one(selector)
-        if el:
-            data["location"] = el.get_text(strip=True)
-            break
-
-    # Extract rate
-    for selector in [".rate", ".price", "[data-field='rate']"]:
-        el = soup.select_one(selector)
-        if el:
-            data["rate"] = el.get_text(strip=True)
-            break
-
-    # Extract bio text
-    for selector in [".bio", ".about", ".description", ".profile-bio", "[data-field='bio']"]:
-        el = soup.select_one(selector)
-        if el:
-            data["bio_text"] = el.get_text(strip=True)[:1000]
-            break
-
-    # Extract availability
-    for selector in [".availability", ".status", ".badge"]:
-        el = soup.select_one(selector)
-        if el:
-            data["availability"] = el.get_text(strip=True)
-            break
-
-    # Count photos
-    photos = soup.select("img[src*='profile'], img[src*='photo'], img[class*='profile']")
-    data["photo_count"] = len(photos)
-
-    # Extract services from text
-    page_text = soup.get_text().lower()
-    service_keywords = [
-        "deep tissue", "swedish", "hot stone", "sports massage", "trigger point",
-        "aromatherapy", "reflexology", "shiatsu", "thai massage", "prenatal",
-        "couples massage", "lymphatic drainage", "myofascial release", "craniosacral",
-        "reiki", "chair massage", "corporate massage", "mobile massage",
-    ]
-    for kw in service_keywords:
-        if kw in page_text:
-            data["services"].append(kw)
-
-    return data
-
-
-def scrape_competitors(urls: list, output_path: str) -> list:
-    """Scrape multiple competitor profiles."""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    results = []
-
-    for url in urls:
-        logger.info("Scraping: %s", url)
-
-        # Try Playwright first, fall back to requests
-        html = fetch_with_playwright(url)
-        if not html:
-            logger.info("Playwright failed, trying requests...")
-            html = fetch_with_requests(url)
-
-        if not html:
-            logger.error("Failed to fetch %s", url)
-            results.append({"url": url, "error": "fetch_failed", "scraped_at": datetime.now(timezone.utc).isoformat()})
-            continue
-
-        # Check for captcha
-        if "captcha" in html.lower() or "crowdsec" in html.lower():
-            logger.warning("Captcha detected for %s", url)
-            results.append({"url": url, "error": "captcha_blocked", "scraped_at": datetime.now(timezone.utc).isoformat()})
-            continue
-
-        data = extract_profile_data(html, url)
-        results.append(data)
-        logger.info("Extracted: name=%s, location=%s, rate=%s, services=%d",
-                     data["name"], data["location"], data["rate"], len(data["services"]))
-
-        time.sleep(2)
-
-    # Save results
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-    logger.info("Saved %d profiles to %s", len(results), output_path)
-
-    return results
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Scrape RentMasseur competitor profiles")
-    parser.add_argument("--urls", nargs="*", default=DEFAULT_COMPETITORS, help="Profile URLs to scrape")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output JSON path")
-    args = parser.parse_args()
-
-    results = scrape_competitors(args.urls, args.output)
-
-    successful = [r for r in results if "error" not in r]
-    failed = [r for r in results if "error" in r]
-    logger.info("=== Scraping complete: %d success, %d failed ===", len(successful), len(failed))
-
-    if successful:
-        avg_services = sum(len(r.get("services", [])) for r in successful) / len(successful)
-        logger.info("Average services listed: %.1f", avg_services)
-        logger.info("Profiles with photos: %d/%d", sum(1 for r in successful if r.get("photo_count", 0) > 0), len(successful))
-
-    print(json.dumps({"total": len(results), "success": len(successful), "failed": len(failed)}, indent=2))
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-make_icons.py:
-```
-import struct, zlib, os
-
-def make_png(size, color, filename):
-    # Simple solid color PNG generator
-    sig = b'\x89PNG\r\n\x1a\n'
-    
-    # IHDR: width, height, bit depth, color type, compression, filter, interlace
-    ihdr_data = struct.pack('>IIBBBBB', size, size, 8, 6, 0, 0, 0)  # 8-bit RGBA
-    ihdr = struct.pack('>I', len(ihdr_data)) + b'IHDR' + ihdr_data
-    ihdr += struct.pack('>I', zlib.crc32(b'IHDR' + ihdr_data) & 0xffffffff)
-    
-    # Image data: each row starts with filter byte 0, then RGBA pixels
-    raw = b''
-    for _ in range(size):
-        raw += b'\x00'  # filter byte
-        for _ in range(size):
-            raw += bytes(color)
-    
-    compressed = zlib.compress(raw)
-    idat = struct.pack('>I', len(compressed)) + b'IDAT' + compressed
-    idat += struct.pack('>I', zlib.crc32(b'IDAT' + compressed) & 0xffffffff)
-    
-    # IEND
-    iend = struct.pack('>I', 0) + b'IEND'
-    iend += struct.pack('>I', zlib.crc32(b'IEND') & 0xffffffff)
-    
-    with open(filename, 'wb') as f:
-        f.write(sig + ihdr + idat + iend)
-
-base = '/Users/alep/Downloads/02_AI_Agents/rentmasseur-extension'
-# Dark bg (#1a1a1f = 26,26,31), accent (#cc8b4a = 204,139,74), white center
-make_png(16,  (204, 139, 74, 255), os.path.join(base, 'icon16.png'))
-make_png(48,  (204, 139, 74, 255), os.path.join(base, 'icon48.png'))
-make_png(128, (204, 139, 74, 255), os.path.join(base, 'icon128.png'))
-print('done')
-
-```
-
-_set_availability.py:
-```
-#!/usr/bin/env python3
-"""Set availability to 24/7 via undetected-chromedriver."""
-import time, os, json
+import time, os, sys, json, argparse
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
 from selenium.webdriver.common.by import By
@@ -530,15 +227,10 @@ load_dotenv()
 
 USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
 PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+INTERVIEW_URL = "https://rentmasseur.com/settings/interview"
 
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,900")
-options.add_argument("--disable-blink-features=AutomationControlled")
 
-driver = uc.Chrome(options=options, version_main=149)
-
-try:
-    print("[1] Login...")
+def login(driver):
     driver.get("https://rentmasseur.com/login")
     time.sleep(6)
     driver.execute_script("""
@@ -551,250 +243,558 @@ try:
     time.sleep(1)
     driver.find_element(By.CSS_SELECTOR, 'input[type="password"]').send_keys(Keys.ENTER)
     time.sleep(5)
-    print(f"  URL: {driver.current_url}")
-    
-    print("\n[2] Setting availability...")
-    driver.get("https://rentmasseur.com/settings/travels")
+    return "login" not in driver.current_url.lower()
+
+
+def post_interview(driver, answers):
+    """Post interview answers. answers = list of {question, answer} or {question_id, answer}."""
+    driver.get(INTERVIEW_URL)
     time.sleep(5)
-    
-    # Find availability controls
-    info = driver.execute_script("""
-        const r = {selects: [], buttons: [], inputs: [], textareas: []};
-        document.querySelectorAll('select').forEach(s => {
-            r.selects.push({id: s.id, name: s.name, options: Array.from(s.options).map(o => o.text).join('|'), value: s.value});
-        });
-        document.querySelectorAll('button').forEach(b => r.buttons.push({text: b.innerText.trim(), type: b.type, id: b.id}));
-        document.querySelectorAll('input').forEach(i => r.inputs.push({type: i.type, id: i.id, name: i.name, value: (i.value||'').substring(0,30), checked: i.checked}));
-        document.querySelectorAll('textarea').forEach(t => r.textareas.push({id: t.id, name: t.name, value: (t.value||'').substring(0,50)}));
-        return r;
-    """)
-    
-    print(f"  Selects: {len(info['selects'])}")
-    for s in info['selects']:
-        print(f"    id={s['id']} name={s['name']} value={s['value']} options={s['options'][:80]}")
-    print(f"  Buttons: {len(info['buttons'])}")
-    for b in info['buttons']:
-        print(f"    {b['text']} type={b['type']}")
-    print(f"  Inputs: {len(info['inputs'])}")
-    for i in info['inputs']:
-        print(f"    type={i['type']} id={i['id']} name={i['name']} value={i['value']} checked={i['checked']}")
-    
-    # Try to set availability
-    set_result = driver.execute_script("""
-        // Look for availability select or radio
-        const selects = Array.from(document.querySelectorAll('select'));
-        const availSelect = selects.find(s => {
-            const opts = Array.from(s.options).map(o => o.text.toLowerCase());
-            return opts.some(o => o.includes('available'));
-        });
-        
-        if (availSelect) {
-            const availOpt = Array.from(availSelect.options).find(o => 
-                o.text.toLowerCase().includes('available') && !o.text.toLowerCase().includes('not'));
-            if (availOpt) {
-                availSelect.value = availOpt.value;
-                availSelect.dispatchEvent(new Event('change', {bubbles: true}));
-                return {method: 'select', value: availOpt.text};
+
+    # Scrape available questions
+    print("  Scraping interview questions...")
+    questions = driver.execute_script("""
+        const result = [];
+        // Look for question elements
+        const qEls = document.querySelectorAll('.interview-question, .question, [data-question], .card-title, h3, h4, label, .form-label');
+        qEls.forEach((el, i) => {
+            const text = el.innerText.trim();
+            if (text && text.endsWith('?') && text.length > 10) {
+                // Find associated textarea
+                let textarea = null;
+                let parent = el.closest('.form-group, .card, .mb-3, .field, .interview-item, .form-row') || el.parentElement;
+                if (parent) {
+                    textarea = parent.querySelector('textarea');
+                }
+                if (!textarea) {
+                    textarea = document.querySelectorAll('textarea')[i];
+                }
+                result.push({
+                    question: text,
+                    textarea_id: textarea ? textarea.id : null,
+                    textarea_name: textarea ? textarea.name : null,
+                    index: i
+                });
             }
-        }
-        
-        // Look for radio buttons
-        const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
-        const availRadio = radios.find(r => /avail/i.test(r.name + r.id + (r.value||'')));
-        if (availRadio) {
-            availRadio.click();
-            return {method: 'radio', value: availRadio.value};
-        }
-        
-        // Look for toggle/checkbox
-        const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
-        const availCheckbox = checkboxes.find(c => /avail/i.test(c.name + c.id));
-        if (availCheckbox && !availCheckbox.checked) {
-            availCheckbox.click();
-            return {method: 'checkbox', checked: true};
-        }
-        
-        return {error: 'no_availability_control'};
+        });
+        return result;
     """)
-    print(f"\n  Set result: {set_result}")
-    
-    if 'error' not in set_result:
-        time.sleep(1)
-        # Save
-        saved = driver.execute_script("""
-            const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-            const sb = btns.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'')+' '+(b.value||'')));
-            if (sb) { sb.click(); return {ok: true, text: sb.innerText}; }
-            return {ok: false};
-        """)
-        print(f"  Save: {saved}")
-        time.sleep(3)
-        
-        # Write receipt
-        receipts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
-        os.makedirs(receipts_dir, exist_ok=True)
-        receipt = {"action": "set_availability", "status": "available_24_7", "success": True, "timestamp": datetime.now(timezone.utc).isoformat(), "method": "undetected-chromedriver"}
-        rpath = os.path.join(receipts_dir, f"availability_{receipt['timestamp'].replace(':','-')}.json")
-        with open(rpath, "w") as f:
-            json.dump(receipt, f, indent=2)
-        print(f"\n=== AVAILABILITY SET === Receipt: {rpath}")
-    else:
-        # Try the travels page or other settings pages
-        print("  Trying /settings page directly...")
-        driver.get("https://rentmasseur.com/settings")
-        time.sleep(4)
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/settings_avail.png")
-        
-        # Check for availability toggle on main settings
-        toggles = driver.execute_script("""
-            return Array.from(document.querySelectorAll('input[type="checkbox"], .toggle, .switch, [role="switch"]')).map(e => ({
-                type: e.type, id: e.id, name: e.name, checked: e.checked, 
-                label: e.closest('label') ? e.closest('label').innerText : (e.parentElement ? e.parentElement.innerText : '')
-            }));
-        """)
-        print(f"  Toggles: {len(toggles)}")
-        for t in toggles:
-            print(f"    {t}")
+    print(f"  Found {len(questions)} questions")
+    for q in questions[:5]:
+        print(f"    [{q['index']}] {q['question'][:60]}... (textarea: {q['textarea_id']})")
 
-finally:
-    driver.quit()
-    print("\nDone.")
+    # Fill answers
+    filled = 0
+    for ans in answers:
+        question_text = ans.get('question', '').lower()
+        answer_text = ans.get('answer', '')
+        question_id = ans.get('question_id')
 
-```
+        # Match question
+        matched = None
+        if question_id is not None and question_id < len(questions):
+            matched = questions[question_id]
+        else:
+            matched = questions.find(lambda q: question_text in q['question'].lower()) if hasattr(questions, 'find') else None
+            if not matched:
+                for q in questions:
+                    if question_text and question_text in q['question'].lower():
+                        matched = q
+                        break
 
-.env.example:
-```
-# RentMasseur automation credentials (used by optimizer / availability keeper)
-RENTMASSEUR_USERNAME=your_username
-RENTMASSEUR_PASSWORD=your_password
+        if not matched:
+            print(f"  No match for: {question_text[:40]}")
+            continue
 
-# Groq API key for bio generation and intent routing
-GROQ_API_KEY=gsk_...
-GROQ_MODEL=llama-3.3-70b-versatile
+        # Fill textarea
+        result = driver.execute_script("""
+            const textareas = document.querySelectorAll('textarea');
+            const ta = textareas[arguments[0]] || document.getElementById(arguments[1]) || document.querySelector(`textarea[name="${arguments[1]}"]`);
+            if (!ta) return {error: 'no_textarea'};
+            const ns = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+            ns.call(ta, arguments[2]);
+            ta.dispatchEvent(new Event('input', {bubbles: true}));
+            ta.dispatchEvent(new Event('change', {bubbles: true}));
+            return {id: ta.id, name: ta.name, len: arguments[2].length};
+        """, matched['index'], matched.get('textarea_id') or matched.get('textarea_name'), answer_text)
+        print(f"  Filled: {matched['question'][:40]}... -> {result}")
+        if isinstance(result, dict) and 'error' not in result:
+            filled += 1
+        time.sleep(0.5)
 
-# Clickable booking link used in bios and CTAs
-REBRANDLY_LINK=https://rebrand.ly/your-booking-link
+    if filled == 0:
+        return False, {"error": "no_questions_matched", "questions_found": len(questions)}
 
-# Hugging Face Space for deployment
-HF_SPACE_NAME=your-username/rentmasseur-optimizer
+    time.sleep(1)
 
-```
+    # Save
+    saved = driver.execute_script("""
+        const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+        const sb = btns.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'') + ' ' + (b.value||'')));
+        if (sb) { sb.click(); return {ok: true, text: sb.innerText || sb.value}; }
+        return {ok: false};
+    """)
+    print(f"  Save: {saved}")
+    time.sleep(5)
 
-rentmasseur_coordinator.py:
-```
-#!/usr/bin/env python3
-"""
-RentMasseur Coordinator — uses intent router to pick top strategies,
-generates bios, auto-saves to files, and updates the best one to the site.
-"""
+    return saved.get('ok', False), {"filled": filled, "save": saved}
 
-import os
-import sys
-import json
-import logging
-import time
-from typing import List, Optional
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger(__name__)
-
-# Strategy definitions
-STRATEGIES = {
-    "sensory_luxury": "Write a luxurious, sensory-rich bio. Vivid imagery: warm oils, candlelight, silk, aromatherapy. Premium experience, discretion, bespoke sessions. Sophisticated, intimate, high-end. CTA.",
-    "therapeutic_expert": "Professional, therapeutic bio. Certifications, deep tissue, Swedish, sports, trigger point. Pain relief, recovery, wellness. Clinical yet warm, authoritative. CTA.",
-    "mystery_desire": "Magnetic, mysterious bio. Tease the experience. Confident, alluring. Curiosity and urgency. Enigmatic, seductive-but-classy. Strong CTA.",
-    "local_hustle": "Grounded, local-vibe for Manhattan NYC. Neighborhood energy, convenience, go-to masseur. Friendly, approachable, confident. CTA for easy booking.",
-    "transformation_story": "Mini-story bio. Client problem (stress, tension, exhaustion) leads to your massage as solution. Empathetic, inspiring, results-oriented. Emotional hook + CTA.",
-    "night_owl": "Late-night availability angle. Available when others aren't. Private evening sessions for busy professionals. Intimate, exclusive, after-hours. CTA.",
-    "athlete_recovery": "Target gym-goers and athletes. Pre/post-workout massage, muscle recovery, injury prevention. Performance-focused, energetic, results-driven. CTA.",
-    "ceo_executive": "Executive wellness bio. High-stress relief for CEOs, founders, professionals. Time-efficient, powerful, transformative. Discreet, premium. CTA.",
-    "spiritual_healer": "Holistic, spiritual approach. Energy work, chakras, mindfulness, breathwork. Calming, nurturing, soulful. CTA for inner peace.",
-    "traveler_companion": "Bio for out-of-town visitors. Jet lag relief, welcome to NYC, concierge-style service. Friendly, worldly, accommodating. CTA.",
-    "medical_referral": "Clinical, doctor-recommended angle. Back pain, sciatica, posture correction. Evidence-based, professional, reassuring. CTA.",
-    "artist_soul": "Creative, artistic bio. Massage as art form, body as canvas, intuitive touch. Poetic, expressive, unique. CTA.",
-    "discrete_confidential": "Absolute discretion angle. Private studio, no waiting room, confidential, judgment-free. Safe, secure, trusted. CTA for VIP clients.",
-    "first_timer": "Welcoming first-timers. No experience needed, guided session, gentle introduction. Warm, patient, educational. CTA.",
-    "seasonal_special": "Seasonal theme. Winter warmth, summer cool-down, holiday stress relief. Timely, festive, relevant. CTA.",
-    "couples_duo": "Couples massage angle. Partners, friends, duet sessions. Romantic, bonding, shared experience. CTA.",
-    "bodybuilder_therapy": "Heavy lifting recovery. Deep pressure, muscle breakdown, fascia release. Intense, powerful, respected. CTA.",
-    "yoga_fusion": "Yoga + massage fusion. Stretching, flexibility, mind-body connection. Flow, balance, zen. CTA.",
-    "luxury_concierge": "White-glove service. In-home, hotel, personal concierge. Elite, effortless, bespoke. CTA for VIP booking.",
-    "recovery_addiction": "Sober wellness angle. Clean living, recovery support, healthy coping. Supportive, non-judgmental, empowering. CTA.",
-    "military_veteran": "Veteran-friendly, service-member respect. Camaraderie, PT recovery, brotherhood. Honorable, strong, understanding. CTA.",
-    "lgbtq_pride": "Pride-forward, inclusive bio. Safe space, community, authentic self-expression. Celebratory, welcoming, proud. CTA.",
-    "senior_gentle": "Senior-friendly, gentle touch. Mobility, arthritis, circulation. Patient, respectful, nurturing. CTA.",
-    "office_relief": "Desk job recovery. Neck pain, carpal tunnel, posture. Corporate warrior relief. Practical, relatable, urgent. CTA.",
-    "dancer_flexibility": "Dancer and performer focused. Flexibility, maintenance, injury prevention. Graceful, dedicated, artistic. CTA.",
-    "meditation_guide": "Guided meditation + massage. Mindfulness, breath, presence. Tranquil, centered, deep. CTA.",
-    "hot_stone_specialist": "Hot stone specialty. Warm stones, heat therapy, deep relaxation. Expert, unique, indulgent. CTA.",
-    "quick_lunch": "Express lunch-break massage. 30-45 min, in-and-out, midday recharge. Fast, effective, convenient. CTA.",
-    "birthday_gift": "Gift-worthy experience. Treat yourself, special occasion, deserved indulgence. Celebratory, gift-like, memorable. CTA.",
-    "weekly_ritual": "Subscription/recurring angle. Weekly maintenance, body upkeep, ritual. Committed, long-term, investment in self. CTA for repeat booking.",
-}
+def write_receipt(action, data, success=True):
+    receipts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
+    os.makedirs(receipts_dir, exist_ok=True)
+    receipt = {"action": action, "success": success, "timestamp": datetime.now(timezone.utc).isoformat(), **data}
+    rpath = os.path.join(receipts_dir, f"{action}_{receipt['timestamp'].replace(':','-')}.json")
+    with open(rpath, "w") as f:
+        json.dump(receipt, f, indent=2)
+    return rpath
 
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--headless", default="true")
-    parser.add_argument("--skip-availability", action="store_true")
-    parser.add_argument("--skip-bio", action="store_true")
-    parser.add_argument("--pick-best", action="store_true", help="Use intent router to pick top strategies")
-    parser.add_argument("--top-n", type=int, default=5, help="Number of strategies to run when using intent router")
+    parser = argparse.ArgumentParser(description="Post interview answers to RentMasseur")
+    parser.add_argument("--answers", required=False, help="JSON array of {question, answer}")
+    parser.add_argument("--file", required=False, help="JSON file with answers array")
     args = parser.parse_args()
 
-    from rentmasseur_core import (
-        setup_driver, login, set_availability_24_7,
-        update_bio, groq_generate_bio, save_bio_field,
-    )
-    from intent_router import route_intents
+    if args.file:
+        with open(args.file, "r") as f:
+            answers = json.load(f)
+    elif args.answers:
+        answers = json.loads(args.answers)
+    else:
+        print("Error: --answers or --file required")
+        sys.exit(1)
 
-    results = {"availability": False, "bio": False, "login": False, "strategies_run": 0, "top_strategies": []}
-    driver = setup_driver(headless=args.headless.lower() != "false")
+    if isinstance(answers, dict):
+        answers = [answers]
+
+    print(f"Answers to post: {len(answers)}")
+
+    options = uc.ChromeOptions()
+    options.add_argument("--window-size=1280,900")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+
+    driver = uc.Chrome(options=options, version_main=149)
 
     try:
+        print("\n[1] Login...")
         if not login(driver):
-            print(json.dumps({"login": False, "bio": False, "availability": False}))
+            print("  Login failed!")
             sys.exit(1)
-        results["login"] = True
 
-        if not args.skip_availability:
-            results["availability"] = set_availability_24_7(driver)
+        print("\n[2] Posting interview answers...")
+        success, details = post_interview(driver, answers)
 
-        if not args.skip_bio:
-            # Get current bio field info
-            bio_res = update_bio(driver, "")
-            if bio_res is None or (isinstance(bio_res, dict) and bio_res.get("error")):
-                logger.error("Could not find bio field")
-                results["bio"] = False
-            else:
-                field_info, current_bio = bio_res
+        rpath = write_receipt("post_interview", {"answers_count": len(answers), "details": details}, success)
+        if success:
+            print(f"\n=== INTERVIEW POSTED === Receipt: {rpath}")
+        else:
+            print(f"\n=== INTERVIEW POST FAILED === Receipt: {rpath}")
+            sys.exit(1)
 
-                if args.pick_best:
-                    # Use intent router to pick top strategies
-                    top_strategies = route_intents(args.top_n)
-                    results["top_strategies"] = top_strategies
-                    logger.info("Intent router selected: %s", top_strategies)
-                else:
-                    # Run all strategies
-                    top_strategies = list(STRATEGIES.keys())
+    finally:
+        driver.quit()
+        print("\nDone.")
 
-                generated = []
-                for strategy_name in top_strategies:
-                    prompt = STRATEGIES.get(strategy_name)
-                    if not prompt:
-                        continue
-                    bio = groq_generate_bio(strategy_name, prompt, current_bio)
-                    if bio:
-                        generated.append({"strategy": strategy_name, "bio": bio, "chars": len(bio)})
-                    time.sleep(1)  # rate limit buffer
 
-                results["strategies_run"] = len(generated)
-                logger.info("Generated %d bios", len(generated))
+if __name__ == "__main__":
+    main()
 
-                if generated:
-                    # Pick longest bio as best
+```
+
+rm_dashboard.py:
+```
+#!/usr/bin/env python3
+"""
+RM Live Dashboard — Real-time RentMasseur operations dashboard.
+
+Shows:
+  - Current live bio (fetched from RM or cached)
+  - Visitor count + timeline from engagement DB
+  - Top visitors by visit count
+  - Message history and status
+  - Bio experiment results (which bio got more visitors)
+  - Ollama bio candidates with scores
+  - iMessage recent conversations
+
+Usage:
+  python3 rm_dashboard.py
+  python3 rm_dashboard.py --port 8080 --host 0.0.0.0
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
+import uvicorn
+
+BASE_DIR = Path(__file__).parent
+ENGAGEMENT_DB = BASE_DIR / "artifacts" / "engagement" / "engagement.db"
+BIO_CACHE = BASE_DIR / "artifacts" / "engagement" / "current_bio.json"
+BIO_EXPERIMENTS = BASE_DIR / "artifacts" / "engagement" / "bio_experiments.db"
+IMESSAGE_DB = Path.home() / "Library" / "Messages" / "chat.db"
+
+app = FastAPI(title="RM Live Dashboard", docs_url="/api/docs")
+
+
+def get_engagement_conn() -> sqlite3.Connection:
+    if not ENGAGEMENT_DB.exists():
+        return None
+    conn = sqlite3.connect(str(ENGAGEMENT_DB))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_bio_experiments_conn() -> sqlite3.Connection:
+    if not BIO_EXPERIMENTS.exists():
+        return None
+    conn = sqlite3.connect(str(BIO_EXPERIMENTS))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def load_current_bio() -> dict:
+    if BIO_CACHE.exists():
+        try:
+            return json.loads(BIO_CACHE.read_text())
+        except Exception:
+            pass
+    return {"bio": "(not fetched yet)", "fetched_at": None, "char_count": 0}
+
+
+def get_visitor_stats() -> dict:
+    conn = get_engagement_conn()
+    if not conn:
+        return {"total": 0, "repeat_3plus": 0, "messaged": 0, "top_visitors": []}
+
+    total = conn.execute("SELECT COUNT(*) FROM visitors").fetchone()[0]
+    repeat_3 = conn.execute("SELECT COUNT(*) FROM visitors WHERE visit_count >= 3").fetchone()[0]
+    repeat_2 = conn.execute("SELECT COUNT(*) FROM visitors WHERE visit_count >= 2").fetchone()[0]
+    messaged = conn.execute("SELECT COUNT(*) FROM visitors WHERE message_count > 0").fetchone()[0]
+    events = conn.execute("SELECT COUNT(*) FROM visit_log").fetchone()[0]
+    msgs_sent = conn.execute("SELECT COUNT(*) FROM message_log").fetchone()[0]
+
+    top = conn.execute(
+        "SELECT username, visit_count, last_online, last_seen, last_messaged, message_count "
+        "FROM visitors ORDER BY visit_count DESC LIMIT 20"
+    ).fetchall()
+
+    conn.close()
+    return {
+        "total": total,
+        "repeat_3plus": repeat_3,
+        "repeat_2plus": repeat_2,
+        "messaged": messaged,
+        "visit_events": events,
+        "messages_sent": msgs_sent,
+        "top_visitors": [dict(r) for r in top],
+    }
+
+
+def get_recent_events(limit: int = 50) -> list:
+    conn = get_engagement_conn()
+    if not conn:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT username, session_id, visited_at, status, content_hash "
+            "FROM visit_log ORDER BY visited_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        conn.close()
+        return []
+
+
+def get_message_history(limit: int = 20) -> list:
+    conn = get_engagement_conn()
+    if not conn:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT username, sent_at, message_text, status, template_index "
+            "FROM message_log ORDER BY sent_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        conn.close()
+        return []
+
+
+def get_bio_experiments() -> list:
+    conn = get_bio_experiments_conn()
+    if not conn:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT id, bio_text, model, deployed_at, removed_at, visitors_during, "
+            "contact_clicks_during, score, status "
+            "FROM bio_experiments ORDER BY deployed_at DESC LIMIT 20"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        conn.close()
+        return []
+
+
+def get_imessage_recent(limit: int = 10) -> list:
+    if not IMESSAGE_DB.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(IMESSAGE_DB))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT
+                message.ROWID as msg_id,
+                message.text as text,
+                message.date as date,
+                message.is_from_me as is_from_me,
+                handle.id as contact
+            FROM message
+            LEFT JOIN handle ON message.handle_id = handle.ROWID
+            WHERE message.text IS NOT NULL
+            ORDER BY message.date DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+        results = []
+        for r in rows:
+            d = dict(r)
+            # Convert Apple epoch to ISO
+            apple_epoch = d.get("date", 0)
+            if apple_epoch:
+                try:
+                    dt = datetime(2001, 1, 1, tzinfo=timezone.utc).timestamp() + apple_epoch / 1e9
+                    d["date_iso"] = datetime.fromtimestamp(dt, tz=timezone.utc).isoformat()
+                except Exception:
+                    d["date_iso"] = str(apple_epoch)
+            results.append(d)
+        return results
+    except Exception:
+        return []
+
+
+def get_imessage_conversations(limit: int = 20) -> list:
+    if not IMESSAGE_DB.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(IMESSAGE_DB))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT
+                handle.id as contact,
+                COUNT(*) as msg_count,
+                MAX(message.date) as last_msg_date,
+                SUM(CASE WHEN message.is_from_me = 1 THEN 1 ELSE 0 END) as sent_by_me,
+                SUM(CASE WHEN message.is_from_me = 0 THEN 1 ELSE 0 END) as sent_by_them
+            FROM message
+            LEFT JOIN handle ON message.handle_id = handle.ROWID
+            WHERE message.text IS NOT NULL
+            GROUP BY handle.id
+            ORDER BY last_msg_date DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+        results = []
+        for r in rows:
+            d = dict(r)
+            apple_epoch = d.get("last_msg_date", 0)
+            if apple_epoch:
+                try:
+                    dt = datetime(2001, 1, 1, tzinfo=timezone.utc).timestamp() + apple_epoch / 1e9
+                    d["last_msg_iso"] = datetime.fromtimestamp(dt, tz=timezone.utc).isoformat()
+                except Exception:
+                    d["last_msg_iso"] = str(apple_epoch)
+            results.append(d)
+        return results
+    except Exception:
+        return []
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard_html():
+    bio = load_current_bio()
+    visitors = get_visitor_stats()
+    events = get_recent_events(30)
+    messages = get_message_history(20)
+    experiments = get_bio_experiments()
+    imessage_convs = get_imessage_conversations(15)
+
+    visitor_rows = "".join([
+        f"<tr><td>{v['username']}</td><td>{v['visit_count']}</td>"
+        f"<td>{v.get('last_online') or '—'}</td>"
+        f"<td>{v.get('last_messaged')[:19] if v.get('last_messaged') else 'never'}</td>"
+        f"<td>{v.get('message_count', 0)}</td></tr>"
+        for v in visitors.get("top_visitors", [])[:15]
+    ])
+
+    event_rows = "".join([
+        f"<tr><td>{(e.get('visited_at') or '?')[:19]}</td><td>{e.get('username')}</td>"
+        f"<td>{e.get('status')}</td></tr>"
+        for e in events[:20]
+    ]) if events else "<tr><td colspan='3'>No visit events logged yet</td></tr>"
+
+    msg_rows = "".join([
+        f"<tr><td>{(m.get('sent_at') or '?')[:19]}</td><td>{m.get('username')}</td>"
+        f"<td>{m.get('status')}</td><td>{(m.get('message_text') or '')[:60]}...</td></tr>"
+        for m in messages
+    ]) if messages else "<tr><td colspan='4'>No messages sent yet</td></tr>"
+
+    exp_rows = "".join([
+        f"<tr><td>{(e.get('deployed_at') or '—')[:19]}</td>"
+        f"<td>{(e.get('bio_text') or '')[:80]}...</td>"
+        f"<td>{e.get('model', '?')}</td>"
+        f"<td>{e.get('visitors_during', 0)}</td>"
+        f"<td>{e.get('score', '—')}</td>"
+        f"<td>{e.get('status', '?')}</td></tr>"
+        for e in experiments
+    ]) if experiments else "<tr><td colspan='6'>No bio experiments yet</td></tr>"
+
+    imessage_rows = "".join([
+        f"<tr><td>{c.get('contact', '?')}</td>"
+        f"<td>{c.get('msg_count', 0)}</td>"
+        f"<td>{c.get('sent_by_me', 0)}/{c.get('sent_by_them', 0)}</td>"
+        f"<td>{(c.get('last_msg_iso') or '—')[:19]}</td></tr>"
+        for c in imessage_convs
+    ]) if imessage_convs else "<tr><td colspan='4'>iMessage DB not accessible</td></tr>"
+
+    bio_text = (bio.get("bio") or "(not fetched)")
+    bio_display = bio_text[:500].replace("\n", "<br>") if bio_text else "(empty)"
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<title>RentMasseur Live Dashboard</title>
+<meta http-equiv="refresh" content="30">
+<style>
+* {{ box-sizing: border-box; }}
+body {{ font-family: -apple-system, sans-serif; margin: 0; padding: 20px; background: #0d1117; color: #c9d1d9; }}
+h1 {{ color: #58a6ff; margin: 0 0 10px 0; }}
+h2 {{ color: #79c0ff; margin-top: 30px; font-size: 18px; }}
+.subtitle {{ color: #8b949e; font-size: 13px; margin-bottom: 20px; }}
+.stats {{ display: flex; gap: 16px; margin: 20px 0; flex-wrap: wrap; }}
+.stat {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 24px; text-align: center; min-width: 120px; }}
+.stat .num {{ font-size: 28px; font-weight: bold; color: #58a6ff; }}
+.stat .label {{ font-size: 11px; color: #8b949e; margin-top: 4px; }}
+.grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }}
+@media (max-width: 900px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+.panel {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; overflow-x: auto; }}
+.bio-box {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 10px 0; white-space: pre-wrap; font-size: 14px; line-height: 1.5; max-height: 300px; overflow-y: auto; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+th {{ text-align: left; color: #8b949e; padding: 8px 6px; border-bottom: 1px solid #30363d; }}
+td {{ padding: 6px; border-bottom: 1px solid #21262d; }}
+tr:hover {{ background: #1c2128; }}
+.badge {{ display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; }}
+.badge-ok {{ background: #1a7f37; color: #fff; }}
+.badge-fail {{ background: #da3633; color: #fff; }}
+.badge-pending {{ background: #d29922; color: #000; }}
+a {{ color: #58a6ff; }}
+.refresh-note {{ color: #8b949e; font-size: 11px; margin-top: 10px; }}
+</style>
+</head>
+<body>
+<h1>RentMasseur Live Dashboard</h1>
+<div class="subtitle">Auto-refreshing every 30s | {datetime.now(timezone.utc).isoformat()[:19]}</div>
+
+<div class="stats">
+<div class="stat"><div class="num">{visitors.get('total', 0)}</div><div class="label">Total Visitors</div></div>
+<div class="stat"><div class="num">{visitors.get('repeat_3plus', 0)}</div><div class="label">3+ Visits</div></div>
+<div class="stat"><div class="num">{visitors.get('repeat_2plus', 0)}</div><div class="label">2+ Visits</div></div>
+<div class="stat"><div class="num">{visitors.get('messages_sent', 0)}</div><div class="label">Messages Sent</div></div>
+<div class="stat"><div class="num">{visitors.get('messaged', 0)}</div><div class="label">Visitors Messaged</div></div>
+<div class="stat"><div class="num">{len(experiments)}</div><div class="label">Bio Experiments</div></div>
+</div>
+
+<h2>Current Live Bio</h2>
+<div class="bio-box">{bio_display}</div>
+<div class="subtitle">Fetched: {bio.get('fetched_at', 'never')[:19] if bio.get('fetched_at') else 'never'} | {bio.get('char_count', 0)} chars</div>
+
+<div class="grid">
+<div class="panel">
+<h2>Top Visitors (by visit count)</h2>
+<table>
+<tr><th>Username</th><th>Visits</th><th>Last Online</th><th>Last Messaged</th><th>Msgs</th></tr>
+{visitor_rows}
+</table>
+</div>
+
+<div class="panel">
+<h2>Recent Visit Events</h2>
+<table>
+<tr><th>Time</th><th>Visitor</th><th>Status</th></tr>
+{event_rows}
+</table>
+</div>
+
+<div class="panel">
+<h2>Message History</h2>
+<table>
+<tr><th>Sent At</th><th>To</th><th>Status</th><th>Preview</th></tr>
+{msg_rows}
+</table>
+</div>
+
+<div class="panel">
+<h2>Bio Experiments (Ollama)</h2>
+<table>
+<tr><th>Deployed</th><th>Bio Preview</th><th>Model</th><th>Visitors</th><th>Score</th><th>Status</th></tr>
+{exp_rows}
+</table>
+</div>
+</div>
+
+<h2>iMessage Conversations</h2>
+<div class="panel">
+<table>
+<tr><th>Contact</th><th>Total Msgs</th><th>Sent/Received</th><th>Last Message</th></tr>
+{imessage_rows}
+</table>
+</div>
+
+<div class="refresh-note">Auto-refresh: 30s | <a href="/api/stats">JSON API</a> | <a href="/api/visitors">Visitors JSON</a> | <a href="/api/bio">Bio JSON</a></div>
+</body>
+</html>"""
+
+
+@app.get("/api/stats")
+async def api_stats():
+    return JSONResponse({
+        "bio": load_current_bio(),
+        "visitors": get_visitor_stats(),
+        "recent_events": get_recent_events(50),
+        "messages": get_message_history(50),
+        "bio_experiments": get_bio_experiments(),
+        "imessage_conversations": get_imessage_conversations(20),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.get("/api/visitors")
+async def api_visitors():
+    return JSONResponse(get_visitor_stats())
+
+
+@app.get("/api/bio")
+async def api_bio():
+    return JSONResponse(load_current_bio())
+
+
+@app.get("/api/messages")
+async def api_messages():
+    return JSONResponse(get_message_history(100))
+
+
+@app.get("/api/experiments")

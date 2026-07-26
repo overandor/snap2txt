@@ -1,800 +1,800 @@
-            decision TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            profile_views INTEGER,
-            contact_clicks INTEGER,
-            contact_click_rate REAL,
-            minimum_views_met INTEGER,
-            minimum_hours_met INTEGER,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS experiments (
-            experiment_id TEXT PRIMARY KEY,
-            bio_id TEXT NOT NULL,
-            variant_class TEXT,
-            started_at TEXT NOT NULL,
-            ended_at TEXT,
-            baseline_bio_id TEXT,
-            before_views INTEGER,
-            before_contact_clicks INTEGER,
-            before_emails INTEGER,
-            after_views INTEGER,
-            after_contact_clicks INTEGER,
-            after_emails INTEGER,
-            actual_lift REAL,
-            winner TEXT,
-            rollback_snapshot TEXT,
-            status TEXT DEFAULT 'running'
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS receipt_chain (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            receipt_hash TEXT NOT NULL,
-            prev_hash TEXT,
-            action TEXT NOT NULL,
-            data_json TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def get_conn(db_path: Path = DB_PATH):
-    return sqlite3.connect(str(db_path))
-
-
-def sha256_of(data: str) -> str:
-    return hashlib.sha256(data.encode()).hexdigest()
-
-
-def write_receipt(action: str, data: dict, db_path: Path = DB_PATH) -> str:
-    conn = get_conn(db_path)
-    ts = datetime.now(timezone.utc).isoformat()
-    data_str = json.dumps(data, sort_keys=True, default=str)
-    prev = conn.execute("SELECT receipt_hash FROM receipt_chain ORDER BY id DESC LIMIT 1").fetchone()
-    prev_hash = prev[0] if prev else ""
-    receipt_hash = sha256_of(prev_hash + action + ts + data_str)
-    conn.execute(
-        "INSERT INTO receipt_chain (receipt_hash, prev_hash, action, data_json) VALUES (?, ?, ?, ?)",
-        (receipt_hash, prev_hash, action, data_str),
-    )
-    conn.commit()
-    conn.close()
-    return receipt_hash
-
-
-def verify_receipt_chain(db_path: Path = DB_PATH) -> bool:
-    conn = get_conn(db_path)
-    rows = conn.execute("SELECT receipt_hash, prev_hash, action, data_json FROM receipt_chain ORDER BY id").fetchall()
-    conn.close()
-    prev = ""
-    for r_hash, r_prev, action, data_json in rows:
-        if r_prev != prev:
-            return False
-        # Can't fully recompute hash without timestamp, but chain linkage is verifiable
-        prev = r_hash
-    return True
-
-
-def ingest_metrics(packet: dict, db_path: Path = DB_PATH) -> dict:
-    """Ingest a daily metrics packet. Returns computed values + decision."""
-    conn = get_conn(db_path)
-    ts = datetime.now(timezone.utc).isoformat()
-    date = packet.get("date", datetime.now(timezone.utc).date().isoformat())
-    bio_id = packet.get("bio_id", "unknown")
-    profile_views = int(packet.get("profile_views", 0))
-    contact_clicks = int(packet.get("contact_clicks", 0))
-    new_visits = int(packet.get("new_visits", 0))
-    new_emails = int(packet.get("new_emails", 0))
-    availability = 1 if packet.get("availability_state", True) else 0
-    visible = 1 if packet.get("profile_visible", True) else 0
-    headline_hash = packet.get("headline_hash", "")
-    bio_hash = packet.get("bio_hash", "")
-
-    contact_click_rate = contact_clicks / profile_views if profile_views > 0 else 0.0
-    email_rate = new_emails / profile_views if profile_views > 0 else 0.0
-
-    conn.execute(
-        """INSERT INTO daily_profile_metrics
-           (date, bio_id, headline_hash, bio_hash, profile_views, contact_clicks,
-            new_visits, new_emails, availability_state, profile_visible, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (date, bio_id, headline_hash, bio_hash, profile_views, contact_clicks,
-         new_visits, new_emails, availability, visible, packet.get("notes", "")),
-    )
-    conn.commit()
-
-    decision = compute_decision(bio_id, profile_views, contact_clicks, new_emails,
-                                 availability, visible, conn)
-    conn.close()
-
-    write_receipt("metrics_ingest", {
-        "date": date, "bio_id": bio_id, "profile_views": profile_views,
-        "contact_clicks": contact_clicks, "contact_click_rate": contact_click_rate,
-        "decision": decision["status"], "reason": decision["reason"],
-    }, db_path)
-
-    return {
-        "ok": True,
-        "ingested": True,
-        "computed": {
-            "contact_click_rate": round(contact_click_rate, 4),
-            "email_rate": round(email_rate, 4),
-            "contact_clicks_per_100_views": round(contact_click_rate * 100, 2),
-        },
-        "decision": decision,
-    }
-
-
-def compute_decision(bio_id: str, profile_views: int, contact_clicks: int,
-                     new_emails: int, availability: int, visible: int,
-                     conn: sqlite3.Connection) -> dict:
-    """Strict decision engine. No magic. Just rules."""
-
-    if not visible:
-        return {"status": "BLOCK_BAD_ACCOUNT_STATE",
-                "reason": "Profile is not visible.", "next_action": "make_visible"}
-
-    if not availability:
-        return {"status": "BLOCK_BAD_ACCOUNT_STATE",
-                "reason": "Profile is not available. Metrics not comparable.",
-                "next_action": "set_available"}
-
-    if profile_views == 0:
-        return {"status": "BLOCK_NO_METRICS",
-                "reason": "No profile metrics available.", "next_action": "ingest_metrics"}
-
-    # Check for running experiment
-    exp = conn.execute(
-        "SELECT * FROM experiments WHERE status = 'running' ORDER BY started_at DESC LIMIT 1"
-    ).fetchone()
-
-    if not exp:
-        # No experiment running — check if we have baseline data
-        baseline = conn.execute(
-            "SELECT profile_views, contact_clicks FROM daily_profile_metrics "
-            "WHERE bio_id = ? ORDER BY id DESC LIMIT 1", (bio_id,)
-        ).fetchone()
-        if not baseline:
-            return {"status": "BLOCK_NO_BASELINE_EXPERIMENT",
-                    "reason": "Real traffic exists, but no completed experiment exists yet. "
-                              "Start one controlled bio-only experiment.",
-                    "next_action": "start_experiment",
-                    "baseline": {"profile_views": profile_views, "contact_clicks": contact_clicks,
-                                 "contact_click_rate": round(contact_clicks / profile_views, 5) if profile_views > 0 else 0},
-                    "next_candidate": {"bio_id": "targeted_wolf_v1", "change_scope": "headline_and_bio_only",
-                                       "minimum_views": MIN_VIEWS_FOR_DECISION, "minimum_hours": MIN_HOURS_FOR_DECISION}}
-        return {"status": "READY_TO_TEST",
-                "reason": "Baseline established. No active experiment. Ready to start next test.",
-                "next_action": "start_experiment",
-                "baseline": {"profile_views": baseline[0], "contact_clicks": baseline[1],
-                             "contact_click_rate": round(baseline[1] / baseline[0], 5) if baseline[0] > 0 else 0}}
-
-    # Experiment is running — check exposure
-    exp_id, exp_bio_id, _, started_at, _, _, before_views, before_clicks, before_emails = exp[:9]
-
-    # Parse started_at
-    try:
-        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-        elapsed_hours = (datetime.now(timezone.utc) - start).total_seconds() / 3600
-    except Exception:
-        elapsed_hours = 0
-
-    delta_views = profile_views - (before_views or 0)
-    delta_clicks = contact_clicks - (before_clicks or 0)
-
-    min_views_met = delta_views >= MIN_VIEWS_FOR_DECISION
-    min_hours_met = elapsed_hours >= MIN_HOURS_FOR_DECISION
-
-    if not min_views_met and not min_hours_met:
-        return {"status": "BLOCK_LOW_EXPOSURE",
-                "reason": f"Only {delta_views} views in {elapsed_hours:.1f}h. "
-                          f"Need {MIN_VIEWS_FOR_DECISION} views or {MIN_HOURS_FOR_DECISION}h.",
-                "next_action": "wait",
-                "experiment_id": exp_id,
-                "elapsed_hours": round(elapsed_hours, 1),
-                "current_delta_views": delta_views}
-
-    # We have enough exposure — compute lift
-    before_ctr = before_clicks / before_views if before_views and before_views > 0 else 0
-    after_ctr = contact_clicks / profile_views if profile_views > 0 else 0
-    lift = after_ctr - before_ctr
-
-    # Severe drop check (can trigger before full window if CTR collapses)
-    if before_ctr > 0 and after_ctr < before_ctr * (1 - SEVERE_DROP_THRESHOLD):
-        return {"status": "REVERT_TO_BASELINE",
-                "reason": f"CTR dropped {abs(lift)*100:.1f}pp. Severe drop threshold exceeded.",
-                "next_action": "rollback",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
-
-    if not min_views_met or not min_hours_met:
-        return {"status": "TEST_RUNNING",
-                "reason": f"Experiment running: delta_views={delta_views}/{MIN_VIEWS_FOR_DECISION}, "
-                          f"hours={elapsed_hours:.1f}/{MIN_HOURS_FOR_DECISION}",
-                "next_action": "wait",
-                "experiment_id": exp_id}
-
-    # Enough exposure — decide
-    if lift > 0.01:
-        return {"status": "WINNER_FOUND",
-                "reason": f"CTR improved by {lift*100:.1f}pp.",
-                "next_action": "close_experiment_winner",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
-    elif lift < -0.01:
-        return {"status": "REVERT_TO_BASELINE",
-                "reason": f"CTR decreased by {abs(lift)*100:.1f}pp.",
-                "next_action": "rollback",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
-    else:
-        return {"status": "KEEP_CURRENT",
-                "reason": f"CTR flat ({lift*100:.1f}pp). No significant change.",
-                "next_action": "test_next_bio",
-                "experiment_id": exp_id,
-                "before_ctr": round(before_ctr, 4),
-                "after_ctr": round(after_ctr, 4),
-                "lift": round(lift, 4)}
-
-
-def start_experiment(bio_id: str, variant_class: str, before_views: int,
-                     before_contact_clicks: int, before_emails: int,
-                     db_path: Path = DB_PATH) -> dict:
-    conn = get_conn(db_path)
-    exp_id = f"exp_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{variant_class}"
-    ts = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        """INSERT INTO experiments
-           (experiment_id, bio_id, variant_class, started_at, baseline_bio_id,
-            before_views, before_contact_clicks, before_emails, status)
-           VALUES (?, ?, ?, ?, 'current_live', ?, ?, ?, 'running')""",
-        (exp_id, bio_id, variant_class, ts, before_views, before_contact_clicks, before_emails),
-    )
-    conn.commit()
-    conn.close()
-    write_receipt("experiment_start", {
-        "experiment_id": exp_id, "bio_id": bio_id, "variant_class": variant_class,
-        "before_views": before_views, "before_contact_clicks": before_contact_clicks,
-    }, db_path)
-    return {"experiment_id": exp_id, "status": "running", "bio_id": bio_id}
-
-
-def close_experiment(experiment_id: str, after_views: int, after_contact_clicks: int,
-                     after_emails: int, db_path: Path = DB_PATH) -> dict:
-    conn = get_conn(db_path)
-    exp = conn.execute("SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)).fetchone()
-    if not exp:
-        conn.close()
-        return {"error": "experiment not found"}
-    before_views = exp[6] or 0
-    before_clicks = exp[7] or 0
-    before_ctr = before_clicks / before_views if before_views > 0 else 0
-    after_ctr = after_contact_clicks / after_views if after_views > 0 else 0
-    lift = after_ctr - before_ctr
-    winner = "test_bio" if lift > 0.01 else ("baseline" if lift < -0.01 else "no_significant_change")
-    ts = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        """UPDATE experiments SET ended_at=?, after_views=?, after_contact_clicks=?,
-           after_emails=?, actual_lift=?, winner=?, status='closed' WHERE experiment_id=?""",
-        (ts, after_views, after_contact_clicks, after_emails, lift, winner, experiment_id),
-    )
-    conn.commit()
-    conn.close()
-    write_receipt("experiment_close", {
-        "experiment_id": experiment_id, "winner": winner, "lift": lift,
-        "before_ctr": before_ctr, "after_ctr": after_ctr,
-    }, db_path)
-    return {"experiment_id": experiment_id, "winner": winner, "lift": round(lift, 4),
-            "before_ctr": round(before_ctr, 4), "after_ctr": round(after_ctr, 4)}
-
-
-def generate_daily_evidence_packet(rm_traffic_db: str, bio_id: str = "karpathian_wolf_live",
-                                    db_path: Path = DB_PATH) -> dict:
-    """Generate daily_evidence_packet.json from rm_traffic profileops.db."""
-    traffic_conn = sqlite3.connect(rm_traffic_db)
-    snap = traffic_conn.execute(
-        "SELECT profile_views, contact_clicks, new_visits, new_emails, "
-        "is_hidden, is_available, headline, description_len "
-        "FROM traffic_snapshots ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    traffic_conn.close()
-
-    if not snap:
-        return {"error": "no traffic snapshot found"}
-
-    views, clicks, visits, emails, hidden, available, headline, desc_len = snap
-    visible = not hidden
-    avail = bool(available)
-    ctr = clicks / views if views > 0 else 0
-    email_rate = emails / views if views > 0 else 0
-
-    # Get current experiment
-    conn = get_conn(db_path)
-    exp = conn.execute(
-        "SELECT experiment_id, bio_id, status, started_at FROM experiments "
-        "WHERE status='running' ORDER BY started_at DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
-
-    date_str = datetime.now(timezone.utc).date().isoformat()
-    packet_id = f"rmep_{date_str.replace('-', '_')}_{datetime.now(timezone.utc).strftime('%H%M')}"
-
-    bio_text = headline or ""
-    bio_hash = "sha256:" + sha256_of(bio_text)
-
-    decision = compute_decision(bio_id, views, clicks, emails,
-                                1 if avail else 0, 1 if visible else 0,
-                                get_conn(db_path))
-
-    packet = {
-        "packet_id": packet_id,
-        "date": date_str,
-        "account": {
-            "profile_visible": visible,
-            "is_available": avail,
-            "gold_status": True,
-        },
-        "bio": {
-            "bio_id": bio_id,
-            "headline": bio_text,
-            "bio_hash": bio_hash,
-            "variant_class": "current_live",
-        },
-        "metrics": {
-            "profile_views": views,
-            "contact_clicks": clicks,
-            "new_visits": visits,
-            "new_emails": emails,
-            "booking_requests": None,
-            "confirmed_clients": None,
-            "revenue": None,
-        },
-        "derived": {
-            "contact_click_rate": round(ctr, 4),
-            "email_rate": round(email_rate, 4),
-            "contact_clicks_per_100_views": round(ctr * 100, 2),
-        },
-        "experiment": {
-            "experiment_id": exp[0] if exp else None,
-            "state": exp[2] if exp else "none",
-            "baseline_bio_id": "current_live",
-            "test_bio_id": exp[1] if exp else None,
-            "minimum_views_required": MIN_VIEWS_FOR_DECISION,
-            "minimum_hours_required": MIN_HOURS_FOR_DECISION,
-        },
-        "decision": decision,
-        "receipt": {
-            "source": "rm_traffic",
-            "created_by": "daily_promotion_script",
-            "source_db": rm_traffic_db,
-            "packet_hash": "sha256:" + sha256_of(packet_id + str(views) + str(clicks)),
-        },
-    }
-    return packet
-
-
-def get_latest_decision(db_path: Path = DB_PATH) -> dict:
-    conn = get_conn(db_path)
-    row = conn.execute(
-        "SELECT experiment_id, bio_id, decision, reason, profile_views, "
-        "contact_clicks, contact_click_rate, created_at "
-        "FROM experiment_decisions ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
-    if not row:
-        return {"status": "BLOCK_NO_SIGNAL", "reason": "No decisions yet."}
-    return {
-        "experiment_id": row[0], "bio_id": row[1], "decision": row[2],
-        "reason": row[3], "profile_views": row[4], "contact_clicks": row[5],
-        "contact_click_rate": row[6], "created_at": row[7],
-    }
-
-
-def get_metrics_history(limit: int = 30, db_path: Path = DB_PATH) -> list:
-    conn = get_conn(db_path)
-    rows = conn.execute(
-        "SELECT date, bio_id, profile_views, contact_clicks, new_visits, "
-        "new_emails, availability_state, profile_visible, created_at "
-        "FROM daily_profile_metrics ORDER BY id DESC LIMIT ?", (limit,)
-    ).fetchall()
-    conn.close()
-    return [{"date": r[0], "bio_id": r[1], "profile_views": r[2], "contact_clicks": r[3],
-             "new_visits": r[4], "new_emails": r[5], "available": bool(r[6]),
-             "visible": bool(r[7]), "created_at": r[8]} for r in rows]
-
-
-def get_experiments(db_path: Path = DB_PATH) -> list:
-    conn = get_conn(db_path)
-    rows = conn.execute(
-        "SELECT experiment_id, bio_id, variant_class, started_at, ended_at, "
-        "status, winner, actual_lift FROM experiments ORDER BY started_at DESC"
-    ).fetchall()
-    conn.close()
-    return [{"experiment_id": r[0], "bio_id": r[1], "variant_class": r[2],
-             "started_at": r[3], "ended_at": r[4], "status": r[5],
-             "winner": r[6], "actual_lift": r[7]} for r in rows]
-
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
 ```
 
-daemon.log:
+pipeline_20260709_234126.json:
 ```
-2026-07-16 13:36:11,708 [INFO] rm_daemon: RentMasseur Optimizer Daemon starting
-2026-07-16 13:36:11,782 [INFO] rm_daemon: Health: {'timestamp': '2026-07-16T17:36:11.708546+00:00', 'space': 'rentmasseur-optimizer', 'subsystems': {'rm_traffic.engine': False, 'rm_revenue_engine.revenue_ops': True, 'server': True}, 'credentials_set': False}
-2026-07-16 13:36:11,810 [INFO] rm_daemon: Starting FastAPI server on 0.0.0.0:7860
-2026-07-16 13:36:13,787 [INFO] rm_daemon: Running one daemon cycle
-2026-07-16 13:36:13,788 [INFO] rm_daemon: Running bio merge
-2026-07-16 13:36:13,788 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/merge_bios.py
-2026-07-16 13:36:13,866 [INFO] rm_daemon: Running view backfill
-2026-07-16 13:36:13,866 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/backfill_views.py
-2026-07-16 13:37:44,603 [INFO] rm_daemon: RentMasseur Optimizer Daemon starting
-2026-07-16 13:37:44,650 [INFO] rm_daemon: Health: {'timestamp': '2026-07-16T17:37:44.603261+00:00', 'space': 'rentmasseur-optimizer', 'subsystems': {'rm_traffic.engine': False, 'rm_revenue_engine.revenue_ops': True, 'server': True}, 'credentials_set': True}
-2026-07-16 13:37:44,678 [INFO] rm_daemon: Starting FastAPI server on 0.0.0.0:7860
-2026-07-16 13:37:46,651 [INFO] rm_daemon: Running one daemon cycle
-2026-07-16 13:37:46,651 [INFO] rm_daemon: Running bio merge
-2026-07-16 13:37:46,651 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/merge_bios.py
-2026-07-16 13:37:46,725 [INFO] rm_daemon: Running view backfill
-2026-07-16 13:37:46,726 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/backfill_views.py
-2026-07-16 13:38:17,454 [INFO] rm_daemon: Running traffic cycle
-2026-07-16 13:38:17,455 [INFO] rm_daemon: Running daily promotion
-2026-07-16 13:38:17,455 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/daily_promotion.py
-2026-07-16 13:46:27,976 [INFO] rm_daemon: RentMasseur Optimizer Daemon starting
-2026-07-16 13:46:28,024 [INFO] rm_daemon: Health: {'timestamp': '2026-07-16T17:46:27.976473+00:00', 'space': 'rentmasseur-optimizer', 'subsystems': {'rm_traffic.engine': False, 'rm_revenue_engine.revenue_ops': True, 'server': True}, 'credentials_set': True}
-2026-07-16 13:46:28,049 [INFO] rm_daemon: Starting FastAPI server on 0.0.0.0:7860
-2026-07-16 13:46:30,030 [INFO] rm_daemon: Running one daemon cycle
-2026-07-16 13:46:30,030 [INFO] rm_daemon: Running bio merge
-2026-07-16 13:46:30,031 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/merge_bios.py
-2026-07-16 13:46:30,113 [INFO] rm_daemon: Running view backfill
-2026-07-16 13:46:30,113 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/backfill_views.py
-2026-07-16 13:48:28,892 [INFO] rm_daemon: Running traffic cycle
-2026-07-16 13:48:28,892 [INFO] rm_daemon: Running daily promotion
-2026-07-16 13:48:28,892 [INFO] rm_daemon: Running subprocess: /Users/alep/miniconda3/bin/python /Users/alep/Downloads/rentmasseur-optimizer/daily_promotion.py
-
-```
-
-README.md:
-```
-# RM-PRI — RentMasseur Profile Revenue Intelligence
-
-Non-toy, closed-loop profile optimization engine.
-
-## Honest version ladder
-
-- v0.1: Real Bio Corpus Analyzer ✅
-- v0.2: Public Views/Day Enricher — in progress
-- v0.3: Views/Day Predictor
-- v0.4: Candidate Bio Generator + Risk Filter
-- v0.5: Approval Queue + Profile Snapshotter
-- v0.6: Live Experiment Runner
-- v0.7: Dashboard Feedback Learner
-- v1.0: Closed-Loop Profile Revenue Intelligence
-
-Only v1.0 earns the "AGI-like" label.
-
-## Directory layout
-
-```text
-rm_pri/
-  cpp/          C++ intelligence engine
-  py/           Python API control plane
-  data/         Datasets, models, candidates, receipts, experiments
-  README.md     this file
-```
-
-## Build
-
-```bash
-cd rm_pri/cpp
-make
-```
-
-## Commands
-
-```bash
-python3 rm_pri/py/cli.py status
-python3 rm_pri/py/cli.py validate
-python3 rm_pri/py/cli.py api-check
-python3 rm_pri/py/enrich.py --delay 1.0
-python3 rm_pri/py/cli.py train --label reviews --cv 5
-```
-
-## Current blocker
-
-Public visit enrichment requires reaching `rentmasseur.com` without CrowdSec captcha.
-When the site is clear, run the enricher. If captcha returns, rotate IP or wait.
-
-## Data contracts
-
-- `real_bios_raw.jsonl` — raw corpus from RentMasseur
-- `real_bios_with_views.jsonl` — enriched with public_visits, member_since, days_online, views_per_day
-- `candidates.jsonl` — generated candidate bios
-- `scored_candidates.jsonl` — scored by trained model
-- `experiments.jsonl` — before/after experiment labels
-- `receipts/ledger.jsonl` — chained SHA-256 receipts
-
-## Safety rules
-
-- No fake reviews
-- No fake visits
-- No fake availability
-- No spam messaging
-- No scraping private user data
-- No bypassing controls
-- No publishing risky content without approval
-- No hardcoded credentials
-
-```
-
-fast_enrich.py:
-```
-#!/usr/bin/env python3
-"""Fast multi-threaded enricher with global rate limiting."""
-
-import argparse
-import json
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
-from pathlib import Path
-from threading import Lock
-
-import requests
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-09T23:41:26Z",
+  "run_id": "29057822079",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
 }
 
-PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
-SITE_WIDE_PHONES = {"1778766027", "6720911878"}
+```
 
-rate_lock = Lock()
-last_request_time = 0.0
-
-
-def rate_limited_request(url: str, min_delay: float) -> requests.Response:
-    global last_request_time
-    with rate_lock:
-        elapsed = time.time() - last_request_time
-        if elapsed < min_delay:
-            time.sleep(min_delay - elapsed)
-        last_request_time = time.time()
-    return requests.get(url, headers=HEADERS, timeout=15)
-
-
-def extract_phone(text: str) -> str:
-    phones = PHONE_RE.findall(text)
-    for p in phones:
-        digits = re.sub(r"\D", "", p)
-        if len(digits) == 11 and digits.startswith("1"):
-            digits = digits[1:]
-        if len(digits) != 10:
-            continue
-        if digits in SITE_WIDE_PHONES:
-            continue
-        return digits
-    return ""
-
-
-def fetch_profile(username: str, min_delay: float) -> dict:
-    try:
-        r = rate_limited_request(f"https://rentmasseur.com/{username}", min_delay)
-        if r.status_code != 200:
-            return {"username": username, "error": f"HTTP {r.status_code}"}
-        if "CrowdSec" in r.text:
-            return {"username": username, "error": "captcha"}
-
-        m = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
-        member_since = m.group(1).strip() if m else ""
-
-        visit_values = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
-        visits = max(visit_values) if visit_values else 0
-
-        days_online = 0
-        if member_since:
-            try:
-                joined = datetime.strptime(member_since, "%b %d, %Y")
-                days_online = max(1, (datetime.now() - joined).days)
-            except ValueError:
-                pass
-
-        views_per_day = visits / days_online if days_online > 0 else 0.0
-        phone = extract_phone(r.text)
-
-        return {
-            "username": username,
-            "visits": visits,
-            "member_since": member_since,
-            "days_online": days_online,
-            "views_per_day": views_per_day,
-            "phone": phone,
-        }
-    except Exception as e:
-        return {"username": username, "error": str(e)}
-
-
-def enrich(input_path: Path, output_path: Path, workers: int = 5, min_delay: float = 0.5):
-    bios = [json.loads(l) for l in input_path.open() if l.strip()]
-    total = len(bios)
-
-    existing = {}
-    if output_path.exists():
-        for line in output_path.open():
-            if line.strip():
-                row = json.loads(line)
-                if row.get("views_per_day", 0) > 0 and row.get("phone", "") not in SITE_WIDE_PHONES and row.get("phone") is not None:
-                    existing[row.get("username")] = row
-        print(f"Resuming: {len(existing)} profiles already enriched")
-
-    todo = [b for b in bios if b.get("username") not in existing]
-    print(f"Total: {total} | Already enriched: {len(existing)} | To fetch: {len(todo)}")
-
-    results = {}
-    captcha_hit = False
-
-    def fetch_one(b):
-        nonlocal captcha_hit
-        if captcha_hit:
-            return None
-        u = b.get("username")
-        r = fetch_profile(u, min_delay)
-        if r.get("error") == "captcha":
-            captcha_hit = True
-            print(f"\nCAPTCHA at {u}. Stopping.")
-        return r
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(fetch_one, b): b for b in todo}
-        for i, fut in enumerate(futures):
-            if captcha_hit:
-                break
-            r = fut.result()
-            if r:
-                results[r.get("username")] = r
-            if (i + 1) % 50 == 0:
-                print(f"  Fetched {i+1}/{len(todo)}")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w") as out:
-        for b in bios:
-            u = b.get("username")
-            if u in existing:
-                out.write(json.dumps(existing[u], ensure_ascii=False) + "\n")
-            elif u in results:
-                v = results[u]
-                if "error" in v:
-                    b.update({"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0, "phone": "", "error": v["error"], "scraped_at": datetime.now(timezone.utc).isoformat()})
-                else:
-                    b.update(v)
-                    b["scraped_at"] = datetime.now(timezone.utc).isoformat()
-                out.write(json.dumps(b, ensure_ascii=False) + "\n")
-            else:
-                b.update({"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0, "phone": "", "scraped_at": datetime.now(timezone.utc).isoformat()})
-                out.write(json.dumps(b, ensure_ascii=False) + "\n")
-
-    print(f"\nDone. Fetched: {len(results)} | Captcha: {captcha_hit}")
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="rm_pri/data/real_bios_raw.jsonl")
-    ap.add_argument("--output", default="rm_pri/data/real_bios_with_views.jsonl")
-    ap.add_argument("--workers", type=int, default=5)
-    ap.add_argument("--delay", type=float, default=0.5)
-    args = ap.parse_args()
-    enrich(Path(args.input), Path(args.output), args.workers, args.delay)
-
-
-if __name__ == "__main__":
-    main()
+pipeline_20260704_233352.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-04T23:33:52Z",
+  "run_id": "28723076701",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
 ```
 
-auth.py:
+pipeline_20260718_055544.json:
 ```
-"""
-AuthSession — login, JWT, session health.
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-18T05:55:44Z",
+  "run_id": "29632964089",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
-Never stores raw password in code. Reads from env vars or keychain.
-"""
+```
 
-import json
-import logging
-import os
-import subprocess
-from typing import Optional
+pipeline_20260713_233709.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-13T23:37:09Z",
+  "run_id": "29293340916",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
-import requests
+```
 
-from .api_client import RentMasseurAPI
+metrics_20260711_213536.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-11T21:35:36.870027+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-log = logging.getLogger("profileops.auth")
+metrics_20260725_201051.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-25T20:10:51.495186+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
+rotation_20260706_105609.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-06T10:56:09Z",
+  "run_id": "28786046968",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28786046968"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260706_105609.json ",
+  "status": "completed"
+}
 
-def get_credential(name: str) -> Optional[str]:
-    """Read credential from environment or macOS keychain."""
-    val = os.environ.get(name)
-    if val:
-        return val
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", f"rm_profileops_{name}", "-w"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return None
+```
 
+kpi_2026-07-11T23-32-47.116225-00-00.json:
+```
+{
+  "id": "kpi_1783812767",
+  "timestamp": "2026-07-11T23:32:47.116225+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-11T23:32:47.116144+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-def save_token_to_keychain(token: str):
-    """Save access token to keychain (optional)."""
-    try:
-        subprocess.run(
-            ["security", "add-generic-password", "-s", "rm_profileops_access_token",
-             "-a", "rm_profileops", "-w", token, "-U"],
-            capture_output=True, text=True, timeout=5
-        )
-    except Exception as e:
-        log.warning("Could not save token to keychain: %s", e)
+metrics_20260627_075601.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-06-27T07:56:01.800648+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
+kpi_2026-07-17T10-34-32.648750-00-00.json:
+```
+{
+  "id": "kpi_1784284472",
+  "timestamp": "2026-07-17T10:34:32.648750+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-17T10:34:32.648702+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-def load_session_from_file(path: str) -> Optional[list]:
-    """Load cookies from a saved session JSON file."""
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        return data.get("cookies", [])
-    except Exception as e:
-        log.warning("Could not load session file: %s", e)
-        return None
+pipeline_20260704_180113.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-04T18:01:13Z",
+  "run_id": "28714782452",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
+```
 
-class AuthSession:
-    """Manages login and session state."""
+kpi_2026-07-05T08-30-47.838007-00-00.json:
+```
+{
+  "id": "kpi_1783240247",
+  "timestamp": "2026-07-05T08:30:47.838007+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-05T08:30:47.837922+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-    def __init__(self, api: RentMasseurAPI, session_file: Optional[str] = None):
-        self.api = api
-        self.session_file = session_file
-        self.username = None
+metrics_20260715_083946.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-15T08:39:46.513738+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-    def login(self, username: Optional[str] = None, password: Optional[str] = None) -> bool:
-        """Login using credentials or saved session."""
-        self.username = username or get_credential("RM_USER")
-        password = password or get_credential("RM_PASS")
+kpi_2026-06-27T21-55-41.535228-00-00.json:
+```
+{
+  "id": "kpi_1782597341",
+  "timestamp": "2026-06-27T21:55:41.535228+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-27T21:55:41.535134+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-        if not self.username or not password:
-            log.error("Credentials missing. Set RM_USER and RM_PASS environment variables.")
-            return False
+metrics_20260717_213524.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-17T21:35:24.176423+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-        # Try saved session first if available
-        if self.session_file:
-            cookies = load_session_from_file(self.session_file)
-            if cookies:
-                self.api.load_cookies(cookies)
-                log.info("Loaded saved session cookies")
-                # Test with a lightweight request
-                try:
-                    self.api.get_keeponline()
-                    log.info("Saved session is valid")
-                    return True
-                except Exception:
-                    log.info("Saved session expired, trying login")
+rotation_20260705_221458.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-05T22:14:58Z",
+  "run_id": "28756461827",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28756461827"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260705_221458.json ",
+  "status": "completed"
+}
 
-        return self.api.login(self.username, password)
+```
 
-    def is_authenticated(self) -> bool:
-        try:
-            self.api.get_keeponline()
+kpi_2026-07-24T22-57-59.586815-00-00.json:
+```
+{
+  "id": "kpi_1784933879",
+  "timestamp": "2026-07-24T22:57:59.586815+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-24T22:57:59.586741+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-07-24T14-49-59.657815-00-00.json:
+```
+{
+  "id": "kpi_1784904599",
+  "timestamp": "2026-07-24T14:49:59.657815+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-24T14:49:59.657724+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260726_000329.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-26T00:03:29Z",
+  "run_id": "30180177258",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed",
+  "prev_fingerprint": "5a54783ffcc245bdf2dc1a9f87aaf39f1d9e97c70cdfc1101853e890a08aad49",
+  "chain_index": 7,
+  "fingerprint": "5871f9d1d0ddda3ab9d525cab79756b74e4572ec4c1be60626bdd9b9c2d6cb52"
+}
+```
+
+pipeline_20260708_050515.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-08T05:05:15Z",
+  "run_id": "28918700153",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-07T20-26-10.088463-00-00.json:
+```
+{
+  "id": "kpi_1783455970",
+  "timestamp": "2026-07-07T20:26:10.088463+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-07T20:26:10.088355+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260703_080011.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-03T08:00:11Z",
+  "run_id": "28646761878",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+pipeline_20260712_142921.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-12T14:29:21Z",
+  "run_id": "29196186656",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+metrics_20260714_213311.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-14T21:33:11.323554+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+metrics_20260710_113608.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-10T11:36:08.925039+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+rotation_20260703_194513.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-03T19:45:13Z",
+  "run_id": "28680146895",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28680146895"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260703_194513.json ",
+  "status": "completed"
+}
+
+```
+
+metrics_20260719_123203.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-19T12:32:03.617849+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-17T04-27-16.369830-00-00.json:
+```
+{
+  "id": "kpi_1784262436",
+  "timestamp": "2026-07-17T04:27:16.369830+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-17T04:27:16.369769+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260715_061713.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-15T06:17:13.971855+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+metrics_20260712_071850.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-12T07:18:50.017817+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-14T13-13-51.142179-00-00.json:
+```
+{
+  "id": "kpi_1784034831",
+  "timestamp": "2026-07-14T13:13:51.142179+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-14T13:13:51.142095+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-06-30T16-17-25.852020-00-00.json:
+```
+{
+  "id": "kpi_1782836245",
+  "timestamp": "2026-06-30T16:17:25.852020+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-30T16:17:25.851943+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+rotation_20260705_162148.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-05T16:21:48Z",
+  "run_id": "28746940057",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28746940057"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260705_162148.json ",
+  "status": "completed"
+}
+
+```
+
+metrics_20260705_154039.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-05T15:40:39.403192+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+pipeline_20260717_172635.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-17T17:26:35Z",
+  "run_id": "29599743464",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-04T01-20-05.457302-00-00.json:
+```
+{
+  "id": "kpi_1783128005",
+  "timestamp": "2026-07-04T01:20:05.457302+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-04T01:20:05.457217+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260718_201535.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-18T20:15:35.493290+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-23T19-47-51.381697-00-00.json:
+```
+{
+  "id": "kpi_1784836071",
+  "timestamp": "2026-07-23T19:47:51.381697+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-23T19:47:51.381603+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-07-02T15-07-06.305404-00-00.json:
+```
+{
+  "id": "kpi_1783004826",
+  "timestamp": "2026-07-02T15:07:06.305404+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-02T15:07:06.305323+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260715_164755.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-15T16:47:55.985959+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+pipeline_20260719_150436.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-19T15:04:36Z",
+  "run_id": "29691933096",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```

@@ -1,800 +1,800 @@
-    );
-    CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status);
-    CREATE INDEX IF NOT EXISTS idx_hyp_category ON hypotheses(category);
-    CREATE INDEX IF NOT EXISTS idx_runs_hyp ON hypothesis_runs(hypothesis_id);
-    """)
-    conn.commit()
-    return conn
-
-
-# ─── FDR Control ───────────────────────────────────────────────────
-
-def benjamini_hochberg(p_values: List[float], alpha: float = 0.05) -> List[bool]:
-    """Benjamini-Hochberg FDR correction. Returns list of which hypotheses survive."""
-    n = len(p_values)
-    if n == 0:
-        return []
-
-    # Sort by p-value, keep track of original indices
-    indexed = sorted(enumerate(p_values), key=lambda x: x[1])
-    rejected = [False] * n
-
-    # BH procedure: find largest k where p(k) <= k/n * alpha
-    max_k = 0
-    for rank, (orig_idx, p) in enumerate(indexed, 1):
-        threshold = (rank / n) * alpha
-        if p <= threshold:
-            max_k = rank
-
-    # Reject all hypotheses with rank <= max_k
-    for rank, (orig_idx, p) in enumerate(indexed, 1):
-        if rank <= max_k:
-            rejected[orig_idx] = True
-
-    return rejected
-
-
-def apply_fdr_control(conn: sqlite3.Connection, tenant_id: str) -> Dict:
-    """Apply FDR correction every 25 completed hypothesis tests."""
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT hypothesis_id, reward, runs_completed
-        FROM hypotheses
-        WHERE status IN ('candidate', 'running') AND runs_completed > 0
-        ORDER BY reward DESC
-    """)
-    rows = cur.fetchall()
-
-    if len(rows) < 25:
-        return {"applied": False, "reason": f"only {len(rows)} completed, need 25"}
-
-    # Compute approximate p-values from reward scores
-    # (using reward as proxy: higher reward = lower p-value)
-    rewards = [r["reward"] for r in rows]
-    max_reward = max(rewards) if rewards else 1.0
-    p_values = [1.0 - (r / max_reward) if max_reward > 0 else 1.0 for r in rewards]
-
-    rejected = benjamini_hochberg(p_values, alpha=0.05)
-
-    promoted = 0
-    retired = 0
-    for i, row in enumerate(rows):
-        if rejected[i]:
-            conn.execute("UPDATE hypotheses SET status = 'winner' WHERE hypothesis_id = ?", (row["hypothesis_id"],))
-            conn.execute("INSERT INTO hypothesis_promotions (hypothesis_id, tenant_id, promoted_at, reward, confidence, fdr_corrected) VALUES (?, ?, ?, ?, ?, 1)",
-                        (row["hypothesis_id"], tenant_id, datetime.now(timezone.utc).isoformat(), row["reward"], 0.8))
-            promoted += 1
-        elif row["runs_completed"] >= 5:
-            conn.execute("UPDATE hypotheses SET status = 'retired' WHERE hypothesis_id = ?", (row["hypothesis_id"],))
-            retired += 1
-
-    conn.commit()
-    return {"applied": True, "promoted": promoted, "retired": retired, "tested": len(rows)}
-
-
-# ─── Bandit selection ──────────────────────────────────────────────
-
-def select_next_hypothesis(conn: sqlite3.Connection, state) -> Optional[Dict]:
-    """Select next hypothesis using contextual bandit (UCB-style)."""
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM hypotheses
-        WHERE status IN ('candidate', 'running') AND runs_completed < max_runs
-        ORDER BY reward DESC, confidence DESC
-    """)
-    rows = cur.fetchall()
-
-    if not rows:
-        return None
-
-    # UCB-style: score = avg_reward + exploration_bonus
-    total_runs = sum(r["runs_completed"] for r in rows) or 1
-    scored = []
-    for row in rows:
-        avg_reward = row["reward"] / max(1, row["runs_completed"])
-        exploration = math.sqrt(2 * math.log(total_runs) / max(1, row["runs_completed"]))
-        ucb_score = avg_reward + 0.3 * exploration
-        scored.append((ucb_score, dict(row)))
-
-    scored.sort(key=lambda x: -x[0])
-    return scored[0][1]
-
-
-# ─── Action execution ──────────────────────────────────────────────
-
-def execute_hyp_action(action: str, api: RentMasseurAPI, state) -> Dict:
-    """Execute the hypothesis action. Returns {error, result}."""
-    result = {"error": "", "result": {}}
-    try:
-        if action == "refresh_availability":
-            if state.available_status != "Available" or state.availability_seconds_left < 3600:
-                api.set_availability(option=1, duration=5)
-                api.invalidate_cache("availability")
-                result["result"] = {"set_to": "Available"}
-            else:
-                result["result"] = {"already_available": True}
-
-        elif action == "ensure_visible":
-            if state.profile_hidden:
-                try:
-                    api._post("/account/dashboard/hide", {"hide": False})
-                    result["result"] = {"unhid": True}
-                except Exception:
-                    result["result"] = {"note": "manual check needed"}
-            else:
-                result["result"] = {"already_visible": True}
-
-        elif action == "detect_account_issues":
-            keep = api.get_keeponline()
-            issues = keep.get("issues", {})
-            result["result"] = {"total_issues": issues.get("totalItems", 0), "alerts": len(issues.get("alerts", []))}
-
-        elif action == "classify_mailbox_intent":
-            mailbox = api.get_mailbox(page=1, folder=1, sort=1)
-            from .intent_engine import classify_mailbox
-            emails = mailbox.get("emails", [])
-            classified = classify_mailbox(emails)
-            result["result"] = {"total": len(emails), "booking_now": sum(1 for c in classified if c["classification"] == "booking_now")}
-
-        elif action == "draft_reply_queue":
-            mailbox = api.get_mailbox(page=1, folder=1, sort=1)
-            from .intent_engine import classify_mailbox
-            emails = mailbox.get("emails", [])
-            classified = classify_mailbox(emails)
-            drafts = [c for c in classified if c["suggested_reply_class"] and c["classification"] != "do_not_contact"]
-            result["result"] = {"drafts": len(drafts)}
-
-        elif action == "headline_variant_test":
-            result["result"] = {"note": "headline test requires manual approval"}
-            result["error"] = "manual_approval_required"
-
-        elif action == "about_variant_test":
-            result["result"] = {"note": "about test requires manual approval"}
-            result["error"] = "manual_approval_required"
-
-        elif action == "search_rank_scan":
-            results = api.search_masseurs(city="manhattan-ny", page=1)
-            result["result"] = {"total": len(results.get("users", [])), "rank": state.search_rank}
-
-        elif action == "competitor_position_scan":
-            results = api.search_masseurs(city="manhattan-ny", page=1)
-            users = results.get("users", [])
-            result["result"] = {"competitors": len(users), "top3": [u.get("username", "") for u in users[:3]]}
-
-        elif action == "pricing_copy_test":
-            result["result"] = {"note": "pricing test requires manual approval"}
-            result["error"] = "manual_approval_required"
-
-        elif action == "traffic_delta_report":
-            result["result"] = {"views": state.views, "contacts": state.contact_clicks, "ctr": state.contact_rate}
-
-        elif action == "roi_report":
-            result["result"] = {"pressure": state.revenue_pressure, "components": state.pressure_components}
-
-        else:
-            result["error"] = f"unknown action: {action}"
-
-    except Exception as e:
-        result["error"] = str(e)
-
-    return result
-
-
-# ─── Commands ──────────────────────────────────────────────────────
-
-def cmd_seed_300():
-    """Seed 300 hypotheses into the database."""
-    conn = _db()
-    hyps = generate_300_hypotheses()
-    now = datetime.now(timezone.utc).isoformat()
-
-    for h in hyps:
-        conn.execute("""
-            INSERT OR REPLACE INTO hypotheses
-            (hypothesis_id, category, claim, action, primary_metric,
-             secondary_metrics, guardrail_metrics, minimum_window_hours,
-             max_runs, status, confidence, reward, runs_completed,
-             evidence_receipts, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (h["hypothesis_id"], h["category"], h["claim"], h["action"],
-              h["primary_metric"], json.dumps(h["secondary_metrics"]),
-              json.dumps(h["guardrail_metrics"]), h["minimum_window_hours"],
-              h["max_runs"], h["status"], h["confidence"], h["reward"],
-              h["runs_completed"], json.dumps(h["evidence_receipts"]), now))
-
-    conn.commit()
-    conn.close()
-
-    by_cat = {}
-    for h in hyps:
-        by_cat[h["category"]] = by_cat.get(h["category"], 0) + 1
-
-    print(f"✅ Seeded {len(hyps)} hypotheses")
-    for cat, count in sorted(by_cat.items()):
-        print(f"  {cat}: {count}")
-
-
-def cmd_list():
-    """List all hypotheses with their status."""
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("SELECT category, status, COUNT(*) as n FROM hypotheses GROUP BY category, status ORDER BY category, status")
-    rows = cur.fetchall()
-
-    print(f"\n{'Category':<15} {'Status':<12} {'Count':>5}")
-    print(f"{'-'*15} {'-'*12} {'-'*5}")
-    for r in rows:
-        print(f"{r['category']:<15} {r['status']:<12} {r['n']:>5}")
-
-    cur.execute("SELECT COUNT(*) as total FROM hypotheses")
-    total = cur.fetchone()["total"]
-    print(f"\nTotal: {total} hypotheses")
-
-    cur.execute("SELECT status, COUNT(*) as n FROM hypotheses GROUP BY status")
-    for r in cur.fetchall():
-        print(f"  {r['status']}: {r['n']}")
-
-    conn.close()
-
-
-def cmd_run_next(tenant_id: str, username: str, password: str):
-    """Run the next best hypothesis."""
-    conn = _db()
-
-    # Login
-    api = RentMasseurAPI(min_request_interval=2.0)
-    if not api.login(username, password):
-        print("🔴 Login failed")
-        return 2
-
-    # Collect state before
-    print("[STATE] Collecting state before...")
-    state_before = collect_state(api, tenant_id)
-    print(f"  ◉ State: {state_before.state_hash} | Pressure: {state_before.revenue_pressure}")
-
-    # Select hypothesis
-    hyp = select_next_hypothesis(conn, state_before)
-    if not hyp:
-        print("No hypotheses available to run.")
-        # Try FDR control
-        fdr = apply_fdr_control(conn, tenant_id)
-        if fdr["applied"]:
-            print(f"FDR control applied: {fdr}")
-        conn.close()
-        return 0
-
-    print(f"\n[HYPOTHESIS] {hyp['hypothesis_id']} ({hyp['category']})")
-    print(f"  Claim: {hyp['claim']}")
-    print(f"  Action: {hyp['action']}")
-    print(f"  Primary metric: {hyp['primary_metric']}")
-    print(f"  Runs: {hyp['runs_completed']}/{hyp['max_runs']}")
-
-    # Execute
-    print(f"\n[EXEC] Executing {hyp['action']}...")
-    result = execute_hyp_action(hyp["action"], api, state_before)
-    if result["error"]:
-        print(f"  ⟁ Error: {result['error']}")
-    else:
-        print(f"  ◉ Result: {json.dumps(result['result'])}")
-
-    # Collect state after
-    print("\n[MEASURE] Collecting state after...")
-    time.sleep(2)
-    api.invalidate_cache()
-    state_after = collect_state(api, tenant_id)
-
-    # Compute reward
-    delta = compute_delta(state_before, state_after)
-    reward = compute_reward(delta, hyp["action"], result["error"])
-    print(f"\n[REWARD] Delta: {json.dumps(delta_to_dict(delta))}")
-    print(f"  Reward: {reward:.3f}")
-
-    # Write receipt
-    receipt_hash = hashlib.sha256(
-        f"{hyp['hypothesis_id']}:{state_before.state_hash}:{state_after.state_hash}:{reward}".encode()
-    ).hexdigest()[:16]
-
-    conn.execute("""INSERT INTO hypothesis_runs
-        (hypothesis_id, tenant_id, state_before_hash, state_after_hash, metric_delta, reward, receipt_hash, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (hyp["hypothesis_id"], tenant_id, state_before.state_hash, state_after.state_hash,
-         json.dumps(delta_to_dict(delta)), reward, receipt_hash, datetime.now(timezone.utc).isoformat()))
-
-    conn.execute("""INSERT OR IGNORE INTO hypothesis_receipts
-        (hypothesis_id, tenant_id, receipt_hash, timestamp, action, reward, metric_delta, state_before_hash, state_after_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (hyp["hypothesis_id"], tenant_id, receipt_hash, datetime.now(timezone.utc).isoformat(),
-         hyp["action"], reward, json.dumps(delta_to_dict(delta)), state_before.state_hash, state_after.state_hash))
-
-    # Update hypothesis
-    new_runs = hyp["runs_completed"] + 1
-    new_reward = hyp["reward"] + reward
-    new_confidence = min(1.0, new_runs / hyp["max_runs"])
-
-    new_status = hyp["status"]
-    if new_runs >= hyp["max_runs"]:
-        if new_reward / new_runs > 0.5:
-            new_status = "winner"
-        elif new_reward / new_runs < -0.5:
-            new_status = "loser"
-        else:
-            new_status = "retired"
-
-    conn.execute("""UPDATE hypotheses SET runs_completed = ?, reward = ?, confidence = ?, status = ? WHERE hypothesis_id = ?""",
-                (new_runs, new_reward, new_confidence, new_status, hyp["hypothesis_id"]))
-
-    # FDR control every 25 runs
-    total_completed = conn.execute("SELECT COUNT(*) as n FROM hypothesis_runs").fetchone()["n"]
-    if total_completed % 25 == 0 and total_completed > 0:
-        print(f"\n[FDR] Applying Benjamini-Hochberg correction at {total_completed} completed runs...")
-        fdr = apply_fdr_control(conn, tenant_id)
-        print(f"  Result: {fdr}")
-
-    conn.commit()
-    conn.close()
-
-    print(f"\n{'='*60}")
-    print(f"  HYPOTHESIS {hyp['hypothesis_id']} COMPLETE")
-    print(f"  Reward: {reward:.3f} | Total: {new_reward:.3f} | Runs: {new_runs}/{hyp['max_runs']}")
-    print(f"  Status: {new_status} | Receipt: {receipt_hash}")
-    print(f"{'='*60}")
-    return 0
-
-
-def cmd_report(tenant_id: str):
-    """Generate report for a tenant."""
-    conn = _db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT status, COUNT(*) as n FROM hypotheses GROUP BY status ORDER BY status")
-    status_rows = cur.fetchall()
-
-    cur.execute("""SELECT hypothesis_id, category, claim, reward, runs_completed, status, confidence
-                   FROM hypotheses WHERE runs_completed > 0
-                   ORDER BY reward DESC LIMIT 20""")
-    top_rows = cur.fetchall()
-
-    cur.execute("SELECT COUNT(*) as n FROM hypothesis_runs WHERE tenant_id = ?", (tenant_id,))
-    total_runs = cur.fetchone()["n"]
-
-    cur.execute("SELECT COUNT(*) as n FROM hypothesis_promotions WHERE tenant_id = ?", (tenant_id,))
-    total_promotions = cur.fetchone()["n"]
-
-    print(f"\n{'='*60}")
-    print(f"  HYPOTHESIS LAB REPORT — {tenant_id}")
-    print(f"  Generated: {datetime.now(timezone.utc).isoformat()}")
-    print(f"{'='*60}\n")
-
-    print(f"Status Summary:")
-    for r in status_rows:
-        print(f"  {r['status']:<12} {r['n']:>4}")
-
-    print(f"\nTotal runs: {total_runs}")
-    print(f"Total promotions: {total_promotions}")
-
-    if top_rows:
-        print(f"\nTop 20 Tested Hypotheses:")
-        print(f"{'ID':<6} {'Category':<12} {'Status':<10} {'Reward':>8} {'Runs':>5} {'Conf':>5} Claim")
-        print(f"{'-'*6} {'-'*12} {'-'*10} {'-'*8} {'-'*5} {'-'*5} {'-'*40}")
-        for r in top_rows:
-            print(f"{r['hypothesis_id']:<6} {r['category']:<12} {r['status']:<10} {r['reward']:>8.3f} {r['runs_completed']:>5} {r['confidence']:>5.2f} {r['claim'][:50]}")
-
-    conn.close()
-
-
-def cmd_winners(tenant_id: str):
-    """Show winning hypotheses."""
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM hypotheses WHERE status = 'winner' ORDER BY reward DESC")
-    rows = cur.fetchall()
-
-    if not rows:
-        print("No winners yet.")
-        conn.close()
-        return
-
-    print(f"\n{'='*60}")
-    print(f"  WINNING HYPOTHESES — {len(rows)}")
-    print(f"{'='*60}\n")
-
-    for r in rows:
-        print(f"  {r['hypothesis_id']} [{r['category']}] reward={r['reward']:.3f} runs={r['runs_completed']}")
-        print(f"    {r['claim']}")
-        print(f"    Action: {r['action']} | Metric: {r['primary_metric']}")
-        print()
-
-    conn.close()
-
-
-def cmd_daemon(tenant_id: str, username: str, password: str, interval: int = 300):
-    """Run hypothesis lab as daemon."""
-    print(f"Starting hypothesis lab daemon (interval={interval}s, tenant={tenant_id})")
-    while True:
-        try:
-            cmd_run_next(tenant_id, username, password)
-        except Exception as e:
-            log.error(f"Run error: {e}")
-        print(f"\nSleeping {interval}s...\n")
-        time.sleep(interval)
-
-
-# ─── CLI ───────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(description="300-Hypothesis Growth Lab")
-    parser.add_argument("--seed-300", action="store_true", help="Seed 300 hypotheses")
-    parser.add_argument("--list", action="store_true", help="List all hypotheses")
-    parser.add_argument("--run-next", action="store_true", help="Run next best hypothesis")
-    parser.add_argument("--daemon", action="store_true", help="Run as daemon")
-    parser.add_argument("--report", action="store_true", help="Generate report")
-    parser.add_argument("--winners", action="store_true", help="Show winners")
-    parser.add_argument("--tenant", default="", help="Tenant ID")
-    parser.add_argument("--interval", type=int, default=300, help="Daemon interval (s)")
-    args = parser.parse_args()
-
-    username = os.environ.get("RENTMASSEUR_USER", os.environ.get("RM_USER", ""))
-    password = os.environ.get("RENTMASSEUR_PASS", os.environ.get("RM_PASS", ""))
-    tenant_id = args.tenant or hashlib.sha256(username.encode()).hexdigest()[:16]
-
-    if args.seed_300:
-        cmd_seed_300()
-        return
-    if args.list:
-        cmd_list()
-        return
-    if args.run_next:
-        sys.exit(cmd_run_next(tenant_id, username, password))
-        return
-    if args.daemon:
-        cmd_daemon(tenant_id, username, password, args.interval)
-        return
-    if args.report:
-        cmd_report(tenant_id)
-        return
-    if args.winners:
-        cmd_winners(tenant_id)
-        return
-
-    parser.print_help()
-
-
-if __name__ == "__main__":
-    main()
+        "phone_cta_strength": 80,
+        "urgency": 70,
+        "emotional_hook": 90,
+        "seo_keywords": 80,
+        "uniqueness": 85,
+        "length_optimal": 90,
+        "beats_competitors": 90,
+        "overall_score": 88,
+        "reasoning": "This bio effectively targets a specific niche, conveys a sense of expertise, and has a strong emotional hook, making it stand out from competitors."
+      }
+    },
+    {
+      "strategy": "yoga_fusion",
+      "length": 896,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_yoga_fusion.md",
+      "score": {
+        "phone_cta_strength": 90,
+        "urgency": 80,
+        "emotional_hook": 85,
+        "seo_keywords": 70,
+        "uniqueness": 80,
+        "length_optimal": 95,
+        "beats_competitors": 90,
+        "overall_score": 88,
+        "reasoning": "This bio stands out from competitors with its unique fusion of massage and yoga, strong call-to-action, and emotional appeal, making it a compelling choice for potential clients."
+      }
+    },
+    {
+      "strategy": "lgbtq_pride",
+      "length": 940,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_lgbtq_pride.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 60,
+        "emotional_hook": 90,
+        "seo_keywords": 70,
+        "uniqueness": 90,
+        "length_optimal": 80,
+        "beats_competitors": 90,
+        "overall_score": 88,
+        "reasoning": "This bio stands out for its unique selling proposition of catering to the LGBTQ+ community, creating a strong emotional hook and sense of safety, which likely surpasses its competitors."
+      }
+    },
+    {
+      "strategy": "traveler_companion",
+      "length": 877,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_traveler_companion.md",
+      "score": {
+        "phone_cta_strength": 90,
+        "urgency": 80,
+        "emotional_hook": 95,
+        "seo_keywords": 70,
+        "uniqueness": 85,
+        "length_optimal": 90,
+        "beats_competitors": 90,
+        "overall_score": 87,
+        "reasoning": "This bio effectively combines a strong emotional hook, clear phone call-to-action, and unique selling points to outshine competitors, but may benefit from more strategic SEO keyword placement."
+      }
+    },
+    {
+      "strategy": "recovery_addiction",
+      "length": 879,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_recovery_addiction.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 60,
+        "emotional_hook": 90,
+        "seo_keywords": 70,
+        "uniqueness": 80,
+        "length_optimal": 90,
+        "beats_competitors": 90,
+        "overall_score": 87,
+        "reasoning": "This bio stands out from competitors due to its strong emotional hook, unique selling proposition, and effective call-to-action, making it a compelling and well-crafted profile."
+      }
+    },
+    {
+      "strategy": "meditation_guide",
+      "length": 904,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_meditation_guide.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 60,
+        "emotional_hook": 90,
+        "seo_keywords": 40,
+        "uniqueness": 70,
+        "length_optimal": 80,
+        "beats_competitors": 90,
+        "overall_score": 87,
+        "reasoning": "This bio effectively combines a strong emotional hook with a clear call to action and unique approach to massage therapy, setting it apart from top competitors."
+      }
+    },
+    {
+      "strategy": "sensory_luxury",
+      "length": 972,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_sensory_luxury.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 60,
+        "emotional_hook": 90,
+        "seo_keywords": 40,
+        "uniqueness": 70,
+        "length_optimal": 80,
+        "beats_competitors": 90,
+        "overall_score": 85,
+        "reasoning": "This bio scores high due to its immersive and emotive language, effective use of sensory details, and strong call-to-action, which collectively outshine the competitor bios."
+      }
+    },
+    {
+      "strategy": "athlete_recovery",
+      "length": 857,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_athlete_recovery.md",
+      "score": {
+        "phone_cta_strength": 90,
+        "urgency": 80,
+        "emotional_hook": 70,
+        "seo_keywords": 60,
+        "uniqueness": 50,
+        "length_optimal": 80,
+        "beats_competitors": 90,
+        "overall_score": 85,
+        "reasoning": "This bio effectively targets a specific audience, emphasizes the benefits of the massage therapy, and has a strong call-to-action, making it stand out from competitors."
+      }
+    },
+    {
+      "strategy": "artist_soul",
+      "length": 846,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_artist_soul.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 70,
+        "emotional_hook": 90,
+        "seo_keywords": 60,
+        "uniqueness": 80,
+        "length_optimal": 80,
+        "beats_competitors": 90,
+        "overall_score": 85,
+        "reasoning": "This bio stands out from competitors with its poetic and artistic language, effectively creating a serene atmosphere and highlighting the therapist's unique approach, but may lack in explicitly stating specific massage techniques and SEO keywords."
+      }
+    },
+    {
+      "strategy": "couples_duo",
+      "length": 814,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_couples_duo.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 60,
+        "emotional_hook": 90,
+        "seo_keywords": 40,
+        "uniqueness": 70,
+        "length_optimal": 80,
+        "beats_competitors": 90,
+        "overall_score": 85,
+        "reasoning": "This bio scores high due to its strong emotional hook, unique selling proposition, and effective call-to-action, which collectively outshine competitor bios."
+      }
+    },
+    {
+      "strategy": "senior_gentle",
+      "length": 852,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_senior_gentle.md",
+      "score": {
+        "phone_cta_strength": 90,
+        "urgency": 80,
+        "emotional_hook": 70,
+        "seo_keywords": 60,
+        "uniqueness": 50,
+        "length_optimal": 80,
+        "beats_competitors": 90,
+        "overall_score": 85,
+        "reasoning": "This bio stands out from competitors due to its strong phone call-to-action, sense of urgency, and tailored services, making it a compelling choice for potential clients."
+      }
+    },
+    {
+      "strategy": "dancer_flexibility",
+      "length": 845,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_dancer_flexibility.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 90,
+        "emotional_hook": 70,
+        "seo_keywords": 60,
+        "uniqueness": 80,
+        "length_optimal": 90,
+        "beats_competitors": 90,
+        "overall_score": 85,
+        "reasoning": "This bio stands out from competitors due to its unique blend of a compelling personal story, clear specialty, and effective call-to-action, making it a top-scoring profile."
+      }
+    },
+    {
+      "strategy": "weekly_ritual",
+      "length": 1076,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_weekly_ritual.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 60,
+        "emotional_hook": 90,
+        "seo_keywords": 70,
+        "uniqueness": 80,
+        "length_optimal": 80,
+        "beats_competitors": 90,
+        "overall_score": 85,
+        "reasoning": "This bio stands out from competitors with its engaging emotional hook, unique sanctuary concept, and effective call-to-action, making it a compelling choice for clients seeking a personalized massage experience."
+      }
+    },
+    {
+      "strategy": "mystery_desire",
+      "length": 752,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_mystery_desire.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 90,
+        "emotional_hook": 95,
+        "seo_keywords": 40,
+        "uniqueness": 90,
+        "length_optimal": 80,
+        "beats_competitors": 85,
+        "overall_score": 82,
+        "reasoning": "This bio scores high due to its emotional and unique storytelling, sense of urgency, and effective call-to-action, but its lack of clear SEO keywords and optimal length prevents it from being a perfect score."
+      }
+    },
+    {
+      "strategy": "night_owl",
+      "length": 848,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_night_owl.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 90,
+        "emotional_hook": 95,
+        "seo_keywords": 60,
+        "uniqueness": 90,
+        "length_optimal": 80,
+        "beats_competitors": 85,
+        "overall_score": 82,
+        "reasoning": "This bio stands out for its unique nighttime theme and vivid descriptive language, but its overall score is limited by a lack of prominent SEO keywords and a phone CTA that could be more direct."
+      }
+    },
+    {
+      "strategy": "military_veteran",
+      "length": 953,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_military_veteran.md",
+      "score": {
+        "phone_cta_strength": 90,
+        "urgency": 80,
+        "emotional_hook": 95,
+        "seo_keywords": 70,
+        "uniqueness": 90,
+        "length_optimal": 80,
+        "beats_competitors": 85,
+        "overall_score": 82,
+        "reasoning": "This bio effectively combines a strong emotional hook, clear unique selling proposition, and compelling call-to-action, making it slightly better than top competitor bios."
+      }
+    },
+    {
+      "strategy": "quick_lunch",
+      "length": 863,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_quick_lunch.md",
+      "score": {
+        "phone_cta_strength": 90,
+        "urgency": 80,
+        "emotional_hook": 85,
+        "seo_keywords": 70,
+        "uniqueness": 60,
+        "length_optimal": 95,
+        "beats_competitors": 85,
+        "overall_score": 82,
+        "reasoning": "This bio effectively combines a clear call-to-action, emotional appeal, and concise language, making it slightly better than the top competitor bios."
+      }
+    },
+    {
+      "strategy": "office_relief",
+      "length": 958,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_office_relief.md",
+      "score": {
+        "phone_cta_strength": 90,
+        "urgency": 80,
+        "emotional_hook": 90,
+        "seo_keywords": 70,
+        "uniqueness": 60,
+        "length_optimal": 80,
+        "beats_competitors": 70,
+        "overall_score": 78,
+        "reasoning": "The bio effectively targets a specific demographic and creates a sense of urgency, but its uniqueness and SEO keyword usage could be improved to surpass all competitors."
+      }
+    },
+    {
+      "strategy": "medical_referral",
+      "length": 882,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_medical_referral.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 90,
+        "emotional_hook": 70,
+        "seo_keywords": 60,
+        "uniqueness": 50,
+        "length_optimal": 80,
+        "beats_competitors": 70,
+        "overall_score": 74,
+        "reasoning": "This bio effectively conveys the therapist's expertise and creates a sense of urgency, but its uniqueness and SEO keyword usage are somewhat lacking compared to top competitors."
+      }
+    },
+    {
+      "strategy": "first_timer",
+      "length": 871,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_first_timer.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 70,
+        "emotional_hook": 90,
+        "seo_keywords": 60,
+        "uniqueness": 50,
+        "length_optimal": 80,
+        "beats_competitors": 40,
+        "overall_score": 60,
+        "reasoning": "The bio effectively creates a serene atmosphere and encourages booking, but its uniqueness and SEO keywords are not strong enough to surpass all competitors."
+      }
+    },
+    {
+      "strategy": "birthday_gift",
+      "length": 743,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_birthday_gift.md",
+      "score": {
+        "phone_cta_strength": 90,
+        "urgency": 80,
+        "emotional_hook": 90,
+        "seo_keywords": 70,
+        "uniqueness": 60,
+        "length_optimal": 80,
+        "beats_competitors": 40,
+        "overall_score": 60,
+        "reasoning": "The bio is well-written and effectively conveys a sense of luxury and relaxation, but it doesn't particularly stand out from top competitors and lacks a strong unique selling proposition."
+      }
+    },
+    {
+      "strategy": "therapeutic_expert",
+      "length": 914,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_therapeutic_expert.md",
+      "score": {
+        "phone_cta_strength": 80,
+        "urgency": 60,
+        "emotional_hook": 70,
+        "seo_keywords": 80,
+        "uniqueness": 50,
+        "length_optimal": 90,
+        "beats_competitors": 40,
+        "overall_score": 58,
+        "reasoning": "The bio is well-structured and effectively communicates the services offered, but it lacks a unique selling proposition and doesn't significantly differentiate itself from top competitor bios."
+      }
+    },
+    {
+      "strategy": "local_hustle",
+      "length": 969,
+      "file": "/home/runner/work/rentmasseur-extension/rentmasseur-extension/content/bios/20260723_local_hustle.md",
+      "score": {
+        "phone_cta_strength": 90,
+        "urgency": 80,
+        "emotional_hook": 70,
+        "seo_keywords": 60,
+        "uniqueness": 50,
+        "length_optimal": 80,
+        "beats_competitors": 20,
+        "overall_score": 40,
+        "reasoning": "The bio is well-structured and effectively conveys the massage therapist's services, but it lacks a unique selling point and doesn't significantly differentiate itself from top competitors."
+      }
+    }
+  ],
+  "winner": "hot_stone_specialist",
+  "winner_score": {
+    "phone_cta_strength": 90,
+    "urgency": 80,
+    "emotional_hook": 95,
+    "seo_keywords": 70,
+    "uniqueness": 85,
+    "length_optimal": 90,
+    "beats_competitors": 95,
+    "overall_score": 92,
+    "reasoning": "This bio effectively combines a strong emotional hook, sense of urgency, and clear call-to-action, making it a highly competitive and compelling profile that stands out from the competition."
+  }
+}
+```
+
+hourly_kpis.jsonl:
+```
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-26T18:53:12.838170+00:00", "immortality": {"score": 0.475, "grade": "STABLE", "components": {"days_online": 0, "views_per_day": 0, "profile_age_score": 0, "views_per_day_trend": 0.5, "visibility_persistence": 1.0, "availability_stability": 1.0, "retention_score": 0}}, "virality": {"score": 0.1072, "grade": "STAGNANT", "components": {"profile_views": 2802, "views_velocity": 0, "views_acceleration": 0, "contact_clicks": 135, "contact_click_velocity": 0, "new_visits": 31, "new_visitor_rate": 0.0111, "online_bookmarks": 1, "bookmark_rate": 0.0004, "new_emails": 0, "email_rate": 0.0, "contact_click_rate": 0.0482}}, "metrics_snapshots_used": 1}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-26T18:53:24.441227+00:00", "immortality": {"score": 0.8375, "grade": "IMMORTAL", "components": {"days_online": 964, "views_per_day": 81.0, "profile_age_score": 0.964, "views_per_day_trend": 0.5, "visibility_persistence": 1.0, "availability_stability": 1.0, "retention_score": 0.81}}, "virality": {"score": 0.1072, "grade": "STAGNANT", "components": {"profile_views": 2802, "views_velocity": 0, "views_acceleration": 0, "contact_clicks": 135, "contact_click_velocity": 0, "new_visits": 31, "new_visitor_rate": 0.0111, "online_bookmarks": 1, "bookmark_rate": 0.0004, "new_emails": 0, "email_rate": 0.0, "contact_click_rate": 0.0482}}, "metrics_snapshots_used": 1}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-26T18:54:03.194968+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-26T20:27:50.241690+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-26T22:04:00.445430+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-26T23:56:26.086453+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T02:41:49.961322+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T06:23:20.401391+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T09:23:56.358295+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T11:21:31.444983+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T13:13:45.190178+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T15:09:14.323942+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T16:59:10.665805+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T18:06:18.135049+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T20:03:47.369962+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T21:55:41.535134+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T22:57:20.106306+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-27T23:59:54.015372+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-28T04:14:48.079482+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-28T08:16:36.325947+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-28T10:59:23.372797+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-28T12:17:36.099273+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-28T14:43:16.107276+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-28T16:03:29.778287+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-28T17:59:02.989751+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-28T19:23:42.971893+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-28T20:52:25.244731+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-28T21:55:23.133916+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-28T22:56:05.826227+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-29T00:02:58.271808+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-29T05:24:01.159890+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-29T10:24:54.090920+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-29T14:42:45.712185+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-29T17:28:40.389703+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-29T19:44:41.742651+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-29T21:17:47.655463+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-29T22:47:48.726090+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-29T23:55:10.226819+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-30T02:33:46.330663+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-30T06:49:08.493641+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-30T10:26:58.173146+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-30T13:04:43.862951+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-30T16:17:25.851943+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-30T18:29:46.889776+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-30T20:52:08.508179+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-30T22:10:08.056328+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-06-30T23:59:52.790610+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-01T04:16:51.624863+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-01T08:44:55.226318+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-01T11:52:50.025158+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-01T14:11:07.309596+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-01T17:07:58.319712+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-01T19:40:36.595824+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-01T21:19:19.895354+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-01T23:03:48.191599+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-02T02:29:23.276704+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-02T06:32:18.335565+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-02T09:53:32.542639+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-02T12:03:32.001621+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-02T15:07:06.305323+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-02T17:28:33.580071+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-02T19:11:07.335723+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-02T20:55:30.375380+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-02T22:00:56.322856+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-02T23:56:37.152511+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T02:31:42.587801+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T08:00:11.714135+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T10:32:14.113509+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T12:29:34.291754+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T14:42:21.528992+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T16:16:33.470144+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T17:51:33.502086+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T19:07:24.874434+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T20:26:19.349214+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T21:42:31.056975+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T22:45:15.720103+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-03T23:46:06.247278+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T01:20:05.457217+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T05:06:14.135298+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T08:08:39.336867+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T10:28:00.770412+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T11:54:20.170590+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T13:05:18.033171+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T14:49:17.493104+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T15:51:35.709548+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T16:58:32.976747+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T18:01:13.122250+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T19:06:50.212752+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T20:20:35.544718+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T21:29:59.893903+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T22:30:13.974166+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-04T23:33:52.647519+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T01:19:58.139351+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T05:33:56.989351+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T08:30:47.837922+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T10:40:48.749969+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T12:07:26.347261+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T14:11:12.813545+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T15:40:39.320787+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T16:45:55.742155+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T17:48:34.997164+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T18:50:38.824636+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T20:11:01.044451+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T21:22:34.184472+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T22:33:11.938829+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-05T23:39:57.459950+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-06T01:26:02.437186+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-06T05:51:58.293842+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-06T10:01:32.047254+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-06T13:45:53.469762+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-06T16:48:48.421509+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-06T18:36:22.870700+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-06T20:37:51.130053+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-06T22:06:59.379253+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-06T23:26:42.623281+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-07T01:18:14.254133+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-07T05:11:44.324393+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-07T08:42:51.306373+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-07T11:33:32.190503+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-07T13:38:54.964990+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-07T16:14:49.448646+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-07T18:22:11.871069+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-07T20:26:10.088355+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-07T21:54:33.444990+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-07T22:56:28.823658+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-07T23:52:31.425719+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T01:52:57.750037+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T05:05:15.003511+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T07:45:20.933787+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T10:03:12.732861+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T11:51:17.432886+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T13:45:59.239004+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T15:57:54.020846+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T17:24:47.464500+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T18:57:26.686823+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T20:21:11.122581+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T21:42:14.834908+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T22:46:31.248255+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-08T23:48:44.369948+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-09T01:20:36.538408+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-09T05:34:03.135962+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-09T08:56:06.189933+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-09T11:55:06.470790+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-09T14:37:50.112445+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-09T17:09:35.662209+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-09T19:03:51.648440+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-09T20:52:10.007488+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-09T22:18:35.173879+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-09T23:41:26.395111+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T01:19:27.448368+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T05:13:47.991417+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T08:42:08.988467+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T11:36:09.038556+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T13:38:08.199641+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T16:08:34.051947+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T18:04:03.983219+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T19:40:16.585885+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T20:56:36.881840+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T21:56:40.775622+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T22:56:16.283694+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-10T23:53:56.597895+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T01:51:34.563648+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T04:59:58.837309+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T07:11:11.796368+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T09:02:37.067353+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T10:17:54.849111+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T11:23:18.664629+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T12:15:48.469711+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T13:56:10.279893+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T14:48:48.393820+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T15:42:05.282493+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T16:36:50.189242+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T17:44:11.654773+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T18:38:10.702317+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T19:54:51.829178+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T20:43:21.185959+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T21:35:36.798237+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T22:34:17.055017+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-11T23:32:47.116144+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T01:08:31.551858+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T04:40:32.293922+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T07:18:49.950607+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T09:21:04.542857+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T11:01:26.789570+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T11:57:48.028132+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T13:01:43.652965+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T14:29:21.443820+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T15:35:56.529682+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T16:38:00.020506+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T17:45:20.172024+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T18:39:54.586780+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T19:52:45.006543+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T20:40:13.810236+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T21:36:33.089019+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T22:33:44.789849+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-12T23:31:32.799413+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T01:06:16.545236+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T04:48:00.032287+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T07:58:22.460211+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T10:54:55.489201+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T13:16:53.217076+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T15:56:01.961073+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T17:53:11.826072+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T19:17:07.925378+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T20:38:32.517659+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T21:38:04.780080+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T22:39:26.944401+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-13T23:37:09.313480+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T01:06:56.021350+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T04:20:04.731283+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T06:37:14.902958+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T08:58:02.635783+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T10:33:56.950608+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T11:59:39.733286+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T13:13:51.142095+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T15:07:13.681438+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T16:41:23.949357+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T17:50:35.999642+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T19:07:29.404342+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T20:26:24.088751+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T21:33:11.243997+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T22:34:52.402684+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-14T23:36:05.397214+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T01:03:14.599671+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T04:02:42.568001+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T06:17:14.094751+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T08:39:46.426792+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T10:31:55.358879+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T12:01:53.761928+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T13:30:31.705341+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T15:10:56.566737+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T16:47:56.099353+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T17:59:17.508364+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T19:00:18.068915+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T20:08:20.205511+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T21:18:00.738983+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-15T23:16:23.258803+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T00:13:10.616812+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T03:38:03.869685+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T06:07:13.162306+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T10:38:38.066893+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T12:12:38.962924+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T14:23:22.290373+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T15:57:23.171909+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T17:08:16.086370+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T18:22:33.486761+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T19:42:35.511526+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T20:37:55.683815+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T21:48:01.875667+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T22:42:30.052370+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-16T23:40:44.962255+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T01:14:48.829224+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T04:27:16.369769+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T06:38:48.847579+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T08:59:36.387750+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T10:34:32.648702+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T11:57:59.673147+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T13:10:01.433105+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T14:56:40.763830+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T16:12:47.836169+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T17:26:35.574389+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T18:36:20.778773+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T19:49:28.566357+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T20:39:22.203036+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T21:35:24.103258+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T22:33:57.772631+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-17T23:29:09.170288+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T00:18:45.976756+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T03:37:09.467080+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T05:55:44.372329+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T07:32:20.911364+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T09:13:11.433878+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T10:43:21.747550+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T11:39:56.630157+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T12:41:07.869673+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T14:11:18.811119+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T15:16:32.996846+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T17:16:23.523529+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T18:11:18.811843+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T19:26:27.379330+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T20:15:35.411254+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T21:08:52.218151+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T22:09:55.516297+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-18T23:11:35.223246+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T00:11:40.211722+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T03:54:43.753114+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T06:27:35.180074+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T08:45:15.583446+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T10:18:08.970916+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T11:34:14.119999+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T12:32:03.540368+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T14:04:42.598514+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T15:04:36.454709+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T16:04:44.761999+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T17:06:25.101750+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T18:10:46.322881+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T19:33:32.759955+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T20:27:41.015955+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T21:16:34.067302+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-19T22:12:39.128594+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-20T04:04:56.948564+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-20T06:55:54.707997+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-20T09:54:37.833537+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-20T16:17:39.207539+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-20T18:23:24.857456+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-20T20:07:33.943303+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-20T21:26:27.189684+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-20T22:33:24.938809+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-20T23:35:26.460659+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T01:10:11.124623+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T04:33:41.360038+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T07:12:45.653830+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T09:41:41.441501+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T11:32:21.876511+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T12:56:42.786635+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T15:00:20.869000+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T16:21:45.431461+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T17:54:52.087615+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T20:38:51.800579+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T21:48:51.217716+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T22:41:34.814650+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-21T23:43:28.366848+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T01:09:33.858716+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T04:36:15.793543+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T07:23:53.005547+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T09:49:55.878145+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T11:46:44.431103+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T13:14:27.964295+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T15:20:09.535627+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T16:58:49.411380+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T18:07:06.737012+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T20:48:03.750255+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T21:49:04.147169+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T22:46:24.307429+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-22T23:44:08.386879+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-23T07:20:34.746048+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-23T11:37:32.286795+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-23T13:16:38.542247+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-23T15:28:09.405510+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-23T16:58:05.386388+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-23T18:12:01.474660+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-23T19:47:51.381603+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-23T20:47:11.899532+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-23T21:46:45.585122+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-23T22:42:17.475753+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-23T23:40:13.570324+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T01:10:32.322790+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T04:34:29.328988+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T07:13:21.549407+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T09:36:02.011391+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T11:27:01.432266+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T12:57:17.820334+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T14:49:59.657724+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T18:01:41.849850+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T19:23:09.175547+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T20:49:00.024455+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T21:50:11.614463+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-24T22:57:59.586741+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T00:00:57.604695+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T02:07:34.895070+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T05:27:27.533910+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T07:35:26.928976+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T09:25:07.301330+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T10:56:00.215041+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T12:01:36.725393+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T13:16:54.749978+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T14:46:30.667012+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T15:50:04.478851+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T16:50:29.174727+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T17:56:39.134271+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T18:57:53.845700+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T20:10:51.414260+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T21:21:12.807074+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T21:32:21.250511+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T21:43:07.985804+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T21:54:27.393780+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T23:19:21.967464+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-25T23:50:34.135308+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-26T00:03:29.502473+00:00", "immortality": {"score": 0, "grade": "NO_DATA", "components": {}}, "virality": {"score": 0, "grade": "NO_DATA", "components": {}}, "metrics_snapshots_used": 0}
+{"packet_type": "rm_hourly_kpis", "timestamp": "2026-07-26T00:28:17.691190+00:00", "immortality": {"score": 0.125, "grade": "DECLINING", "components": {"days_online": 0, "views_per_day": 0, "profile_age_score": 0, "views_per_day_trend": 0.5, "visibility_persistence": 0.0, "availability_stability": 0.0, "retention_score": 0}}, "virality": {"score": 0.0, "grade": "STAGNANT", "components": {"profile_views": 0, "views_velocity": 0, "views_acceleration": 0, "contact_clicks": 0, "contact_click_velocity": 0, "new_visits": 0, "new_visitor_rate": 0, "online_bookmarks": 0, "bookmark_rate": 0, "new_emails": 0, "email_rate": 0, "contact_click_rate": 0}}, "metrics_snapshots_used": 1}
 
 ```
 
-discover_blog_interview.py:
+profile_snapshot.json:
 ```
-"""
-Discover Blog + Interview API endpoints via Selenium CDP.
-
-Uses the existing logged-in Chrome profile to avoid login/captcha.
-Opens the blog and interview editor pages and captures the exact network
-requests when saving/publishing.
-
-Usage:
-    python3 rm_traffic/discover_blog_interview.py
-
-Output:
-    rm_traffic/blog_interview_endpoints.json
-"""
-
-import json
-import time
-from pathlib import Path
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-
-BASE = "https://rentmasseur.com"
-PROFILE = "/tmp/rm_action_api"
-
-
-def get_driver():
-    opts = Options()
-    opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument(f"--user-data-dir={PROFILE}")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    return webdriver.Chrome(options=opts)
-
-
-def dismiss_popups(driver):
-    time.sleep(1)
-    try:
-        driver.execute_script("document.querySelectorAll('.DialogOverlay,[class*=\"overlay\"]').forEach(e=>e.remove())")
-    except Exception:
-        pass
-
-
-def get_api_calls(driver):
-    logs = driver.get_log("performance")
-    reqs = {}
-    for entry in logs:
-        try:
-            msg = json.loads(entry["message"])["message"]
-            if msg["method"] == "Network.requestWillBeSent":
-                p = msg["params"]
-                r = p["request"]
-                rid = p["requestId"]
-                reqs[rid] = {
-                    "url": r["url"],
-                    "method": r["method"],
-                    "postData": r.get("postData", "")[:2000],
-                }
-            elif msg["method"] == "Network.responseReceived":
-                p = msg["params"]
-                rid = p["requestId"]
-                if rid in reqs:
-                    reqs[rid]["status"] = p["response"]["status"]
-                    try:
-                        body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": rid})
-                        reqs[rid]["response"] = body.get("body", "")[:2000]
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    return [v for v in reqs.values() if "/api/" in v["url"]]
-
-
-def find_clickable(driver, texts):
-    for text in texts:
-        for el in driver.find_elements(By.XPATH, f"//*[contains(text(),'{text}')]"):
-            if el.is_displayed():
-                return el
-    return None
-
-
-def discover_blog(driver):
-    print("\n=== BLOG DISCOVERY ===")
-    driver.get(f"{BASE}/settings?blog=1")
-    time.sleep(5)
-    dismiss_popups(driver)
-    print(f"URL: {driver.current_url}")
-
-    # List possible buttons
-    buttons = driver.find_elements(By.TAG_NAME, "button")
-    print(f"Buttons found: {len(buttons)}")
-    for b in buttons:
-        txt = (b.text or "").strip()
-        if txt:
-            print(f"  Button: {txt[:50]}")
-
-    # Try to click "Create" or "New"
-    for action_text in ["Create", "New", "Add", "Write", "Post"]:
-        el = find_clickable(driver, [action_text])
-        if el:
-            print(f"Clicking '{action_text}'...")
-            driver.execute_script("arguments[0].click()", el)
-            time.sleep(3)
-            break
-
-    # Clear logs and try to find form
-    driver.get_log("performance")
-    textareas = driver.find_elements(By.TAG_NAME, "textarea")
-    inputs = driver.find_elements(By.TAG_NAME, "input")
-    print(f"Textareas: {len(textareas)}, Inputs: {len(inputs)}")
-    for i, ta in enumerate(textareas):
-        print(f"  textarea[{i}]: placeholder={ta.get_attribute('placeholder') or 'N/A'}")
-    for i, inp in enumerate(inputs):
-        t = inp.get_attribute("type") or "text"
-        if t in ("text", "email", "search"):
-            print(f"  input[{i}]: type={t} placeholder={inp.get_attribute('placeholder') or 'N/A'}")
-
-    # Save action
-    save_btn = find_clickable(driver, ["Save", "Submit", "Publish", "Create", "Post"])
-    if save_btn:
-        print("Clicking save...")
-        driver.execute_script("arguments[0].click()", save_btn)
-        time.sleep(3)
-        calls = get_api_calls(driver)
-        print(f"Captured {len(calls)} API calls")
-        for c in calls:
-            print(f"  {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
-        return calls
-    else:
-        print("No save button found")
-        return []
-
-
-def discover_interview(driver):
-    print("\n=== INTERVIEW DISCOVERY ===")
-    driver.get(f"{BASE}/settings?interview=1")
-    time.sleep(5)
-    dismiss_popups(driver)
-    print(f"URL: {driver.current_url}")
-
-    # List inputs and buttons
-    textareas = driver.find_elements(By.TAG_NAME, "textarea")
-    inputs = driver.find_elements(By.TAG_NAME, "input")
-    buttons = driver.find_elements(By.TAG_NAME, "button")
-    print(f"Textareas: {len(textareas)}, Inputs: {len(inputs)}, Buttons: {len(buttons)}")
-    for i, ta in enumerate(textareas):
-        print(f"  textarea[{i}]: placeholder={ta.get_attribute('placeholder') or 'N/A'}")
-    for b in buttons:
-        txt = (b.text or "").strip()
-        if txt:
-            print(f"  Button: {txt[:50]}")
-
-    # Clear logs and try to save
-    driver.get_log("performance")
-    save_btn = find_clickable(driver, ["Save", "Submit", "Update", "Confirm"])
-    if save_btn:
-        print("Clicking save...")
-        driver.execute_script("arguments[0].click()", save_btn)
-        time.sleep(3)
-        calls = get_api_calls(driver)
-        print(f"Captured {len(calls)} API calls")
-        for c in calls:
-            print(f"  {c['method']:4s} {c.get('status','?')} {c['url'][:80]}")
-        return calls
-    else:
-        print("No save button found")
-        return []
-
-
-def main():
-    driver = get_driver()
-    try:
-        blog_calls = discover_blog(driver)
-        interview_calls = discover_interview(driver)
-        out = {
-            "blog": blog_calls,
-            "interview": interview_calls,
-            "timestamp": time.time(),
-        }
-        Path("rm_traffic/blog_interview_endpoints.json").write_text(
-            json.dumps(out, indent=2, default=str)
-        )
-        print("\nSaved to rm_traffic/blog_interview_endpoints.json")
-    finally:
-        driver.quit()
-
-
-if __name__ == "__main__":
-    main()
+{
+  "profile_url": "https://www.rentmasseur.com/karpathianwolf",
+  "username": "karpathianwolf",
+  "name": "KARPATHIAN WOLF",
+  "real_name": "Joseph",
+  "location": "Manhattan, NYC",
+  "experience_years": 7,
+  "profile_views": "74,000+",
+  "specialties": ["deep tissue massage", "sports recovery"],
+  "booking_link": "rebrand.ly/carpathianwolf",
+  "prices": {"incall": "$199", "outcall": "$269"},
+  "reviews": [
+    {
+      "author": "Drimosh",
+      "text": "I expected a good massage. Got something way more precise. Joseph doesn't guess—he knows where the tension is and actually fixes it. Left feeling looser than I have in a long time."
+    },
+    {
+      "author": "japurich",
+      "text": "I consider myself strong. I lift. I do cardio. I handle my own. But whatever Joseph did? Different league. His technique was like a high-stakes action movie—except instead of explosions, it was knots."
+    },
+    {
+      "author": "alexisom",
+      "text": "Didn't even get to settle in before my body started unraveling. I thought I was tense from today—turns out, this was tension from years ago. Pressure hit just right."
+    }
+  ],
+  "bio_voice": "witty, confident, specific, anti-woo-woo, Ukrainian, professional but funny",
+  "bio_themes": ["desk goblins", "gym animals", "frequent flyers", "startup founders", "shoulders as earrings", "find the knot / negotiate / defeat", "no crystals / no energy portals / no mercury retrograde", "large Ukrainian guy", "body keeps score / Wolf audits the books"],
+  "issue": "Generic LLM bio was pasted AFTER the real bio on the live profile, diluting the strong original voice"
+}
 
 ```
 
-bio_ml_trainer.py:
+live_bio.md:
 ```
-"""
-Real ML training pipeline for bio performance prediction.
-
-Includes:
-- k-fold cross-validation
-- backpropagation with Adam-like optimizer
-- walk-forward validation
-- online training loop
-- metrics: MAE, RMSE, R^2
-"""
-
-import json
-import logging
-import pickle
-from pathlib import Path
-from typing import Dict, List, Tuple
-
-import numpy as np
-
-from .bio_features import feature_vector
-from .bio_generator import _score_variant
-from .bio_appraiser import load_bios
-
-log = logging.getLogger("profileops.ml_trainer")
-
-MODEL_PATH = Path(__file__).parent / "data" / "models" / "bio_ml_model.pkl"
-
-
-class MLP:
-    """MLP with Adam optimizer and dropout."""
-
-    def __init__(self, input_size: int, hidden_size: int = 32, output_size: int = 3,
-                 seed: int = 42, dropout: float = 0.2):
-        rng = np.random.default_rng(seed)
-        self.W1 = rng.normal(0, np.sqrt(2.0 / input_size), (input_size, hidden_size))
-        self.b1 = np.zeros((1, hidden_size))
-        self.W2 = rng.normal(0, np.sqrt(2.0 / hidden_size), (hidden_size, output_size))
-        self.b2 = np.zeros((1, output_size))
-        self.dropout = dropout
-
-        # Adam moments
-        self.mW1 = np.zeros_like(self.W1)
-        self.vW1 = np.zeros_like(self.W1)
-        self.mb1 = np.zeros_like(self.b1)
-        self.vb1 = np.zeros_like(self.b1)
-        self.mW2 = np.zeros_like(self.W2)
-        self.vW2 = np.zeros_like(self.W2)
-        self.mb2 = np.zeros_like(self.b2)
-        self.vb2 = np.zeros_like(self.b2)
-        self.t = 0
-
-    def _relu(self, x):
-        return np.maximum(0, x)
-
-    def _sigmoid(self, x):
-        return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
-
-    def forward(self, X, training=False):
-        self.z1 = X @ self.W1 + self.b1
-        self.a1 = self._relu(self.z1)
-        if training and self.dropout > 0:
-            self.mask = (np.random.rand(*self.a1.shape) > self.dropout).astype(float)
-            self.a1 *= self.mask / (1 - self.dropout)
-        self.z2 = self.a1 @ self.W2 + self.b2
-        self.a2 = self._sigmoid(self.z2)
-        return self.a2
-
-    def backward(self, X, y, y_pred, lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8):
-        self.t += 1
-        m = X.shape[0]
-
-        dz2 = (y_pred - y) / m
-        dW2 = self.a1.T @ dz2
-        db2 = np.sum(dz2, axis=0, keepdims=True)
-
-        da1 = dz2 @ self.W2.T
-        if self.dropout > 0:
-            da1 *= self.mask
-        dz1 = da1 * (self.z1 > 0)
-        dW1 = X.T @ dz1
-        db1 = np.sum(dz1, axis=0, keepdims=True)
-
-        # Adam update
-        for dW, mW, vW, W in [(dW1, self.mW1, self.vW1, self.W1),
-                                (db1, self.mb1, self.vb1, self.b1),
-                                (dW2, self.mW2, self.vW2, self.W2),
-                                (db2, self.mb2, self.vb2, self.b2)]:
-            mW[:] = beta1 * mW + (1 - beta1) * dW
-            vW[:] = beta2 * vW + (1 - beta2) * (dW ** 2)
-            m_hat = mW / (1 - beta1 ** self.t)
-            v_hat = vW / (1 - beta2 ** self.t)
-            W -= lr * m_hat / (np.sqrt(v_hat) + eps)
-
-    def train_epoch(self, X, y, lr=0.01, batch_size=64):
-        n = X.shape[0]
-        indices = np.random.permutation(n)
-        total_loss = 0
-        for i in range(0, n, batch_size):
-            idx = indices[i:i+batch_size]
-            Xb = X[idx]
-            yb = y[idx]
-            y_pred = self.forward(Xb, training=True)
-            loss = np.mean((y_pred - yb) ** 2)
-            total_loss += loss * len(idx)
-            self.backward(Xb, yb, y_pred, lr=lr)
-        return total_loss / n
-
-    def predict(self, X):
-        return self.forward(X, training=False)
-
-    def save(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as f:
-            pickle.dump(self, f)
-
-    @staticmethod
-    def load(path: Path):
-        with open(path, "rb") as f:
-            return pickle.load(f)
-
-
-def build_dataset(bios: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
-    """Build feature matrix X and label matrix y from bios."""
-    X, y = [], []
-    for bio in bios:
-        X.append(feature_vector(bio["headline"], bio["description"]))
-        scores = _score_variant(bio["headline"], bio["description"])
-        # Synthetic labels: realistic CTR/email/phone
-        ctr = min(0.08, scores["composite"] * 0.08 + 0.01)
-        email = min(0.05, scores["composite"] * 0.05 + 0.005)
-        phone = min(0.03, scores["composite"] * 0.03 + 0.003)
-        y.append([ctr, email, phone])
-    return np.array(X), np.array(y)
-

@@ -1,800 +1,800 @@
-                    author_id = tweet.get("author_id", "")
-                    user = users.get(author_id, {})
-                    text = tweet.get("text", "")
-                    if len(text) < 10:
-                        continue
-                    tweets.append({
-                        "platform": "x",
-                        "subreddit": None,
-                        "author": user.get("username", "unknown"),
-                        "title": text[:100],
-                        "body": text,
-                        "url": f"https://x.com/{user.get('username', 'i')}/status/{tweet.get('id', '')}",
-                        "score": tweet.get("public_metrics", {}).get("like_count", 0),
-                        "created_utc": None,
-                        "metadata": {
-                            "query": query,
-                            "public_metrics": tweet.get("public_metrics", {}),
-                            "author_name": user.get("name", ""),
-                        },
-                    })
-                log.info(f"X.com query '{query[:40]}': scraped")
-            except Exception as e:
-                log.error(f"X.com query '{query[:40]}': {e}")
-
-    except Exception as e:
-        log.error(f"X.com scraping failed: {e}")
-
-    log.info(f"X.com: {len(tweets)} tweets scraped from {len(X_QUERIES)} queries")
-    return tweets
-
-
-# ═══════════════════════════════════════════════════════════════
-# LLM Classification + Response Generation
-# ═══════════════════════════════════════════════════════════════
-
-def classify_intent(post: Dict) -> Tuple[str, float]:
-    """Use LLM to classify post intent. Returns (intent, confidence)."""
-    try:
-        from rm_traffic.llm_client import generate_with_fallback
-
-        prompt = INTENT_PROMPT.format(
-            title=post.get("title", "")[:200],
-            body=post.get("body", "")[:500],
-        )
-        response = generate_with_fallback(prompt, max_tokens=20)
-        if not response:
-            return ("unclassified", 0.0)
-
-        intent = response.strip().lower().replace(" ", "_")
-        valid_intents = {"seeking_massage", "looking_for_therapist", "pain_relief",
-                         "sports_recovery", "not_relevant"}
-        if intent not in valid_intents:
-            for vi in valid_intents:
-                if vi in intent:
-                    intent = vi
-                    break
-            else:
-                intent = "not_relevant"
-
-        confidence = 0.85 if intent != "not_relevant" else 0.90
-        return (intent, confidence)
-    except Exception as e:
-        log.error(f"LLM classification failed: {e}")
-        return ("unclassified", 0.0)
-
-
-def generate_response(post: Dict) -> Optional[str]:
-    """Use LLM to generate a personalized, non-spammy response."""
-    try:
-        from rm_traffic.llm_client import generate_with_fallback
-
-        prompt = RESPONSE_PROMPT.format(post=post.get("body", post.get("title", ""))[:500])
-        response = generate_with_fallback(prompt, max_tokens=200)
-        if response and len(response.strip()) > 10:
-            return response.strip()
-        return None
-    except Exception as e:
-        log.error(f"LLM response generation failed: {e}")
-        return None
-
-
-# ═══════════════════════════════════════════════════════════════
-# Main Tunnel Cycle
-# ═══════════════════════════════════════════════════════════════
-
-HIGH_INTENT = {"seeking_massage", "looking_for_therapist", "pain_relief", "sports_recovery"}
-
-
-def run_tunnel_cycle(cycle_num: int = 0, platforms: str = "all") -> Dict:
-    """Run one full social traffic tunnel cycle."""
-    init_db()
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-
-    stats = {
-        "cycle": cycle_num,
-        "timestamp": _ts(),
-        "platforms": platforms,
-        "posts_scraped": 0,
-        "leads_stored": 0,
-        "leads_classified": 0,
-        "high_intent": 0,
-        "responses_generated": 0,
-        "duplicates_skipped": 0,
-        "errors": 0,
-        "by_platform": {},
-        "by_intent": {},
-    }
-
-    all_posts = []
-    if platforms in ("all", "reddit"):
-        reddit_posts = scrape_reddit()
-        all_posts.extend(reddit_posts)
-        stats["by_platform"]["reddit"] = len(reddit_posts)
-
-    if platforms in ("all", "x"):
-        x_posts = scrape_x()
-        all_posts.extend(x_posts)
-        stats["by_platform"]["x"] = len(x_posts)
-
-    stats["posts_scraped"] = len(all_posts)
-
-    if not all_posts:
-        log.info("No posts scraped — nothing to do")
-        conn.close()
-        receipt_id = write_receipt(stats)
-        stats["receipt_id"] = receipt_id
-        return stats
-
-    for post in all_posts:
-        lead = dict(post)
-        stored = store_lead(conn, lead)
-        if not stored:
-            stats["duplicates_skipped"] += 1
-            continue
-        stats["leads_stored"] += 1
-
-        intent, confidence = classify_intent(post)
-        lead["intent"] = intent
-        lead["confidence"] = confidence
-        stats["leads_classified"] += 1
-        stats["by_intent"][intent] = stats["by_intent"].get(intent, 0) + 1
-
-        c_hash = _hash(f"{lead['platform']}:{lead.get('url', '')}:{lead.get('title', '')}")
-        conn.execute(
-            "UPDATE leads SET intent=?, confidence=? WHERE content_hash=?",
-            (intent, confidence, c_hash),
-        )
-
-        if intent in HIGH_INTENT:
-            stats["high_intent"] += 1
-            response = generate_response(post)
-            if response:
-                lead["generated_response"] = response
-                stats["responses_generated"] += 1
-                conn.execute(
-                    "UPDATE leads SET generated_response=?, status='response_ready' WHERE content_hash=?",
-                    (response, c_hash),
-                )
-                log.info(f"  ◆ {lead['platform']}/{lead.get('subreddit', '?')}: intent={intent} response generated ({len(response)} chars)")
-            else:
-                conn.execute(
-                    "UPDATE leads SET status='high_intent' WHERE content_hash=?",
-                    (c_hash,),
-                )
-                log.info(f"  ▲ {lead['platform']}/{lead.get('subreddit', '?')}: intent={intent} (no response)")
-        else:
-            conn.execute(
-                "UPDATE leads SET status='low_intent' WHERE content_hash=?",
-                (c_hash,),
-            )
-
-    conn.commit()
-
-    conn.execute(
-        "INSERT INTO tunnel_cycles (cycle_num, platform, posts_scraped, leads_classified, "
-        "high_intent, responses_generated, errors, timestamp) VALUES (?,?,?,?,?,?,?,?)",
-        (cycle_num, platforms, stats["posts_scraped"], stats["leads_classified"],
-         stats["high_intent"], stats["responses_generated"], stats["errors"], _ts()),
-    )
-    conn.commit()
-    conn.close()
-
-    receipt_id = write_receipt(stats)
-    stats["receipt_id"] = receipt_id
-
-    log.info(f"  ═══ Social Tunnel Cycle {cycle_num} Complete ═══")
-    log.info(f"  Scraped: {stats['posts_scraped']} | Stored: {stats['leads_stored']} | Duplicates: {stats['duplicates_skipped']}")
-    log.info(f"  Classified: {stats['leads_classified']} | High intent: {stats['high_intent']} | Responses: {stats['responses_generated']}")
-    log.info(f"  By intent: {json.dumps(stats['by_intent'])}")
-    log.info(f"  Receipt: {receipt_id}")
-
-    return stats
-
-
-def show_stats():
-    """Show tunnel statistics."""
-    init_db()
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-
-    total = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
-    by_platform = {r["platform"]: r["count"] for r in conn.execute(
-        "SELECT platform, COUNT(*) as count FROM leads GROUP BY platform").fetchall()}
-    by_intent = {r["intent"]: r["count"] for r in conn.execute(
-        "SELECT intent, COUNT(*) as count FROM leads GROUP BY intent").fetchall()}
-    by_status = {r["status"]: r["count"] for r in conn.execute(
-        "SELECT status, COUNT(*) as count FROM leads GROUP BY status").fetchall()}
-    cycles = conn.execute("SELECT COUNT(*) FROM tunnel_cycles").fetchone()[0]
-    recent_cycles = [dict(r) for r in conn.execute(
-        "SELECT * FROM tunnel_cycles ORDER BY timestamp DESC LIMIT 5").fetchall()]
-
-    print(f"\n  ═══ Social Traffic Tunnel Stats ═══")
-    print(f"  Total leads: {total}")
-    print(f"  Total cycles: {cycles}")
-    print(f"  By platform: {json.dumps(by_platform, indent=2)}")
-    print(f"  By intent: {json.dumps(by_intent, indent=2)}")
-    print(f"  By status: {json.dumps(by_status, indent=2)}")
-    print(f"  Recent cycles:")
-    for c in recent_cycles:
-        print(f"    ◉ cycle {c['cycle_num']}: {c['platform']} | scraped={c['posts_scraped']} "
-              f"classified={c['leads_classified']} high_intent={c['high_intent']} "
-              f"responses={c['responses_generated']}")
-
-    high_intent_leads = [dict(r) for r in conn.execute(
-        "SELECT platform, subreddit, author, title, intent, generated_response, url, created_at "
-        "FROM leads WHERE status='response_ready' ORDER BY created_at DESC LIMIT 10").fetchall()]
-    if high_intent_leads:
-        print(f"\n  ═══ Recent High-Intent Leads (response ready) ═══")
-        for lead in high_intent_leads:
-            print(f"  ◉ [{lead['platform']}] {lead.get('subreddit', '')} — {lead['title'][:60]}")
-            print(f"    intent: {lead['intent']} | author: {lead['author']}")
-            print(f"    url: {lead['url']}")
-            if lead["generated_response"]:
-                print(f"    response: {lead['generated_response'][:120]}...")
-            print()
-
-    conn.close()
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Social Traffic Tunnel — Reddit + X.com")
-    parser.add_argument("--reddit", action="store_true", help="Scrape Reddit only")
-    parser.add_argument("--x", action="store_true", help="Scrape X.com only")
-    parser.add_argument("--stats", action="store_true", help="Show statistics")
-    parser.add_argument("--cycle", type=int, default=0, help="Cycle number")
-    args = parser.parse_args()
-
-    if args.stats:
-        show_stats()
-        return
-
-    platforms = "all"
-    if args.reddit and not args.x:
-        platforms = "reddit"
-    elif args.x and not args.reddit:
-        platforms = "x"
-
-    run_tunnel_cycle(cycle_num=args.cycle, platforms=platforms)
-
-
-if __name__ == "__main__":
-    main()
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
 ```
 
-bio_scraper.py:
+pipeline_20260716_001310.json:
 ```
-"""
-Scrape real bios from RentMasseur search results.
-Uses the verified POST /api/v1/search endpoint.
-"""
-
-import json
-import logging
-import time
-from pathlib import Path
-from typing import Dict, List
-
-from .api_client import RentMasseurAPI
-
-log = logging.getLogger("profileops.scraper")
-
-CITIES = [
-    # NY
-    "manhattan-ny", "brooklyn-ny", "queens-ny", "bronx-ny", "staten-island-ny",
-    "long-island-ny", "rochester-ny", "buffalo-ny", "albany-ny", "syracuse-ny",
-    # NJ
-    "jersey-city-nj", "hoboken-nj", "newark-nj", "atlantic-city-nj", "princeton-nj",
-    # MA
-    "boston-ma", "cambridge-ma", "provincetown-ma", "springfield-ma", "worcester-ma",
-    # PA
-    "philadelphia-pa", "pittsburgh-pa", "allentown-pa",
-    # IL
-    "chicago-il", "springfield-il",
-    # CA
-    "los-angeles-ca", "san-francisco-ca", "san-diego-ca", "sacramento-ca",
-    "san-jose-ca", "oakland-ca", "long-beach-ca", "fresno-ca", "palm-springs-ca",
-    "palm-desert-ca", "west-hollywood-ca", "berkeley-ca", "pasadena-ca",
-    # FL
-    "miami-fl", "fort-lauderdale-fl", "orlando-fl", "tampa-fl", "jacksonville-fl",
-    "key-west-fl", "st-petersburg-fl", "naples-fl", "west-palm-beach-fl",
-    # GA
-    "atlanta-ga", "savannah-ga",
-    # TX
-    "dallas-tx", "houston-tx", "austin-tx", "san-antonio-tx", "fort-worth-tx",
-    # DC
-    "washington-dc",
-    # WA
-    "seattle-wa", "tacoma-wa", "spokane-wa",
-    # NV
-    "las-vegas-nv", "reno-nv",
-    # CO
-    "denver-co", "boulder-co", "aspen-co", "colorado-springs-co",
-    # AZ
-    "phoenix-az", "tucson-az", "scottsdale-az",
-    # OR
-    "portland-or", "eugene-or",
-    # OH
-    "columbus-oh", "cleveland-oh", "cincinnati-oh",
-    # MI
-    "detroit-mi", "grand-rapids-mi",
-    # MN
-    "minneapolis-mn", "saint-paul-mn",
-    # MO
-    "st-louis-mo", "kansas-city-mo",
-    # TN
-    "nashville-tn", "memphis-tn",
-    # NC
-    "charlotte-nc", "raleigh-nc", "asheville-nc",
-    # SC
-    "charleston-sc", "columbia-sc",
-    # LA
-    "new-orleans-la", "baton-rouge-la",
-    # IN
-    "indianapolis-in",
-    # WI
-    "milwaukee-wi", "madison-wi",
-    # CT
-    "hartford-ct", "new-haven-ct",
-    # RI
-    "providence-ri",
-    # MD
-    "baltimore-md",
-    # VA
-    "richmond-va", "norfolk-va",
-    # KY
-    "louisville-ky",
-    # NM
-    "albuquerque-nm", "santa-fe-nm",
-    # UT
-    "salt-lake-city-ut",
-    # ID
-    "boise-id",
-    # OK
-    "oklahoma-city-ok", "tulsa-ok",
-    # KS
-    "wichita-ks",
-    # NE
-    "omaha-ne",
-    # IA
-    "des-moines-ia",
-    # AR
-    "little-rock-ar",
-    # MS
-    "jackson-ms",
-    # AL
-    "birmingham-al",
-    # ME
-    "portland-me",
-    # NH
-    "manchester-nh",
-    # VT
-    "burlington-vt",
-    # DE
-    "wilmington-de",
-    # HI
-    "honolulu-hi",
-    # AK
-    "anchorage-ak",
-    # Canada
-    "toronto-on", "montreal-qc", "vancouver-bc", "ottawa-on",
-    # UK
-    "london", "manchester",
-    # Other
-    "providence-ri", "buffalo-ny",
-]
-
-OUTPUT_PATH = Path(__file__).parent / "data" / "real_bios.jsonl"
-
-
-def search_city(api: RentMasseurAPI, city: str, page: int = 1) -> Dict:
-    """Search a city and return results."""
-    return api.search(city=city, page=page)
-
-
-def extract_bios_from_results(results: Dict, city: str = "") -> List[Dict]:
-    """Extract bio data from search results."""
-    bios = []
-    users = results.get("users", [])
-    if isinstance(users, dict):
-        users = users.get("list", users.get("data", []))
-    for user in users:
-        if not isinstance(user, dict):
-            continue
-        headline = user.get("headline", "")
-        description = user.get("description", "")
-        if not description and not headline:
-            continue
-        card = user.get("userCard", {})
-        bios.append({
-            "id": card.get("userId", ""),
-            "username": card.get("username", ""),
-            "city": city or card.get("searchCity", card.get("location", "")),
-            "headline": headline,
-            "description": description,
-            "isAvailable": card.get("status", {}).get("available", 0),
-            "isGold": card.get("isGold", 0),
-            "ratingAverage": user.get("ratingAverage", ""),
-            "reviewsCount": user.get("reviewsCount", 0),
-            "isCertified": user.get("isCertified", 0),
-            "services": user.get("services", []),
-            "distance": user.get("distance", 0),
-            "travels": user.get("travels", []),
-        })
-    return bios
-
-
-def scrape_all_cities(api: RentMasseurAPI, max_pages: int = 10, delay: float = 0.8) -> List[Dict]:
-    """Scrape bios from all cities, deep paging."""
-    all_bios = []
-    seen_ids = set()
-
-    for city in CITIES:
-        log.info("Scraping %s...", city)
-        for page in range(1, max_pages + 1):
-            try:
-                results = search_city(api, city, page)
-                bios = extract_bios_from_results(results, city)
-                if not bios:
-                    break
-                new_count = 0
-                for bio in bios:
-                    if bio["id"] and bio["id"] not in seen_ids:
-                        seen_ids.add(bio["id"])
-                        all_bios.append(bio)
-                        new_count += 1
-                log.info("  %s p%d: %d bios (%d new, total %d)", city, page, len(bios), new_count, len(all_bios))
-                if new_count == 0:
-                    break
-                time.sleep(delay)
-            except Exception as e:
-                log.error("  Error on %s page %d: %s", city, page, e)
-                break
-
-    log.info("Scraped %d unique bios from %d cities", len(all_bios), len(CITIES))
-    return all_bios
-
-
-def save_bios(bios: List[Dict], path: Path = OUTPUT_PATH):
-    """Save bios to JSONL."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for bio in bios:
-            f.write(json.dumps(bio, default=str) + "\n")
-    log.info("Saved %d bios to %s", len(bios), path)
-
-
-def rank_by_engagement(bios: List[Dict]) -> List[Dict]:
-    """Rank bios by engagement proxy: reviews * rating."""
-    def score(b):
-        try:
-            rating = float(b.get("ratingAverage", 0) or 0)
-        except (ValueError, TypeError):
-            rating = 0
-        reviews = b.get("reviewsCount", 0) or 0
-        return rating * reviews
-    return sorted(bios, key=score, reverse=True)
-
-
-def save_ranked_report(bios: List[Dict], path: Path = None):
-    """Save a ranked report of all bios by engagement."""
-    if path is None:
-        path = Path(__file__).parent / "data" / "real_bios_ranked.txt"
-    ranked = rank_by_engagement(bios)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for i, b in enumerate(ranked):
-            try:
-                rating = float(b.get("ratingAverage", 0) or 0)
-            except (ValueError, TypeError):
-                rating = 0
-            reviews = b.get("reviewsCount", 0) or 0
-            engagement = rating * reviews
-            f.write(f"#{i+1} | {b['username']} | {b['city']} | ⭐{rating} | {reviews} reviews | engagement={engagement}\n")
-            f.write(f"  Headline: {b['headline']}\n")
-            desc = b['description'].replace('\n', ' | ')[:500]
-            f.write(f"  Desc: {desc}\n")
-            f.write(f"  Services: {b.get('services', [])}\n")
-            f.write(f"  Gold: {b.get('isGold', 0)} | Avail: {b.get('isAvailable', 0)} | Certified: {b.get('isCertified', 0)}\n")
-            f.write("\n")
-    log.info("Ranked report saved to %s", path)
-    return path
-
-
-def scrape_and_save(api: RentMasseurAPI, max_pages: int = 10, delay: float = 0.8) -> int:
-    """Full scrape pipeline with ranking."""
-    bios = scrape_all_cities(api, max_pages=max_pages, delay=delay)
-    save_bios(bios)
-    save_ranked_report(bios)
-    return len(bios)
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-16T00:13:10Z",
+  "run_id": "29460598598",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
 ```
 
-bio_generator:
+rotation_20260709_152933.json:
 ```
-Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
-```
-
-traffic.log:
-```
-2026-06-25 15:28:57,528 [INFO] DB initialized at /Users/alep/Downloads/windsurf-smoke/rm_traffic/traffic.db
-2026-06-25 15:28:57,528 [INFO] === Single cycle ===
-2026-06-25 15:28:58,229 [INFO] Browser started (profile: /tmp/rm_traffic_chrome)
-2026-06-25 15:28:58,229 [INFO] Logging in as karpathianwolf...
-2026-06-25 15:29:12,920 [INFO] Login successful. URL: https://rentmasseur.com/
-
-```
-
-state.py:
-```
-"""
-State Snapshotter — capture complete profile state.
-"""
-
-import json
-from pathlib import Path
-from typing import Dict
-from datetime import datetime, timezone
-
-from .api_client import RentMasseurAPI
-
-SNAPSHOT_DIR = Path(__file__).parent / "data" / "profile_snapshots"
-
-
-def snapshot_state(api: RentMasseurAPI) -> Dict:
-    """Capture a full snapshot of profile state."""
-    state = api.full_status()
-    state["timestamp"] = datetime.now(timezone.utc).isoformat()
-    return state
-
-
-def save_snapshot(state: Dict, snapshot_dir: Path = SNAPSHOT_DIR):
-    """Save a snapshot to disk for forensic rollback."""
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    ts = state["timestamp"].replace(":", "-")
-    path = snapshot_dir / f"snapshot_{ts}.json"
-    path.write_text(json.dumps(state, indent=2, default=str))
-    return path
-
-
-def load_latest_snapshot(snapshot_dir: Path = SNAPSHOT_DIR) -> Dict:
-    """Load the most recent snapshot."""
-    files = sorted(snapshot_dir.glob("snapshot_*.json"), reverse=True)
-    if not files:
-        return {}
-    return json.loads(files[0].read_text())
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-09T15:29:33Z",
+  "run_id": "29029107301",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29029107301"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260709_152933.json ",
+  "status": "completed"
+}
 
 ```
 
-engine.py:
+metrics_20260714_223452.json:
 ```
-"""
-RentMasseur Traffic Engine — persistent daemon that:
-1. Maintains authenticated session (re-login on expiry)
-2. Auto-refreshes availability before expiry (default: every 55 min)
-3. Tracks profile stats (views, contacts, online bookmarks)
-4. Logs search position for target city
-5. Persists everything to SQLite for trend analysis
-6. Sends alerts on status changes (visibility, membership, ranking drops)
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-14T22:34:52.484607+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-Usage:
-    python -m rm_traffic.engine                    # run daemon
-    python -m rm_traffic.engine --once              # single cycle
-    python -m rm_traffic.engine --stats             # print stats summary
-    python -m rm_traffic.engine --watch "Manhattan, NY"  # track search position
-"""
+kpi_2026-07-07T21-54-33.445066-00-00.json:
+```
+{
+  "id": "kpi_1783461273",
+  "timestamp": "2026-07-07T21:54:33.445066+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-07T21:54:33.444990+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-import argparse
-import json
-import os
-import re
-import sqlite3
-import subprocess
-import sys
-import time
-import logging
-from datetime import datetime, timezone
-from pathlib import Path
+metrics_20260706_164848.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-06T16:48:48.494967+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-# Selenium
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.common.exceptions import (
-    StaleElementReferenceException,
-    NoSuchElementException,
-    TimeoutException,
-    WebDriverException,
-)
+metrics_20260712_223344.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-12T22:33:44.866311+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+kpi_2026-07-26T00-28-17.691285-00-00.json:
+```
+{
+  "id": "kpi_1785025697",
+  "timestamp": "2026-07-26T00:28:17.691285+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-26T00:28:17.691190+00:00",
+    "immortality": {
+      "score": 0.125,
+      "grade": "DECLINING",
+      "components": {
+        "days_online": 0,
+        "views_per_day": 0,
+        "profile_age_score": 0,
+        "views_per_day_trend": 0.5,
+        "visibility_persistence": 0.0,
+        "availability_stability": 0.0,
+        "retention_score": 0
+      }
+    },
+    "virality": {
+      "score": 0.0,
+      "grade": "STAGNANT",
+      "components": {
+        "profile_views": 0,
+        "views_velocity": 0,
+        "views_acceleration": 0,
+        "contact_clicks": 0,
+        "contact_click_velocity": 0,
+        "new_visits": 0,
+        "new_visitor_rate": 0,
+        "online_bookmarks": 0,
+        "bookmark_rate": 0,
+        "new_emails": 0,
+        "email_rate": 0,
+        "contact_click_rate": 0
+      }
+    },
+    "metrics_snapshots_used": 1
+  },
+  "prev_fingerprint": "ceeb39cbb9d594bb1be37fab0fd6cf3607a5195c3267d98bf6b8fd28b0a6a7d6",
+  "chain_index": 9,
+  "fingerprint": "d1788a2fc32938921fb62be06976e34409238c605719cacdb367207b6e67737f"
+}
+```
 
-USERNAME = "karpathianwolf"
-PASSWORD = os.environ.get("RM_PASSWORD", "")
-BASE_URL = "https://rentmasseur.com"
-DB_PATH = Path(__file__).parent / "traffic.db"
-LOG_PATH = Path(__file__).parent / "traffic.log"
-CHROME_PROFILE = "/tmp/rm_traffic_chrome"
-REFRESH_INTERVAL = 55 * 60  # 55 minutes — refresh before 1h expiry
-STAT_INTERVAL = 5 * 60      # check stats every 5 min
-SEARCH_CHECK_INTERVAL = 30 * 60  # check search position every 30 min
+metrics_20260719_001140.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-19T00:11:40.299633+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+kpi_2026-06-30T20-52-08.508262-00-00.json:
+```
+{
+  "id": "kpi_1782852728",
+  "timestamp": "2026-06-30T20:52:08.508262+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-30T20:52:08.508179+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger("rm_traffic")
+kpi_2026-07-04T05-06-14.135385-00-00.json:
+```
+{
+  "id": "kpi_1783141574",
+  "timestamp": "2026-07-04T05:06:14.135385+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-04T05:06:14.135298+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
+rotation_20260715_140159.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-15T14:01:59Z",
+  "run_id": "29421051249",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29421051249"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260715_140159.json ",
+  "status": "completed"
+}
 
-def db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+```
 
-def init_db():
-    conn = db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS availability_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        action TEXT NOT NULL,
-        status TEXT,
-        hours INTEGER,
-        minutes INTEGER,
-        duration_set INTEGER,
-        success INTEGER,
-        detail TEXT
-    );
-    CREATE TABLE IF NOT EXISTS stats_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        profile_views INTEGER,
-        contact_clicks INTEGER,
-        online_bookmarks INTEGER,
-        who_saw_me INTEGER,
-        membership_status TEXT,
-        visibility TEXT,
-        availability_status TEXT,
-        availability_remaining TEXT
-    );
-    CREATE TABLE IF NOT EXISTS search_position (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        city TEXT NOT NULL,
-        position INTEGER,
-        total_results INTEGER,
-        available_now INTEGER,
-        username TEXT
-    );
-    CREATE TABLE IF NOT EXISTS alerts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        type TEXT NOT NULL,
-        severity TEXT,
-        message TEXT,
-        acknowledged INTEGER DEFAULT 0
-    );
-    CREATE INDEX IF NOT EXISTS idx_avail_ts ON availability_log(ts);
-    CREATE INDEX IF NOT EXISTS idx_stats_ts ON stats_log(ts);
-    CREATE INDEX IF NOT EXISTS idx_search_ts ON search_position(ts);
-    """)
-    conn.commit()
-    conn.close()
-    log.info("DB initialized at %s", DB_PATH)
+pipeline_20260724_043429.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-24T04:34:29Z",
+  "run_id": "30066927362",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
-def log_availability(action, status=None, hours=None, minutes=None,
-                     duration_set=None, success=True, detail=""):
-    conn = db()
-    conn.execute(
-        "INSERT INTO availability_log (ts, action, status, hours, minutes, duration_set, success, detail) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), action, status, hours, minutes,
-         duration_set, int(success), detail)
-    )
-    conn.commit()
-    conn.close()
+```
 
-def log_stats(views, contacts, bookmarks, who_saw, membership, visibility,
-              avail_status, avail_remaining):
-    conn = db()
-    conn.execute(
-        "INSERT INTO stats_log (ts, profile_views, contact_clicks, online_bookmarks, "
-        "who_saw_me, membership_status, visibility, availability_status, availability_remaining) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), views, contacts, bookmarks,
-         who_saw, membership, visibility, avail_status, avail_remaining)
-    )
-    conn.commit()
-    conn.close()
+kpi_2026-07-05T10-40-48.750062-00-00.json:
+```
+{
+  "id": "kpi_1783248048",
+  "timestamp": "2026-07-05T10:40:48.750062+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-05T10:40:48.749969+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-def log_search_position(city, position, total, available_now, username):
-    conn = db()
-    conn.execute(
-        "INSERT INTO search_position (ts, city, position, total_results, available_now, username) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), city, position, total, available_now, username)
-    )
-    conn.commit()
-    conn.close()
+kpi_2026-07-22T18-07-06.737095-00-00.json:
+```
+{
+  "id": "kpi_1784743626",
+  "timestamp": "2026-07-22T18:07:06.737095+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-22T18:07:06.737012+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-def log_alert(atype, severity, message):
-    conn = db()
-    conn.execute(
-        "INSERT INTO alerts (ts, type, severity, message) VALUES (?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), atype, severity, message)
-    )
-    conn.commit()
-    conn.close()
-    log.warning("ALERT [%s] %s: %s", severity, atype, message)
+metrics_20260721_203851.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-21T20:38:51.885058+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-# ---------------------------------------------------------------------------
-# Browser
-# ---------------------------------------------------------------------------
+rotation_20260719_220705.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-19T22:07:05Z",
+  "run_id": "29705285433",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29705285433"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260719_220705.json ",
+  "status": "completed"
+}
 
-class Browser:
-    """Managed Chrome instance with session persistence."""
+```
 
-    def __init__(self):
-        self.driver = None
-        self.logged_in = False
-        self.last_login = 0
+pipeline_20260722_165849.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-22T16:58:49Z",
+  "run_id": "29940007747",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
-    def start(self):
-        opts = Options()
-        opts.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument(f"--user-data-dir={CHROME_PROFILE}")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        self.driver = webdriver.Chrome(options=opts)
-        # Remove webdriver flag
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        })
-        log.info("Browser started (profile: %s)", CHROME_PROFILE)
+```
 
-    def stop(self):
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-        self.driver = None
-        self.logged_in = False
-        log.info("Browser stopped")
+metrics_20260718_124107.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-18T12:41:07.958355+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-    def _dismiss_popups(self):
-        time.sleep(1)
-        for xpath in [
-            "//button[contains(text(),'Not now')]",
-            "//button[contains(text(),'Accept all')]",
-            "//button[contains(text(),'Close')]",
-            "//*[contains(@aria-label,'Close')]",
-        ]:
-            try:
-                for el in self.driver.find_elements(By.XPATH, xpath):
-                    if el.is_displayed():
-                        el.click()
-                        time.sleep(0.5)
-            except Exception:
-                pass
+metrics_20260718_001846.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-18T00:18:46.068203+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
+kpi_2026-07-01T08-44-55.226397-00-00.json:
+```
+{
+  "id": "kpi_1782895495",
+  "timestamp": "2026-07-01T08:44:55.226397+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-01T08:44:55.226318+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260724_215011.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-24T21:50:11.703453+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+pipeline_20260711_071111.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-11T07:11:11Z",
+  "run_id": "29143928023",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-24T07-13-21.549522-00-00.json:
+```
+{
+  "id": "kpi_1784877201",
+  "timestamp": "2026-07-24T07:13:21.549522+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-24T07:13:21.549407+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260711_135610.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-11T13:56:10Z",
+  "run_id": "29155051379",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+kpi_2026-06-30T23-59-52.790695-00-00.json:
+```
+{
+  "id": "kpi_1782863992",
+  "timestamp": "2026-06-30T23:59:52.790695+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-30T23:59:52.790610+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260706_232642.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-06T23:26:42Z",
+  "run_id": "28830030827",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+pipeline_20260725_213221.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-25T21:32:21Z",
+  "run_id": "30175549188",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+pipeline_20260706_220659.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-06T22:06:59Z",
+  "run_id": "28826284271",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+rotation_20260707_172952.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-07T17:29:52Z",
+  "run_id": "28885332517",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28885332517"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260707_172952.json ",
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-23T18-12-01.474726-00-00.json:
+```
+{
+  "id": "kpi_1784830321",
+  "timestamp": "2026-07-23T18:12:01.474726+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-23T18:12:01.474660+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-07-25T20-10-51.414343-00-00.json:
+```
+{
+  "id": "kpi_1785010251",
+  "timestamp": "2026-07-25T20:10:51.414343+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-25T20:10:51.414260+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260708_234844.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-08T23:48:44Z",
+  "run_id": "28983472367",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+metrics_20260721_162145.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-21T16:21:45.512288+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+metrics_20260718_104321.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-18T10:43:21.798757+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+metrics_20260705_083047.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-05T08:30:47.910796+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+rotation_20260719_134312.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-19T13:43:12Z",
+  "run_id": "29689145664",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29689145664"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260719_134312.json ",
+  "status": "completed"
+}
+
+```
+
+pipeline_20260714_202624.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-14T20:26:24Z",
+  "run_id": "29365381399",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+pipeline_20260718_104321.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-18T10:43:21Z",
+  "run_id": "29641182814",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-16T23-40-44.962352-00-00.json:
+```
+{
+  "id": "kpi_1784245244",
+  "timestamp": "2026-07-16T23:40:44.962352+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-16T23:40:44.962255+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260715_133031.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-15T13:30:31Z",
+  "run_id": "29419122274",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-17T11-57-59.673238-00-00.json:
+```
+{
+  "id": "kpi_1784289479",

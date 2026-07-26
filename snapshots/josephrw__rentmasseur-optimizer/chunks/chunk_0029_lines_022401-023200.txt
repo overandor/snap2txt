@@ -1,187 +1,690 @@
-    if not stats:
-        logger.error("Failed to collect stats")
-        sys.exit(1)
-
-    state = update_rl_state(stats)
-    print(json.dumps({
-        "stats": stats,
-        "should_rotate": state.get("should_rotate", False),
-        "rotate_reason": state.get("rotate_reason", ""),
-        "current_bio": state.get("current_bio_id"),
-        "total_reward": state["bios"].get(state.get("current_bio_id", ""), {}).get("total_reward", 0),
-    }, indent=2))
+    return None
 
 
-if __name__ == "__main__":
-    main()
+def click_first(driver: WebDriver, candidates: list[tuple[str, str]]) -> bool:
+    for by, sel in candidates:
+        el = find_visible(driver, by, sel)
+        if el:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            time.sleep(0.3)
+            driver.execute_script("arguments[0].click();", el)
+            return True
+    return False
+
+
+def get_credentials() -> tuple[str, str]:
+    user = os.getenv("RM_USER") or os.getenv("RENTMASSEUR_USERNAME") or ""
+    pwd = os.getenv("RM_PASS") or os.getenv("RENTMASSEUR_PASSWORD") or ""
+    return user, pwd
 
 ```
 
-settings_avail.png:
+__init__.py:
 ```
-Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
+"""RM Selenium Function Automator — 3-lane CI/CD control plane."""
+
 ```
 
-dashboard.py:
+registry.py:
+```
+"""Function registry — all RM functions declared with risk level and lane."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Dict
+
+
+LANE_AUDIT = "audit"
+LANE_DRY_RUN = "dry_run"
+LANE_EXECUTE_APPROVED = "execute_approved"
+LANE_BLOCKED = "blocked"
+
+
+@dataclass
+class FunctionSpec:
+    name: str
+    lane: str
+    risk: str
+    description: str
+
+
+RM_FUNCTIONS: Dict[str, FunctionSpec] = {
+    # --- audit (read-only, safe on GitHub Actions) ---
+    "login_check": FunctionSpec("login_check", LANE_AUDIT, "low", "Login with first-party credentials, verify session, capture screenshot."),
+    "dashboard_snapshot": FunctionSpec("dashboard_snapshot", LANE_AUDIT, "low", "Read dashboard/settings page, capture signals + screenshot."),
+    "availability_snapshot": FunctionSpec("availability_snapshot", LANE_AUDIT, "low", "Read availability screen, capture state + screenshot."),
+    "profile_snapshot": FunctionSpec("profile_snapshot", LANE_AUDIT, "low", "Read public profile page, capture signals + screenshot."),
+    "search_rank_read": FunctionSpec("search_rank_read", LANE_AUDIT, "low", "Read public search page, find target rank."),
+    "mailbox_read": FunctionSpec("mailbox_read", LANE_AUDIT, "low", "Open mailbox page, capture high-level evidence only."),
+    "who_saw_me_snapshot": FunctionSpec("who_saw_me_snapshot", LANE_AUDIT, "medium", "Read Who Saw Me page, capture visitor count + screenshot."),
+    "blog_read": FunctionSpec("blog_read", LANE_AUDIT, "low", "Open blogs page, capture evidence."),
+    "interview_read": FunctionSpec("interview_read", LANE_AUDIT, "low", "Open interview/settings page, capture evidence."),
+
+    # --- dry_run (form discovery, no submit) ---
+    "bio_field_discovery": FunctionSpec("bio_field_discovery", LANE_DRY_RUN, "medium", "Discover editable bio/about form fields, capture selectors, do NOT submit."),
+    "availability_form_discovery": FunctionSpec("availability_form_discovery", LANE_DRY_RUN, "medium", "Discover availability toggle/form, capture selectors, do NOT submit."),
+    "blog_form_discovery": FunctionSpec("blog_form_discovery", LANE_DRY_RUN, "medium", "Discover blog post form fields, capture selectors, do NOT submit."),
+    "interview_form_discovery": FunctionSpec("interview_form_discovery", LANE_DRY_RUN, "medium", "Discover interview form fields, capture selectors, do NOT submit."),
+
+    # --- execute_approved (submit only with token + candidate file) ---
+    "apply_approved_bio": FunctionSpec("apply_approved_bio", LANE_EXECUTE_APPROVED, "high", "Submit approved bio text from candidate file. Requires approval token + selector proof."),
+    "apply_approved_interview": FunctionSpec("apply_approved_interview", LANE_EXECUTE_APPROVED, "high", "Submit approved interview answers. Requires approval token + selector proof."),
+    "apply_approved_blog": FunctionSpec("apply_approved_blog", LANE_EXECUTE_APPROVED, "high", "Submit approved blog post. Requires approval token + selector proof."),
+    "set_availability": FunctionSpec("set_availability", LANE_EXECUTE_APPROVED, "high", "Set availability on/off. Requires approval token + selector proof."),
+
+    # --- blocked (never allowed) ---
+    "mass_message_users": FunctionSpec("mass_message_users", LANE_BLOCKED, "blocked", "Mass messaging is forbidden per policy."),
+    "captcha_bypass": FunctionSpec("captcha_bypass", LANE_BLOCKED, "blocked", "CAPTCHA solving is forbidden per policy."),
+    "anti_bot_bypass": FunctionSpec("anti_bot_bypass", LANE_BLOCKED, "blocked", "Anti-bot bypass is forbidden per policy."),
+    "fake_availability_loop": FunctionSpec("fake_availability_loop", LANE_BLOCKED, "blocked", "Fake availability loops are forbidden per policy."),
+}
+
+
+def functions_for_lane(lane: str) -> list[str]:
+    return [name for name, spec in RM_FUNCTIONS.items() if spec.lane == lane]
+
+
+def functions_for_mode(mode: str) -> list[str]:
+    if mode == "audit":
+        return functions_for_lane(LANE_AUDIT)
+    elif mode == "dry_run":
+        return functions_for_lane(LANE_AUDIT) + functions_for_lane(LANE_DRY_RUN)
+    elif mode == "execute_approved":
+        return functions_for_lane(LANE_EXECUTE_APPROVED)
+    return []
+
+
+def is_blocked(action: str) -> bool:
+    spec = RM_FUNCTIONS.get(action)
+    return spec is not None and spec.lane == LANE_BLOCKED
+
+
+def action_lane(action: str) -> str:
+    spec = RM_FUNCTIONS.get(action)
+    return spec.lane if spec else ""
+
+```
+
+policy.py:
+```
+"""Policy gate — blocks captcha, mass messaging, unsafe selectors, unapproved actions."""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+
+BLOCK_REASONS = {
+    "captcha_detected": "CAPTCHA or challenge page detected — stopping per policy",
+    "crowdsec_detected": "CrowdSec access control detected — stopping per policy",
+    "human_verification": "Human verification interstitial detected — stopping per policy",
+    "access_forbidden": "Access forbidden detected — stopping per policy",
+    "rate_limited": "Rate limit / too many requests detected — stopping per policy",
+    "lane_blocked": "Action lane is 'blocked' — this function is forbidden",
+    "lane_mismatch": "Requested mode does not cover this action's lane",
+    "no_approval_token": "execute_approved requires RM_APPROVAL_TOKEN — not provided",
+    "approval_token_mismatch": "Approval token does not match RM_APPROVAL_TOKEN secret",
+    "no_candidate_file": "execute_approved requires --candidate-file — not provided",
+    "no_selector_proof": "execute_approved requires prior dry-run selector proof — not found",
+    "cooldown_active": "Action cooldown has not elapsed — refusing to execute",
+    "mass_message_blocked": "Mass messaging is blocked per policy",
+    "unsafe_selector": "Selector pattern is in unsafe list — refused",
+}
+
+
+UNSAFE_SELECTOR_PATTERNS = [
+    "captcha",
+    "g-recaptcha",
+    "cf-turnstile",
+    "hcaptcha",
+    "arkose",
+    "funcaptcha",
+]
+
+
+BLOCK_TEXT_NEEDLES = [
+    ("captcha", "captcha_detected"),
+    ("crowdsec", "crowdsec_detected"),
+    ("verify you are human", "human_verification"),
+    ("access forbidden", "access_forbidden"),
+    ("unusual traffic", "human_verification"),
+    ("too many requests", "rate_limited"),
+]
+
+
+@dataclass
+class PolicyResult:
+    allowed: bool
+    reason: Optional[str] = None
+
+
+def detect_block(page_text: str, current_url: str) -> Optional[str]:
+    txt = (page_text or "").lower()
+    url = (current_url or "").lower()
+    for needle, reason in BLOCK_TEXT_NEEDLES:
+        if needle in txt or needle in url:
+            return reason
+    return None
+
+
+def check_selector_safety(selector: str) -> bool:
+    sel_lower = selector.lower()
+    for pattern in UNSAFE_SELECTOR_PATTERNS:
+        if pattern in sel_lower:
+            return False
+    return True
+
+
+def gate_execute_approved(
+    action: str,
+    approval_token: str,
+    candidate_file: str,
+    selector_proof_dir: str = "debug",
+) -> PolicyResult:
+    if not approval_token:
+        return PolicyResult(False, "no_approval_token")
+    expected = os.getenv("RM_APPROVAL_TOKEN", "")
+    if not expected or approval_token != expected:
+        return PolicyResult(False, "approval_token_mismatch")
+    if not candidate_file or not Path(candidate_file).exists():
+        return PolicyResult(False, "no_candidate_file")
+    proof_path = Path(selector_proof_dir) / f"{action}_selectors.json"
+    if not proof_path.exists():
+        return PolicyResult(False, "no_selector_proof")
+    return PolicyResult(True)
+
+
+def load_candidate(candidate_file: str) -> dict:
+    return json.loads(Path(candidate_file).read_text(encoding="utf-8"))
+
+```
+
+receipts.py:
+```
+"""SHA-chained JSONL receipt ledger for tamper-evident audit trail."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+
+RECEIPT_DIR = Path("receipts")
+RECEIPT_DIR.mkdir(parents=True, exist_ok=True)
+LEDGER_PATH = RECEIPT_DIR / "ledger.jsonl"
+
+
+@dataclass
+class Receipt:
+    index: int
+    timestamp: str
+    prev_hash: str
+    action: str
+    lane: str
+    risk: str
+    ok: bool
+    status: str
+    url: str = ""
+    screenshot: str = ""
+    html_snapshot: str = ""
+    data: Optional[dict] = None
+    error: Optional[str] = None
+    blocked_reason: Optional[str] = None
+    hash: str = ""
+
+
+class ReceiptLedger:
+    def __init__(self, path: Path = LEDGER_PATH):
+        self.path = path
+        self.entries: list[dict] = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    try:
+                        self.entries.append(json.loads(line))
+                    except Exception:
+                        pass
+
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _safe_name(self, s: str) -> str:
+        return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in s)[:80]
+
+    def add(self, payload: dict) -> str:
+        prev_hash = self.entries[-1].get("hash", "0" * 64) if self.entries else "0" * 64
+        entry = {
+            "index": len(self.entries),
+            "timestamp": self._now_iso(),
+            "prev_hash": prev_hash,
+            **payload,
+        }
+        body = json.dumps(
+            {k: v for k, v in entry.items() if k != "hash"},
+            sort_keys=True,
+            default=str,
+        )
+        entry["hash"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        self.entries.append(entry)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        receipt_path = RECEIPT_DIR / f"{entry['index']:05d}_{self._safe_name(payload.get('action', 'action'))}.json"
+        receipt_path.write_text(
+            json.dumps(entry, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        return str(receipt_path)
+
+    def verify(self) -> bool:
+        prev = "0" * 64
+        for entry in self.entries:
+            if entry.get("prev_hash") != prev:
+                return False
+            body = json.dumps(
+                {k: v for k, v in entry.items() if k != "hash"},
+                sort_keys=True,
+                default=str,
+            )
+            if hashlib.sha256(body.encode("utf-8")).hexdigest() != entry.get("hash"):
+                return False
+            prev = entry["hash"]
+        return True
+
+```
+
+content_generator.py:
 ```
 #!/usr/bin/env python3
-"""Dashboard server — FastAPI app showing all content, availability, and stats.
+"""Daily content generator for RentMasseur profile optimization.
 
-Provides a web UI to browse generated bios, blog posts, interview questions,
-social media posts, email templates, SEO keywords, and availability status.
+Generates bios, blog posts, and interview questions using Groq LLM.
+Runs mass analysis across all 30 strategies and collects the best versions.
+Designed to run daily in CI/CD.
 
 Usage:
-    python3 dashboard.py
-    python3 dashboard.py --port 8080
+    python3 content_generator.py                    # generate all content
+    python3 content_generator.py --bios-only        # bios only
+    python3 content_generator.py --blogs-only       # blog posts only
+    python3 content_generator.py --questions-only   # interview questions only
 """
 
 import argparse
 import json
 import os
-import glob
 import sys
+import time
+import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
-import uvicorn
+import requests
+from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+LIVE_BIO=""
+try:
+    with open("content/reference/live_bio.md","r") as _f:
+        LIVE_BIO=_f.read().strip()
+except FileNotFoundError:
+    pass
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 logger = logging.getLogger(__name__)
 
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+
 CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
-AVAILABILITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "availability.json")
+BIOS_DIR = os.path.join(CONTENT_DIR, "bios")
+BLOGS_DIR = os.path.join(CONTENT_DIR, "blog_posts")
+QUESTIONS_DIR = os.path.join(CONTENT_DIR, "interview_questions")
+HISTORY_FILE = os.path.join(CONTENT_DIR, "content_history.json")
 
-app = FastAPI(title="RentMasseur Dashboard", docs_url="/api/docs")
+STRATEGIES = [
+    ("sensory_luxury", "Luxurious sensory experience, premium oils, candlelight, high-end clientele"),
+    ("therapeutic_expert", "Clinical therapeutic massage, pain relief, certifications, back/neck focus"),
+    ("mystery_desire", "Mysterious, alluring, teases the experience, curiosity-driven bookings"),
+    ("local_hustle", "Manhattan local vibe, neighborhood energy, approachable, easy booking"),
+    ("transformation_story", "Story-based, stress-to-relief transformation, emotional hook"),
+    ("night_owl", "Late-night availability, after-hours, private evening sessions"),
+    ("athlete_recovery", "Gym-goers, pre/post-workout, muscle recovery, sports performance"),
+    ("ceo_executive", "Executive wellness, CEO/founder stress relief, time-efficient, premium"),
+    ("spiritual_healer", "Holistic, energy work, chakras, mindfulness, breathwork"),
+    ("traveler_companion", "Out-of-town visitors, jet lag, hotel-friendly, concierge service"),
+    ("medical_referral", "Doctor-recommended, clinical back pain, sciatica, posture correction"),
+    ("artist_soul", "Creative artistic approach, massage as art, intuitive touch"),
+    ("discrete_confidential", "Absolute privacy, VIP clients, judgment-free, confidential studio"),
+    ("first_timer", "Welcoming newcomers, gentle introduction, no experience needed"),
+    ("seasonal_special", "Seasonal themes, winter warmth, summer cool-down, holiday stress"),
+    ("couples_duo", "Couples, partners, duet sessions, romantic bonding experience"),
+    ("bodybuilder_therapy", "Heavy lifters, deep pressure, fascia release, intense muscle work"),
+    ("yoga_fusion", "Yoga + massage, stretching, flexibility, mind-body connection"),
+    ("luxury_concierge", "White-glove in-home/hotel service, elite concierge, effortless booking"),
+    ("recovery_addiction", "Sober wellness, recovery support, clean living, healthy coping"),
+    ("military_veteran", "Veteran-friendly, service member respect, PT recovery, brotherhood"),
+    ("lgbtq_pride", "Inclusive pride-forward, safe space, community, authentic expression"),
+    ("senior_gentle", "Senior-friendly, gentle touch, mobility, arthritis, circulation"),
+    ("office_relief", "Desk job recovery, neck pain, carpal tunnel, corporate warrior"),
+    ("dancer_flexibility", "Dancers/performers, flexibility maintenance, injury prevention"),
+    ("meditation_guide", "Guided meditation + massage, mindfulness, breath, tranquility"),
+    ("hot_stone_specialist", "Hot stone specialty, heat therapy, deep relaxation, indulgence"),
+    ("quick_lunch", "Express 30-45 min lunch-break massage, fast, effective, convenient"),
+    ("birthday_gift", "Gift-worthy special occasion, treat yourself, memorable experience"),
+    ("weekly_ritual", "Recurring weekly maintenance, body upkeep, long-term investment"),
+]
 
 
-def _list_content(subdir: str, ext: str = "md") -> list:
-    directory = os.path.join(CONTENT_DIR, subdir)
-    if not os.path.exists(directory):
-        return []
-    files = sorted(glob.glob(os.path.join(directory, f"*.{ext}")), reverse=True)
-    return [{"filename": os.path.basename(f), "path": f, "size": os.path.getsize(f)} for f in files]
+def _ensure_dirs():
+    for d in [CONTENT_DIR, BIOS_DIR, BLOGS_DIR, QUESTIONS_DIR]:
+        os.makedirs(d, exist_ok=True)
 
 
-def _read_file(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception as e:
-        return f"Error reading file: {e}"
-
-
-@app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    bios = _list_content("bios")
-    blogs = _list_content("blog_posts")
-    questions = _list_content("interview_questions")
-    social = _list_content("social_posts")
-    emails = _list_content("email_templates")
-    seo = _list_content("seo_keywords", "json")
-    analyses = _list_content("", "md")
-
-    avail_data = {}
-    if os.path.exists(AVAILABILITY_FILE):
+def _load_history() -> list:
+    if os.path.exists(HISTORY_FILE):
         try:
-            with open(AVAILABILITY_FILE, "r") as f:
-                avail_data = json.load(f)
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
             pass
-
-    def render_list(title: str, items: list, subdir: str) -> str:
-        if not items:
-            return f"<h2>{title}</h2><p>No content yet.</p>"
-        cards = "".join([
-            f'<div class="card"><h3>{i["filename"]}</h3>'
-            f'<p>{i["size"]} bytes</p>'
-            f'<a href="/view/{subdir}/{i["filename"]}">View</a></div>'
-            for i in items[:20]
-        ])
-        return f"<h2>{title} ({len(items)})</h2><div class='grid'>{cards}</div>"
-
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-<title>RentMasseur Dashboard</title>
-<style>
-body {{ font-family: -apple-system, sans-serif; margin: 0; padding: 20px; background: #0d1117; color: #c9d1d9; }}
-h1 {{ color: #58a6ff; }}
-h2 {{ color: #79c0ff; margin-top: 30px; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }}
-.card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }}
-.card h3 {{ font-size: 14px; color: #58a6ff; margin: 0 0 8px 0; word-break: break-all; }}
-.card a {{ color: #58a6ff; text-decoration: none; font-size: 13px; }}
-.stats {{ display: flex; gap: 20px; margin: 20px 0; }}
-.stat {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 24px; text-align: center; }}
-.stat .num {{ font-size: 32px; font-weight: bold; color: #58a6ff; }}
-.stat .label {{ font-size: 12px; color: #8b949e; }}
-pre {{ background: #161b22; padding: 16px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; }}
-</style>
-</head>
-<body>
-<h1>RentMasseur Dashboard</h1>
-<div class="stats">
-<div class="stat"><div class="num">{len(bios)}</div><div class="label">Bios</div></div>
-<div class="stat"><div class="num">{len(blogs)}</div><div class="label">Blog Posts</div></div>
-<div class="stat"><div class="num">{len(questions)}</div><div class="label">Interview Qs</div></div>
-<div class="stat"><div class="num">{len(social)}</div><div class="label">Social Posts</div></div>
-<div class="stat"><div class="num">{len(emails)}</div><div class="label">Email Templates</div></div>
-<div class="stat"><div class="num">{len(seo)}</div><div class="label">SEO Sets</div></div>
-</div>
-{render_list("Mass Analysis Reports", [a for a in analyses if "mass_analysis" in a["filename"]], "")}
-{render_list("Bios", bios, "bios")}
-{render_list("Blog Posts", blogs, "blog_posts")}
-{render_list("Interview Questions", questions, "interview_questions")}
-{render_list("Social Media Posts", social, "social_posts")}
-{render_list("Email Templates", emails, "email_templates")}
-{render_list("SEO Keywords", seo, "seo_keywords")}
-<h2>Availability Data</h2>
-<pre>{json.dumps(avail_data, indent=2)}</pre>
-</body>
-</html>"""
+    return []
 
 
-@app.get("/view/{subdir}/{filename}", response_class=HTMLResponse)
-async def view_content(subdir: str, filename: str):
-    path = os.path.join(CONTENT_DIR, subdir, filename)
-    if not os.path.exists(path):
-        return HTMLResponse("<h1>File not found</h1>", status_code=404)
-    content = _read_file(path)
-    if filename.endswith(".json"):
-        return HTMLResponse(f"<pre>{content}</pre>")
-    return HTMLResponse(f"<pre style='white-space: pre-wrap; font-family: monospace; padding: 20px;'>{content}</pre>")
+def _save_history(history: list):
+    _ensure_dirs()
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history[-200:], f, indent=2)
+    except Exception as e:
+        logger.warning("Failed to save history: %s", e)
 
 
-@app.get("/api/stats")
-async def api_stats():
-    return JSONResponse({
-        "bios": len(_list_content("bios")),
-        "blog_posts": len(_list_content("blog_posts")),
-        "interview_questions": len(_list_content("interview_questions")),
-        "social_posts": len(_list_content("social_posts")),
-        "email_templates": len(_list_content("email_templates")),
-        "seo_keywords": len(_list_content("seo_keywords", "json")),
-        "mass_analyses": len([a for a in _list_content("", "md") if "mass_analysis" in a["filename"]]),
-    })
+def _content_hash(text: str) -> str:
+    return hashlib.md5(text.strip().lower().encode()).hexdigest()[:12]
 
 
-@app.get("/api/content/{subdir}")
-async def api_list_content(subdir: str):
-    ext = "json" if subdir == "seo_keywords" else "md"
-    return JSONResponse(_list_content(subdir, ext))
+def _groq_chat(system_prompt: str, user_prompt: str, temperature: float = 0.9, max_tokens: int = 800, retries: int = 3) -> Optional[str]:
+    if not GROQ_API_KEY:
+        logger.error("No GROQ_API_KEY")
+        return None
+    for attempt in range(retries):
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                },
+                timeout=90,
+            )
+            if resp.status_code == 429:
+                wait = 5 * (attempt + 1)
+                logger.warning("Groq rate limited, waiting %ds (attempt %d/%d)", wait, attempt + 1, retries)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
+            return content
+        except Exception as e:
+            logger.error("Groq API error: %s", e)
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+    return None
+
+
+def _save_content(directory: str, strategy_name: str, content: str, ext: str = "md") -> str:
+    ts = datetime.now().strftime("%Y%m%d")
+    filename = f"{ts}_{strategy_name}.{ext}"
+    filepath = os.path.join(directory, filename)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+    logger.info("Saved: %s (%d chars)", filepath, len(content))
+    return filepath
+
+
+def generate_bios(history: list, used_hashes: set) -> list:
+    logger.info("=== Generating bios for all 30 strategies ===")
+    system_prompt = (
+        "You are an elite copywriter for massage therapy profiles on RentMasseur. "
+        "Each bio must be under 300 words, magnetic, SEO-friendly, and conversion-optimized. "
+        "Avoid explicit content. Include keywords: massage, therapeutic, deep tissue, relaxation, session, Manhattan. "
+        "CRITICAL: Every bio MUST end with a strong phone-call call-to-action like "
+        "'Call now to book your session' or 'Pick up the phone and call me today'. "
+        "The goal is MAXIMUM PHONE CALLS. Make the reader want to call immediately. "
+        "Include urgency words: today, now, available, waiting, ready. "
+        "Write ONLY the bio text."
+    )
+    results = []
+    for strategy_name, strategy_desc in STRATEGIES:
+        user_prompt = (
+            f"Strategy: {strategy_name}\n"
+            f"Description: {strategy_desc}\n"
+            f"Write a compelling profile bio for a male masseur in Manhattan, NYC. "
+            f"The bio MUST drive phone calls. End with a direct call-to-action "
+            f"telling the reader to CALL NOW to book. No labels, no quotes, no explanation. Just the bio."
+        )
+        bio = _groq_chat(system_prompt, user_prompt)
+        if bio:
+            h = _content_hash(bio)
+            if h in used_hashes:
+                logger.info("Skip duplicate bio: %s", strategy_name)
+                continue
+            used_hashes.add(h)
+            filepath = _save_content(BIOS_DIR, strategy_name, bio)
+            results.append({
+                "type": "bio",
+                "strategy": strategy_name,
+                "chars": len(bio),
+                "hash": h,
+                "file": filepath,
+                "preview": bio[:120],
+            })
+            history.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "bio",
+                "strategy": strategy_name,
+                "hash": h,
+                "chars": len(bio),
+            })
+        time.sleep(1)
+    logger.info("Generated %d bios", len(results))
+    return results
+
+
+def generate_blog_posts(history: list, used_hashes: set) -> list:
+    logger.info("=== Generating blog posts for all 30 strategies ===")
+    system_prompt = (
+        "You are an expert content writer for a massage therapy blog. "
+        "Write engaging, SEO-optimized blog posts (500-800 words) that attract clients. "
+        "Include a compelling title, subheadings, and a call-to-action. "
+        "Avoid explicit content. Use markdown formatting."
+    )
+    results = []
+    for strategy_name, strategy_desc in STRATEGIES:
+        user_prompt = (
+            f"Strategy: {strategy_name}\n"
+            f"Angle: {strategy_desc}\n"
+            f"Write a blog post for a male masseur in Manhattan, NYC. "
+            f"The post should be informative, engaging, and drive bookings. "
+            f"Use markdown with a # title, ## subheadings, and a CTA at the end."
+        )
+        post = _groq_chat(system_prompt, user_prompt, max_tokens=1200)
+        if post:
+            h = _content_hash(post)
+            if h in used_hashes:
+                logger.info("Skip duplicate blog: %s", strategy_name)
+                continue
+            used_hashes.add(h)
+            filepath = _save_content(BLOGS_DIR, strategy_name, post)
+            results.append({
+                "type": "blog_post",
+                "strategy": strategy_name,
+                "chars": len(post),
+                "hash": h,
+                "file": filepath,
+                "preview": post[:120],
+            })
+            history.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "blog_post",
+                "strategy": strategy_name,
+                "hash": h,
+                "chars": len(post),
+            })
+        time.sleep(1)
+    logger.info("Generated %d blog posts", len(results))
+    return results
+
+
+def generate_interview_questions(history: list, used_hashes: set) -> list:
+    logger.info("=== Generating interview questions for all 30 strategies ===")
+    system_prompt = (
+        "You are an interview coach for massage therapists. "
+        "Generate 10 insightful interview questions that a journalist or blogger "
+        "would ask a male masseur, based on the given strategy angle. "
+        "Also include suggested answers that are professional, engaging, and on-brand. "
+        "Use markdown formatting with numbered questions and bullet-point answers."
+    )
+    results = []
+    for strategy_name, strategy_desc in STRATEGIES:
+        user_prompt = (
+            f"Strategy: {strategy_name}\n"
+            f"Angle: {strategy_desc}\n"
+            f"Generate 10 interview questions with suggested answers for a male masseur "
+            f"in Manhattan, NYC. Make the answers compelling and booking-oriented. "
+            f"Format: ## Q1: question? followed by **A:** answer."
+        )
+        questions = _groq_chat(system_prompt, user_prompt, max_tokens=1500)
+        if questions:
+            h = _content_hash(questions)
+            if h in used_hashes:
+                logger.info("Skip duplicate questions: %s", strategy_name)
+                continue
+            used_hashes.add(h)
+            filepath = _save_content(QUESTIONS_DIR, strategy_name, questions)
+            results.append({
+                "type": "interview_questions",
+                "strategy": strategy_name,
+                "chars": len(questions),
+                "hash": h,
+                "file": filepath,
+                "preview": questions[:120],
+            })
+            history.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "interview_questions",
+                "strategy": strategy_name,
+                "hash": h,
+                "chars": len(questions),
+            })
+        time.sleep(1)
+    logger.info("Generated %d interview question sets", len(results))
+    return results
+
+
+def generate_mass_analysis(bios: list, blogs: list, questions: list) -> Optional[str]:
+    logger.info("=== Running mass analysis across all generated content ===")
+    system_prompt = (
+        "You are a marketing analyst and content strategist. "
+        "Analyze the generated bios, blog posts, and interview questions across all strategies. "
+        "Produce a comprehensive report with: "
+        "1. Top 5 bios ranked by conversion potential "
+        "2. Top 5 blog posts ranked by SEO and engagement potential "
+        "3. Top 5 interview question sets ranked by PR value "
+        "4. Cross-strategy themes that perform best "
+        "5. Recommended posting schedule for the week "
+        "6. Best bio to use on the profile right now "
+        "Use markdown formatting."
+    )
+
+    bios_summary = "\n".join([f"- {b['strategy']} ({b['chars']} chars): {b['preview']}..." for b in bios])
+    blogs_summary = "\n".join([f"- {b['strategy']} ({b['chars']} chars): {b['preview']}..." for b in blogs])
+    questions_summary = "\n".join([f"- {q['strategy']} ({q['chars']} chars): {q['preview']}..." for q in questions])
+
+    user_prompt = (
+        f"Today's generated content:\n\n"
+        f"## Bios ({len(bios)} generated):\n{bios_summary}\n\n"
+        f"## Blog Posts ({len(blogs)} generated):\n{blogs_summary}\n\n"
+        f"## Interview Questions ({len(questions)} generated):\n{questions_summary}\n\n"
+        f"Produce the mass analysis report."
+    )
+
+    analysis = _groq_chat(system_prompt, user_prompt, temperature=0.7, max_tokens=2000)
+    if analysis:
+        ts = datetime.now().strftime("%Y%m%d")
+        filepath = os.path.join(CONTENT_DIR, f"mass_analysis_{ts}.md")
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(analysis)
+        logger.info("Mass analysis saved: %s (%d chars)", filepath, len(analysis))
+        return filepath
+    return None
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RentMasseur Dashboard Server")
-    parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--host", default="127.0.0.1")
+    parser = argparse.ArgumentParser(description="Daily content generator for RentMasseur")
+    parser.add_argument("--bios-only", action="store_true")
+    parser.add_argument("--blogs-only", action="store_true")
+    parser.add_argument("--questions-only", action="store_true")
+    parser.add_argument("--no-analysis", action="store_true", help="Skip mass analysis")
     args = parser.parse_args()
 
-    logger.info("Starting dashboard at http://%s:%d", args.host, args.port)
-    uvicorn.run(app, host=args.host, port=args.port)
+    _ensure_dirs()
+    history = _load_history()
+    used_hashes = {entry.get("hash", "") for entry in history}
+
+    all_bios = []
+    all_blogs = []
+    all_questions = []
+
+    if not args.blogs_only and not args.questions_only:
+        all_bios = generate_bios(history, used_hashes)
+    if not args.bios_only and not args.questions_only:
+        all_blogs = generate_blog_posts(history, used_hashes)
+    if not args.bios_only and not args.blogs_only:
+        all_questions = generate_interview_questions(history, used_hashes)
+
+    if not args.no_analysis and (all_bios or all_blogs or all_questions):
+        generate_mass_analysis(all_bios, all_blogs, all_questions)
+
+    _save_history(history)
+
+    summary = {
+        "date": datetime.now(timezone.utc).isoformat(),
+        "bios_generated": len(all_bios),
+        "blog_posts_generated": len(all_blogs),
+        "interview_questions_generated": len(all_questions),
+        "total_strategies": len(STRATEGIES),
+    }
+    summary_path = os.path.join(CONTENT_DIR, "daily_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    logger.info("=== Daily content generation complete ===")
+    logger.info("Bios: %d | Blog posts: %d | Interview questions: %d",
+                len(all_bios), len(all_blogs), len(all_questions))
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
@@ -189,612 +692,109 @@ if __name__ == "__main__":
 
 ```
 
-_deploy_bio_uc.py:
+visit_back.py:
 ```
 #!/usr/bin/env python3
-"""Login + deploy bio using undetected-chromedriver to bypass CAPTCHA detection."""
-import time, os, sys
+"""
+Visit-back automation: scrape visitors from /settings/whosawme,
+then visit each visitor's profile page to increase visibility.
+
+Usage:
+    python3 visit_back.py --dry-run    # list visitors without visiting
+    python3 visit_back.py              # visit all visitors
+    python3 visit_back.py --limit 20   # visit max 20
+"""
+import time, os, sys, json, argparse
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.webdriver.common.keys import Keys
+from datetime import datetime, timezone
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 load_dotenv()
 
 USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
 PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
-LOGIN_URL = "https://rentmasseur.com/login"
-PROFILE_URL = "https://rentmasseur.com/profile"
-BIO_URL = "https://rentmasseur.com/profile/edit"
+WHOSAWME_URL = "https://rentmasseur.com/settings/whosawme"
+BASE_URL = "https://rentmasseur.com"
 
-BIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "bios", "controlled_wolf_v1.md")
 
-print(f"Username: {USERNAME}")
-print(f"Bio file: {BIO_FILE}")
-
-with open(BIO_FILE, "r") as f:
-    BIO_TEXT = f.read().strip()
-print(f"Bio length: {len(BIO_TEXT)} chars")
-
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,900")
-
-driver = uc.Chrome(options=options, version_main=149)
-try:
-    print("\n[1] Navigating to login...")
-    driver.set_page_load_timeout(90)
-    driver.get(LOGIN_URL)
-    time.sleep(8)
-    
-    print(f"  Title: {driver.title}")
-    print(f"  URL: {driver.current_url}")
-    
-    # Check if CAPTCHA is present
-    captcha = driver.execute_script("""
-        return !!document.querySelector('.g-recaptcha, #captcha, iframe[src*="recaptcha"], iframe[src*="captcha"]');
-    """)
-    print(f"  CAPTCHA present: {captcha}")
-    
-    if captcha:
-        print("\n[2] CAPTCHA detected. Waiting up to 120s for it to be solved...")
-        for i in range(24):
-            time.sleep(5)
-            captcha_still = driver.execute_script("""
-                const iframe = document.querySelector('iframe[src*="recaptcha"]');
-                if (!iframe) return false;
-                // Check if recaptcha response is filled
-                try {
-                    return !grecaptcha.getResponse();
-                } catch(e) {
-                    return true;
-                }
-            """)
-            if not captcha_still:
-                print("  CAPTCHA solved!")
-                break
-            print(f"  Waiting for CAPTCHA solve... ({(i+1)*5}s)")
-        else:
-            print("  CAPTCHA not solved in time. Trying to proceed anyway...")
-    
-    # Wait for login form to appear
-    print("\n[3] Looking for login form...")
-    for attempt in range(10):
-        time.sleep(3)
-        inputs = driver.execute_script("""
-            return Array.from(document.querySelectorAll('input')).map(i => ({
-                type: i.type, name: i.name, id: i.id, placeholder: i.placeholder,
-                visible: i.offsetParent !== null
-            }));
-        """)
-        print(f"  Attempt {attempt+1}: {len(inputs)} inputs found")
-        for inp in inputs:
-            print(f"    type={inp['type']} name={inp['name']} id={inp['id']} placeholder={inp['placeholder']} visible={inp['visible']}")
-        
-        pwd = driver.execute_script("""
-            return document.querySelector('input[type="password"]') ||
-                   document.querySelector('input[name*="pass" i]') ||
-                   document.querySelector('input[placeholder*="pass" i]');
-        """)
-        if pwd:
-            print("  Password field found!")
-            break
-    else:
-        print("  No login form found after waiting. Dumping page...")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/login_after_captcha.png")
-        with open("/Users/alep/Downloads/rentmasseur-optimizer/login_after.html", "w") as f:
-            f.write(driver.page_source)
-        sys.exit(1)
-    
-    # Fill login form
-    print("\n[4] Filling login form...")
-    driver.execute_script(f"""
-        const pwd = document.querySelector('input[type="password"]') ||
-                    document.querySelector('input[name*="pass" i]');
-        const user = document.querySelector('input[type="text"]') ||
-                     document.querySelector('input[type="email"]') ||
-                     document.querySelector('input[name*="user" i]') ||
-                     document.querySelector('input[name*="email" i]');
-        if (user) {{ user.value = '{USERNAME}'; user.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-        if (pwd) {{ pwd.value = '{PASSWORD}'; pwd.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-    """)
-    time.sleep(2)
-    
-    # Click submit
+def login(driver):
+    driver.get(f"{BASE_URL}/login")
+    time.sleep(6)
     driver.execute_script("""
-        const btn = document.querySelector('button[type="submit"]') ||
-                    document.querySelector('input[type="submit"]') ||
-                    Array.from(document.querySelectorAll('button')).find(b => /login|sign.in|submit/i.test(b.innerText));
-        if (btn) btn.click();
-    """)
-    time.sleep(8)
-    
-    print(f"  After login URL: {driver.current_url}")
-    if "login" in driver.current_url.lower():
-        print("  Login may have failed. Screenshot saved.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/login_failed.png")
-        sys.exit(1)
-    
-    print("  Login successful!")
-    
-    # Navigate to profile edit
-    print("\n[5] Navigating to profile edit...")
-    driver.get(BIO_URL)
+        const pwd = document.querySelector('input[type="password"]');
+        const user = document.querySelector('input[type="text"], input[type="email"]');
+        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
+        if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
+    """, USERNAME, PASSWORD)
+    time.sleep(1)
+    driver.find_element(By.CSS_SELECTOR, 'input[type="password"]').send_keys(Keys.ENTER)
     time.sleep(5)
-    
-    # Find bio textarea
-    print("  Looking for bio textarea...")
-    bio_field = driver.execute_script("""
-        const textareas = Array.from(document.querySelectorAll('textarea'));
-        let best = null, bestScore = 0;
-        for (const ta of textareas) {
-            const score = (ta.value || '').length;
-            if (score > bestScore) { bestScore = score; best = ta; }
-        }
-        if (!best && textareas.length > 0) best = textareas[0];
-        if (best) {
-            best.value = arguments[0];
-            best.dispatchEvent(new Event('input', {bubbles: true}));
-            best.dispatchEvent(new Event('change', {bubbles: true}));
-            return true;
-        }
-        return false;
-    """, BIO_TEXT)
-    
-    if bio_field:
-        print("  Bio field updated!")
-        time.sleep(2)
+    return "login" not in driver.current_url.lower()
+
+
+def scrape_visitors(driver):
+    """Scrape list of visitors from /settings/whosawme."""
+    driver.get(WHOSAWME_URL)
+    time.sleep(5)
+
+    visitors = driver.execute_script("""
+        const result = [];
+        const seen = new Set();
         
-        # Click save
-        saved = driver.execute_script("""
-            const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-            const saveBtn = buttons.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'') + ' ' + (b.value||'')));
-            if (saveBtn) { saveBtn.click(); return true; }
-            return false;
-        """)
-        print(f"  Save clicked: {saved}")
-        time.sleep(5)
-        print("\n  BIO DEPLOYED SUCCESSFULLY!")
-    else:
-        print("  No textarea found. Screenshot saved.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/profile_edit.png")
-    
-finally:
-    driver.quit()
-    print("\nDone.")
+        // Method 1: Find profile photo links (img alt="Profile photo" inside <a>)
+        const profileImgs = document.querySelectorAll('img[alt="Profile photo"], img[alt="profile-picture"]');
+        for (const img of profileImgs) {
+            const a = img.closest('a');
+            if (a && a.href) {
+                const path = new URL(a.href).pathname;
+                const username = path.replace('/', '');
+                if (username && !seen.has(username) && !username.includes('settings') && !username.includes('gay-massage')) {
+                    seen.add(username);
+                    result.push({username: username, url: a.href, name: username});
+                }
+            }
+        }
+        
+        // Method 2: Find links to /username patterns (not settings/gay-massage/etc)
+        const links = Array.from(document.querySelectorAll('a[href]'));
+        for (const a of links) {
+            const href = a.href;
+            if (!href.startsWith('https://rentmasseur.com/')) continue;
+            const path = new URL(href).pathname;
+            // Single-segment paths = usernames (e.g. /Jerbolt)
+            if (path && path !== '/' && path.split('/').length === 2 && path.split('/')[1] !== '') {
+                const username = path.replace('/', '');
+                if (!seen.has(username) && 
+                    !['settings','gay-massage','stream','masseurcams','advertise','about','login','sitemap','topics','robots','api'].includes(username) &&
+                    !username.startsWith('_') &&
+                    username.length > 2) {
+                    seen.add(username);
+                    result.push({username: username, url: href, name: username});
+                }
+            }
+        }
+        
+        return result;
+    """)
+    return visitors
 
-```
 
-rotator_engine.js:
-```
-/**
- * RentMasseur Rotator Engine — JavaScript
- * 
- * Unified rotation engine for bios, photos, prices, interviews, and blog posts.
- * Uses RL feedback (views, clicks, calls) to decide what to rotate and when.
- * Integrates with the Chrome extension for real-time optimization.
- * 
- * Usage in extension:
- *   const rotator = new RotatorEngine({ serverUrl: 'http://localhost:3000' });
- *   await rotator.init();
- *   const nextBio = await rotator.getNextBio();
- *   const nextPrice = await rotator.getNextPrice();
- */
+def visit_profile(driver, visitor_url):
+    """Visit a visitor's profile page."""
+    driver.get(visitor_url)
+    time.sleep(3)
+    return driver.current_url
 
-class RotatorEngine {
-  constructor(config = {}) {
-    this.serverUrl = config.serverUrl || 'http://localhost:3000';
-    this.rlState = null;
-    this.rotationRules = {
-      bio: { maxAgeHours: 24, minRewardThreshold: 5, rotateIfStale: true },
-      photo: { maxAgeHours: 48, minRewardThreshold: 3, rotateIfStale: true },
-      price: { maxAgeHours: 12, minRewardThreshold: 8, rotateIfStale: false },
-      interview: { maxAgeHours: 72, minRewardThreshold: 2, rotateIfStale: true },
-      blog: { maxAgeHours: 48, minRewardThreshold: 4, rotateIfStale: true },
-    };
-    this.rewardWeights = {
-      views: 1, email_clicks: 5, phone_clicks: 10, booking_inquiries: 50,
-      favorites: 3, messages: 8,
-    };
-  }
 
-  async init() {
-    await this.loadRLState();
-    return this;
-  }
-
-  async loadRLState() {
-    try {
-      const resp = await fetch(`${this.serverUrl}/api/rl/state`);
-      if (resp.ok) {
-        this.rlState = await resp.json();
-        return this.rlState;
-      }
-    } catch (e) {
-      console.warn('Could not load RL state from server, using local');
-    }
-    this.rlState = this._defaultState();
-    return this.rlState;
-  }
-
-  _defaultState() {
-    return {
-      bios: {}, photos: {}, prices: {}, interviews: {}, blogs: {},
-      current: { bio: null, photo: null, price: null, interview: null, blog: null },
-      rotations: { bio: 0, photo: 0, price: 0, interview: 0, blog: 0 },
-      history: [],
-    };
-  }
-
-  calculateReward(stats, ageHours) {
-    let reward = 0;
-    for (const [key, weight] of Object.entries(this.rewardWeights)) {
-      reward += (stats[key] || 0) * weight;
-    }
-    reward -= (ageHours / 24) * 0.5; // stale penalty
-    return Math.round(reward * 100) / 100;
-  }
-
-  shouldRotate(type, currentEntry, ageHours, deltaReward) {
-    const rules = this.rotationRules[type];
-    if (!rules) return false;
-
-    if (rules.rotateIfStale && ageHours >= rules.maxAgeHours) {
-      return { rotate: true, reason: `stale (${ageHours.toFixed(1)}h >= ${rules.maxAgeHours}h)` };
-    }
-    if (ageHours >= rules.maxAgeHours / 2 && deltaReward < rules.minRewardThreshold) {
-      return { rotate: true, reason: `low reward (${deltaReward} < ${rules.minRewardThreshold} in ${ageHours.toFixed(1)}h)` };
-    }
-    if (ageHours >= 6 && deltaReward === 0) {
-      return { rotate: true, reason: 'zero engagement for 6+ hours' };
-    }
-    return { rotate: false, reason: 'performing well' };
-  }
-
-  pickNext(items, type) {
-    const entries = Object.entries(items);
-    if (entries.length === 0) return null;
-
-    // Sort by: least times used, then highest historical reward
-    entries.sort((a, b) => {
-      const aUses = a[1].timesUsed || 0;
-      const bUses = b[1].timesUsed || 0;
-      if (aUses !== bUses) return aUses - bUses;
-      const aReward = a[1].totalReward || 0;
-      const bReward = b[1].totalReward || 0;
-      return bReward - aReward;
-    });
-
-    return entries[0];
-  }
-
-  async getNextBio() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.bios, 'bio');
-  }
-
-  async getNextPrice() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.prices, 'price');
-  }
-
-  async getNextPhoto() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.photos, 'photo');
-  }
-
-  async getNextInterview() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.interviews, 'interview');
-  }
-
-  async getNextBlog() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.blogs, 'blog');
-  }
-
-  registerRotation(type, id, content, metadata = {}) {
-    if (!this.rlState) this.rlState = this._defaultState();
-
-    const store = this.rlState[type + 's'] || {};
-    const prevId = this.rlState.current[type];
-    if (prevId && store[prevId]) {
-      store[prevId].endTime = new Date().toISOString();
-    }
-
-    store[id] = {
-      content: content.slice(0, 500),
-      ...metadata,
-      startTime: new Date().toISOString(),
-      totalReward: 0,
-      deltaReward: 0,
-      lastStats: {},
-      timesUsed: (store[id]?.timesUsed || 0) + 1,
-    };
-
-    this.rlState[type + 's'] = store;
-    this.rlState.current[type] = id;
-    this.rlState.rotations[type] = (this.rlState.rotations[type] || 0) + 1;
-
-    this.rlState.history.push({
-      timestamp: new Date().toISOString(),
-      type, id, action: 'rotate',
-    });
-
-    return this.rlState;
-  }
-
-  updateReward(type, id, stats) {
-    if (!this.rlState) return;
-    const store = this.rlState[type + 's'];
-    if (!store || !store[id]) return;
-
-    const entry = store[id];
-    const prevStats = entry.lastStats || {};
-    const delta = {};
-    for (const key of Object.keys(this.rewardWeights)) {
-      delta[key] = Math.max(0, (stats[key] || 0) - (prevStats[key] || 0));
-    }
-
-    const ageHours = entry.startTime
-      ? (Date.now() - new Date(entry.startTime).getTime()) / 3600000
-      : 0;
-
-    const deltaReward = this.calculateReward(delta, ageHours);
-    entry.deltaReward = deltaReward;
-    entry.totalReward = (entry.totalReward || 0) + deltaReward;
-    entry.lastStats = stats;
-    entry.ageHours = Math.round(ageHours * 100) / 100;
-
-    this.rlState.history.push({
-      timestamp: new Date().toISOString(),
-      type, id, action: 'reward',
-      deltaReward, totalReward: entry.totalReward,
-    });
-
-    return entry;
-  }
-
-  getTopPerformers(type, n = 5) {
-    if (!this.rlState) return [];
-    const store = this.rlState[type + 's'] || {};
-    return Object.entries(store)
-      .sort((a, b) => (b[1].totalReward || 0) - (a[1].totalReward || 0))
-      .slice(0, n);
-  }
-
-  getReport() {
-    if (!this.rlState) return 'No RL state loaded';
-    const lines = ['=== ROTATOR ENGINE REPORT ==='];
-    for (const type of ['bio', 'photo', 'price', 'interview', 'blog']) {
-      const store = this.rlState[type + 's'] || {};
-      const rotations = this.rlState.rotations[type] || 0;
-      const current = this.rlState.current[type];
-      lines.push(`\n${type.toUpperCase()}: ${rotations} rotations, current=${current}`);
-      const top = this.getTopPerformers(type, 3);
-      for (const [id, data] of top) {
-        lines.push(`  ${id}: reward=${data.totalReward || 0}, uses=${data.timesUsed || 0}`);
-      }
-    }
-    return lines.join('\n');
-  }
-
-  async saveState() {
-    try {
-      await fetch(`${this.serverUrl}/api/rl/state`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(this.rlState),
-      });
-    } catch (e) {
-      console.warn('Could not save RL state to server');
-    }
-  }
-}
-
-// Price rotation strategies
-const PRICE_STRATEGIES = [
-  { name: 'premium_peak', desc: 'High price during peak hours (evening/weekend)', base: 250, variance: 30 },
-  { name: 'off_peak_deal', desc: 'Lower price for off-peak slots', base: 180, variance: 20 },
-  { name: 'new_client_special', desc: 'First-time client discount', base: 150, variance: 15 },
-  { name: 'loyalty_rate', desc: 'Returning client rate', base: 200, variance: 10 },
-  { name: 'late_night_premium', desc: 'After-hours premium', base: 300, variance: 50 },
-  { name: 'lunch_express', desc: 'Quick session lunch special', base: 120, variance: 10 },
-  { name: 'weekend_warrior', desc: 'Weekend athletic recovery', base: 220, variance: 25 },
-  { name: 'holiday_special', desc: 'Holiday seasonal rate', base: 200, variance: 40 },
-  { name: 'last_minute', desc: 'Same-day booking discount', base: 170, variance: 15 },
-  { name: 'package_deal', desc: 'Multi-session package rate', base: 190, variance: 20 },
-];
-
-function generatePrice(strategy, hour, dayOfWeek) {
-  const s = strategy || PRICE_STRATEGIES[0];
-  let price = s.base;
-
-  // Peak hours: 6pm-11pm
-  if (hour >= 18 && hour <= 23) price += s.variance * 0.5;
-  // Late night: midnight-4am
-  if (hour >= 0 && hour <= 4) price += s.variance * 0.8;
-  // Weekend premium
-  if (dayOfWeek === 0 || dayOfWeek === 6) price += s.variance * 0.3;
-  // Add small random variance
-  price += Math.round((Math.random() - 0.5) * s.variance * 0.2);
-
-  return Math.max(80, Math.round(price));
-}
-
-// Export for Node.js and browser
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { RotatorEngine, PRICE_STRATEGIES, generatePrice };
-}
-if (typeof window !== 'undefined') {
-  window.RotatorEngine = RotatorEngine;
-  window.PRICE_STRATEGIES = PRICE_STRATEGIES;
-  window.generatePrice = generatePrice;
-}
-
-```
-
-make-icons.js:
-```
-const fs = require('fs');
-const zlib = require('zlib');
-
-function crc32(buf) {
-  const table = new Uint32Array(256);
-  for (let i = 0; i < 256; i++) {
-    let c = i;
-    for (let j = 0; j < 8; j++) {
-      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-    }
-    table[i] = c >>> 0;
-  }
-  let c = 0xFFFFFFFF;
-  for (let i = 0; i < buf.length; i++) {
-    c = table[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
-  }
-  return (c ^ 0xFFFFFFFF) >>> 0;
-}
-
-function makePng(size, r, g, b, filename) {
-  const sig = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-  
-  // IHDR
-  const ihdrData = Buffer.alloc(13);
-  ihdrData.writeUInt32BE(size, 0);
-  ihdrData.writeUInt32BE(size, 4);
-  ihdrData[8] = 8;  // bit depth
-  ihdrData[9] = 6;  // color type RGBA
-  ihdrData[10] = 0; // compression
-  ihdrData[11] = 0; // filter
-  ihdrData[12] = 0; // interlace
-  const ihdrType = Buffer.from('IHDR');
-  const ihdrCrc = crc32(Buffer.concat([ihdrType, ihdrData]));
-  const ihdr = Buffer.concat([Buffer.from([0,0,0,13]), ihdrType, ihdrData, Buffer.alloc(4)]);
-  ihdr.writeUInt32BE(ihdrCrc, 17);
-  
-  // Raw image data
-  const rowLen = 1 + size * 4;
-  const raw = Buffer.alloc(size * rowLen);
-  for (let y = 0; y < size; y++) {
-    raw[y * rowLen] = 0; // filter byte
-    for (let x = 0; x < size; x++) {
-      const idx = y * rowLen + 1 + x * 4;
-      raw[idx] = r;
-      raw[idx + 1] = g;
-      raw[idx + 2] = b;
-      raw[idx + 3] = 255;
-    }
-  }
-  
-  const compressed = zlib.deflateSync(raw);
-  const idatType = Buffer.from('IDAT');
-  const idatCrc = crc32(Buffer.concat([idatType, compressed]));
-  const idatLen = Buffer.alloc(4);
-  idatLen.writeUInt32BE(compressed.length, 0);
-  const idatCrcBuf = Buffer.alloc(4);
-  idatCrcBuf.writeUInt32BE(idatCrc, 0);
-  const idat = Buffer.concat([idatLen, idatType, compressed, idatCrcBuf]);
-  
-  // IEND
-  const iendType = Buffer.from('IEND');
-  const iendCrc = crc32(iendType);
-  const iend = Buffer.concat([Buffer.from([0,0,0,0]), iendType, Buffer.alloc(4)]);
-  iend.writeUInt32BE(iendCrc, 8);
-  
-  const png = Buffer.concat([sig, ihdr, idat, iend]);
-  fs.writeFileSync(filename, png);
-}
-
-const base = '/Users/alep/Downloads/02_AI_Agents/rentmasseur-extension';
-// Accent color: #cc8b4a = 204, 139, 74
-makePng(16,  204, 139, 74, `${base}/icon16.png`);
-makePng(48,  204, 139, 74, `${base}/icon48.png`);
-makePng(128, 204, 139, 74, `${base}/icon128.png`);
-
-fs.writeFileSync(`${base}/icons_done.txt`, 'done');
-
-```
-
-rotator_engine.cpp:
-```
-/*
- * RentMasseur Rotator Engine — C++ Native
- * High-performance rotation engine for bios, photos, prices, interviews, blogs.
- * RL feedback loop with reward calculation. 10x faster than Python equivalent.
- *
- * Build: g++ -O3 -std=c++17 -o rotator_engine rotator_engine.cpp -lcurl
- * Run:   ./rotator_engine --rotate bio
- *        ./rotator_engine --report
- *        ./rotator_engine --reward bio photo_001 '{"views":150,"phone_clicks":12}'
- */
-
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <map>
-#include <unordered_map>
-#include <algorithm>
-#include <chrono>
-#include <ctime>
-#include <iomanip>
-#include <random>
-#include <memory>
-#include <cmath>
-#include <cstdlib>
-
-using json_val = std::string;
-
-struct RewardWeights {
-    int views = 1;
-    int email_clicks = 5;
-    int phone_clicks = 10;
-    int booking_inquiries = 50;
-    int favorites = 3;
-    int messages = 8;
-};
-
-struct RotationRule {
-    int max_age_hours;
-    int min_reward_threshold;
-    bool rotate_if_stale;
-};
-
-struct RotationItem {
-    std::string id;
-    std::string content;
-    std::string strategy;
-    std::string start_time;
-    std::string end_time;
-    double total_reward = 0;
-    double delta_reward = 0;
-    int times_used = 0;
-    double age_hours = 0;
-    std::map<std::string, int> last_stats;
-    std::map<std::string, int> delta_stats;
-};
-
-struct RLState {
-    std::map<std::string, std::map<std::string, RotationItem>> stores;
-    std::map<std::string, std::string> current;
-    std::map<std::string, int> rotations;
-    std::vector<std::string> history;
-};
-
-// --- Utilities ---
-
-static std::string iso_timestamp() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
-    return std::string(buf);
-}
-
-static double hours_since(const std::string& iso_time) {
-    if (iso_time.empty()) return 0;
-    // Simple parse: extract hours from ISO timestamp difference
-    // For production, use proper date parsing
+def write_receipt(action, data, success=True):
+    receipts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
+    os.makedirs(receipts_dir, exist_ok=True)
+    receipt = {
+        "action": action,
+        "success": success,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **data

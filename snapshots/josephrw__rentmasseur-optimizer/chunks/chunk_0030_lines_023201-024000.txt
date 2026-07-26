@@ -1,601 +1,58 @@
-    std::time_t now = std::time(nullptr);
-    // Approximate: parse the timestamp
-    struct std::tm tm = {};
-    std::istringstream ss(iso_time);
-    ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
-    std::time_t then = std::mktime(&tm);
-    return std::difftime(now, then) / 3600.0;
-}
-
-static std::string read_file(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) return "";
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
-static void write_file(const std::string& path, const std::string& content) {
-    std::ofstream f(path);
-    if (f) f << content;
-}
-
-// Simple JSON-ish serialization for state
-static std::string serialize_state(const RLState& state) {
-    std::ostringstream ss;
-    ss << "{\n";
-    ss << "  \"stores\": {\n";
-    bool first_store = true;
-    for (const auto& [type, store] : state.stores) {
-        if (!first_store) ss << ",\n";
-        first_store = false;
-        ss << "    \"" << type << "\": {\n";
-        bool first_item = true;
-        for (const auto& [id, item] : store) {
-            if (!first_item) ss << ",\n";
-            first_item = false;
-            ss << "      \"" << id << "\": {\n";
-            ss << "        \"content\": \"" << item.content.substr(0, 200) << "\",\n";
-            ss << "        \"strategy\": \"" << item.strategy << "\",\n";
-            ss << "        \"total_reward\": " << item.total_reward << ",\n";
-            ss << "        \"delta_reward\": " << item.delta_reward << ",\n";
-            ss << "        \"times_used\": " << item.times_used << ",\n";
-            ss << "        \"age_hours\": " << item.age_hours << "\n";
-            ss << "      }";
-        }
-        ss << "\n    }";
     }
-    ss << "\n  },\n";
-    ss << "  \"current\": {\n";
-    bool first_cur = true;
-    for (const auto& [type, id] : state.current) {
-        if (!first_cur) ss << ",\n";
-        first_cur = false;
-        ss << "    \"" << type << "\": \"" << id << "\"";
-    }
-    ss << "\n  },\n";
-    ss << "  \"rotations\": {\n";
-    bool first_rot = true;
-    for (const auto& [type, count] : state.rotations) {
-        if (!first_rot) ss << ",\n";
-        first_rot = false;
-        ss << "    \"" << type << "\": " << count;
-    }
-    ss << "\n  }\n";
-    ss << "}\n";
-    return ss.str();
-}
-
-// --- Core Engine ---
-
-class RotatorEngine {
-private:
-    RLState state;
-    RewardWeights weights;
-    std::map<std::string, RotationRule> rules;
-    std::string state_path;
-    std::mt19937 rng;
-
-public:
-    RotatorEngine(const std::string& content_dir) : state_path(content_dir + "/rl_state.json") {
-        rules["bio"] = {24, 5, true};
-        rules["photo"] = {48, 3, true};
-        rules["price"] = {12, 8, false};
-        rules["interview"] = {72, 2, true};
-        rules["blog"] = {48, 4, true};
-        rng.seed(std::random_device()());
-        load_state();
-    }
-
-    void load_state() {
-        std::string raw = read_file(state_path);
-        if (raw.empty()) return;
-        // Minimal parse — in production use nlohmann/json
-        // For now, state starts empty and gets populated at runtime
-    }
-
-    void save_state() {
-        write_file(state_path, serialize_state(state));
-    }
-
-    double calculate_reward(const std::map<std::string, int>& stats, double age_hours) {
-        double reward = 0;
-        reward += stats.count("views") ? stats.at("views") * weights.views : 0;
-        reward += stats.count("email_clicks") ? stats.at("email_clicks") * weights.email_clicks : 0;
-        reward += stats.count("phone_clicks") ? stats.at("phone_clicks") * weights.phone_clicks : 0;
-        reward += stats.count("booking_inquiries") ? stats.at("booking_inquiries") * weights.booking_inquiries : 0;
-        reward += stats.count("favorites") ? stats.at("favorites") * weights.favorites : 0;
-        reward += stats.count("messages") ? stats.at("messages") * weights.messages : 0;
-        reward -= (age_hours / 24.0) * 0.5;
-        return std::round(reward * 100.0) / 100.0;
-    }
-
-    struct RotateDecision {
-        bool rotate;
-        std::string reason;
-    };
-
-    RotateDecision should_rotate(const std::string& type, double age_hours, double delta_reward) {
-        auto it = rules.find(type);
-        if (it == rules.end()) return {false, "unknown type"};
-
-        const auto& rule = it->second;
-        if (rule.rotate_if_stale && age_hours >= rule.max_age_hours)
-            return {true, "stale (" + std::to_string((int)age_hours) + "h >= " + std::to_string(rule.max_age_hours) + "h)"};
-        if (age_hours >= rule.max_age_hours / 2 && delta_reward < rule.min_reward_threshold)
-            return {true, "low reward (" + std::to_string((int)delta_reward) + " < " + std::to_string(rule.min_reward_threshold) + ")"};
-        if (age_hours >= 6 && delta_reward == 0)
-            return {true, "zero engagement 6h+"};
-        return {false, "performing well"};
-    }
-
-    std::pair<std::string, RotationItem*> pick_next(const std::string& type) {
-        auto store_it = state.stores.find(type);
-        if (store_it == state.stores.end() || store_it->second.empty())
-            return {"", nullptr};
-
-        auto& store = store_it->second;
-        std::vector<std::pair<std::string, RotationItem*>> items;
-        for (auto& [id, item] : store) {
-            items.emplace_back(id, &item);
-        }
-
-        std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
-            if (a.second->times_used != b.second->times_used)
-                return a.second->times_used < b.second->times_used;
-            return a.second->total_reward > b.second->total_reward;
-        });
-
-        return items[0];
-    }
-
-    void register_rotation(const std::string& type, const std::string& id,
-                          const std::string& content, const std::string& strategy) {
-        auto& store = state.stores[type];
-        auto cur_it = state.current.find(type);
-        if (cur_it != state.current.end() && store.count(cur_it->second)) {
-            store[cur_it->second].end_time = iso_timestamp();
-        }
-
-        auto& item = store[id];
-        item.id = id;
-        item.content = content.substr(0, 500);
-        item.strategy = strategy;
-        item.start_time = iso_timestamp();
-        item.total_reward = 0;
-        item.delta_reward = 0;
-        item.times_used++;
-        item.age_hours = 0;
-
-        state.current[type] = id;
-        state.rotations[type]++;
-
-        save_state();
-    }
-
-    void update_reward(const std::string& type, const std::string& id,
-                       const std::map<std::string, int>& stats) {
-        auto store_it = state.stores.find(type);
-        if (store_it == state.stores.end()) return;
-        auto item_it = store_it->second.find(id);
-        if (item_it == store_it->second.end()) return;
-
-        auto& item = item_it->second;
-        std::map<std::string, int> delta;
-        for (const auto& [key, weight] : std::map<std::string, int>{{"views",1},{"email_clicks",5},{"phone_clicks",10},{"booking_inquiries",50},{"favorites",3},{"messages",8}}) {
-            int prev = item.last_stats.count(key) ? item.last_stats[key] : 0;
-            delta[key] = std::max(0, stats.count(key) ? stats.at(key) - prev : 0);
-        }
-
-        double age = hours_since(item.start_time);
-        double dr = calculate_reward(delta, age);
-        item.delta_reward = dr;
-        item.total_reward += dr;
-        item.last_stats = stats;
-        item.age_hours = age;
-
-        save_state();
-    }
-
-    std::vector<std::pair<std::string, double>> top_performers(const std::string& type, int n = 5) {
-        auto store_it = state.stores.find(type);
-        if (store_it == state.stores.end()) return {};
-
-        std::vector<std::pair<std::string, double>> result;
-        for (const auto& [id, item] : store_it->second) {
-            result.emplace_back(id, item.total_reward);
-        }
-        std::sort(result.begin(), result.end(),
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
-        if ((int)result.size() > n) result.resize(n);
-        return result;
-    }
-
-    std::string report() {
-        std::ostringstream ss;
-        ss << "=== ROTATOR ENGINE REPORT (C++) ===\n";
-        for (const auto& type : {"bio", "photo", "price", "interview", "blog"}) {
-            int rotations = state.rotations.count(type) ? state.rotations[type] : 0;
-            std::string cur = state.current.count(type) ? state.current[type] : "none";
-            ss << "\n" << type << ": " << rotations << " rotations, current=" << cur << "\n";
-            auto top = top_performers(type, 3);
-            for (const auto& [id, reward] : top) {
-                ss << "  " << id << ": reward=" << reward << "\n";
-            }
-        }
-        return ss.str();
-    }
-
-    // Price generation
-    struct PriceStrategy {
-        std::string name;
-        std::string desc;
-        int base;
-        int variance;
-    };
-
-    std::vector<PriceStrategy> price_strategies = {
-        {"premium_peak", "High price peak hours", 250, 30},
-        {"off_peak_deal", "Off-peak discount", 180, 20},
-        {"new_client_special", "First-time client", 150, 15},
-        {"loyalty_rate", "Returning client", 200, 10},
-        {"late_night_premium", "After-hours", 300, 50},
-        {"lunch_express", "Quick lunch", 120, 10},
-        {"weekend_warrior", "Weekend athletic", 220, 25},
-        {"holiday_special", "Seasonal", 200, 40},
-        {"last_minute", "Same-day", 170, 15},
-        {"package_deal", "Multi-session", 190, 20},
-    };
-
-    int generate_price(const std::string& strategy_name, int hour, int day_of_week) {
-        const PriceStrategy* s = &price_strategies[0];
-        for (const auto& ps : price_strategies) {
-            if (ps.name == strategy_name) { s = &ps; break; }
-        }
-
-        int price = s->base;
-        if (hour >= 18 && hour <= 23) price += s->variance * 0.5;
-        if (hour >= 0 && hour <= 4) price += s->variance * 0.8;
-        if (day_of_week == 0 || day_of_week == 6) price += s->variance * 0.3;
-
-        std::uniform_real_distribution<double> dist(-0.1, 0.1);
-        price += std::round(dist(rng) * s->variance);
-
-        return std::max(80, price);
-    }
-};
-
-// --- CLI ---
-
-int main(int argc, char* argv[]) {
-    std::string content_dir = "./content";
-    std::string action = "report";
-    std::string type = "bio";
-    std::string item_id;
-    std::string stats_json;
-
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--rotate" && i + 1 < argc) { action = "rotate"; type = argv[++i]; }
-        else if (arg == "--report") { action = "report"; }
-        else if (arg == "--reward" && i + 3 < argc) {
-            action = "reward"; type = argv[++i]; item_id = argv[++i]; stats_json = argv[++i];
-        }
-        else if (arg == "--price" && i + 2 < argc) {
-            action = "price"; std::string strat = argv[++i]; int hr = std::atoi(argv[++i]);
-            int dow = i + 1 < argc ? std::atoi(argv[++i]) : 3;
-            RotatorEngine engine(content_dir);
-            int price = engine.generate_price(strat, hr, dow);
-            std::cout << "Price: $" << price << " (strategy: " << strat << ", hour: " << hr << ")\n";
-            return 0;
-        }
-        else if (arg == "--dir" && i + 1 < argc) { content_dir = argv[++i]; }
-        else if (arg == "--help") {
-            std::cout << "Usage: rotator_engine [options]\n"
-                      << "  --rotate <type>       Pick next item to rotate\n"
-                      << "  --report              Show RL report\n"
-                      << "  --reward <type> <id> <stats_json>  Update reward\n"
-                      << "  --price <strategy> <hour> <day>    Generate price\n"
-                      << "  --dir <path>          Content directory\n";
-            return 0;
-        }
-    }
-
-    RotatorEngine engine(content_dir);
-
-    if (action == "report") {
-        std::cout << engine.report() << "\n";
-    } else if (action == "rotate") {
-        auto [id, item] = engine.pick_next(type);
-        if (item) {
-            std::cout << "Next " << type << ": " << id
-                      << " (strategy: " << item->strategy
-                      << ", uses: " << item->times_used
-                      << ", reward: " << item->total_reward << ")\n";
-        } else {
-            std::cout << "No " << type << " items in pool\n";
-            return 1;
-        }
-    } else if (action == "reward") {
-        std::map<std::string, int> stats;
-        // Simple parse: {"views":150,"phone_clicks":12}
-        // In production, use proper JSON parser
-        std::cout << "Updating reward for " << type << "/" << item_id << "\n";
-        engine.update_reward(type, item_id, stats);
-        std::cout << "Reward updated\n";
-    }
-
-    return 0;
-}
-
-```
-
-Dockerfile.cartman:
-```
-FROM python:3.11-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential g++ curl \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY requirements-cartman.txt .
-RUN pip install --no-cache-dir -r requirements-cartman.txt
-
-COPY data/SouthPark_Lines.csv data/SouthPark_Lines.csv
-COPY cartman_engine.py .
-
-ENV PYTHONUNBUFFERED=1
-ENV CARTMAN_CSV=/app/data/SouthPark_Lines.csv
-ENV CARTMAN_HOST=0.0.0.0
-ENV CARTMAN_PORT=7860
-
-EXPOSE 7860
-
-CMD ["python", "cartman_engine.py"]
-
-```
-
-icon128.png:
-```
-Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
-```
-
-push_bio.py:
-```
-#!/usr/bin/env python3
-"""
-Bio Push Pipeline — pushes the winning bio to the live profile and initializes the experiment ledger.
-
-This is the ONLY script that mutates the live profile bio.
-It pushes one bio, records the start state, and writes a receipt.
-
-Usage:
-  python3 push_bio.py                    # Push the winning bio (variant B)
-  python3 push_bio.py A                  # Push variant A (clinical)
-  python3 push_bio.py B                  # Push variant B (winning wolf)
-  python3 push_bio.py C                  # Push variant C (luxury)
-"""
-
-import json
-import os
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-sys.path.insert(0, str(Path("/Users/alep/Downloads/rentmasseur-optimizer/rm_pri/py")))
-from api_client import RentMasseurAPI
-
-from dotenv import load_dotenv
-
-EXT_DIR = Path(__file__).parent
-CONTENT_DIR = EXT_DIR / "content"
-BIOS_DIR = CONTENT_DIR / "bios"
-RECEIPTS_DIR = EXT_DIR / "receipts"
-LEDGER_PATH = CONTENT_DIR / "experiment_ledger.json"
-
-REBRANDLY_LINK = "rebrand.ly/carpathianwolf"
-
-VARIANTS = {
-    "A": {
-        "id": "bio_A_clinical_recovery",
-        "file": "bio_A_clinical_recovery.md",
-        "strategy": "clinical_recovery",
-        "headline": "KARPATHIAN WOLF — Professional Therapeutic Massage",
-    },
-    "B": {
-        "id": "bio_W_winning_production",
-        "file": "bio_W_winning_production.md",
-        "strategy": "controlled_wolf",
-        "headline": "KARPATHIAN WOLF — Targeted Recovery in Manhattan",
-    },
-    "C": {
-        "id": "bio_C_luxury_concierge",
-        "file": "bio_C_luxury_concierge.md",
-        "strategy": "luxury_concierge",
-        "headline": "KARPATHIAN WOLF — Manhattan's Private Recovery Specialist",
-    },
-}
-
-
-def load_bio(filename: str) -> str:
-    path = BIOS_DIR / filename
-    if not path.exists():
-        print(f"ERROR: Bio file not found: {path}")
-        sys.exit(1)
-    content = path.read_text().strip()
-    # Remove markdown header if present
-    lines = content.split("\n")
-    if lines and lines[0].startswith("#"):
-        lines = lines[1:]
-    bio = "\n".join(lines).strip()
-    # Ensure rebrandly link
-    if REBRANDLY_LINK not in bio:
-        bio += f"\n\nBook: {REBRANDLY_LINK}"
-    return bio
-
-
-def load_ledger() -> dict:
-    if LEDGER_PATH.exists():
-        return json.loads(LEDGER_PATH.read_text())
-    return {"current_bio_id": None, "current_bio_started_at": None,
-            "current_bio_start_views": 0, "current_bio_start_clicks": 0,
-            "history": [], "baseline_ctr": None}
-
-
-def save_ledger(ledger: dict):
-    LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LEDGER_PATH.write_text(json.dumps(ledger, indent=2))
+    rpath = os.path.join(receipts_dir, f"{action}_{receipt['timestamp'].replace(':','-')}.json")
+    with open(rpath, "w") as f:
+        json.dump(receipt, f, indent=2)
+    return rpath
 
 
 def main():
-    variant_key = sys.argv[1] if len(sys.argv) > 1 else "B"
-    if variant_key not in VARIANTS:
-        print(f"ERROR: Unknown variant '{variant_key}'. Use A, B, or C.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Visit back everyone who visited your profile")
+    parser.add_argument("--dry-run", action="store_true", help="List visitors without visiting")
+    parser.add_argument("--limit", type=int, default=50, help="Max visitors to visit")
+    args = parser.parse_args()
 
-    variant = VARIANTS[variant_key]
-    bio_content = load_bio(variant["file"])
+    options = uc.ChromeOptions()
+    options.add_argument("--window-size=1280,900")
+    options.add_argument("--disable-blink-features=AutomationControlled")
 
-    print("=" * 60)
-    print(f"BIO PUSH — Variant {variant_key}: {variant['id']}")
-    print("=" * 60)
-    print(f"  Strategy: {variant['strategy']}")
-    print(f"  Headline: {variant['headline']}")
-    print(f"  Length: {len(bio_content)} chars")
-    print(f"\n  Bio preview:\n{bio_content[:300]}...")
+    driver = uc.Chrome(options=options, version_main=149)
 
-    # Load credentials
-    load_dotenv(EXT_DIR / ".env")
-    username = os.environ.get("RENTMASSEUR_USERNAME")
-    password = os.environ.get("RENTMASSEUR_PASSWORD")
-
-    if not username or not password or username == "REDACTED_ROTATE_ME":
-        print("ERROR: No valid credentials in .env")
-        sys.exit(1)
-
-    # Login — try saved session first, then fresh login
-    print(f"\nLogging in as {username}...")
-    api = RentMasseurAPI(min_request_interval=2.0)
-
-    session_path = Path("/Users/alep/Downloads/windsurf-smoke/rm_traffic/session.json")
-    if session_path.exists():
-        print("Found saved session, loading cookies...")
-        session_data = json.loads(session_path.read_text())
-        cookies = session_data.get("cookies", [])
-        api.load_cookies(cookies)
-        # Test with a lightweight request
-        try:
-            api.get_keeponline()
-            print("Saved session is valid")
-        except Exception as e:
-            print(f"Saved session expired, trying fresh login... ({e})")
-            if not api.login(username, password):
-                print("ERROR: Login failed (CrowdSec captcha may be active)")
-                print("Try again later or use a VPN/different IP")
-                sys.exit(1)
-    else:
-        if not api.login(username, password):
-            print("ERROR: Login failed (CrowdSec captcha may be active)")
-            sys.exit(1)
-    print("Login successful")
-
-    # Capture BEFORE snapshot
-    print("\n--- BEFORE snapshot ---")
-    stats = api.get_ad_statistics()
-    profile_stats = stats.get("profileStatistics", {}) if isinstance(stats, dict) else {}
-    before_views = profile_stats.get("totalPageViews", 0)
-    before_clicks = profile_stats.get("totalContactClicks", 0)
-    print(f"  Total views: {before_views}")
-    print(f"  Total clicks: {before_clicks}")
-
-    about = api.get_about()
-    assets = about.get("userProps", {}).get("assets", {}) if isinstance(about, dict) else {}
-    old_headline = assets.get("headline", "")
-    old_bio = assets.get("description", "")
-    print(f"  Old headline: {old_headline}")
-    print(f"  Old bio length: {len(old_bio)} chars")
-    print(f"  Old bio had rebrandly: {REBRANDLY_LINK in old_bio}")
-
-    # Push new bio
-    print(f"\n--- PUSHING new bio ---")
-    print(f"  Headline: {variant['headline']}")
     try:
-        result = api.set_about(headline=variant["headline"], description=bio_content)
-        print(f"  API response: {json.dumps(result, indent=2)[:500]}")
-        print("  BIO PUSHED SUCCESSFULLY")
-    except Exception as e:
-        print(f"  ERROR: Failed to push bio: {e}")
-        sys.exit(1)
+        print("[1] Login...")
+        if not login(driver):
+            print("  Login failed!")
+            sys.exit(1)
+        print(f"  OK: {driver.current_url}")
 
-    # Verify
-    print(f"\n--- VERIFY ---")
-    verify = api.get_about()
-    v_assets = verify.get("userProps", {}).get("assets", {}) if isinstance(verify, dict) else {}
-    v_headline = v_assets.get("headline", "")
-    v_bio = v_assets.get("description", "")
-    print(f"  Verified headline: {v_headline}")
-    print(f"  Verified bio length: {len(v_bio)} chars")
-    print(f"  Rebrandly in live bio: {'YES' if REBRANDLY_LINK in v_bio else 'NO'}")
+        print("\n[2] Scraping visitors from /settings/whosawme...")
+        visitors = scrape_visitors(driver)
+        print(f"  Found {len(visitors)} visitors")
+        for v in visitors[:10]:
+            print(f"    {v['name']} -> {v['url']}")
 
-    # Update experiment ledger
-    ledger = load_ledger()
-    # Record previous bio in history
-    if ledger.get("current_bio_id"):
-        ledger["history"].append({
-            "bio_id": ledger["current_bio_id"],
-            "started_at": ledger.get("current_bio_started_at"),
-            "ended_at": now_iso(),
-            "start_views": ledger.get("current_bio_start_views", 0),
-            "end_views": before_views,
-            "start_clicks": ledger.get("current_bio_start_clicks", 0),
-            "end_clicks": before_clicks,
+        if args.dry_run:
+            print(f"\n  Dry run — would visit {min(len(visitors), args.limit)} profiles")
+            write_receipt("visit_back", {"visitors_found": len(visitors), "dry_run": True, "visitor_list": visitors[:args.limit]})
+            return
+
+        print(f"\n[3] Visiting {min(len(visitors), args.limit)} profiles...")
+        visited = []
+        for i, v in enumerate(visitors[:args.limit]):
+            print(f"  [{i+1}/{min(len(visitors), args.limit)}] Visiting {v['name']}...")
+            url = visit_profile(driver, v['url'])
+            visited.append({"username": v['username'], "url": v['url'], "visited_at": datetime.now(timezone.utc).isoformat()})
+            time.sleep(2)
+
+        rpath = write_receipt("visit_back", {
+            "visitors_found": len(visitors),
+            "visited_count": len(visited),
+            "visited": visited
         })
+        print(f"\n=== VISITED {len(visited)} PROFILES === Receipt: {rpath}")
 
-    # Set new current bio
-    ledger["current_bio_id"] = variant["id"]
-    ledger["current_bio_started_at"] = now_iso()
-    ledger["current_bio_start_views"] = before_views
-    ledger["current_bio_start_clicks"] = before_clicks
-    save_ledger(ledger)
-    print(f"\n  Experiment ledger updated: {variant['id']}")
-
-    # Write receipt
-    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc)
-    receipt = {
-        "action": "bio_push",
-        "timestamp": ts.isoformat(),
-        "variant": variant_key,
-        "bio_id": variant["id"],
-        "strategy": variant["strategy"],
-        "headline": variant["headline"],
-        "bio_length": len(bio_content),
-        "rebrandly_present": REBRANDLY_LINK in bio_content,
-        "rebrandly_verified_live": REBRANDLY_LINK in v_bio,
-        "before_views": before_views,
-        "before_clicks": before_clicks,
-        "old_headline": old_headline,
-        "api_result": "success" if v_headline == variant["headline"] else "mismatch",
-    }
-    receipt_path = RECEIPTS_DIR / f"bio_push_{ts.strftime('%Y%m%d_%H%M%S')}.json"
-    receipt_path.write_text(json.dumps(receipt, indent=2))
-    print(f"  Receipt: {receipt_path}")
-
-    print("\n" + "=" * 60)
-    print("PUSH COMPLETE")
-    print(f"  Bio: {variant['id']}")
-    print(f"  Headline: {v_headline}")
-    print(f"  Rebrandly: {'LIVE' if REBRANDLY_LINK in v_bio else 'NOT FOUND'}")
-    print(f"  Baseline views: {before_views}")
-    print(f"  Baseline clicks: {before_clicks}")
-    print("=" * 60)
-    print("\nNext: run daily_evidence.py to track performance")
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+    finally:
+        driver.quit()
+        print("\nDone.")
 
 
 if __name__ == "__main__":
@@ -603,198 +60,741 @@ if __name__ == "__main__":
 
 ```
 
-rm_demo_agent.py:
+_dump_whosawme.py:
+```
+#!/usr/bin/env python3
+"""Quick dump of /settings/whosawme to find visitor structure."""
+import time, os, json
+import undetected_chromedriver as uc
+from dotenv import load_dotenv
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv()
+
+USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+
+options = uc.ChromeOptions()
+options.add_argument("--window-size=1280,900")
+options.add_argument("--disable-blink-features=AutomationControlled")
+
+driver = uc.Chrome(options=options, version_main=149)
+
+try:
+    print("[1] Login...")
+    driver.get("https://rentmasseur.com/login")
+    time.sleep(6)
+    driver.execute_script("""
+        const pwd = document.querySelector('input[type="password"]');
+        const user = document.querySelector('input[type="text"], input[type="email"]');
+        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
+        if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
+    """, USERNAME, PASSWORD)
+    time.sleep(1)
+    driver.find_element(By.CSS_SELECTOR, 'input[type="password"]').send_keys(Keys.ENTER)
+    time.sleep(5)
+    print(f"  URL: {driver.current_url}")
+
+    print("\n[2] /settings/whosawme...")
+    driver.get("https://rentmasseur.com/settings/whosawme")
+    time.sleep(5)
+    print(f"  URL: {driver.current_url}")
+    print(f"  Title: {driver.title}")
+
+    # Dump all links
+    links = driver.execute_script("""
+        return Array.from(document.querySelectorAll('a')).map(a => ({
+            href: a.href, text: a.innerText.trim().substring(0,60),
+            cls: a.className, id: a.id
+        })).filter(a => a.text || a.href);
+    """)
+    print(f"\nLinks: {len(links)}")
+    for l in links[:40]:
+        print(f"  {l['text'][:40]} -> {l['href'][:70]}")
+
+    # Dump all images (visitor avatars)
+    imgs = driver.execute_script("""
+        return Array.from(document.querySelectorAll('img')).map(i => ({
+            src: (i.src||'').substring(0,80), alt: i.alt, cls: i.className,
+            parent_tag: i.parentElement ? i.parentElement.tagName : '',
+            parent_href: i.parentElement && i.parentElement.tagName === 'A' ? i.parentElement.href : ''
+        }));
+    """)
+    print(f"\nImages: {len(imgs)}")
+    for i in imgs[:20]:
+        print(f"  src={i['src'][:50]} alt={i['alt'][:20]} parent={i['parent_tag']} href={i['parent_href'][:60]}")
+
+    # Dump page structure
+    structure = driver.execute_script("""
+        const body = document.body;
+        const result = [];
+        function walk(el, depth) {
+            if (depth > 4) return;
+            const tag = el.tagName.toLowerCase();
+            const cls = el.className ? (typeof el.className === 'string' ? el.className.split(' ').slice(0,2).join('.') : '') : '';
+            const id = el.id ? '#' + el.id : '';
+            const text = (el.innerText || '').trim().substring(0, 30);
+            if (text || cls || id) {
+                result.push('  '.repeat(depth) + tag + id + (cls ? '.' + cls : '') + (text ? ' [' + text + ']' : ''));
+            }
+            Array.from(el.children).forEach(c => walk(c, depth + 1));
+        }
+        walk(body, 0);
+        return result.slice(0, 80);
+    """)
+    print(f"\nPage structure:")
+    for s in structure:
+        print(s)
+
+    driver.save_screenshot(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "rentmasseur-optimizer", "whosawme.png"))
+
+finally:
+    driver.quit()
+    print("\nDone.")
+
+```
+
+index.html:
+```
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RentMasseur OS — Netlify Mirror</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0; margin: 0; padding: 40px; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { color: #6ec1e4; }
+    .card { background: #1a1a2e; border-radius: 12px; padding: 24px; margin: 16px 0; }
+    .status { color: #4ade80; font-weight: bold; }
+    a { color: #6ec1e4; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .endpoint { font-family: monospace; font-size: 0.85em; color: #94a3b8; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>RentMasseur OS — Netlify Mirror</h1>
+    <div class="card">
+      <p><span class="status">● Online</span> — This is a Netlify backup of the RentMasseur optimizer.</p>
+      <p>API requests are proxied to the Hugging Face Space backend.</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h3>API Endpoints</h3>
+        <p class="endpoint">GET /api/os/report</p>
+        <p class="endpoint">GET /api/os/bios</p>
+        <p class="endpoint">GET /api/os/competitors</p>
+        <p class="endpoint">POST /api/os/ingest</p>
+        <p class="endpoint">POST /api/collect</p>
+      </div>
+      <div class="card">
+        <h3>Primary Backends</h3>
+        <p><a href="https://josephrw-rentmasseur-optimizer.hf.space">Hugging Face Space</a></p>
+        <p><a href="https://github.com/overandor/rentmasseur-extension">GitHub Repo</a></p>
+        <p><a href="https://rentmasseur-vercel.vercel.app">Vercel Functions</a></p>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Demo Agent</h3>
+      <p>Anti-bot browser automation with Playwright + Selenium.</p>
+      <p class="endpoint">python3 rm_demo_agent.py --engine selenium --headed --login --visit-back</p>
+    </div>
+  </div>
+</body>
+</html>
+
+```
+
+test_provider_growth.py:
+```
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from provider_growth.db import init_db
+from provider_growth.drafts import approve_draft, create_draft
+from provider_growth.engagement import upsert_record
+from provider_growth.experiments import add_snapshot, summarize_by_version
+from provider_growth.imac_relay import open_conversation_record, log_conversation_event
+from provider_growth.kpi import add_revenue_event, revenue_summary
+from provider_growth.outbox import enqueue_draft, export_ready_item, mark_completed
+from provider_growth.policy import evaluate_and_receipt, set_policy
+from provider_growth.profile_content import activate_version, add_version
+
+
+def test_provider_growth_production_manual_loop(tmp_path):
+    db_path = str(tmp_path / "growth.sqlite3")
+    outbox_dir = str(tmp_path / "outbox")
+    init_db(db_path)
+
+    # Avoid local quiet-hour timing in deterministic tests.
+    set_policy("quiet_hours_start", "23", db_path=db_path)
+    set_policy("quiet_hours_end", "0", db_path=db_path)
+
+    record = upsert_record("authorized-record-1", display_name="Client", db_path=db_path)
+    assert record["record_key"]
+    assert record["score"] >= 0
+
+    draft = create_draft(record["record_key"], "same_day", name="Client", channel="imessage", db_path=db_path)
+    assert draft["approval_required"] is True
+    assert draft["status"] == "draft"
+
+    blocked = evaluate_and_receipt(draft["draft_id"], db_path=db_path)
+    assert blocked["decision"] == "needs_approval"
+
+    approved = approve_draft(draft["draft_id"], db_path=db_path)
+    assert approved["draft"]["status"] == "approved"
+
+    allowed = evaluate_and_receipt(draft["draft_id"], db_path=db_path)
+    assert allowed["allowed"] is True
+
+    outbox = enqueue_draft(draft["draft_id"], db_path=db_path)
+    assert outbox["state"] == "ready"
+
+    exported = export_ready_item(outbox["outbox_id"], output_dir=outbox_dir, db_path=db_path)
+    assert Path(exported["path"]).exists()
+
+    completed = mark_completed(outbox["outbox_id"], db_path=db_path)
+    assert completed["state"] == "manual_completed"
+
+    conversation = open_conversation_record(record["record_key"], channel="imessage", db_path=db_path)
+    event = log_conversation_event(conversation["conversation_id"], "note", "manual review completed", db_path=db_path)
+    assert event["direction"] == "note"
+
+    version = add_version("bio", "bio_v1", "Calm, professional profile text.", reason="trust version", db_path=db_path)
+    activated = activate_version(version["version_id"], db_path=db_path)
+    assert activated["status"] == "active"
+
+    add_snapshot(profile_version_label="bio_v1", profile_views=10, repeat_visitors=2, contact_actions=1, inbound_messages=1, booking_requests=1, db_path=db_path)
+    summary = summarize_by_version(db_path=db_path)
+    assert summary[0]["profile_version_label"] == "bio_v1"
+    assert summary[0]["booking_requests"] == 1
+
+    add_revenue_event("confirmed_booking", amount_cents=20000, visitor_key=record["record_key"], db_path=db_path)
+    kpi = revenue_summary(db_path=db_path)
+    assert kpi["confirmed_pipeline_usd"] == 200.0
+    assert kpi["outbox_by_state"]["manual_completed"] == 1
+
+```
+
+package.json:
+```
+{
+  "name": "rentmasseur-vercel-backend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {}
+}
+
+```
+
+README.md:
+```
+# RentMasseur Vercel Backend
+
+Serverless functions that collect metrics and proxy data to the Hugging Face Space OS.
+
+## Deploy
+
+```bash
+cd vercel
+vercel --prod
+```
+
+## Environment Variables
+
+- `HF_SPACE_URL` — URL of the Hugging Face Space (e.g., `https://your-username-rentmasseur-optimizer.hf.space`)
+- `HF_TOKEN` — optional HF token for private spaces
+
+## Functions
+
+- `POST /api/collect` — ingest metrics from extension
+- `GET /api/report` — full OS report
+- `GET /api/bios` — bio candidates
+- `GET /api/competitors` — competitor intelligence
+
+```
+
+competitors.js:
+```
+/*
+ * Vercel Serverless Function: /api/competitors
+ * Fetches competitor intelligence from the HF Space OS backend.
+ */
+
+export default async function handler(req, res) {
+  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
+  try {
+    if (!HF_SPACE_URL) {
+      return res.status(200).json({ competitors: [], note: 'HF_SPACE_URL not set' });
+    }
+    const resp = await fetch(`${HF_SPACE_URL}/api/os/competitors`);
+    const data = await resp.json();
+    return res.status(200).json(data);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+```
+
+report.js:
+```
+/*
+ * Vercel Serverless Function: /api/report
+ * Returns the full RentMasseur OS report from the HF Space backend.
+ */
+
+export default async function handler(req, res) {
+  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
+  try {
+    if (!HF_SPACE_URL) {
+      return res.status(200).json({ note: 'HF_SPACE_URL not set' });
+    }
+    const resp = await fetch(`${HF_SPACE_URL}/api/os/report`);
+    const data = await resp.json();
+    return res.status(200).json(data);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+```
+
+collect.js:
+```
+/*
+ * Vercel Serverless Function: /api/collect
+ * Collects metrics from the RentMasseur Chrome extension or any client
+ * and forwards them to the Hugging Face Space OS backend.
+ */
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
+  const HF_TOKEN = process.env.HF_TOKEN || '';
+
+  try {
+    const payload = req.body;
+    const enriched = {
+      ...payload,
+      source: 'vercel',
+      vercel_region: process.env.VERCEL_REGION || 'unknown',
+      collected_at: new Date().toISOString(),
+    };
+
+    // Forward to HF Space
+    if (HF_SPACE_URL) {
+      await fetch(`${HF_SPACE_URL}/api/os/ingest`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(HF_TOKEN ? { Authorization: `Bearer ${HF_TOKEN}` } : {}),
+        },
+        body: JSON.stringify(enriched),
+      });
+    }
+
+    // Also store in Vercel KV or just return
+    return res.status(200).json({
+      status: 'collected',
+      payload: enriched,
+      hf_forwarded: Boolean(HF_SPACE_URL),
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+```
+
+bios.js:
+```
+/*
+ * Vercel Serverless Function: /api/bios
+ * Returns top-scoring bio candidates from the HF Space OS backend.
+ */
+
+export default async function handler(req, res) {
+  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
+  try {
+    if (!HF_SPACE_URL) {
+      return res.status(200).json({ bios: [], note: 'HF_SPACE_URL not set' });
+    }
+    const resp = await fetch(`${HF_SPACE_URL}/api/os/bios`);
+    const data = await resp.json();
+    return res.status(200).json(data);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+```
+
+review.md:
+```
+---
+auto_execution_mode: 0
+description: Review code changes for bugs, security issues, and improvements
+---
+You are a senior software engineer performing a thorough code review to identify potential bugs.
+
+Your task is to find all potential bugs and code improvements in the code changes. Focus on:
+1. Logic errors and incorrect behavior
+2. Edge cases that aren't handled
+3. Null/undefined reference issues
+4. Race conditions or concurrency issues
+5. Security vulnerabilities
+6. Improper resource management or resource leaks
+7. API contract violations
+8. Incorrect caching behavior, including cache staleness issues, cache key-related bugs, incorrect cache invalidation, and ineffective caching
+9. Violations of existing code patterns or conventions
+
+Make sure to:
+1. If exploring the codebase, call multiple tools in parallel for increased efficiency. Do not spend too much time exploring.
+2. If you find any pre-existing bugs in the code, you should also report those since it's important for us to maintain general code quality for the user.
+3. Do NOT report issues that are speculative or low-confidence. All your conclusions should be based on a complete understanding of the codebase.
+4. Remember that if you were given a specific git commit, it may not be checked out and local code states may be different.
+```
+
+gg.md:
+```
+---
+trigger: always_on
+---
+
+```
+
+mine_ny_clients.py:
 ```
 #!/usr/bin/env python3
 """
-RM Demo Agent — Production-ready Playwright + Selenium browser automation.
+Mine NY non-masseur client profiles from RentMasseur.
 
-Anti-bot features:
-  - Undetected ChromeDriver / stealth Playwright context
-  - Randomized User-Agent, viewport, language
-  - Human-like typing delays, mouse movements, scroll pauses
-  - CAPTCHA / block detection with graceful abort
-  - Request interception for API attribution
+What it does:
+  1. Logs in via Playwright (or reuses saved storage state)
+  2. Navigates to "Who Saw Me" page to extract visitor usernames
+  3. Also hits the dashboard API for visitor data
+  4. Visits each visitor's public profile to determine if they're a masseur or client
+  5. Filters for NY-based visitors
+  6. Saves results as JSON + screenshots
 
-Verification & logging:
-  - Every action writes a JSON receipt with SHA-256 content hash
-  - Screenshots before/after every mutation
-  - Attribution chain: session_id → action → timestamp → screenshot → hash
-  - Structured console logs with [AGENT] prefix and elapsed timers
-
-Usage:
-  python3 rm_demo_agent.py --engine playwright --headed --login --visit-back --limit 5
-  python3 rm_demo_agent.py --engine selenium   --headed --login --visit-back --limit 5
-  python3 rm_demo_agent.py --engine playwright --headed --dry-run
-  python3 rm_demo_agent.py --engine selenium   --headed --probe-only
+Safety:
+  - Read-only — no messages, no mutations
+  - Stops on CAPTCHA/blocks
+  - Rate-limited between profile visits
+  - Screenshots every page
 """
 
 from __future__ import annotations
 
-import argparse
-import hashlib
 import json
 import os
-import random
 import re
-import sqlite3
 import time
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from playwright.sync_api import sync_playwright, Page, BrowserContext
+
+
 BASE_URL = "https://rentmasseur.com"
-ARTIFACTS = Path("artifacts/demo_agent")
+ARTIFACTS = Path("artifacts/ny_mining")
 SCREENSHOTS = ARTIFACTS / "screenshots"
-RECEIPTS = ARTIFACTS / "receipts"
-LOGS = ARTIFACTS / "logs"
+ARTIFACTS.mkdir(parents=True, exist_ok=True)
+SCREENSHOTS.mkdir(exist_ok=True)
 
-for d in (ARTIFACTS, SCREENSHOTS, RECEIPTS, LOGS):
-    d.mkdir(parents=True, exist_ok=True)
-
-SESSION_ID = hashlib.sha256(f"{time.time()}{random.random()}".encode()).hexdigest()[:12]
-START_TIME = time.time()
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+NY_CITIES = [
+    "manhattan-ny", "brooklyn-ny", "queens-ny", "bronx-ny",
+    "staten-island-ny", "long-island-ny", "westchester-ny",
+    "new-york-ny", "nyc", "newyork",
 ]
 
-VIEWPORTS = [
-    {"width": 1440, "height": 900},
-    {"width": 1536, "height": 864},
-    {"width": 1680, "height": 1050},
-    {"width": 1920, "height": 1080},
+NY_KEYWORDS = [
+    "new york", "manhattan", "brooklyn", "queens", "bronx",
+    "staten island", "long island", "westchester", "nyc",
+    "ny,", "ny ", ", ny", "newyork",
 ]
-
-LANGUAGES = ["en-US", "en"]
-
-PAGES = {
-    "login":       {"url": f"{BASE_URL}/login",                   "needs_login": False},
-    "dashboard":   {"url": f"{BASE_URL}/settings",                "needs_login": True},
-    "availability":{"url": f"{BASE_URL}/settings?availability=1", "needs_login": True},
-    "about":       {"url": f"{BASE_URL}/settings/about",          "needs_login": True},
-    "whosawme":    {"url": f"{BASE_URL}/settings/whosawme",       "needs_login": True},
-    "mailbox":     {"url": f"{BASE_URL}/mailbox",                 "needs_login": True},
-    "search":      {"url": f"{BASE_URL}/search/manhattan-ny",     "needs_login": False},
-    "profile":     {"url": f"{BASE_URL}/karpathianwolf",          "needs_login": False},
-}
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def elapsed() -> float:
-    return round(time.time() - START_TIME, 2)
+def safe_name(s: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_-]', '_', s)[:60]
 
 
-def log(msg: str, level: str = "INFO"):
-    print(f"[AGENT] [{elapsed():>7.1f}s] [{level:<5}] {msg}")
+def detect_block(page: Page) -> Optional[str]:
+    try:
+        txt = page.inner_text("body")[:3000].lower()
+    except Exception:
+        txt = ""
+    url = (page.url or "").lower()
+    for needle, reason in [
+        ("captcha", "captcha"), ("crowdsec", "crowdsec"),
+        ("access forbidden", "forbidden"), ("verify you are human", "verification"),
+        ("too many requests", "rate_limited"),
+    ]:
+        if needle in txt or needle in url:
+            return reason
+    return None
 
 
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+def is_ny_location(text: str) -> bool:
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in NY_KEYWORDS)
 
 
-def write_receipt(action: str, status: str, data: dict) -> Path:
-    receipt = {
-        "session_id": SESSION_ID,
-        "action": action,
-        "status": status,
-        "timestamp": now_iso(),
-        "elapsed_s": elapsed(),
-        **data,
+def screenshot(page: Page, name: str) -> str:
+    path = SCREENSHOTS / f"{safe_name(name)}.png"
+    try:
+        page.screenshot(path=str(path), full_page=True)
+    except Exception:
+        return ""
+    return str(path)
+
+
+def attempt_login(page: Page, context: BrowserContext, username: str, password: str) -> bool:
+    try:
+        page.goto(f"{BASE_URL}/login", wait_until="networkidle", timeout=30000)
+        time.sleep(2)
+
+        block = detect_block(page)
+        if block:
+            print(f"  BLOCKED: {block}")
+            return False
+
+        email_el = page.query_selector("input#email") or page.query_selector("input[name='email']")
+        pass_el = page.query_selector("input#password") or page.query_selector("input[type='password']")
+
+        if not email_el or not pass_el:
+            print("  Login form not found")
+            return False
+
+        email_el.fill(username)
+        pass_el.fill(password)
+        time.sleep(0.5)
+
+        login_btn = page.query_selector("button:has-text('LOGIN')") or page.query_selector("button[type='submit']")
+        if login_btn and login_btn.is_visible():
+            login_btn.click()
+        else:
+            pass_el.press("Enter")
+
+        page.wait_for_load_state("networkidle", timeout=15000)
+        time.sleep(3)
+
+        block = detect_block(page)
+        if block:
+            print(f"  Post-login block: {block}")
+            return False
+
+        if "/login" in page.url:
+            print("  Login failed — still on login page")
+            return False
+
+        # Save storage state
+        context.storage_state(path=str(Path(".rm_storage_state.json")))
+        print(f"  Login OK — URL: {page.url}")
+        return True
+
+    except Exception as e:
+        print(f"  Login error: {e}")
+        return False
+
+
+def scrape_who_saw_me(page: Page) -> list[dict]:
+    """Navigate to Who Saw Me page and extract visitor usernames + locations."""
+    visitors = []
+
+    # Try multiple possible URLs for "Who Saw Me"
+    urls_to_try = [
+        f"{BASE_URL}/settings/visitors",
+        f"{BASE_URL}/settings/who-saw-me",
+        f"{BASE_URL}/account/visitors",
+        f"{BASE_URL}/settings/stats",
+    ]
+
+    for url in urls_to_try:
+        print(f"\n  Trying: {url}")
+        try:
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            time.sleep(3)
+
+            # Dismiss cookie consent
+            try:
+                btn = page.query_selector("button:has-text('ACCEPT ALL')")
+                if btn and btn.is_visible():
+                    btn.click()
+                    time.sleep(1)
+            except Exception:
+                pass
+
+            block = detect_block(page)
+            if block:
+                print(f"  Blocked: {block}")
+                continue
+
+            if "/login" in page.url or "/404" in page.url:
+                print(f"  Redirected: {page.url}")
+                continue
+
+            ss = screenshot(page, f"who_saw_me_{safe_name(url.split('/')[-1])}")
+            print(f"  Page loaded: {page.url}")
+            print(f"  Screenshot: {ss}")
+
+            # Try to extract visitor data from __NEXT_DATA__
+            try:
+                nd_text = page.evaluate("() => { const el = document.getElementById('__NEXT_DATA__'); return el ? el.textContent : null; }")
+                if nd_text:
+                    nd = json.loads(nd_text)
+                    props = nd.get("props", {}).get("pageProps", {})
+                    print(f"  __NEXT_DATA__ keys: {list(props.keys())}")
+
+                    # Look for visitors in various possible keys
+                    for key in ["visitors", "whoSawMe", "whoViewed", "views", "stats", "recentVisitors", "profileViews"]:
+                        if key in props:
+                            data = props[key]
+                            if isinstance(data, list):
+                                for item in data:
+                                    username = item.get("username") or item.get("user") or item.get("name") or ""
+                                    location = item.get("location") or item.get("city") or item.get("state") or ""
+                                    if username:
+                                        visitors.append({
+                                            "username": username,
+                                            "location": location,
+                                            "source": f"__NEXT_DATA__.{key}",
+                                            "raw": {k: v for k, v in item.items() if k in [
+                                                "username", "location", "city", "state", "country",
+                                                "userId", "userPhoto", "ts", "timestamp", "isMasseur",
+                                                "type", "role", "searchCity",
+                                            ]},
+                                        })
+                                print(f"  Found {len(visitors)} visitors in __NEXT_DATA__.{key}")
+            except Exception as e:
+                print(f"  __NEXT_DATA__ parse error: {e}")
+
+            # Also try extracting from page DOM — look for profile links
+            try:
+                links = page.query_selector_all("a[href]")
+                seen = {v["username"] for v in visitors}
+                for el in links:
+                    href = el.get_attribute("href") or ""
+                    text = (el.inner_text() or "").strip()
+                    # Profile links are /username (single segment)
+                    if href.startswith("/") and not any(x in href for x in [
+                        "login", "settings", "search", "blog", "reviews", "interviews",
+                        "available", "find-massage", "live-cams", "sitemap", "advertise",
+                        "mailbox", "static", "_next", "images", "api", "blogs", "404",
+                        "account", "gay-massage",
+                    ]):
+                        parts = href.strip("/").split("/")
+                        if parts and parts[0] and len(parts) == 1 and parts[0] not in seen:
+                            # Try to find location near this link
+                            location = ""
+                            try:
+                                parent = el.evaluate("e => e.closest('div, li, tr, card')")
+                                if parent:
+                                    location = page.evaluate("(el) => el ? el.innerText : ''", parent)[:300]
+                            except Exception:
+                                pass
+
+                            visitors.append({
+                                "username": parts[0],
+                                "location": location,
+                                "source": "dom_link",
+                                "raw": {"href": href, "text": text[:60]},
+                            })
+                            seen.add(parts[0])
+                print(f"  DOM links: {len(visitors)} total visitors found")
+            except Exception as e:
+                print(f"  DOM extraction error: {e}")
+
+            # Also capture the page text for analysis
+            try:
+                body_text = page.inner_text("body")[:5000]
+                # Look for patterns like "username from location"
+                # or table rows with user info
+                lines = body_text.split("\n")
+                for line in lines:
+                    line = line.strip()
+                    if line and len(line) > 5 and len(line) < 200:
+                        # Check if it looks like a visitor entry
+                        if any(kw in line.lower() for kw in NY_KEYWORDS):
+                            # Try to extract username from line
+                            for sep in [" from ", " - ", " | ", "  "]:
+                                if sep in line:
+                                    parts = line.split(sep)
+                                    if parts[0] and not any(x in parts[0].lower() for x in ["search", "filter", "sort", "page"]):
+                                        uname = parts[0].strip()
+                                        if uname and len(uname) < 40 and uname not in {v["username"] for v in visitors}:
+                                            visitors.append({
+                                                "username": uname,
+                                                "location": line,
+                                                "source": "page_text_pattern",
+                                                "raw": {"line": line},
+                                            })
+                                    break
+            except Exception:
+                pass
+
+            if visitors:
+                break  # Found visitors, stop trying other URLs
+
+        except Exception as e:
+            print(f"  Error: {e}")
+            continue
+
+    return visitors
+
+
+def check_profile_is_masseur(page: Page, username: str) -> dict:
+    """Visit a profile and determine if it's a masseur or client."""
+    result = {
+        "username": username,
+        "is_masseur": False,
+        "location": "",
+        "is_ny": False,
+        "profile_text": "",
+        "screenshot": "",
+        "error": None,
     }
-    content = json.dumps(receipt, sort_keys=True, indent=2)
-    rhash = sha256_text(content)[:16]
-    receipt["receipt_hash"] = rhash
-    fname = f"{action}_{receipt['timestamp'].replace(':', '-')}.json"
-    rpath = RECEIPTS / fname
-    rpath.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
-    log(f"Receipt: {action} → {status} (hash={rhash}) → {rpath.name}")
-    return rpath
 
+    try:
+        url = f"{BASE_URL}/{username}"
+        page.goto(url, wait_until="networkidle", timeout=20000)
+        time.sleep(2)
 
-def human_delay(min_s: float = 0.8, max_s: float = 2.5):
-    time.sleep(random.uniform(min_s, max_s))
+        block = detect_block(page)
+        if block:
+            result["error"] = f"blocked:{block}"
+            return result
 
+        if "/404" in page.url or "/login" in page.url:
+            result["error"] = f"redirected:{page.url}"
+            return result
 
-def human_type(element, text: str, min_delay: float = 0.05, max_delay: float = 0.15):
-    for char in text:
-        element.send_keys(char)
-        time.sleep(random.uniform(min_delay, max_delay))
+        result["screenshot"] = screenshot(page, f"profile_{safe_name(username)}")
 
+        # Get page text
+        body_text = page.inner_text("body")[:3000]
+        result["profile_text"] = body_text[:500]
 
-DB_PATH = ARTIFACTS / "engagement.db"
-
-MESSAGE_TEMPLATES = [
-    "Hey {name}, noticed you've stopped by a few times — if you're looking for a session this week I have some openings. Let me know what works for you!",
-    "Hi {name}, thanks for checking out my profile again! I'm available this weekend if you'd like to book. Feel free to message me any questions.",
-    "Hey {name}, I see you've been curious about my work — happy to answer any questions you might have. I have availability this week if you're ready to book.",
-    "Hi {name}! You've visited my page a few times — figured I'd reach out. I'm in Manhattan and have some slots opening up. Want to set something up?",
-    "Hey {name}, thanks for the interest! If you're looking for a massage in NYC, I've got openings this week. Shoot me a message and we can work out the details.",
-    "Hi {name}, noticed you checking back in — I appreciate the interest! I'm booking now for this week. Let me know your preferred time and I'll see what I can do.",
-    "Hey {name}, you've been by a few times — no pressure at all, but if you're thinking about booking I'd love to hear from you. I have some flexibility this week.",
-    "Hi {name}! Thanks for visiting my profile again. I'm currently taking bookings — if you have any questions about rates, styles, or availability, just let me know!",
-]
-
-
-def init_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS visitor_history (
-            username TEXT NOT NULL,
-            seen_at TEXT NOT NULL,
-            visit_count INTEGER DEFAULT 1,
-            last_online TEXT,
-            last_visit_my_page TEXT,
-            location TEXT,
-            messaged INTEGER DEFAULT 0,
-            message_text TEXT,
-            messaged_at TEXT,
-            profile_url TEXT,
-            session_id TEXT,
-            UNIQUE(username, seen_at)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS visitor_stats (
-            username TEXT PRIMARY KEY,
-            total_sightings INTEGER DEFAULT 0,
-            first_seen TEXT,
-            last_seen TEXT,
-            last_online TEXT,
-            last_visit_my_page TEXT,
-            location TEXT,
-            messaged_count INTEGER DEFAULT 0,
-            last_messaged_at TEXT
-        )
-    """)
-    conn.commit()
-    init_provenance_tables(conn)
-    init_acucertainty_claims(conn)
-    return conn
-
-
-def record_visitor_sighting(conn, username: str, visit_count: int = 1,
-                             last_online: str = None, last_visit_my_page: str = None,
-                             location: str = None, profile_url: str = None):
-    now = now_iso()
-    conn.execute(
-        "INSERT OR IGNORE INTO visitor_history (username, seen_at, visit_count, last_online, last_visit_my_page, location, profile_url, session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (username, now, visit_count, last_online, last_visit_my_page, location, profile_url, SESSION_ID)
-    )
-    conn.execute("""
-        INSERT INTO visitor_stats (username, total_sightings, first_seen, last_seen, last_online, last_visit_my_page, location)
-        VALUES (?, 1, ?, ?, ?, ?, ?)
-        ON CONFLICT(username) DO UPDATE SET
-            total_sightings = total_sightings + 1,
-            last_seen = excluded.last_seen,
-            last_online = COALESCE(excluded.last_online, last_online),
-            last_visit_my_page = COALESCE(excluded.last_visit_my_page, last_visit_my_page),
-            location = COALESCE(excluded.location, location)
-    """, (username, now, now, last_online, last_visit_my_page, location))
+        # Check if masseur — masseur profiles have "Book Now", "Available", massage rates, etc.

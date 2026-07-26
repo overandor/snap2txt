@@ -1,412 +1,580 @@
-```
-"""
-Content Policy — block risky marketing claims and spam patterns.
-
-Reference: FTC Consumer Reviews and Testimonials Rule; Google spam policies.
-"""
-
-import re
-
-# Risky patterns that should not appear in public profile copy
-RISKY_PATTERNS = [
-    (r"\b(cure|heal|healing|treat|treatment|medical|diagnose|therapy|therapeutic)\b", "medical_claim", 0.4),
-    (r"\b(guaranteed|guarantee|100%|money back|promise)\b", "guarantee", 0.5),
-    (r"\b(fake|buy reviews|fake testimonials|fake clients)\b", "fake_engagement", 1.0),
-    (r"\b(best|top|number one|#1|award winning)\b", "superlative", 0.3),
-    (r"\b(cheap|discount|free|sale|limited time)\b", "discount_spam", 0.3),
-    (r"\b(click here|call now|book now|hurry)\b", "urgency_spam", 0.2),
-    (r"\b(sex|escort|happy ending|full service|nude|naked)\b", "explicit", 1.0),
-    (r"\b(bot|automated|ai-generated|auto-post|spam)\b", "spam_signal", 0.6),
-]
-
-# Cap maximum risk score
-MAX_RISK = 1.0
+    "bio_apply_live",
+    "availability_set_live",
+    "send_message",
+    "mass_message",
+    "profile_scrape",
+    "captcha_bypass",
+    "anti_bot_bypass",
+    "fake_availability_loop",
+}
 
 
-def check_bio_risk(text: str) -> float:
-    """Return risk score 0.0-1.0. Higher is riskier."""
-    if not text:
-        return 0.0
-    text_lower = text.lower()
-    risk = 0.0
-    reasons = []
-    for pattern, reason, weight in RISKY_PATTERNS:
-        if re.search(pattern, text_lower):
-            risk += weight
-            reasons.append(reason)
-    # Keyword stuffing penalty
-    word_count = len(text.split())
-    if word_count > 400:
-        risk += 0.1
-    # Normalize
-    return min(risk, MAX_RISK)
+class ApprovalGate:
+    def __init__(self, mode: str):
+        self.mode = mode
 
+    def is_blocked(self, function_name: str, function_config: dict) -> Optional[str]:
+        ftype = function_config.get("type", "")
+        allowed_in_ci = function_config.get("allowed_in_ci", False)
+        requires_approval = function_config.get("requires_manual_approval", False)
 
-def check_headline_risk(text: str) -> float:
-    """Headlines are more visible; stricter."""
-    if not text:
-        return 0.5
-    risk = check_bio_risk(text)
-    if len(text) > 120:
-        risk += 0.2
-    return min(risk, MAX_RISK)
+        if function_name in BLOCKED_IN_CI:
+            if self.mode != "approved_mutation":
+                return "live_mutation_blocked_outside_approved_mutation_mode"
 
+        if ftype == "mutation" and self.mode != "approved_mutation":
+            return "mutation_requires_approved_mutation_mode"
 
-def check_blog_risk(title: str, body: str) -> float:
-    """Blog posts are public content."""
-    return max(check_bio_risk(title), check_bio_risk(body))
+        if not allowed_in_ci and self.mode in ("proof", "live_readonly"):
+            return "function_not_allowed_in_ci_registry"
 
+        if requires_approval and self.mode != "approved_mutation":
+            return "function_requires_manual_approval"
 
-def explain_risk(text: str) -> dict:
-    """Return risk score and matching reasons."""
-    text_lower = text.lower()
-    reasons = []
-    risk = 0.0
-    for pattern, reason, weight in RISKY_PATTERNS:
-        if re.search(pattern, text_lower):
-            risk += weight
-            reasons.append(reason)
-    return {"score": min(risk, MAX_RISK), "reasons": reasons}
+        return None
+
+    def verify_approval_token(self, token: str) -> bool:
+        expected = os.getenv("ADMIN_TOKEN") or os.getenv("RM_APPROVAL_TOKEN") or ""
+        return bool(expected) and token == expected
+
+    def load_candidate(self, candidate_file: str) -> Optional[dict]:
+        path = Path(candidate_file)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def check_selector_proof(self, action: str, proof_dir: str = "debug") -> bool:
+        proof_path = Path(proof_dir) / f"{action}_selectors.json"
+        return proof_path.exists()
 
 ```
 
-availability_keeper.py:
+playwright_probe.py:
 ```
+#!/usr/bin/env python3
 """
-RM Availability Keeper — standalone 24/7 daemon.
+RM API + XPath Playwright Probe — discovers real endpoints and selectors.
 
-Keeps the profile "Available" at all times. Re-authenticates automatically.
-Refreshes availability before expiry. Handles session drops.
+What it does:
+  1. Opens RM with Playwright (headed, persistent profile)
+  2. Intercepts all fetch/XHR API calls → logs method, URL, status, body
+  3. Navigates key pages (login, dashboard, availability, about/bio, search, mailbox)
+  4. Discovers XPath selectors for visible form fields and buttons
+  5. Screenshots every page
+  6. Writes JSON receipt with all findings
 
 Usage:
-    python3 -m rm_traffic.availability_keeper              # 24/7 daemon
-    python3 -m rm_traffic.availability_keeper --once       # single check + refresh
-    python3 -m rm_traffic.availability_keeper --status     # show current state
+  python3 rm_ci/playwright_probe.py --headed
+  python3 rm_ci/playwright_probe.py --headed --login  # attempt login with .env creds
+  python3 rm_ci/playwright_probe.py --headed --page about  # probe single page
 """
+
+from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
-import signal
-import sqlite3
+import re
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-ENV_PATH = Path(__file__).parent.parent / ".env"
-if ENV_PATH.exists():
-    for line in open(ENV_PATH):
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
-
-os.environ.setdefault("RM_USER", os.environ.get("RENTMASSEUR_USER", ""))
-os.environ.setdefault("RM_PASS", os.environ.get("RENTMASSEUR_PASS", ""))
-
-from .api_client import RentMasseurAPI
-from .auth import AuthSession
-
-log = logging.getLogger("availability_keeper")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(str(Path(__file__).parent / "availability_keeper.log")),
-    ],
-)
-
-KEEPER_DB = Path(__file__).parent / "availability_keeper.db"
-SESSION_FILE = str(Path(__file__).parent / "session.json")
-
-# Refresh when less than this many seconds remain
-REFRESH_THRESHOLD_SEC = 30 * 60  # 30 min before expiry
-# How often to check (when availability is far from expiring)
-CHECK_INTERVAL_SEC = 5 * 60      # 5 min
-# Max duration index (5 = 6 hours, the longest for "Available")
-MAX_DURATION = 5
+from playwright.sync_api import sync_playwright, Page, BrowserContext
 
 
-def _db():
-    conn = sqlite3.connect(str(KEEPER_DB))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+BASE_URL = "https://rentmasseur.com"
+ARTIFACTS = Path("artifacts/probe")
+ARTIFACTS.mkdir(parents=True, exist_ok=True)
+(ARTIFACTS / "screenshots").mkdir(exist_ok=True)
+(ARTIFACTS / "api_calls").mkdir(exist_ok=True)
 
 
-def init_db():
-    conn = _db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS availability_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        action TEXT NOT NULL,
-        option INTEGER,
-        duration INTEGER,
-        remaining_sec INTEGER,
-        success INTEGER DEFAULT 1,
-        detail TEXT
-    );
-    """)
-    conn.commit()
-    conn.close()
+PAGES = {
+    "login": {"url": f"{BASE_URL}/login", "needs_login": False},
+    "dashboard": {"url": f"{BASE_URL}/settings", "needs_login": True},
+    "availability": {"url": f"{BASE_URL}/settings?availability=1", "needs_login": True},
+    "about": {"url": f"{BASE_URL}/settings/about", "needs_login": True},
+    "search": {"url": f"{BASE_URL}/search/manhattan-ny", "needs_login": False},
+    "mailbox": {"url": f"{BASE_URL}/mailbox", "needs_login": True},
+    "compose": {"url": f"{BASE_URL}/mailbox/compose", "needs_login": True},
+    "profile": {"url": f"{BASE_URL}/karpathianwolf", "needs_login": False},
+}
 
 
-def _log(action: str, option: int = None, duration: int = None,
-         remaining: int = None, success: bool = True, detail: str = ""):
-    ts = datetime.now(timezone.utc).isoformat()
-    conn = _db()
-    conn.execute(
-        "INSERT INTO availability_log (ts, action, option, duration, remaining_sec, success, detail) VALUES (?,?,?,?,?,?,?)",
-        (ts, action, option, duration, remaining, int(success), detail[:200])
-    )
-    conn.commit()
-    conn.close()
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-class AvailabilityKeeper:
+def safe_name(s: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_-]', '_', s)[:60]
+
+
+class APIInterceptor:
+    """Captures all API calls during page navigation."""
+
     def __init__(self):
-        self.api = RentMasseurAPI(min_request_interval=2.0)
-        self.auth = AuthSession(self.api, session_file=SESSION_FILE)
-        self.username = os.environ.get("RM_USER", "")
-        self.password = os.environ.get("RM_PASS", "")
-        self.running = True
-        self.last_login = 0
-        self.consecutive_failures = 0
+        self.calls: list[dict] = []
 
-    def login(self) -> bool:
-        if not self.username or not self.password:
-            log.error("RM_USER / RM_PASS not set")
-            return False
-        ok = self.auth.login(self.username, self.password)
-        if ok:
-            self.last_login = time.time()
-            self.consecutive_failures = 0
-            _log("login", success=True, detail=f"logged in as {self.username}")
-            log.info("Login OK as %s", self.username)
-        else:
-            self.consecutive_failures += 1
-            _log("login", success=False, detail=f"login failed (attempt {self.consecutive_failures})")
-            log.error("Login failed (attempt %d)", self.consecutive_failures)
-        return ok
+    def on_request(self, request):
+        url = request.url
+        # Only capture RM API calls, not third-party
+        if "rentmasseur.com/api" in url or "/api/" in url:
+            self.calls.append({
+                "method": request.method,
+                "url": url,
+                "headers": dict(request.headers),
+                "post_data": request.post_data,
+                "ts": now_iso(),
+            })
 
-    def ensure_session(self) -> bool:
-        # Re-login if > 50 min since last login
-        if time.time() - self.last_login > 3000:
-            log.info("Session aging, re-logging in...")
-            return self.login()
-        # Test session with a lightweight call
-        try:
-            self.api.get_keeponline()
-            return True
-        except Exception as e:
-            log.warning("Session check failed (%s), re-logging in...", str(e)[:60])
-            return self.login()
-
-    def get_remaining_sec(self, avail: dict) -> int:
-        countdown = avail.get("countdown", 0)
-        if not countdown:
-            return 0
-        remaining = int(countdown - time.time())
-        return max(0, remaining)
-
-    def check_and_refresh(self) -> dict:
-        """Check availability. Refresh if not Available or near expiry."""
-        result = {"action": "noop", "refreshed": False, "remaining": 0, "detail": ""}
-
-        if not self.ensure_session():
-            result["detail"] = "auth failed"
-            return result
-
-        try:
-            avail = self.api.get_availability()
-        except Exception as e:
-            log.error("get_availability failed: %s", e)
-            # Try re-login once
-            if self.login():
-                try:
-                    avail = self.api.get_availability()
-                except Exception as e2:
-                    result["detail"] = f"get_availability failed after relogin: {e2}"
-                    _log("check", success=False, detail=result["detail"])
-                    return result
-            else:
-                result["detail"] = "relogin failed"
-                _log("check", success=False, detail=result["detail"])
-                return result
-
-        option = avail.get("selected", "")
-        remaining = self.get_remaining_sec(avail)
-
-        log.info("Availability: %s, remaining=%ds (%.1fh)", option, remaining, remaining / 3600)
-
-        needs_refresh = False
-        reason = ""
-
-        if option != "Available":
-            needs_refresh = True
-            reason = f"not Available (was: {option})"
-        elif remaining < REFRESH_THRESHOLD_SEC:
-            needs_refresh = True
-            reason = f"expiring soon ({remaining}s left, threshold {REFRESH_THRESHOLD_SEC}s)"
-
-        if not needs_refresh:
-            result["remaining"] = remaining
-            result["detail"] = f"OK: {option}, {remaining}s left"
-            _log("check", option=1 if option == "Available" else 0, remaining=remaining, success=True, detail=result["detail"])
-            return result
-
-        # Refresh
-        log.info("Refreshing availability: %s", reason)
-        try:
-            self.api.set_availability(option=1, duration=MAX_DURATION)
-            result["action"] = "refresh"
-            result["refreshed"] = True
-            result["detail"] = f"set to Available for 6h ({reason})"
-            _log("refresh", option=1, duration=MAX_DURATION, remaining=remaining, success=True, detail=result["detail"])
-            log.info("◆ Refreshed: set to Available (6h)")
-
-            # Verify
-            time.sleep(2)
-            try:
-                after = self.api.get_availability()
-                after_remaining = self.get_remaining_sec(after)
-                result["remaining"] = after_remaining
-                if after.get("selected") == "Available":
-                    log.info("Verified: Available, %ds remaining", after_remaining)
-                else:
-                    log.warning("Verify mismatch: selected=%s", after.get("selected"))
-            except Exception as e:
-                log.warning("Verify check failed: %s", e)
-
-        except Exception as e:
-            result["detail"] = f"refresh failed: {e}"
-            _log("refresh", option=1, duration=MAX_DURATION, remaining=remaining, success=False, detail=str(e)[:200])
-            log.error("Refresh failed: %s", e)
-
-            # Try re-login and one more attempt
-            if self.consecutive_failures < 3:
-                log.info("Retrying after relogin...")
-                if self.login():
+    def on_response(self, response):
+        url = response.url
+        if "rentmasseur.com/api" in url or "/api/" in url:
+            # Update last matching call with response info
+            for call in reversed(self.calls):
+                if call["url"] == url and "status" not in call:
+                    call["status"] = response.status
+                    call["status_text"] = response.status_text
                     try:
-                        self.api.set_availability(option=1, duration=MAX_DURATION)
-                        result["refreshed"] = True
-                        result["detail"] = f"set to Available on retry"
-                        _log("refresh_retry", option=1, duration=MAX_DURATION, success=True, detail="retry success")
-                        log.info("◆ Refreshed on retry")
-                    except Exception as e2:
-                        log.error("Retry also failed: %s", e2)
-                        _log("refresh_retry", success=False, detail=str(e2)[:200])
+                        body = response.text()
+                        call["response_body"] = body[:2000]
+                        call["response_body_len"] = len(body)
+                    except Exception:
+                        call["response_body"] = None
+                    break
 
-        return result
+    def save(self, page_name: str):
+        path = ARTIFACTS / "api_calls" / f"{safe_name(page_name)}_api.json"
+        path.write_text(json.dumps(self.calls, indent=2, default=str), encoding="utf-8")
+        return path
 
-    def run_forever(self):
-        log.info("═══ AVAILABILITY KEEPER STARTING ═══")
-        log.info("User: %s", self.username)
-        log.info("Check interval: %ds", CHECK_INTERVAL_SEC)
-        log.info("Refresh threshold: %ds before expiry", REFRESH_THRESHOLD_SEC)
-        log.info("Max duration: 6h (index %d)", MAX_DURATION)
 
-        if not self.login():
-            log.error("Initial login failed. Exiting.")
-            sys.exit(1)
+def discover_xpaths(page: Page) -> dict:
+    """Discover XPath selectors for visible form fields and buttons."""
+    findings = {
+        "inputs": [],
+        "textareas": [],
+        "buttons": [],
+        "links_profile": [],
+        "selects": [],
+        "contenteditable": [],
+    }
 
-        # Set up signal handler for clean shutdown
-        def handle_sigterm(sig, frame):
-            log.info("Received signal %d, shutting down...", sig)
-            self.running = False
-        signal.signal(signal.SIGINT, handle_sigterm)
-        signal.signal(signal.SIGTERM, handle_sigterm)
-
-        while self.running:
-            try:
-                self.check_and_refresh()
-            except Exception as e:
-                log.error("Cycle error: %s", e)
-                _log("cycle_error", success=False, detail=str(e)[:200])
-                # Backoff on repeated failures
-                if self.consecutive_failures > 5:
-                    log.error("Too many failures, backing off 10 min...")
-                    time.sleep(600)
-                    self.consecutive_failures = 0
-
-            # Sleep in small increments so signal handler can interrupt
-            slept = 0
-            while slept < CHECK_INTERVAL_SEC and self.running:
-                time.sleep(5)
-                slept += 5
-
-        log.info("Availability keeper stopped.")
-
-    def run_once(self):
-        log.info("═══ AVAILABILITY KEEPER (single run) ═══")
-        if not self.login():
-            sys.exit(1)
-        result = self.check_and_refresh()
-        print(json.dumps(result, indent=2))
-        return result
-
-    def show_status(self):
-        log.info("═══ AVAILABILITY KEEPER STATUS ═══")
-        if not self.login():
-            sys.exit(1)
+    # Inputs
+    for el in page.query_selector_all("input"):
         try:
-            avail = self.api.get_availability()
-            remaining = self.get_remaining_sec(avail)
-            keep = self.api.get_keeponline()
+            if not el.is_visible():
+                continue
+            tag = el.evaluate("e => e.tagName.toLowerCase()")
+            itype = el.get_attribute("type") or ""
+            iname = el.get_attribute("name") or ""
+            iid = el.get_attribute("id") or ""
+            iph = el.get_attribute("placeholder") or ""
+            iaria = el.get_attribute("aria-label") or ""
+            ival = el.input_value() if itype not in ("password",) else "***"
 
-            print(f"\n  {'='*50}")
-            print(f"  AVAILABILITY KEEPER STATUS")
-            print(f"  {'='*50}")
-            print(f"  User:         {self.username}")
-            print(f"  Available:    {avail.get('selected', '?')}")
-            print(f"  Remaining:    {remaining}s ({remaining/3600:.1f}h)")
-            print(f"  Hidden:       {'YES' if keep.get('isAdHidden') else 'NO'}")
-            print(f"  New visits:   {keep.get('newVisits', '?')}")
-            print(f"  New emails:   {keep.get('newEmails', '?')}")
-            print(f"  {'='*50}")
+            # Build XPath
+            xpath_parts = []
+            if iid:
+                xpath_parts.append(f"@id='{iid}'")
+            if iname:
+                xpath_parts.append(f"@name='{iname}'")
+            if itype:
+                xpath_parts.append(f"@type='{itype}'")
 
-            # Show recent log
-            conn = _db()
-            rows = conn.execute(
-                "SELECT * FROM availability_log ORDER BY id DESC LIMIT 10"
-            ).fetchall()
-            conn.close()
-            if rows:
-                print(f"\n  Recent actions:")
-                for r in rows:
-                    glyph = "◆" if r["success"] else "⟁"
-                    print(f"    {glyph} {r['ts'][:19]}  {r['action']:12s}  {r['detail'][:50]}")
-            print()
-        except Exception as e:
-            log.error("Status check failed: %s", e)
-            sys.exit(1)
+            xpath = f"//input[{ ' and '.join(xpath_parts) }]" if xpath_parts else "//input"
+
+            findings["inputs"].append({
+                "xpath": xpath,
+                "type": itype,
+                "name": iname,
+                "id": iid,
+                "placeholder": iph,
+                "aria_label": iaria,
+                "value_preview": (ival[:50] if ival else ""),
+            })
+        except Exception:
+            continue
+
+    # Textareas
+    for el in page.query_selector_all("textarea"):
+        try:
+            if not el.is_visible():
+                continue
+            iname = el.get_attribute("name") or ""
+            iid = el.get_attribute("id") or ""
+            iph = el.get_attribute("placeholder") or ""
+            iaria = el.get_attribute("aria-label") or ""
+            xpath = f"//textarea[@name='{iname}']" if iname else "//textarea"
+            findings["textareas"].append({
+                "xpath": xpath,
+                "name": iname,
+                "id": iid,
+                "placeholder": iph,
+                "aria_label": iaria,
+            })
+        except Exception:
+            continue
+
+    # Buttons
+    for el in page.query_selector_all("button"):
+        try:
+            if not el.is_visible():
+                continue
+            text = (el.inner_text() or "").strip()[:80]
+            btype = el.get_attribute("type") or ""
+            bclass = el.get_attribute("class") or ""
+            baria = el.get_attribute("aria-label") or ""
+            xpath = f"//button[contains(text(),'{text}')]" if text else "//button"
+            findings["buttons"].append({
+                "xpath": xpath,
+                "text": text,
+                "type": btype,
+                "class": bclass[:100],
+                "aria_label": baria,
+            })
+        except Exception:
+            continue
+
+    # Selects
+    for el in page.query_selector_all("select"):
+        try:
+            if not el.is_visible():
+                continue
+            iname = el.get_attribute("name") or ""
+            iid = el.get_attribute("id") or ""
+            xpath = f"//select[@name='{iname}']" if iname else "//select"
+            findings["selects"].append({
+                "xpath": xpath,
+                "name": iname,
+                "id": iid,
+            })
+        except Exception:
+            continue
+
+    # Contenteditable
+    for el in page.query_selector_all("[contenteditable='true']"):
+        try:
+            if not el.is_visible():
+                continue
+            cclass = el.get_attribute("class") or ""
+            crole = el.get_attribute("role") or ""
+            findings["contenteditable"].append({
+                "xpath": "//*[@contenteditable='true']",
+                "class": cclass[:100],
+                "role": crole,
+            })
+        except Exception:
+            continue
+
+    # Profile links (for search/visitor discovery)
+    for el in page.query_selector_all("a[href]"):
+        try:
+            href = el.get_attribute("href") or ""
+            if href.startswith("/") and not any(x in href for x in [
+                "login", "settings", "search", "blog", "reviews", "interviews",
+                "available", "find-massage", "live-cams", "sitemap", "advertise",
+                "mailbox", "static", "_next", "images", "api", "blogs",
+            ]):
+                parts = href.strip("/").split("/")
+                if parts and parts[0] and len(parts) == 1:
+                    findings["links_profile"].append({
+                        "href": href,
+                        "text": (el.inner_text() or "").strip()[:60],
+                    })
+        except Exception:
+            continue
+
+    return findings
+
+
+def detect_block(page: Page) -> Optional[str]:
+    """Check for CAPTCHA / anti-bot / access blocks."""
+    txt = page.inner_text("body")[:3000].lower()
+    url = page.url.lower()
+    needles = [
+        ("captcha", "captcha_detected"),
+        ("crowdsec", "crowdsec_detected"),
+        ("access forbidden", "access_forbidden"),
+        ("verify you are human", "human_verification"),
+        ("unusual traffic", "traffic_challenge"),
+        ("too many requests", "rate_limited"),
+    ]
+    for needle, reason in needles:
+        if needle in txt or needle in url:
+            return reason
+    return None
+
+
+def attempt_login(page: Page, username: str, password: str) -> bool:
+    """Attempt login using Playwright."""
+    try:
+        page.goto(f"{BASE_URL}/login", wait_until="networkidle", timeout=30000)
+        time.sleep(2)
+
+        block = detect_block(page)
+        if block:
+            print(f"  BLOCKED: {block}")
+            return False
+
+        # Find email/username field
+        email_selectors = [
+            "input[type='email']",
+            "input[name*='email' i]",
+            "input[name*='user' i]",
+            "input[type='text']",
+        ]
+        email_el = None
+        for sel in email_selectors:
+            email_el = page.query_selector(sel)
+            if email_el and email_el.is_visible():
+                break
+            email_el = None
+
+        # Find password field
+        pass_el = page.query_selector("input[type='password']")
+
+        if not email_el or not pass_el:
+            print("  Login form not found")
+            return False
+
+        email_el.fill(username)
+        pass_el.fill(password)
+        time.sleep(0.5)
+
+        # Click submit
+        submit_selectors = [
+            "button[type='submit']",
+            "button:has-text('LOG')",
+            "button:has-text('Log')",
+            "form button",
+        ]
+        for sel in submit_selectors:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                break
+
+        page.wait_for_load_state("networkidle", timeout=15000)
+        time.sleep(3)
+
+        if "/login" in page.url:
+            print("  Login failed — still on login page")
+            return False
+
+        print(f"  Login OK — URL: {page.url}")
+        return True
+
+    except Exception as e:
+        print(f"  Login error: {e}")
+        return False
+
+
+def probe_page(page: Page, page_name: str, page_cfg: dict, logged_in: bool, 
+               interceptor: APIInterceptor) -> dict:
+    """Probe a single page: navigate, capture API, discover XPaths, screenshot."""
+    print(f"\n── Probing: {page_name} ──")
+    print(f"  URL: {page_cfg['url']}")
+
+    result = {
+        "page": page_name,
+        "url": page_cfg["url"],
+        "timestamp": now_iso(),
+        "needs_login": page_cfg["needs_login"],
+        "logged_in": logged_in,
+    }
+
+    # Clear API calls for this page
+    interceptor.calls = []
+
+    try:
+        page.goto(page_cfg["url"], wait_until="networkidle", timeout=30000)
+        time.sleep(3)
+
+        # Detect blocks
+        block = detect_block(page)
+        if block:
+            result["status"] = "blocked"
+            result["block_reason"] = block
+            print(f"  BLOCKED: {block}")
+        else:
+            result["status"] = "ok"
+            result["title"] = page.title()
+            result["final_url"] = page.url
+
+            # Check if redirected to login
+            if page_cfg["needs_login"] and "/login" in page.url:
+                result["status"] = "redirected_to_login"
+                result["note"] = "Page requires login — not authenticated"
+                print(f"  Redirected to login")
+            else:
+                # Discover XPath selectors
+                xpaths = discover_xpaths(page)
+                result["xpaths"] = xpaths
+                print(f"  Found: {len(xpaths['inputs'])} inputs, {len(xpaths['textareas'])} textareas, "
+                      f"{len(xpaths['buttons'])} buttons, {len(xpaths['links_profile'])} profile links")
+
+                # Capture __NEXT_DATA__ if present
+                try:
+                    next_data = page.evaluate("() => { const el = document.getElementById('__NEXT_DATA__'); return el ? el.textContent : null; }")
+                    if next_data:
+                        result["next_data_preview"] = next_data[:2000]
+                        result["next_data_len"] = len(next_data)
+                        print(f"  __NEXT_DATA__: {len(next_data)} chars")
+                except Exception:
+                    pass
+
+        # Screenshot
+        ss_path = ARTIFACTS / "screenshots" / f"{safe_name(page_name)}.png"
+        page.screenshot(path=str(ss_path), full_page=True)
+        result["screenshot"] = str(ss_path)
+        print(f"  Screenshot: {ss_path}")
+
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+        print(f"  ERROR: {e}")
+
+    # Save API calls
+    api_path = interceptor.save(page_name)
+    result["api_calls"] = interceptor.calls
+    result["api_calls_count"] = len(interceptor.calls)
+    if interceptor.calls:
+        print(f"  API calls: {len(interceptor.calls)}")
+        for call in interceptor.calls[:5]:
+            print(f"    {call['method']:6s} {call.get('status', '???')} {call['url'][:80]}")
+
+    return result
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RM Availability Keeper — 24/7 availability daemon")
-    parser.add_argument("--once", action="store_true", help="Single check + refresh")
-    parser.add_argument("--status", action="store_true", help="Show current availability status")
-    parser.add_argument("--check-interval", type=int, default=CHECK_INTERVAL_SEC, help="Seconds between checks (default: 300)")
+    parser = argparse.ArgumentParser(description="RM API + XPath Playwright Probe")
+    parser.add_argument("--headed", action="store_true", help="Run with visible browser")
+    parser.add_argument("--login", action="store_true", help="Attempt login with .env credentials")
+    parser.add_argument("--page", default="all", help="Specific page to probe (or 'all')")
     args = parser.parse_args()
 
-    init_db()
-    keeper = AvailabilityKeeper()
-    keeper.check_interval = args.check_interval
+    # Load .env
+    env_path = Path(__file__).parent.parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
 
-    if args.status:
-        keeper.show_status()
-        return
+    username = os.getenv("RM_USER") or os.getenv("RENTMASSEUR_USER") or ""
+    password = os.getenv("RM_PASS") or os.getenv("RENTMASSEUR_PASS") or ""
 
-    if args.once:
-        keeper.run_once()
-        return
+    pages_to_probe = [args.page] if args.page != "all" else list(PAGES.keys())
 
-    keeper.run_forever()
+    results = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=not args.headed,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1200},
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+
+        # Set up API interception
+        interceptor = APIInterceptor()
+        context.on("request", interceptor.on_request)
+        context.on("response", interceptor.on_response)
+
+        page = context.new_page()
+
+        # Login if requested
+        logged_in = False
+        if args.login and username and password:
+            print(f"\n=== Attempting login as {username} ===")
+            logged_in = attempt_login(page, username, password)
+        elif args.login:
+            print("\n!! No credentials found in .env (RM_USER / RM_PASS)")
+
+        # Probe pages
+        for page_name in pages_to_probe:
+            if page_name not in PAGES:
+                print(f"Unknown page: {page_name}")
+                continue
+
+            cfg = PAGES[page_name]
+            result = probe_page(page, page_name, cfg, logged_in, interceptor)
+            results.append(result)
+
+        browser.close()
+
+    # Write summary receipt
+    summary = {
+        "timestamp": now_iso(),
+        "username": username or "(not set)",
+        "login_attempted": args.login,
+        "login_success": logged_in if args.login else None,
+        "pages_probed": [r["page"] for r in results],
+        "results": results,
+    }
+
+    receipt_path = ARTIFACTS / "probe_receipt.json"
+    receipt_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+
+    # Write selector map for rm_ci/selectors.yml update
+    selector_map = {}
+    for r in results:
+        if r.get("xpaths"):
+            selector_map[r["page"]] = {
+                "url": r.get("final_url", r["url"]),
+                "inputs": r["xpaths"]["inputs"],
+                "textareas": r["xpaths"]["textareas"],
+                "buttons": r["xpaths"]["buttons"],
+                "selects": r["xpaths"]["selects"],
+                "contenteditable": r["xpaths"]["contenteditable"],
+            }
+
+    selector_path = ARTIFACTS / "discovered_selectors.json"
+    selector_path.write_text(json.dumps(selector_map, indent=2, default=str), encoding="utf-8")
+
+    # Write API endpoint map
+    api_map = {}
+    for r in results:
+        if r.get("api_calls"):
+            api_map[r["page"]] = [
+                {
+                    "method": c["method"],
+                    "url": c["url"],
+                    "status": c.get("status"),
+                    "post_data": c.get("post_data"),
+                    "response_preview": (c.get("response_body") or "")[:200],
+                }
+                for c in r["api_calls"]
+            ]
+
+    api_map_path = ARTIFACTS / "discovered_api_endpoints.json"
+    api_map_path.write_text(json.dumps(api_map, indent=2, default=str), encoding="utf-8")
+
+    print(f"\n{'='*60}")
+    print(f"Probe complete — {len(results)} pages")
+    print(f"  Receipt:     {receipt_path}")
+    print(f"  Selectors:   {selector_path}")
+    print(f"  API endpoints: {api_map_path}")
+    print(f"  Screenshots: {ARTIFACTS / 'screenshots'}/")
+    print(f"  API calls:   {ARTIFACTS / 'api_calls'}/")
+
+    # Print API summary
+    total_api = sum(len(r.get("api_calls", [])) for r in results)
+    print(f"\n  Total API calls captured: {total_api}")
+    for r in results:
+        if r.get("api_calls"):
+            print(f"\n  {r['page']}:")
+            for c in r["api_calls"]:
+                print(f"    {c['method']:6s} {c.get('status', '???'):>4} {c['url'][:90]}")
 
 
 if __name__ == "__main__":
@@ -414,387 +582,219 @@ if __name__ == "__main__":
 
 ```
 
-reward_engine.py:
+report_builder.py:
 ```
-"""
-Reward Engine — measures metric deltas after actions and computes reward.
+"""Report builder — generates CI artifact summary from receipts."""
 
-reward = 5.0 * booking_intent_delta
-       + 3.0 * contact_click_delta
-       + 2.0 * email_delta
-       + 1.0 * view_delta
-       - 2.0 * error_penalty
-       - 3.0 * compliance_risk
-       - 1.0 * excessive_mutation_penalty
-
-Also computes attribution: which action produced which metric movement.
-"""
-
-import logging
-import sqlite3
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, Optional
-
-log = logging.getLogger("reward_engine")
-
-REWARD_DB = Path(__file__).parent / "overclock_bandit.db"
-
-
-@dataclass
-class MetricDelta:
-    views_delta: int = 0
-    contact_clicks_delta: int = 0
-    emails_delta: int = 0
-    booking_intent_delta: float = 0.0
-    rank_delta: int = 0
-    availability_changed: bool = False
-    visibility_changed: bool = False
-
-
-def is_measurement_valid(state_before, state_after) -> bool:
-    """Check if both snapshots have valid measurements.
-    A failed measurement is not a negative outcome — it is no outcome."""
-    if not state_before.measurement_valid:
-        return False
-    if not state_after.measurement_valid:
-        return False
-    return True
-
-
-def compute_delta(state_before, state_after) -> MetricDelta:
-    """Compute metric delta between two TrafficState snapshots.
-    Returns all-zero delta if measurement is invalid."""
-    if not is_measurement_valid(state_before, state_after):
-        log.warning("  ⟁ MEASUREMENT INVALID — returning zero delta, no bandit update")
-        return MetricDelta()
-    return MetricDelta(
-        views_delta=state_after.views - state_before.views,
-        contact_clicks_delta=state_after.contact_clicks - state_before.contact_clicks,
-        emails_delta=state_after.mailbox_count - state_before.mailbox_count,
-        booking_intent_delta=round(
-            state_after.mailbox_intent_score - state_before.mailbox_intent_score, 3
-        ),
-        rank_delta=state_after.search_rank - state_before.search_rank if state_after.search_rank and state_before.search_rank else 0,
-        availability_changed=state_after.available_status != state_before.available_status,
-        visibility_changed=state_after.profile_hidden != state_before.profile_hidden,
-    )
-
-
-def compute_reward(delta: MetricDelta, action: str, error: str = "",
-                     measurement_valid: bool = True,
-                     action_result: Dict = None) -> float:
-    """
-    Compute reward from metric delta.
-
-    If measurement is invalid (403/timeout/auth failure on after-snapshot),
-    return 0.0 — a failed measurement is not a negative outcome.
-
-    For reply_draft_queue, reward by draft quality and workflow outputs,
-    not by same-cycle traffic deltas.
-    """
-    if not measurement_valid:
-        log.warning("  ⟁ MEASUREMENT INVALID — reward=0.0, no bandit update")
-        return 0.0
-
-    # ─── reply_draft_queue: reward by draft quality, not traffic deltas ───
-    if action == "reply_draft_queue" and action_result:
-        drafts_created = action_result.get("drafts_queued", 0)
-        blocked = action_result.get("blocked", 0)
-        needs_approval = action_result.get("needs_approval", 0)
-        auto_ok = action_result.get("auto_ok", 0)
-        cloud_leaked = action_result.get("cloud_fallback_attempted", False)
-        bad_llm = action_result.get("bad_llm_output", False)
-
-        reward = 0.0
-        reward += 0.5 * drafts_created       # small positive per valid draft
-        reward += 0.3 * blocked               # small positive for catching unsafe/DNC
-        reward += 0.2 * auto_ok               # small positive for safe auto-ok
-        if cloud_leaked:
-            reward -= 2.0                     # penalty: cloud fallback on private data
-        if bad_llm:
-            reward -= 1.0                     # penalty: bad LLM output
-        return round(reward, 3)
-
-    # ─── visitor_revisit: drafts are inventory, not revenue ───
-    # Reward only by downstream outcomes, not drafts generated.
-    # Small provisional positive for queue building + suppression catches.
-    # Real reward comes later when reviewed/approved/sent/replied/booked.
-    if action == "visitor_revisit" and action_result:
-        drafts_queued = action_result.get("drafts_queued", 0)
-        ignored = action_result.get("ignored", 0)  # suppression catches
-        p0 = action_result.get("p0_revisit_now", 0)
-        cloud_leaked = action_result.get("cloud_fallback_attempted", False)
-
-        # Downstream outcomes (these come later, not same-cycle)
-        reply_sent = action_result.get("reply_sent_after_approval", 0)
-        client_replied = action_result.get("client_replied", 0)
-        call_received = action_result.get("call_received", 0)
-        booking_confirmed = action_result.get("booking_confirmed", 0)
-        session_completed = action_result.get("session_completed", 0)
-
-        reward = 0.0
-        # Small provisional positive for building the queue
-        reward += 0.2 * drafts_queued          # drafts are inventory, small credit
-        reward += 0.3 * ignored                 # catching suppressions is valuable
-        reward += 0.1 * p0                      # identifying urgent recovery targets
-
-        # Real reward from downstream outcomes
-        reward += 2.0 * reply_sent              # approved reply actually sent
-        reward += 5.0 * client_replied          # client responded to our reply
-        reward += 10.0 * call_received          # real call
-        reward += 20.0 * booking_confirmed      # booking confirmed
-        reward += 50.0 * session_completed      # session completed = revenue
-
-        if cloud_leaked:
-            reward -= 2.0                       # penalty: cloud on private data
-
-        return round(reward, 3)
-
-    # ─── Standard traffic-delta reward for other actions ───
-    reward = (
-        5.0 * max(0, delta.booking_intent_delta)
-        + 3.0 * max(0, delta.contact_clicks_delta)
-        + 2.0 * max(0, delta.emails_delta)
-        + 1.0 * max(0, delta.views_delta) * 0.01
-    )
-
-    # Penalty for negative deltas (only if measurement is valid)
-    if delta.booking_intent_delta < 0:
-        reward += 3.0 * delta.booking_intent_delta
-    if delta.contact_clicks_delta < 0:
-        reward += 2.0 * delta.contact_clicks_delta
-
-    # Rank improvement is good (lower rank number = better)
-    if delta.rank_delta < 0:
-        reward += 1.0 * abs(delta.rank_delta) * 0.5
-
-    # Error penalty
-    if error:
-        reward -= 2.0
-
-    # Compliance risk
-    risky_actions = {"rate_position_test", "photo_order_test"}
-    if action in risky_actions:
-        reward -= 0.5
-
-    # Excessive mutation penalty
-    mutation_actions = {"headline_variant_test", "bio_variant_test", "photo_order_test", "rate_position_test"}
-    if action in mutation_actions:
-        if delta.contact_clicks_delta == 0 and delta.booking_intent_delta == 0:
-            reward -= 1.0
-
-    # Availability fix reward
-    if action == "refresh_availability" and delta.availability_changed:
-        reward += 2.0
-
-    # Visibility fix reward
-    if action == "ensure_visible" and delta.visibility_changed:
-        reward += 2.0
-
-    return round(reward, 3)
-
-
-def delta_to_dict(delta: MetricDelta) -> Dict:
-    return {
-        "views_delta": delta.views_delta,
-        "contact_clicks_delta": delta.contact_clicks_delta,
-        "emails_delta": delta.emails_delta,
-        "booking_intent_delta": delta.booking_intent_delta,
-        "rank_delta": delta.rank_delta,
-        "availability_changed": delta.availability_changed,
-        "visibility_changed": delta.visibility_changed,
-    }
-
-```
-
-money_daemon.py:
-```
-"""
-Money-Making 24/7 Daemon — continuous revenue optimization loop.
-
-Combines:
-  1. Profile visibility guard (unhide if hidden → clients find you)
-  2. Availability auto-refresh (stay "Available" → appear in search)
-  3. Stats collection (views, contacts, emails → track conversion)
-  4. Search rank monitoring (know your position in Manhattan)
-  5. ML training loop (retrain money model every 6h → better bio predictions)
-  6. Bio A/B testing (rotate bio every 24h → higher CTR → more bookings)
-  7. Selenium verification (verify search visibility every 30min)
-  8. Live dashboard (print revenue metrics to terminal)
-
-The loop never stops. It handles crashes, re-auths, and writes receipts.
-
-Usage:
-    python3 -m rm_traffic.money_daemon
-
-Credentials read from .env file or environment variables.
-"""
+from __future__ import annotations
 
 import json
-import logging
-import os
-import signal
-import sys
-import threading
-import time
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
-
-import numpy as np
-
-CYCLE_TIMEOUT = 120  # max seconds per cycle before watchdog kills it
-
-# Load .env
-ENV_PATH = Path(__file__).parent.parent / ".env"
-if ENV_PATH.exists():
-    for line in open(ENV_PATH):
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
-
-os.environ.setdefault("RM_USER", os.environ.get("RENTMASSEUR_USER", ""))
-os.environ.setdefault("RM_PASS", os.environ.get("RENTMASSEUR_PASS", ""))
-
-from .api_client import RentMasseurAPI
-from .auth import AuthSession
-from .db import init_db, write_receipt, write_traffic_snapshot, get_latest_traffic_snapshot
-from .visibility_guard import ensure_visible
-from .availability_guard import check_availability, refresh_availability
-from .stats_collector import collect_snapshot
-from .search_rank import check_search_rank
-from .content_optimizer import run_daily_draft_cycle
-from .bio_ml_trainer import MLP
-from .bio_appraiser import load_bios
-from .money_training_selenium import build_money_dataset, predict_top_bios, selenium_verify_search
-
-log = logging.getLogger("money.daemon")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(Path(__file__).parent / "data" / "money_daemon.log"),
-    ],
-)
-
-# Intervals (seconds)
-CYCLE_INTERVAL = 5 * 60           # 5 min — main loop
-AVAIL_REFRESH_THRESHOLD = 45 * 60 # refresh if < 45 min left
-STATS_INTERVAL = 15 * 60          # 15 min
-SEARCH_RANK_INTERVAL = 60 * 60    # 60 min
-ML_RETRAIN_INTERVAL = 6 * 60 * 60 # 6 hours
-BIO_TEST_INTERVAL = 24 * 60 * 60  # 24 hours
-SELENIUM_INTERVAL = 30 * 60       # 30 min
-
-BIOS_PATH = Path(__file__).parent / "data" / "real_bios_with_views.jsonl"
-MODEL_PATH = Path(__file__).parent / "data" / "models" / "money_mlp.pkl"
-DASHBOARD_PATH = Path(__file__).parent / "data" / "money_dashboard.json"
+from typing import list
 
 
-class MoneyDaemon:
-    def __init__(self):
-        self.api = RentMasseurAPI(min_request_interval=2.0)
-        self.auth = AuthSession(self.api, session_file="rm_traffic/session.json")
-        self.running = True
-        self.cycle_count = 0
-        self.start_time = time.time()
-
-        # Timers
-        self.last_stats = 0
-        self.last_search_rank = 0
-        self.last_ml_retrain = 0
-        self.last_bio_test = 0
-        self.last_selenium = 0
-        self.last_avail_check = 0
-
-        # State
-        self.current_stats = {}
-        self.search_position = None
-        self.ml_model = None
-        self.ml_summary = {}
-        self.top_bios = []
-        self.selenium_status = "pending"
-        self.total_revenue_signals = 0
-        self.total_actions = 0
-        self.total_receipts = 0
-        self.errors = 0
-        self.last_error = ""
-
-        signal.signal(signal.SIGINT, self._shutdown)
-        signal.signal(signal.SIGTERM, self._shutdown)
-
-    def _shutdown(self, signum, frame):
-        log.info("Shutdown signal %d received. Finishing cycle...", signum)
-        self.running = False
-
-    def login(self) -> bool:
-        try:
-            ok = self.auth.login()
-            if ok:
-                log.info("Authenticated as %s", self.auth.username or "karpathianwolf")
-            else:
-                log.warning("Auth failed — running in offline mode (ML + Selenium only)")
-            return ok
-        except Exception as e:
-            log.warning("Auth error: %s — offline mode", e)
-            return False
-
-    def run(self):
-        log.info("=" * 60)
-        log.info("MONEY-MAKING DAEMON — 24/7 REVENUE OPTIMIZATION")
-        log.info("=" * 60)
-
-        init_db()
-        self.login()
-
-        # Initial ML training
-        self._retrain_ml()
-
-        while self.running:
-            cycle_done = threading.Event()
-            cycle_error = [None]
-
-            def _run_cycle():
+def build_report(receipts_dir: Path, artifacts_dir: Path, mode: str, functions_run: list[str]) -> Path:
+    receipts = []
+    ledger_path = receipts_dir / "ledger.jsonl"
+    if ledger_path.exists():
+        for line in ledger_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
                 try:
-                    self._cycle()
-                except Exception as e:
-                    cycle_error[0] = e
-                finally:
-                    cycle_done.set()
+                    receipts.append(json.loads(line))
+                except Exception:
+                    pass
 
-            t = threading.Thread(target=_run_cycle, daemon=True)
-            t.start()
-            t.join(timeout=CYCLE_TIMEOUT)
+    passed = sum(1 for r in receipts if r.get("status") == "pass")
+    failed = sum(1 for r in receipts if r.get("status") == "fail")
+    blocked = sum(1 for r in receipts if r.get("status") == "blocked")
+    skipped = sum(1 for r in receipts if r.get("status") == "skipped")
 
-            if not cycle_done.is_set():
-                log.error("⚠ Cycle %d TIMED OUT after %ds — killing thread", self.cycle_count, CYCLE_TIMEOUT)
-                self.errors += 1
-                self.last_error = f"cycle_timeout_{CYCLE_TIMEOUT}s"
-                # Thread is daemon, will be abandoned. Continue.
-            elif cycle_error[0]:
-                self.errors += 1
-                self.last_error = str(cycle_error[0])
-                log.error("Cycle %d error: %s", self.cycle_count, cycle_error[0])
-                traceback.print_exc()
-                write_receipt("daemon_error_v1", "cycle_error", {},
-                              {"error": str(cycle_error[0]), "cycle": self.cycle_count}, verified=False)
+    report = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "functions_requested": functions_run,
+        "summary": {
+            "total": len(receipts),
+            "passed": passed,
+            "failed": failed,
+            "blocked": blocked,
+            "skipped": skipped,
+        },
+        "receipts": receipts,
+    }
 
-            # Sleep between cycles — flush stdout so logs appear in nohup file
-            for _ in range(CYCLE_INTERVAL):
-                if not self.running:
-                    break
-                time.sleep(1)
-            sys.stdout.flush()
-            sys.stderr.flush()
+    reports_dir = artifacts_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_path = reports_dir / f"ci_report_{int(datetime.now(timezone.utc).timestamp())}.json"
+    report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
 
-        self._print_final_report()
-        log.info("Daemon stopped after %d cycles, %d actions, %d receipts",
-                 self.cycle_count, self.total_actions, self.total_receipts)
+    # Also write latest.json for easy access
+    (reports_dir / "latest.json").write_text(
+        json.dumps(report, indent=2, default=str), encoding="utf-8"
+    )
 
-    def _cycle(self):
-        self.cycle_count += 1
+    return report_path
+
+```
+
+selectors.yml:
+```
+# RM UI selectors — discovered and verified via dry-run, used by approved mutation.
+# Updated by bio_field_detect / availability_form_discovery dry-run actions.
+
+login:
+  email_input:
+    - "input[type='email']"
+    - "input[name*='email' i]"
+    - "input[name*='user' i]"
+    - "input[type='text']"
+  password_input:
+    - "input[type='password']"
+    - "input[name*='pass' i]"
+  submit_button:
+    - "button[type='submit']"
+    - "button[contains(text(),'LOG')]"
+    - "button[contains(text(),'Log')]"
+
+dashboard:
+  url: "/settings"
+  signals:
+    - "availability"
+    - "profile"
+    - "statistics"
+    - "views"
+    - "messages"
+    - "mailbox"
+
+availability:
+  url: "/settings?availability=1"
+  toggle_label: "available"
+  save_button:
+    - "button[contains(text(),'Save')]"
+    - "button[contains(text(),'Apply')]"
+    - "button[type='submit']"
+
+bio_about:
+  url: "/settings/about"
+  textarea:
+    - "textarea[name*='description' i]"
+    - "textarea[name*='bio' i]"
+    - "textarea"
+    - "[contenteditable='true']"
+  save_button:
+    - "button[contains(text(),'Save')]"
+    - "button[contains(text(),'Update')]"
+    - "button[type='submit']"
+
+search:
+  url_pattern: "/search/{city}"
+  profile_link_selector: "a[href]"
+
+mailbox:
+  url: "/mailbox"
+  compose_url: "/mailbox/compose"
+  recipient_field:
+    - "input[name*='recipient' i]"
+    - "input[name*='to' i]"
+    - "input[placeholder*='username' i]"
+  subject_field:
+    - "input[name*='subject' i]"
+    - "input[name*='title' i]"
+  body_field:
+    - "textarea"
+    - "[contenteditable='true']"
+  send_button:
+    - "button[contains(text(),'Send')]"
+    - "button[type='submit']"
+
+```
+
+selenium_runner.py:
+```
+"""RM CI/CD Selenium Automator — proof, live-readonly, and approved-mutation modes.
+
+Safety model:
+  proof            → local control plane + extension + candidate tests only
+  live_readonly    → can login to your own account, read pages, screenshot, no mutations
+  approved_mutation → requires ADMIN_TOKEN + approved candidate, applies one change, verifies
+
+Never: CAPTCHA bypass, anti-bot bypass, mass messaging, scraping, fake availability.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+import requests
+import yaml
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+from receipt_ledger import ReceiptLedger
+from approval_gate import ApprovalGate
+from report_builder import build_report
+
+
+BASE_URL = "https://rentmasseur.com"
+LOCAL_CP_URL = "http://localhost:7860"
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+class RMSeleniumAutomator:
+    def __init__(self, mode: str, artifacts: Path, registry_path: Path):
+        self.mode = mode
+        self.artifacts = artifacts
+        self.screenshots = artifacts / "screenshots"
+        self.receipts = ReceiptLedger(artifacts / "receipts")
+        self.gate = ApprovalGate(mode)
+        self.screenshots.mkdir(parents=True, exist_ok=True)
+        self.registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        self.driver: Optional[webdriver.Chrome] = None
+        self.functions_run: list[str] = []
+
+    def _make_driver(self):
+        options = Options()
+        if self.mode != "live_readonly":
+            options.add_argument("--headless=new")
+        options.add_argument("--window-size=1440,1200")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        if os.getenv("RM_CHROME_BINARY"):
+            options.binary_location = os.getenv("RM_CHROME_BINARY")
+        driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(45)
+        return driver
+
+    def _ensure_driver(self):
+        if not self.driver:
+            self.driver = self._make_driver()
+
+    def screenshot(self, name: str) -> str:
+        self._ensure_driver()
+        path = self.screenshots / f"{int(time.time())}_{name}.png"
+        try:
+            self.driver.save_screenshot(str(path))
+        except Exception:
+            return ""
+        return str(path)
+
+    def page_text(self) -> str:
+        try:
+            return self.driver.execute_script("return document.body ? document.body.innerText : ''") or ""
+        except Exception:
+            return ""
+

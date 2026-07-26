@@ -1,800 +1,800 @@
-            "protocol": "CAPD/1.0",
-            "description": "Content-Addressed Progressive Disclosure — navigate this file without downloading it",
-            "file": self.file_info,
-            "merkle_root": root,
-            "chunk_size": self.chunk_size,
-            "num_chunks": self.merkle.num_chunks,
-            "endpoints": {
-                "GET /meta": "This response — file metadata + Merkle root",
-                "GET /summary": "First/last 4KB + structure hints (start here)",
-                "GET /head?n=100": "First N lines",
-                "GET /tail?n=100": "Last N lines",
-                "GET /chunk/{i}": "Chunk i (64KB) with Merkle proof header",
-                "GET /range?s=0&e=65536": "Arbitrary byte range [s, e)",
-                "GET /search?q=pattern&context=2": "Server-side grep, returns matching lines + context",
-                "GET /merkle": "Full Merkle tree (all chunk hashes)",
-                "GET /stream": "Full file stream (downloads entire file — use sparingly)",
-                "GET /health": "Health check",
-            },
-            "usage_hint": (
-                "1. Read /meta to understand the file. "
-                "2. Read /summary to see structure. "
-                "3. Use /search?q=... to find relevant sections. "
-                "4. Pull specific /chunk/{i} or /range?s=X&e=Y for detail. "
-                "Never download /stream unless you truly need every byte."
-            ),
-        }
-        if self._wants_json():
-            self._send_json(meta)
-        else:
-            # Human-readable landing page
-            html = self._render_landing(meta)
-            self._send_text(html, content_type="text/html")
-
-    def _render_landing(self, meta: dict) -> str:
-        f = meta["file"]
-        return f"""<!DOCTYPE html>
-<html>
-<head><title>LLM File Proxy — {f['filename']}</title>
-<style>
-  body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; color: #333; }}
-  h1 {{ color: #2563eb; }}
-  .meta {{ background: #f8fafc; padding: 16px; border-radius: 8px; margin: 16px 0; }}
-  .endpoint {{ font-family: monospace; background: #1e293b; color: #93c5fd; padding: 2px 8px; border-radius: 4px; }}
-  .hint {{ background: #fef3c7; padding: 12px; border-radius: 8px; margin: 16px 0; }}
-  code {{ background: #f1f5f9; padding: 2px 6px; border-radius: 3px; }}
-</style>
-</head>
-<body>
-<h1>LLM File Proxy</h1>
-<p><strong>{f['filename']}</strong> — {f['size_human']} ({f['mime_type']})</p>
-<div class="meta">
-  <p><strong>Protocol:</strong> CAPD/1.0 — Content-Addressed Progressive Disclosure</p>
-  <p><strong>Merkle Root:</strong> <code>{meta['merkle_root']}</code></p>
-  <p><strong>Chunks:</strong> {meta['num_chunks']} × {self.chunk_size // 1024}KB</p>
-  <p><strong>Format:</strong> {f.get('format', 'unknown')}</p>
-</div>
-<div class="hint">
-  <strong>For LLMs:</strong> Send the base URL to your LLM. It can navigate this file
-  using the endpoints below without downloading the full {f['size_human']}.
-</div>
-<h2>Endpoints</h2>
-<ul>
-  <li><span class="endpoint">GET /meta</span> — File metadata + Merkle root</li>
-  <li><span class="endpoint">GET /summary</span> — First/last 4KB + structure</li>
-  <li><span class="endpoint">GET /head?n=100</span> — First N lines</li>
-  <li><span class="endpoint">GET /tail?n=100</span> — Last N lines</li>
-  <li><span class="endpoint">GET /chunk/&#123;i&#125;</span> — Chunk i (64KB) with Merkle proof</li>
-  <li><span class="endpoint">GET /range?s=0&e=65536</span> — Byte range</li>
-  <li><span class="endpoint">GET /search?q=pattern</span> — Server-side grep + context</li>
-  <li><span class="endpoint">GET /merkle</span> — Full Merkle tree</li>
-  <li><span class="endpoint">GET /stream</span> — Full file (use sparingly)</li>
-</ul>
-</body>
-</html>"""
-
-    def handle_summary(self):
-        """First/last 4KB + line count + structure."""
-        size = self.file_info["size_bytes"]
-        head_bytes = min(4096, size)
-        tail_start = max(0, size - 4096)
-        tail_bytes = size - tail_start
-
-        with open(self.filepath, "rb") as f:
-            head = f.read(head_bytes)
-            f.seek(tail_start)
-            tail = f.read(tail_bytes)
-
-        # Count total lines (streaming, no full load)
-        line_count = 0
-        with open(self.filepath, "rb") as f:
-            for _ in f:
-                line_count += 1
-
-        summary = {
-            "file": self.file_info["filename"],
-            "size_bytes": size,
-            "total_lines": line_count,
-            "head_4kb": head.decode("utf-8", errors="replace"),
-            "tail_4kb": tail.decode("utf-8", errors="replace"),
-            "head_bytes": head_bytes,
-            "tail_start_byte": tail_start,
-            "tail_bytes": tail_bytes,
-            "format": self.file_info.get("format", "text"),
-            "is_binary": self.file_info.get("is_binary", False),
-        }
-        self._send_json(summary)
-
-    def handle_head(self, n: int):
-        """First N lines."""
-        lines = []
-        with open(self.filepath, "r", errors="replace") as f:
-            for i, line in enumerate(f):
-                if i >= n:
-                    break
-                lines.append(line.rstrip("\n"))
-        self._send_json({
-            "lines": lines,
-            "count": len(lines),
-            "requested": n,
-        })
-
-    def handle_tail(self, n: int):
-        """Last N lines (efficient via seek from end)."""
-        # Read last 64KB chunk, split into lines, take last N
-        size = self.file_info["size_bytes"]
-        read_size = min(size, n * 512 + 4096)  # generous estimate
-        with open(self.filepath, "rb") as f:
-            f.seek(max(0, size - read_size))
-            data = f.read()
-        all_lines = data.decode("utf-8", errors="replace").splitlines()
-        lines = all_lines[-n:] if len(all_lines) >= n else all_lines
-        self._send_json({
-            "lines": lines,
-            "count": len(lines),
-            "requested": n,
-        })
-
-    def handle_chunk(self, index: int):
-        """Chunk i with Merkle proof in headers."""
-        if index < 0 or index >= self.merkle.num_chunks:
-            self._send_json({"error": f"chunk index out of range [0, {self.merkle.num_chunks})"}, 400)
-            return
-
-        with open(self.filepath, "rb") as f:
-            f.seek(index * self.chunk_size)
-            data = f.read(self.chunk_size)
-
-        chunk_hash = self.merkle.get_chunk_hash(index)
-        proof = self.merkle.get_proof(index)
-
-        self._send_bytes(
-            data,
-            content_type=self.file_info.get("mime_type", "application/octet-stream"),
-            extra_headers={
-                "X-Merkle-Root": self.merkle.get_root(),
-                "X-Chunk-Index": str(index),
-                "X-Chunk-Hash": chunk_hash,
-                "X-Chunk-Proof": json.dumps(proof),
-                "X-Total-Chunks": str(self.merkle.num_chunks),
-                "X-Chunk-Size": str(len(data)),
-            }
-        )
-
-    def handle_range(self, start: int, end: int):
-        """Arbitrary byte range [start, end)."""
-        size = self.file_info["size_bytes"]
-        start = max(0, start)
-        end = min(size, end)
-        if start >= end:
-            self._send_json({"error": "invalid range", "start": start, "end": end}, 400)
-            return
-
-        with open(self.filepath, "rb") as f:
-            f.seek(start)
-            data = f.read(end - start)
-
-        range_hash = hashlib.sha256(data).hexdigest()
-        self._send_bytes(
-            data,
-            content_type=self.file_info.get("mime_type", "application/octet-stream"),
-            extra_headers={
-                "Content-Range": f"bytes {start}-{end-1}/{size}",
-                "X-Range-Hash": range_hash,
-                "X-Range-Start": str(start),
-                "X-Range-End": str(end),
-            }
-        )
-
-    def handle_search(self, query: str, context: int, max_results: int):
-        """Server-side grep — stream file, return matching lines + context."""
-        if not query:
-            self._send_json({"error": "missing q parameter", "usage": "/search?q=pattern&context=2&max=50"}, 400)
-            return
-
-        results = []
-        pattern = re.compile(re.escape(query), re.IGNORECASE)
-        buffer: list[tuple[int, str]] = []  # (line_num, line_text) for context
-        match_count = 0
-
-        with open(self.filepath, "r", errors="replace") as f:
-            for line_num, line in enumerate(f):
-                line_text = line.rstrip("\n")
-                buffer.append((line_num, line_text))
-                if len(buffer) > context + 1:
-                    buffer.pop(0)
-
-                if pattern.search(line_text):
-                    # Include context lines
-                    ctx_start = max(0, len(buffer) - context - 1)
-                    ctx_lines = buffer[ctx_start:]
-                    results.append({
-                        "line": line_num,
-                        "match": line_text,
-                        "context_before": [l for n, l in ctx_lines[:-1]],
-                        "context_after": [],  # filled below
-                    })
-                    match_count += 1
-
-                    # Read context after
-                    if context > 0:
-                        after = []
-                        for _ in range(context):
-                            try:
-                                next_line = next(f)
-                                after.append(next_line.rstrip("\n"))
-                            except StopIteration:
-                                break
-                        results[-1]["context_after"] = after
-
-                    if match_count >= max_results:
-                        break
-
-        self._send_json({
-            "query": query,
-            "matches": match_count,
-            "truncated": match_count >= max_results,
-            "max_results": max_results,
-            "results": results,
-        })
-
-    def handle_merkle(self):
-        """Full Merkle tree — all leaf hashes + root."""
-        leaves = self.merkle.get_all_leaves()
-        self._send_json({
-            "root": self.merkle.get_root(),
-            "chunk_size": self.chunk_size,
-            "num_chunks": self.merkle.num_chunks,
-            "leaves": leaves,
-        })
-
-    def handle_stream(self):
-        """Full file stream — only if explicitly requested."""
-        size = self.file_info["size_bytes"]
-        self.send_response(200)
-        self.send_header("Content-Type", self.file_info.get("mime_type", "application/octet-stream"))
-        self.send_header("Content-Length", str(size))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("X-Merkle-Root", self.merkle.get_root())
-        self.end_headers()
-        with open(self.filepath, "rb") as f:
-            while True:
-                chunk = f.read(self.chunk_size)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="LLM File Proxy — Content-Addressed Progressive Disclosure"
-    )
-    parser.add_argument("file", help="Path to file to serve")
-    parser.add_argument("--port", type=int, default=8765, help="Port (default 8765)")
-    parser.add_argument("--chunk-size", type=int, default=65536, help="Chunk size in bytes (default 65536 = 64KB)")
-    args = parser.parse_args()
-
-    filepath = os.path.abspath(args.file)
-    if not os.path.isfile(filepath):
-        print(f"Error: {filepath} is not a file", file=sys.stderr)
-        sys.exit(1)
-
-    file_info = detect_file_type(filepath)
-    merkle = MerkleTree(filepath, args.chunk_size)
-
-    # Inject config into handler class
-    CAPDHandler.filepath = filepath
-    CAPDHandler.chunk_size = args.chunk_size
-    CAPDHandler.merkle = merkle
-    CAPDHandler.file_info = file_info
-    CAPDHandler.start_time = time.time()
-
-    server = HTTPServer(("127.0.0.1", args.port), CAPDHandler)
-    print(f"LLM File Proxy serving: {file_info['filename']} ({file_info['size_human']})", file=sys.stderr)
-    print(f"Listening on http://127.0.0.1:{args.port}", file=sys.stderr)
-    print(f"Chunks: {merkle.num_chunks} × {args.chunk_size // 1024}KB", file=sys.stderr)
-    print(f"Endpoints: /meta /summary /head /tail /chunk/{{i}} /range /search /merkle /stream", file=sys.stderr)
-    print(f"READY", file=sys.stderr)
-    server.serve_forever()
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-Dockerfile:
-```
-FROM python:3.11-slim
-
-RUN apt-get update && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY hf_space.py .
-
-# Persistent storage mount point
-RUN mkdir -p /data/indexes
-
-ENV PORT=7860
-EXPOSE 7860
-
-CMD ["python", "hf_space.py"]
-
-```
-
-hf_space.py:
-```
-"""
-JORKI — AI File Gateway
-HF Space server v2.0: persistent storage, auth, chunk retrieval, MCP, compression.
-
-Fixes:
-1. Persistent storage (/data mount) + SQLite registry — survives restarts
-2. Bearer token auth on upload
-3. GET /chunk/{file_id}/{idx} — returns semantic chunk content
-4. GET /mcp — MCP-compatible endpoint for AI tools
-5. Index compression (gzip) on upload, decompress on query
-"""
-
-import os
-import json
-import sqlite3
-import shutil
-import gzip
-import time
-import hashlib
-import struct
-import base64
-from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Query, Body
-from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-
-# Google OAuth client ID (set as HF Space secret, no credentials.json needed)
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
-
-app = FastAPI(title="JORKI — AI File Gateway", version="2.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Fix 1: Persistent storage ---
-# HF Space mounts /data as persistent volume. Fallback to /tmp if not available.
-DATA_DIR = Path(os.environ.get("JORKI_DATA_DIR", "/data" if Path("/data").exists() else "/tmp/jorki"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-STORAGE_DIR = DATA_DIR / "indexes"
-STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-REGISTRY_DB = DATA_DIR / "registry.sqlite3"
-
-# Auth token (set as HF Space secret)
-AUTH_TOKEN = os.environ.get("JORKI_AUTH_TOKEN", "")
-
-def init_registry_db():
-    """SQLite-backed registry — survives restarts."""
-    conn = sqlite3.connect(str(REGISTRY_DB))
-    conn.execute("""CREATE TABLE IF NOT EXISTS files (
-        file_id TEXT PRIMARY KEY,
-        filename TEXT,
-        path TEXT,
-        size_human TEXT,
-        merkle_root TEXT,
-        format TEXT,
-        total_lines TEXT,
-        uploaded_at REAL,
-        meta_json TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS query_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_id TEXT,
-        query_type TEXT,
-        query_text TEXT,
-        timestamp REAL,
-        client_ip TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
-        file_id TEXT,
-        user_email TEXT,
-        created_at REAL,
-        status TEXT DEFAULT 'active'
-    )""")
-    conn.commit()
-    conn.close()
-
-init_registry_db()
-
-def load_registry() -> dict:
-    """Load registry from SQLite into memory."""
-    conn = sqlite3.connect(str(REGISTRY_DB))
-    conn.row_factory = sqlite3.Row
-    reg = {}
-    for row in conn.execute("SELECT * FROM files"):
-        reg[row["file_id"]] = {
-            "path": row["path"],
-            "filename": row["filename"],
-            "meta": json.loads(row["meta_json"]) if row["meta_json"] else {},
-            "uploaded_at": row["uploaded_at"],
-        }
-    conn.close()
-    return reg
-
-def save_file_entry(file_id: str, meta: dict, path: str):
-    conn = sqlite3.connect(str(REGISTRY_DB))
-    conn.execute(
-        "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?,?,?)",
-        (file_id, meta.get("filename", "unknown"), path,
-         meta.get("size_human", "?"), meta.get("merkle_root", "?"),
-         meta.get("format", "?"), meta.get("total_lines", "?"),
-         time.time(), json.dumps(meta))
-    )
-    conn.commit()
-    conn.close()
-
-def log_query(file_id: str, query_type: str, query_text: str, client_ip: str = ""):
-    try:
-        conn = sqlite3.connect(str(REGISTRY_DB))
-        conn.execute(
-            "INSERT INTO query_log (file_id, query_type, query_text, timestamp, client_ip) VALUES (?,?,?,?,?)",
-            (file_id, query_type, query_text[:500], time.time(), client_ip)
-        )
-        conn.commit()
-        conn.close()
-    except:
-        pass
-
-def get_file_path(file_id: str) -> str:
-    """Resolve file_id to index path, checking DB."""
-    reg = load_registry()
-    if file_id not in reg:
-        raise HTTPException(404, {
-            "status": "session_not_found",
-            "file_id": file_id,
-            "message": "This Jorki session is expired, revoked, or unavailable.",
-            "possible_causes": ["session expired", "session revoked", "Space restarted and local disk was lost", "index was never uploaded", "persistent storage not attached"],
-            "next": "Create a new Jorki session."
-        })
-    path = reg[file_id]["path"]
-    if not Path(path).exists():
-        raise HTTPException(410, {
-            "status": "session_expired",
-            "file_id": file_id,
-            "message": "This Jorki session's index is gone. Re-upload required.",
-            "next": "Create a new Jorki session."
-        })
-    return path
-
-def check_auth(authorization: str = None):
-    """Auth token validation — fail-closed in production."""
-    if not AUTH_TOKEN:
-        raise HTTPException(403, {
-            "status": "not_configured",
-            "message": "Server not configured for uploads. Set JORKI_AUTH_TOKEN secret."
-        })
-    if not authorization:
-        raise HTTPException(401, "Missing Authorization header. Use: Bearer <token>")
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Use Bearer token auth")
-    token = authorization[7:]
-    if token != AUTH_TOKEN:
-        raise HTTPException(403, "Invalid auth token")
-
-
-# --- Google OAuth token verification ---
-def verify_google_token(token: str) -> dict:
-    """Verify Google ID token using Google's public keys (no credentials.json)."""
-    import urllib.request
-    # Fetch Google's public certs
-    url = "https://www.googleapis.com/oauth2/v3/tokeninfo?id_token=" + token
-    try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-        if GOOGLE_CLIENT_ID and data.get("aud") != GOOGLE_CLIENT_ID:
-            raise HTTPException(401, "Token audience mismatch")
-        return {"email": data.get("email", ""), "name": data.get("name", ""), "picture": data.get("picture", "")}
-    except Exception as e:
-        raise HTTPException(401, f"Invalid Google token: {e}")
-
-
-@app.post("/auth/google")
-async def auth_google(body: dict = None):
-    """Verify Google ID token and create a session."""
-    params = body or {}
-    token = params.get("token", "")
-    if not token:
-        raise HTTPException(400, "Missing 'token' in request body")
-    user = verify_google_token(token)
-    session_id = hashlib.sha256((user["email"] + str(time.time())).encode()).hexdigest()[:12]
-    conn = sqlite3.connect(str(REGISTRY_DB))
-    conn.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?)",
-                 (session_id, "", user["email"], time.time(), "active"))
-    conn.commit()
-    conn.close()
-    return {"session_id": session_id, "user": user, "status": "authenticated"}
-
-
-@app.get("/auth/status")
-async def auth_status():
-    """Check if Google OAuth is configured."""
-    return {"google_oauth": bool(GOOGLE_CLIENT_ID), "client_id": GOOGLE_CLIENT_ID}
-
-
-# --- Landing page ---
-@app.get("/", response_class=HTMLResponse)
-async def landing():
-    reg = load_registry()
-    file_count = len(reg)
-    files_list = "\n".join([
-        f'<div class="file-item" data-id="{fid}"><span class="file-icon">📄</span><span class="file-name">{info["filename"]}</span><span class="file-id">{fid}</span><button class="file-action" onclick="copyUrl(\'{fid}\')">Copy URL</button><button class="file-action danger" onclick="revokeFile(\'{fid}\')">Revoke</button></div>'
-        for fid, info in reg.items()
-    ])
-    return LANDING_HTML.replace("__FILE_COUNT__", str(file_count)).replace("__FILES_LIST__", files_list).replace("__GOOGLE_CLIENT_ID__", GOOGLE_CLIENT_ID)
-
-
-LANDING_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Jorki — The Operating System for AI File Access</title>
-<meta name="description" content="Files don't move. Context does. Jorki turns any local file into a live AI-readable session.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-<script src="https://accounts.google.com/gsi/client" async defer></script>
-<style>
-  :root {
-    --bg: #09090B; --surface: #111114;
-    --primary: #4F7CFF; --accent: #8B5CFF;
-    --glass: rgba(255,255,255,0.03); --glass-border: rgba(255,255,255,0.08);
-    --text: #FAFAFA; --text-dim: rgba(250,250,250,0.5); --text-faint: rgba(250,250,250,0.2);
-    --success: #22C55E; --danger: #EF4444;
-    --radius: 20px; --radius-sm: 12px;
+  "action": "metrics-collector",
+  "timestamp": "2026-07-16T12:12:38.848542+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
   }
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:'Inter',-apple-system,system-ui,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; -webkit-font-smoothing:antialiased; overflow-x:hidden; }
-  .glow { position:fixed; top:-300px; left:50%; transform:translateX(-50%); width:900px; height:500px; background:radial-gradient(ellipse at center,rgba(79,124,255,0.06) 0%,transparent 70%); pointer-events:none; z-index:0; }
-  .wrap { max-width:720px; margin:0 auto; padding:0 24px; position:relative; z-index:1; }
-  .hero { text-align:center; padding:140px 0 80px; }
-  .hero h1 { font-size:3.5rem; font-weight:800; letter-spacing:-0.04em; background:linear-gradient(135deg,var(--primary) 0%,var(--accent) 100%); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:20px; line-height:1; }
-  .hero .tagline { font-size:1.1rem; color:var(--text-dim); margin-bottom:8px; }
-  .hero .killer { font-size:1.6rem; color:var(--text); font-weight:600; letter-spacing:-0.02em; margin-bottom:12px; }
-  .hero .desc { font-size:0.95rem; color:var(--text-dim); max-width:480px; margin:0 auto 40px; line-height:1.6; }
-  .hero-btns { display:flex; gap:12px; justify-content:center; }
-  .btn { padding:14px 32px; border-radius:100px; font-size:0.9rem; font-weight:600; border:none; cursor:pointer; transition:all 0.2s; text-decoration:none; display:inline-flex; align-items:center; gap:8px; font-family:inherit; }
-  .btn-primary { background:var(--primary); color:#fff; }
-  .btn-primary:hover { background:#6B91FF; transform:scale(1.03); box-shadow:0 0 40px rgba(79,124,255,0.3); }
-  .btn-ghost { background:var(--glass); color:var(--text); border:1px solid var(--glass-border); }
-  .btn-ghost:hover { background:rgba(255,255,255,0.06); transform:scale(1.02); }
-  .google-login { display:flex; justify-content:center; margin-top:28px; }
-  .user-badge { display:inline-flex; align-items:center; gap:8px; padding:6px 14px; background:var(--glass); border:1px solid var(--glass-border); border-radius:100px; font-size:0.8rem; color:var(--text-dim); }
-  .user-badge img { width:22px; height:22px; border-radius:50%; }
-  .panel { background:var(--glass); backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px); border:1px solid var(--glass-border); border-radius:var(--radius); padding:28px; margin-bottom:16px; }
-  .panel-title { font-size:0.78rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-dim); margin-bottom:20px; display:flex; align-items:center; gap:8px; }
-  .session-row { display:flex; justify-content:space-between; align-items:center; padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.04); }
-  .session-row:last-child { border-bottom:none; }
-  .session-label { font-size:0.82rem; color:var(--text-dim); }
-  .session-val { font-size:0.82rem; color:var(--text); font-weight:500; font-variant-numeric:tabular-nums; }
-  .session-dot { width:8px; height:8px; border-radius:50%; background:var(--success); display:inline-block; box-shadow:0 0 8px var(--success); }
-  .session-status { display:flex; align-items:center; gap:8px; font-size:0.78rem; color:var(--success); font-weight:600; }
-  .file-item { display:flex; align-items:center; gap:10px; padding:12px 14px; border-radius:var(--radius-sm); background:var(--surface); margin-bottom:8px; transition:all 0.15s; }
-  .file-item:hover { background:rgba(255,255,255,0.04); }
-  .file-icon { font-size:1.1rem; }
-  .file-name { flex:1; font-size:0.85rem; color:var(--text); font-weight:500; }
-  .file-id { font-family:'SF Mono',monospace; font-size:0.72rem; color:var(--text-faint); }
-  .file-action { padding:5px 12px; border-radius:8px; font-size:0.72rem; font-weight:500; border:1px solid var(--glass-border); background:transparent; color:var(--text-dim); cursor:pointer; transition:all 0.15s; font-family:inherit; }
-  .file-action:hover { background:rgba(79,124,255,0.1); color:var(--primary); border-color:var(--primary); }
-  .file-action.danger:hover { background:rgba(239,68,68,0.1); color:var(--danger); border-color:var(--danger); }
-  .chat-demo { font-family:'SF Mono',monospace; font-size:0.82rem; line-height:1.8; }
-  .chat-user { color:var(--text); }
-  .chat-user::before { content:'> '; color:var(--primary); }
-  .chat-ai { color:var(--text-dim); padding-left:20px; }
-  .chat-ai::before { content:'\25C6 '; color:var(--accent); }
-  .chat-time { color:var(--text-faint); font-size:0.7rem; float:right; }
-  .console-input { width:100%; padding:14px 16px; border-radius:var(--radius-sm); background:var(--surface); border:1px solid var(--glass-border); color:var(--text); font-size:0.85rem; font-family:inherit; outline:none; transition:border-color 0.2s; }
-  .console-input:focus { border-color:var(--primary); }
-  .console-input::placeholder { color:var(--text-faint); }
-  .console-output { margin-top:12px; }
-  .console-line { padding:6px 0; font-size:0.78rem; color:var(--text-dim); font-family:'SF Mono',monospace; }
-  .console-check { color:var(--success); margin-right:6px; }
-  .console-time { color:var(--text-faint); margin-left:12px; }
-  .arch { text-align:center; font-family:'SF Mono',monospace; font-size:0.78rem; color:var(--text-dim); line-height:2.2; }
-  .arch .step { color:var(--text); }
-  .arch .arrow { color:var(--text-faint); }
-  .arch .highlight { color:var(--primary); }
-  .arch .result { color:var(--success); }
-  .api-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-  .api-item { padding:10px 14px; border-radius:var(--radius-sm); background:var(--surface); font-family:'SF Mono',monospace; font-size:0.75rem; color:var(--text-dim); display:flex; align-items:center; gap:8px; }
-  .api-item .method { font-weight:700; font-size:0.68rem; padding:2px 6px; border-radius:4px; }
-  .api-item .get { background:rgba(79,124,255,0.15); color:var(--primary); }
-  .api-item .post { background:rgba(34,197,94,0.15); color:var(--success); }
-  .api-item .del { background:rgba(239,68,68,0.15); color:var(--danger); }
-  .sec-item { display:flex; align-items:flex-start; gap:10px; padding:10px 0; }
-  .sec-check { color:var(--success); font-size:0.9rem; flex-shrink:0; }
-  .sec-text { font-size:0.82rem; color:var(--text-dim); line-height:1.5; }
-  .mac-mock { background:var(--surface); border-radius:var(--radius-sm); padding:20px; font-family:'SF Mono',monospace; font-size:0.78rem; line-height:1.8; }
-  .mac-mock .mac-title { color:var(--primary); font-weight:600; margin-bottom:8px; }
-  .mac-mock .mac-item { color:var(--text-dim); }
-  .mac-mock .mac-accent { color:var(--accent); }
-  .footer { text-align:center; padding:60px 0 40px; }
-  .footer-text { font-size:0.75rem; color:var(--text-faint); }
-  .footer-text span { color:var(--text-dim); }
-  .usecase { padding:14px 0; border-bottom:1px solid rgba(255,255,255,0.04); }
-  .usecase:last-child { border-bottom:none; }
-  .usecase-text { font-size:0.85rem; color:var(--text); }
-  .mini-btn { padding:6px 14px; border-radius:8px; font-size:0.75rem; font-weight:500; border:1px solid var(--glass-border); background:transparent; color:var(--text-dim); cursor:pointer; transition:all 0.15s; font-family:inherit; }
-  .mini-btn:hover { background:rgba(79,124,255,0.1); color:var(--primary); }
-  .mini-btn.danger { color:var(--danger); }
-  .mini-btn.danger:hover { background:rgba(239,68,68,0.1); }
-  .before-after { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
-  .ba-card { padding:16px; border-radius:var(--radius-sm); background:var(--surface); font-size:0.78rem; line-height:1.6; }
-  .ba-card .ba-label { font-size:0.7rem; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:8px; }
-  .ba-before .ba-label { color:var(--danger); }
-  .ba-after .ba-label { color:var(--success); }
-  .ba-before { color:var(--text-dim); }
-  .ba-after { color:var(--text); }
-</style>
-</head>
-<body>
-<div class="glow"></div>
-<div class="wrap">
-  <div class="hero">
-    <h1>Jorki</h1>
-    <p class="tagline">The Operating System for AI File Access</p>
-    <p class="killer">Files don't move. Context does.</p>
-    <p class="desc">AI doesn't need your whole file. It needs a live way to ask it questions. Create a secure session, copy one URL, let ChatGPT/Claude/Cursor/Gemini query exactly what they need.</p>
-    <div class="hero-btns">
-      <a href="#session" class="btn btn-primary">Create Session</a>
-      <a href="#api" class="btn btn-ghost">Read Docs</a>
-    </div>
-    <div class="google-login" id="google-login-zone"></div>
-    <div id="user-info" style="display:none;margin-top:16px">
-      <div class="user-badge"><img id="user-avatar" src=""><span id="user-name"></span></div>
-    </div>
-  </div>
-  <div class="panel" style="padding:20px">
-    <div class="before-after">
-      <div class="ba-card ba-before">
-        <div class="ba-label">Before Jorki</div>
-        Upload giant file &rarr; wait &rarr; model truncates &rarr; context lost
-      </div>
-      <div class="ba-card ba-after">
-        <div class="ba-label">After Jorki</div>
-        Create session &rarr; share URL &rarr; model queries exactly what it needs
-      </div>
-    </div>
-  </div>
-  <div class="panel" id="session">
-    <div class="panel-title"><span class="session-dot"></span> Live Session</div>
-    <div class="session-row"><span class="session-label">File</span><span class="session-val" id="session-file">&mdash;</span></div>
-    <div class="session-row"><span class="session-label">Size</span><span class="session-val" id="session-size">&mdash;</span></div>
-    <div class="session-row"><span class="session-label">Uploaded bytes</span><span class="session-val">0 B</span></div>
-    <div class="session-row"><span class="session-label">Queries</span><span class="session-val" id="session-queries">0</span></div>
-    <div class="session-row"><span class="session-label">Bytes returned</span><span class="session-val" id="session-bytes">0 B</span></div>
-    <div class="session-row"><span class="session-label">Data movement avoided</span><span class="session-val" style="color:var(--success)" id="session-saved">&mdash;</span></div>
-    <div class="session-row"><span class="session-label">Status</span><span class="session-status"><span class="session-dot"></span><span id="session-state">No active session</span></span></div>
-    <div style="margin-top:16px;display:flex;gap:8px">
-      <button class="mini-btn" onclick="navigator.clipboard.writeText(sessionUrl)">Copy URL</button>
-      <button class="mini-btn" onclick="alert('Pause is a Pro feature')">Pause</button>
-      <button class="mini-btn danger" onclick="revokeCurrent()">Revoke</button>
-    </div>
-  </div>
-  <div class="panel">
-    <div class="panel-title">Active Sessions <span style="margin-left:auto;font-size:0.7rem;color:var(--text-faint)">__FILE_COUNT__ total</span></div>
-    <div id="files-list">__FILES_LIST__</div>
-    <div id="no-files" style="text-align:center;padding:20px;color:var(--text-faint);font-size:0.82rem">No active sessions. Right-click a file in Finder &rarr; Jorki &rarr; Copy AI URL to start.</div>
-  </div>
-  <div class="panel">
-    <div class="panel-title">AI Explorer</div>
-    <div class="chat-demo" style="margin-bottom:16px">
-      <div class="chat-user">What tables exist?</div>
-      <div class="chat-ai">users, orders, payments, subscriptions, inventory<span class="chat-time">142ms</span></div>
-      <div class="chat-user">Search for "revenue"</div>
-      <div class="chat-ai">13 matches across headers, functions, and chunks<span class="chat-time">38ms</span></div>
-      <div class="chat-user">Get chunk 0</div>
-      <div class="chat-ai">Lines 0-20, 716B, type=paragraph<span class="chat-time">12ms</span></div>
-    </div>
-    <input class="console-input" placeholder="Ask your file..." onkeydown="if(event.key==='Enter'){askFile(this)}">
-    <div class="console-output" id="console-out">
-      <div class="console-line"><span class="console-check">&#10003;</span>Ready &mdash; type a query and press Enter</div>
-    </div>
-  </div>
-  <div class="panel">
-    <div class="panel-title">Architecture</div>
-    <div class="arch">
-      <span class="step">Local File</span> <span class="arrow">&rarr;</span>
-      <span class="highlight">Local Index</span> <span class="arrow">&rarr;</span>
-      <span class="highlight">Secure Session URL</span> <span class="arrow">&rarr;</span>
-      <span class="step">AI Query</span> <span class="arrow">&rarr;</span>
-      <span class="result">Minimal Context Returned</span>
-    </div>
-  </div>
-  <div class="panel" id="api">
-    <div class="panel-title">API Surface</div>
-    <div class="api-grid">
-      <div class="api-item"><span class="method post">POST</span>/upload</div>
-      <div class="api-item"><span class="method get">GET</span>/meta/{id}</div>
-      <div class="api-item"><span class="method get">GET</span>/summary/{id}</div>
-      <div class="api-item"><span class="method get">GET</span>/chunk/{id}/{n}</div>
-      <div class="api-item"><span class="method get">GET</span>/chunks/{id}</div>
-      <div class="api-item"><span class="method get">GET</span>/search/{id}</div>
-      <div class="api-item"><span class="method post">POST</span>/query/sql/{id}</div>
-      <div class="api-item"><span class="method post">POST</span>/query/nosql/{id}</div>
-      <div class="api-item"><span class="method get">GET</span>/stats/{id}</div>
-      <div class="api-item"><span class="method del">DEL</span>/revoke/{id}</div>
-      <div class="api-item"><span class="method get">GET</span>/mcp</div>
-      <div class="api-item"><span class="method post">POST</span>/mcp/query</div>
-    </div>
-  </div>
-  <div class="panel">
-    <div class="panel-title">Security</div>
-    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">Session-scoped access &mdash; each URL is a temporary, revocable session</span></div>
-    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">Minimal data movement &mdash; AI receives only metadata, chunks, and query results</span></div>
-    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">Local-first indexing &mdash; your file is indexed locally, only the compact index is shared</span></div>
-    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">No raw tokens in repo &mdash; auth via environment variables only</span></div>
-    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">Full audit trail &mdash; every query is logged with timestamp and type</span></div>
-    <div class="sec-item"><span class="sec-check">&#10003;</span><span class="sec-text">Instant revocation &mdash; destroy a session and all access is gone immediately</span></div>
-  </div>
-  <div class="panel">
-    <div class="panel-title">Premium Use Cases</div>
-    <div class="usecase"><div class="usecase-text">&ldquo;Ask this 1GB SQLite database anything.&rdquo;</div></div>
-    <div class="usecase"><div class="usecase-text">&ldquo;Let ChatGPT inspect this repo without uploading the whole ZIP.&rdquo;</div></div>
-    <div class="usecase"><div class="usecase-text">&ldquo;Give Claude temporary access to a file session.&rdquo;</div></div>
-    <div class="usecase"><div class="usecase-text">&ldquo;Expose only metadata and chunks, not the full file.&rdquo;</div></div>
-    <div class="usecase"><div class="usecase-text">&ldquo;Revoke the AI URL when the task is done.&rdquo;</div></div>
-    <div class="usecase"><div class="usecase-text">&ldquo;Turn local files into MCP-style tools.&rdquo;</div></div>
-  </div>
-  <div class="panel">
-    <div class="panel-title">macOS Integration</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-      <div class="mac-mock">
-        <div class="mac-title">Finder Right-Click</div>
-        <div class="mac-item"><span class="mac-accent">&#11088; Jorki</span></div>
-        <div class="mac-item">&#9654; Copy AI URL</div>
-        <div class="mac-item">&#9654; Create Session</div>
-        <div class="mac-item">&#9654; Open Dashboard</div>
-        <div class="mac-item">&#9654; View Queries</div>
-        <div class="mac-item">&#9654; Revoke Access</div>
-      </div>
-      <div class="mac-mock">
-        <div class="mac-title">Menu Bar</div>
-        <div class="mac-item"><span class="mac-accent">&#9679; Jorki</span></div>
-        <div class="mac-item">Active Sessions: 4</div>
-        <div class="mac-item">AI Connected: Yes</div>
-        <div class="mac-item">Queries/sec: 218</div>
-        <div class="mac-item">Bytes saved: 1.01 GB</div>
-        <div class="mac-item">Dashboard &#9654;</div>
-      </div>
-    </div>
-  </div>
-  <div class="panel" style="text-align:center">
-    <div style="font-size:1.1rem;font-weight:600;color:var(--text);margin-bottom:12px">Jorki is not Dropbox for AI.</div>
-    <div style="font-size:1.1rem;font-weight:600;color:var(--text);margin-bottom:12px">Jorki is not WeTransfer for AI.</div>
-    <div style="font-size:1.1rem;font-weight:600;color:var(--text);margin-bottom:12px">Jorki is not another RAG demo.</div>
-    <div style="font-size:1.3rem;font-weight:700;color:var(--primary);margin-top:20px">Jorki is a live file interface for AI agents.</div>
-  </div>
-  <div class="footer">
-    <p class="footer-text">Jorki &mdash; <span>Files don't move. Context does.</span> &mdash; __FILE_COUNT__ sessions active</p>
-  </div>
-</div>
-<script>
-let sessionUrl = '';
-let currentFileId = '';
+}
+```
 
-async function copyUrl(fid) {
-  const url = 'https://josephrw-llm-file-proxy.hf.space/meta/' + fid;
-  await navigator.clipboard.writeText(url);
-  alert('URL copied: ' + url);
+pipeline_20260716_234045.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-16T23:40:45Z",
+  "run_id": "29542538318",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
 }
 
+```
+
+rotation_20260710_221827.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-10T22:18:27Z",
+  "run_id": "29126924636",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29126924636"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260710_221827.json ",
+  "status": "completed"
+}
+
+```
+
+pipeline_20260717_085936.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-17T08:59:36Z",
+  "run_id": "29568079328",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-25T13-16-54.750043-00-00.json:
+```
+{
+  "id": "kpi_1784985414",
+  "timestamp": "2026-07-25T13:16:54.750043+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-25T13:16:54.749978+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-07-25T14-46-30.667077-00-00.json:
+```
+{
+  "id": "kpi_1784990790",
+  "timestamp": "2026-07-25T14:46:30.667077+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-25T14:46:30.667012+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260718_001846.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-18T00:18:46Z",
+  "run_id": "29622629634",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+metrics_20260712_130143.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-12T13:01:43.730459+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-21T22-41-34.814722-00-00.json:
+```
+{
+  "id": "kpi_1784673694",
+  "timestamp": "2026-07-21T22:41:34.814722+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-21T22:41:34.814650+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260715_151056.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-15T15:10:56.625326+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+metrics_20260711_071111.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-11T07:11:11.856903+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+metrics_20260713_223927.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-13T22:39:27.019086+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+pipeline_20260709_053403.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-09T05:34:03Z",
+  "run_id": "28996340492",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+pipeline_20260703_103214.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-03T10:32:14Z",
+  "run_id": "28654617515",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+pipeline_20260704_080839.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-04T08:08:39Z",
+  "run_id": "28699952998",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-11T13-56-10.279978-00-00.json:
+```
+{
+  "id": "kpi_1783778170",
+  "timestamp": "2026-07-11T13:56:10.279978+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-11T13:56:10.279893+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260711_144848.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-11T14:48:48.468193+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+rotation_20260626_140211.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-06-26T14:02:11Z",
+  "run_id": "28242557577",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28242557577"
+},
+  "availability_step": "skipped_in_dry_run_or_disabled_for_platform_safety",
+  "content_changed": " M content/decisions/latest_decision.json ?? content/blog_posts/ ?? content/competitor_bios.json ?? content/interview_questions/ ?? production_control_loop ?? receipts/rotation_20260626_140211.json ",
+  "status": "completed"
+}
+
+```
+
+rotation_20260716_055533.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-16T05:55:33Z",
+  "run_id": "29474808813",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29474808813"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260716_055533.json ",
+  "status": "completed"
+}
+
+```
+
+pipeline_20260725_201051.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-25T20:10:51Z",
+  "run_id": "30172905992",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+kpi_2026-06-29T10-24-54.090992-00-00.json:
+```
+{
+  "id": "kpi_1782728694",
+  "timestamp": "2026-06-29T10:24:54.090992+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-29T10:24:54.090920+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260709_221835.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-09T22:18:35Z",
+  "run_id": "29053901683",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+rotation_20260707_040151.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-07T04:01:51Z",
+  "run_id": "28840264422",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28840264422"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260707_040151.json ",
+  "status": "completed"
+}
+
+```
+
+rotation_20260725_135311.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-25T13:53:11Z",
+  "run_id": "30160321197",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "30160321197"
+},
+  "content_changed": " M content/blog_posts/20260725_funniest_client_requests.md  M content/decisions/latest_decision.json ?? content/interview_questions/20260725_best_modality_debate.md ?? content/interview_questions/20260725_myth_busting.md ?? production_control_loop ?? receipts/rotation_20260725_135311.json ",
+  "status": "completed"
+}
+
+```
+
+metrics_20260722_114644.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-22T11:46:44.514899+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+deploy_controlled_wolf_v1_2026-06-26T09-35-19.536791+00-00.json:
+```
+{
+  "action": "bio_deploy",
+  "bio_id": "controlled_wolf_v1",
+  "experiment_id": "exp_001_targeted_wolf",
+  "success": false,
+  "timestamp": "2026-06-26T09:35:19.536791+00:00",
+  "notes": "dry_run_only"
+}
+```
+
+kpi_2026-07-18T23-11-35.223316-00-00.json:
+```
+{
+  "id": "kpi_1784416295",
+  "timestamp": "2026-07-18T23:11:35.223316+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-18T23:11:35.223246+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260711_101754.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-11T10:17:54Z",
+  "run_id": "29148991008",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+pipeline_20260713_105455.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-13T10:54:55Z",
+  "run_id": "29244126126",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-14T21-33-11.244088-00-00.json:
+```
+{
+  "id": "kpi_1784064791",
+  "timestamp": "2026-07-14T21:33:11.244088+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-14T21:33:11.243997+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260702_211545.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-02T21:15:45.685260+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+pipeline_20260724_215011.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-24T21:50:11Z",
+  "run_id": "30128797483",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+rotation_20260703_221719.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-03T22:17:19Z",
+  "run_id": "28685427867",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28685427867"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260703_221719.json ",
+  "status": "completed"
+}
+
+```
+
+pipeline_20260725_214308.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-25T21:43:08Z",
+  "run_id": "30175903571",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+rotation_20260714_221137.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-14T22:11:37Z",
+  "run_id": "29371647719",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29371647719"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260714_221137.json ",
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-13T19-17-07.925461-00-00.json:
+```
+{
+  "id": "kpi_1783970227",
+  "timestamp": "2026-07-13T19:17:07.925461+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-13T19:17:07.925378+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-06-28T20-52-25.244806-00-00.json:
+```
+{
+  "id": "kpi_1782679945",
+  "timestamp": "2026-06-28T20:52:25.244806+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-28T20:52:25.244731+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260717_183620.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-17T18:36:20Z",
+  "run_id": "29604127789",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+pipeline_20260720_212627.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-20T21:26:27Z",
+  "run_id": "29779865093",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+rotation_20260628_131606.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-06-28T13:16:06Z",
+  "run_id": "28323229911",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28323229911"
+},
+  "availability_step": "skipped_in_dry_run_or_disabled_for_platform_safety",
+  "content_changed": " M content/decisions/latest_decision.json  M content/interview_questions/20260628_dream_client.md ?? content/blog_posts/20260628_the_science_of_relaxation.md ?? content/interview_questions/20260628_off_the_grid_life.md ?? production_control_loop ?? receipts/rotation_20260628_131606.json ",
+  "status": "completed"
+}
+
+```
+
+metrics_20260721_224134.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-21T22:41:34.899960+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-02T09-53-32.542715-00-00.json:
+```
+{
+  "id": "kpi_1782986012",
+  "timestamp": "2026-07-02T09:53:32.542715+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-02T09:53:32.542639+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260713_131653.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-13T13:16:53Z",
+  "run_id": "29252830889",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+pipeline_20260709_143750.json:

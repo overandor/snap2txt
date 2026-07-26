@@ -1,800 +1,800 @@
-    )
-
-    for email_type, description in EMAIL_TYPES:
-        logger.info("Generating: %s", email_type)
-        user_prompt = (
-            f"Email type: {email_type}\n"
-            f"Description: {description}\n"
-            f"Write the email template. Include subject line."
-        )
-        email = _groq_chat(system_prompt, user_prompt, max_tokens=600)
-        if email:
-            filepath = os.path.join(EMAIL_DIR, f"{today}_{email_type}.md")
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(email)
-            total += 1
-            logger.info("Saved: %s (%d chars)", filepath, len(email))
-        time.sleep(1)
-
-    logger.info("=== Generated %d email templates ===", total)
-    print(json.dumps({"total_emails": total, "date": today}, indent=2))
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-rentmasseur_core.py:
-```
-"""
-RentMasseur Core — shared login, driver, availability, and bio update utilities.
-Used by all 30 strategy scripts and the coordinator.
-"""
-
-import os
-import re
-import sys
-import time
-import json
-import logging
-import hashlib
-import requests
-from datetime import datetime
-from typing import Optional
-
-from dotenv import load_dotenv
-try:
-    import undetected_chromedriver as uc
-    HAS_UC = True
-except ImportError:
-    HAS_UC = False
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import NoSuchElementException
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger(__name__)
-
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv()
-
-RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-RENTMASSEUR_PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-LOGIN_URL = "https://rentmasseur.com/login"
-AVAILABILITY_URL = "https://rentmasseur.com/settings?availability=1"
-PROFILE_URL = "https://rentmasseur.com/settings?profile=1"
-IMPLICIT_WAIT = 10
-PAGE_TIMEOUT = 30
-
-BIO_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bio_history.json")
-BIOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bios")
-os.makedirs(BIOS_DIR, exist_ok=True)
-
-
-def setup_driver(headless: bool = True) -> webdriver.Chrome:
-    if HAS_UC:
-        opts = uc.ChromeOptions()
-        if headless:
-            opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        try:
-            import subprocess
-            chrome_ver_out = subprocess.check_output(["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--version"], stderr=subprocess.DEVNULL).decode().strip()
-            chrome_major = int(re.search(r'(\d+)\.', chrome_ver_out).group(1))
-            driver = uc.Chrome(options=opts, version_main=chrome_major)
-        except Exception:
-            driver = uc.Chrome(options=opts)
-        driver.implicitly_wait(IMPLICIT_WAIT)
-        driver.set_page_load_timeout(PAGE_TIMEOUT)
-        return driver
-    else:
-        opts = Options()
-        if headless:
-            opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument(
-            "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-        )
-        driver = webdriver.Chrome(options=opts)
-        driver.implicitly_wait(IMPLICIT_WAIT)
-        driver.set_page_load_timeout(PAGE_TIMEOUT)
-        return driver
-
-
-def _dump_debug(driver: webdriver.Chrome, label: str) -> None:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
-    os.makedirs(debug_dir, exist_ok=True)
-    prefix = os.path.join(debug_dir, f"debug_{label}_{ts}")
-    try:
-        driver.save_screenshot(f"{prefix}.png")
-    except Exception:
-        pass
-    try:
-        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
-    except Exception:
-        pass
-
-
-def login(driver: webdriver.Chrome) -> bool:
-    if not RENTMASSEUR_USERNAME or not RENTMASSEUR_PASSWORD:
-        logger.error("Missing credentials")
-        return False
-    try:
-        logger.info("Navigating to login: %s", LOGIN_URL)
-        driver.set_page_load_timeout(90)
-        driver.get(LOGIN_URL)
-        time.sleep(8)
-        for xpath in [
-            "//button[contains(text(),'Accept')]",
-            "//button[contains(text(),'OK')]",
-            "//button[contains(text(),'Got it')]",
-            "//button[contains(text(),'Dismiss')]",
-            "//button[contains(text(),'Agree')]",
-            "//button[contains(text(),'Continue')]",
-        ]:
-            try:
-                el = driver.find_element(By.XPATH, xpath)
-                driver.execute_script("arguments[0].click();", el)
-                time.sleep(1)
-            except NoSuchElementException:
-                pass
-
-        for attempt in range(1, 5):
-            logger.info("Login discovery attempt %d/5", attempt)
-            time.sleep(3)
-            result = driver.execute_script("""
-                let pwd = document.querySelector('input[type=\"password\"]');
-                if (!pwd) {
-                    pwd = document.querySelector('input[name*=\"pass\" i]') ||
-                          document.querySelector('input[id*=\"pass\" i]') ||
-                          document.querySelector('input[placeholder*=\"pass\" i]') ||
-                          document.querySelector('input[class*=\"pass\" i]');
-                    if (pwd) { pwd.type = 'password'; }
-                }
-                if (!pwd) {
-                    const allInputs = Array.from(document.querySelectorAll('input'));
-                    for (const inp of allInputs) {
-                        const ctx = (inp.name||'') + ' ' + (inp.id||'') + ' ' + (inp.placeholder||'') + ' ' + (inp.className||'');
-                        if (/pass/i.test(ctx)) { pwd = inp; break; }
-                    }
-                }
-                if (!pwd) return {error: 'no_password'};
-                const allInputs = Array.from(document.querySelectorAll('input'));
-                const candidates = allInputs.filter(i => i !== pwd && (i.type === 'text' || i.type === 'email'));
-                let user = null, bestDist = Infinity;
-                for (const cand of candidates) {
-                    const pos = pwd.compareDocumentPosition(cand);
-                    if (pos & Node.DOCUMENT_POSITION_PRECEDING) {
-                        let dist = 0, el = cand;
-                        while (el && el !== pwd) { el = el.nextElementSibling || el.parentElement; dist++; if (dist > 100) break; }
-                        if (dist < bestDist) { bestDist = dist; user = cand; }
-                    }
-                }
-                if (!user && candidates.length > 0) user = candidates[0];
-                if (!user) return {error: 'no_username'};
-                let btn = null;
-                const form = pwd.closest('form');
-                if (form) {
-                    btn = form.querySelector('button[type=\"submit\"]') || form.querySelector('input[type=\"submit\"]');
-                    if (!btn) { const fb = Array.from(form.querySelectorAll('button')); btn = fb.find(b => /login|sign.in|submit/i.test(b.innerText)) || fb[0]; }
-                }
-                if (!btn) {
-                    let ancestor = pwd.parentElement;
-                    for (let i = 0; i < 5 && ancestor && !btn; i++) {
-                        const ab = Array.from(ancestor.querySelectorAll('button'));
-                        btn = ab.find(b => /login|sign.in|submit/i.test(b.innerText)) || ab[0];
-                        ancestor = ancestor.parentElement;
-                    }
-                }
-                if (!btn) { const allBtns = Array.from(document.querySelectorAll('button, [role=\"button\"]')); btn = allBtns.find(b => /login|sign.in|submit/i.test(b.innerText)); }
-                if (!btn) return {error: 'no_button'};
-                function attrs(el) { return {tag: el.tagName.toLowerCase(), id: el.id||'', name: el.name||'', type: el.type||'', class: (el.className&&typeof el.className==='string')?el.className.split(' ').filter(Boolean).join(' '):'', placeholder: el.placeholder||''}; }
-                return {user: attrs(user), pwd: attrs(pwd), btn: attrs(btn)};
-            """)
-            if isinstance(result, dict) and 'error' not in result:
-                break
-            logger.warning("Login attempt %d failed: %s", attempt, result.get('error'))
-            if attempt < 5:
-                time.sleep(5)
-            else:
-                logger.error("Login failed after 5 attempts")
-                _dump_debug(driver, f"login_{result.get('error','unknown')}")
-                return False
-
-        def build_selector(info: dict) -> str:
-            if info['id']: return f"#{info['id']}"
-            if info['name']: return f"{info['tag']}[name='{info['name']}']"
-            if info['placeholder']: return f"{info['tag']}[placeholder='{info['placeholder']}']"
-            if info['class']: return f"{info['tag']}.{info['class'].split()[0]}"
-            return info['tag']
-
-        user_sel = build_selector(result['user'])
-        pwd_sel = build_selector(result['pwd'])
-        btn_sel = build_selector(result['btn'])
-        # Use native setter for React/Next.js compatibility
-        driver.execute_script("""
-            const pwd = document.querySelector('input[type="password"]');
-            const user = document.querySelector('input[type="text"], input[type="email"]');
-            const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
-            if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
-        """, RENTMASSEUR_USERNAME, RENTMASSEUR_PASSWORD)
-        time.sleep(1)
-        # Submit via Enter key on password field
-        try:
-            pwd_el = driver.find_element(By.CSS_SELECTOR, 'input[type="password"]')
-            pwd_el.send_keys(Keys.ENTER)
-        except Exception:
-            driver.execute_script("""
-                const btn = document.querySelector('button[type="submit"]') ||
-                            Array.from(document.querySelectorAll('button')).find(b => /login|sign|submit/i.test(b.innerText));
-                if (btn) btn.click();
-            """)
-        time.sleep(5)
-        if LOGIN_URL not in driver.current_url:
-            logger.info("Login successful -> %s", driver.current_url)
-            return True
-        err = driver.execute_script("const el = document.querySelector('[role=alert], .error, .form-error'); return el ? el.innerText : '';")
-        if err:
-            logger.error("Login error: %s", err.strip())
-        _dump_debug(driver, "login_failed")
-        return False
-    except Exception as e:
-        logger.error("Login exception: %s", e)
-        _dump_debug(driver, "login_exception")
-        return False
-
-
-def set_availability_24_7(driver: webdriver.Chrome) -> bool:
-    try:
-        logger.info("Setting availability: %s", AVAILABILITY_URL)
-        driver.get(AVAILABILITY_URL)
-        time.sleep(3)
-        ok = driver.execute_script("""
-            const selects = Array.from(document.querySelectorAll('select'));
-            const buttons = Array.from(document.querySelectorAll('button'));
-            const statusSelect = selects.find(s => {
-                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
-                return opts.includes('available') || opts.includes('not set');
-            });
-            if (!statusSelect) return {error: 'no_status_select'};
-            const availOpt = Array.from(statusSelect.options).find(
-                o => o.text.toLowerCase().includes('available') && !o.text.toLowerCase().includes('not')
-            );
-            if (availOpt) { statusSelect.value = availOpt.value; statusSelect.dispatchEvent(new Event('change', {bubbles: true})); }
-            const timeSelect = selects.find(s => {
-                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
-                return opts.some(t => t.includes('hour') || t.includes('minute'));
-            });
-            if (timeSelect) {
-                const durationOpts = Array.from(timeSelect.options).filter(o => /\\d/.test(o.text));
-                if (durationOpts.length > 0) {
-                    const longest = durationOpts[durationOpts.length - 1];
-                    timeSelect.value = longest.value;
-                    timeSelect.dispatchEvent(new Event('change', {bubbles: true}));
-                }
-            }
-            const setBtn = buttons.find(b => /set|save|apply/i.test(b.innerText));
-            if (!setBtn) return {error: 'no_set_button'};
-            setBtn.click();
-            return {ok: true};
-        """)
-        if isinstance(ok, dict) and ok.get('error'):
-            logger.error("Availability failed: %s", ok['error'])
-            _dump_debug(driver, f"availability_{ok['error']}")
-            return False
-        logger.info("Availability set successfully")
-        time.sleep(2)
-        return True
-    except Exception as e:
-        logger.error("Availability exception: %s", e)
-        return False
-
-
-def _load_bio_history() -> list:
-    if os.path.exists(BIO_HISTORY_FILE):
-        try:
-            with open(BIO_HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
-
-
-def _save_bio_history(history: list) -> None:
-    try:
-        with open(BIO_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history[-50:], f, indent=2)
-    except Exception as e:
-        logger.warning("Failed to save bio history: %s", e)
-
-
-def _bio_hash(bio: str) -> str:
-    return hashlib.md5(bio.strip().lower().encode()).hexdigest()[:12]
-
-
-def groq_generate_bio(strategy_name: str, strategy_prompt: str, current_bio: Optional[str]) -> Optional[str]:
-    if not GROQ_API_KEY:
-        logger.error("No GROQ_API_KEY")
-        return None
-    history = _load_bio_history()
-    used_hashes = {entry.get("hash", "") for entry in history}
-    system_base = (
-        "You are an elite copywriter for massage therapy profiles. "
-        "Each bio must be under 300 words, magnetic, SEO-friendly, and conversion-optimized. "
-        "Avoid explicit content. Include keywords: massage, therapeutic, deep tissue, relaxation, session, Manhattan. "
-        "Always end with a subtle call-to-action."
-    )
-    context = f"\nCurrent bio:\n---\n{current_bio}\n---\n" if current_bio and current_bio.strip() else ""
-    user_prompt = (
-        f"{context}"
-        f"Strategy: {strategy_name}\n"
-        f"Instructions: {strategy_prompt}\n"
-        f"Now write ONLY the bio text. No labels, no quotes, no explanation. Just the bio."
-    )
-    try:
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_base},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.9,
-                "max_tokens": 600,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        bio = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
-        h = _bio_hash(bio)
-        if h in used_hashes:
-            logger.info("Skipping duplicate bio strategy=%s", strategy_name)
-            return None
-        history.append({
-            "timestamp": datetime.now().isoformat(),
-            "strategy": strategy_name,
-            "hash": h,
-            "chars": len(bio),
-            "bio_preview": bio[:120],
-        })
-        _save_bio_history(history)
-        _save_bio_to_file(strategy_name, bio)
-        logger.info("Generated bio: strategy=%s chars=%d", strategy_name, len(bio))
-        return bio
-    except Exception as e:
-        logger.error("Groq API error for %s: %s", strategy_name, e)
-        return None
-
-
-def _save_bio_to_file(strategy_name: str, bio: str) -> None:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"bio_{strategy_name}_{ts}.txt"
-    filepath = os.path.join(BIOS_DIR, filename)
-    try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(bio)
-        logger.info("Bio saved to file: %s", filepath)
-    except Exception as e:
-        logger.warning("Failed to save bio to file: %s", e)
-
-
-def update_bio(driver: webdriver.Chrome, new_bio: str) -> bool:
-    try:
-        urls_to_try = [
-            "https://rentmasseur.com/settings/about",
-            PROFILE_URL,
-            "https://rentmasseur.com/settings?bio=1",
-            "https://rentmasseur.com/settings",
-            "https://rentmasseur.com/profile/edit",
-            f"https://rentmasseur.com/{RENTMASSEUR_USERNAME}/edit",
-        ]
-        for url in urls_to_try:
-            logger.info("Trying profile settings: %s", url)
-            driver.get(url)
-            time.sleep(3)
-            result = driver.execute_script("""
-                const textareas = Array.from(document.querySelectorAll('textarea'));
-                const editables = Array.from(document.querySelectorAll('[contenteditable=\"true\"]'));
-                const inputs = Array.from(document.querySelectorAll('input[type=\"text\"]'));
-                function scoreBio(el, isTextarea) {
-                    const clues = ['bio','about','description','profile','intro','summary'];
-                    const text = (el.placeholder+' '+el.name+' '+(el.id||'')+' '+(el.getAttribute('aria-label')||'')).toLowerCase();
-                    let score=0;
-                    for (const c of clues) if (text.includes(c)) score+=3;
-                    if (isTextarea) score+=5;
-                    const val=el.value||el.innerText||'';
-                    if (val.length>30) score+=2; if (val.length>100) score+=3;
-                    return score;
-                }
-                let best=null, bestScore=-1;
-                for (const el of textareas) { const s=scoreBio(el,true); if (s>bestScore){bestScore=s; best=el;} }
-                for (const el of editables) { const s=scoreBio(el,false); if (s>bestScore){bestScore=s; best=el;} }
-                if (!best && inputs.length>0) { for (const el of inputs){const s=scoreBio(el,false); if(s>bestScore){bestScore=s;best=el;}} }
-                if (!best) return {error:'no_bio_field'};
-                const current=best.value||best.innerText||'';
-                return {
-                    tag:best.tagName.toLowerCase(), id:best.id||'', name:best.name||'',
-                    class:(best.className&&typeof best.className==='string')?best.className.split(' ').filter(Boolean).join(' '):'',
-                    placeholder:best.placeholder||'', contenteditable:best.getAttribute('contenteditable')||'',
-                    current:current.slice(0,500),
-                    selector:best.tagName.toLowerCase()+(best.id?'#'+best.id:'')+(best.name?'[name=\"'+best.name+'\"]':''),
-                };
-            """)
-            if isinstance(result, dict) and result.get('error'):
-                logger.info("No bio field at %s, trying next...", url)
-                continue
-            logger.info("Found bio field: %s", result.get('selector'))
-            current_bio = result.get('current', '')
-            logger.info("Current bio preview: %s...", current_bio[:80])
-            return result, current_bio
-        logger.error("Bio field not found on any settings page")
-        _dump_debug(driver, "bio_not_found")
-        return None
-    except Exception as e:
-        logger.error("Bio update exception: %s", e)
-        _dump_debug(driver, "bio_exception")
-        return None
-
-
-def save_bio_field(driver: webdriver.Chrome, result: dict, new_bio: str) -> bool:
-    try:
-        sel = result['selector']
-        if result.get('contenteditable') == 'true':
-            el = driver.find_element(By.CSS_SELECTOR, sel)
-            driver.execute_script("arguments[0].innerText = arguments[1];", el, new_bio)
-            driver.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles: true}));", el)
-        else:
-            el = driver.find_element(By.CSS_SELECTOR, sel)
-            el.clear()
-            el.send_keys(new_bio)
-        save_ok = driver.execute_script("""
-            const buttons = Array.from(document.querySelectorAll('button, input[type=\"submit\"], a[role=\"button\"]'));
-            let saveBtn = buttons.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'')+' '+(b.value||'')+' '+(b.textContent||'')));
-            if (!saveBtn) {
-                const form = document.querySelector('textarea')?.closest('form');
-                if (form) { const fb=Array.from(form.querySelectorAll('button, input[type=\"submit\"]')); saveBtn=fb.find(b=>/save|update|submit|apply|confirm/i.test((b.innerText||'')+' '+(b.value||''))); }
-            }
-            if (!saveBtn) return {error:'no_save_button'};
-            saveBtn.click();
-            return {ok:true};
-        """)
-        if isinstance(save_ok, dict) and save_ok.get('error'):
-            logger.error("Save button not found: %s", save_ok['error'])
-            _dump_debug(driver, "bio_no_save")
-            return False
-        logger.info("Bio updated and saved")
-        time.sleep(2)
-        return True
-    except Exception as e:
-        logger.error("Save bio exception: %s", e)
-        return False
-
-```
-
-vercel.json:
 ```
 {
-  "name": "rentmasseur-extension",
-  "version": "1.0.0",
-  "private": true,
-  "description": "RentMasseur OS — Vercel serverless backend proxy",
-  "scripts": {
-    "dev": "vercel dev",
-    "deploy": "vercel --prod"
-  },
-  "dependencies": {},
-  "env": {
-    "HF_SPACE_URL": "https://josephrw-rentmasseur-optimizer.hf.space"
-  },
-  "rewrites": [
-    { "source": "/api/:path*", "destination": "/api/:path*" }
+  "id": "kpi_1783809257",
+  "timestamp": "2026-07-11T22:34:17.055105+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-11T22:34:17.055017+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-06-27T13-13-45.190253-00-00.json:
+```
+{
+  "id": "kpi_1782566025",
+  "timestamp": "2026-06-27T13:13:45.190253+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-27T13:13:45.190178+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+visit_back_2026-06-26T09-59-14.605912+00-00.json:
+```
+{
+  "action": "visit_back",
+  "success": true,
+  "timestamp": "2026-06-26T09:59:14.605912+00:00",
+  "visitors_found": 13,
+  "dry_run": true,
+  "visitor_list": [
+    {
+      "name": "jetflight",
+      "url": "https://rentmasseur.com/jetflight",
+      "username": "jetflight"
+    },
+    {
+      "name": "Jerbolt",
+      "url": "https://rentmasseur.com/Jerbolt",
+      "username": "Jerbolt"
+    },
+    {
+      "name": "Mcmark",
+      "url": "https://rentmasseur.com/Mcmark",
+      "username": "Mcmark"
+    },
+    {
+      "name": "Gingerman",
+      "url": "https://rentmasseur.com/Gingerman",
+      "username": "Gingerman"
+    },
+    {
+      "name": "GAZITT",
+      "url": "https://rentmasseur.com/GAZITT",
+      "username": "GAZITT"
+    },
+    {
+      "name": "pierrejms",
+      "url": "https://rentmasseur.com/pierrejms",
+      "username": "pierrejms"
+    },
+    {
+      "name": "BeauLaid",
+      "url": "https://rentmasseur.com/BeauLaid",
+      "username": "BeauLaid"
+    },
+    {
+      "name": "JohnJChristopher",
+      "url": "https://rentmasseur.com/JohnJChristopher",
+      "username": "JohnJChristopher"
+    },
+    {
+      "name": "lemmesee",
+      "url": "https://rentmasseur.com/lemmesee",
+      "username": "lemmesee"
+    },
+    {
+      "name": "Benyou",
+      "url": "https://rentmasseur.com/Benyou",
+      "username": "Benyou"
+    },
+    {
+      "name": "Karpathianwolf",
+      "url": "https://rentmasseur.com/Karpathianwolf",
+      "username": "Karpathianwolf"
+    },
+    {
+      "name": "sitemap",
+      "url": "https://rentmasseur.com/sitemap",
+      "username": "sitemap"
+    },
+    {
+      "name": "topics",
+      "url": "https://rentmasseur.com/topics",
+      "username": "topics"
+    }
   ]
+}
+```
+
+kpi_2026-07-13T15-56-01.961148-00-00.json:
+```
+{
+  "id": "kpi_1783958161",
+  "timestamp": "2026-07-13T15:56:01.961148+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-13T15:56:01.961073+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260721_011011.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-21T01:10:11.208595+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+pipeline_20260712_163800.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-12T16:38:00Z",
+  "run_id": "29200338504",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
 }
 
 ```
 
-post_interview.py:
+pipeline_20260714_213311.json:
 ```
-#!/usr/bin/env python3
-"""
-Post interview answers to RentMasseur profile.
-
-Usage:
-    python3 post_interview.py --answers '{"question":"What is your style?","answer":"Deep tissue focused..."}'
-    python3 post_interview.py --file content/interview/answers.json
-"""
-import time, os, sys, json, argparse
-import undetected_chromedriver as uc
-from dotenv import load_dotenv
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from datetime import datetime, timezone
-
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv()
-
-USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
-INTERVIEW_URL = "https://rentmasseur.com/settings/interview"
-
-
-def login(driver):
-    driver.get("https://rentmasseur.com/login")
-    time.sleep(6)
-    driver.execute_script("""
-        const pwd = document.querySelector('input[type="password"]');
-        const user = document.querySelector('input[type="text"], input[type="email"]');
-        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
-        if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
-    """, USERNAME, PASSWORD)
-    time.sleep(1)
-    driver.find_element(By.CSS_SELECTOR, 'input[type="password"]').send_keys(Keys.ENTER)
-    time.sleep(5)
-    return "login" not in driver.current_url.lower()
-
-
-def post_interview(driver, answers):
-    """Post interview answers. answers = list of {question, answer} or {question_id, answer}."""
-    driver.get(INTERVIEW_URL)
-    time.sleep(5)
-
-    # Scrape available questions
-    print("  Scraping interview questions...")
-    questions = driver.execute_script("""
-        const result = [];
-        // Look for question elements
-        const qEls = document.querySelectorAll('.interview-question, .question, [data-question], .card-title, h3, h4, label, .form-label');
-        qEls.forEach((el, i) => {
-            const text = el.innerText.trim();
-            if (text && text.endsWith('?') && text.length > 10) {
-                // Find associated textarea
-                let textarea = null;
-                let parent = el.closest('.form-group, .card, .mb-3, .field, .interview-item, .form-row') || el.parentElement;
-                if (parent) {
-                    textarea = parent.querySelector('textarea');
-                }
-                if (!textarea) {
-                    textarea = document.querySelectorAll('textarea')[i];
-                }
-                result.push({
-                    question: text,
-                    textarea_id: textarea ? textarea.id : null,
-                    textarea_name: textarea ? textarea.name : null,
-                    index: i
-                });
-            }
-        });
-        return result;
-    """)
-    print(f"  Found {len(questions)} questions")
-    for q in questions[:5]:
-        print(f"    [{q['index']}] {q['question'][:60]}... (textarea: {q['textarea_id']})")
-
-    # Fill answers
-    filled = 0
-    for ans in answers:
-        question_text = ans.get('question', '').lower()
-        answer_text = ans.get('answer', '')
-        question_id = ans.get('question_id')
-
-        # Match question
-        matched = None
-        if question_id is not None and question_id < len(questions):
-            matched = questions[question_id]
-        else:
-            matched = questions.find(lambda q: question_text in q['question'].lower()) if hasattr(questions, 'find') else None
-            if not matched:
-                for q in questions:
-                    if question_text and question_text in q['question'].lower():
-                        matched = q
-                        break
-
-        if not matched:
-            print(f"  No match for: {question_text[:40]}")
-            continue
-
-        # Fill textarea
-        result = driver.execute_script("""
-            const textareas = document.querySelectorAll('textarea');
-            const ta = textareas[arguments[0]] || document.getElementById(arguments[1]) || document.querySelector(`textarea[name="${arguments[1]}"]`);
-            if (!ta) return {error: 'no_textarea'};
-            const ns = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-            ns.call(ta, arguments[2]);
-            ta.dispatchEvent(new Event('input', {bubbles: true}));
-            ta.dispatchEvent(new Event('change', {bubbles: true}));
-            return {id: ta.id, name: ta.name, len: arguments[2].length};
-        """, matched['index'], matched.get('textarea_id') or matched.get('textarea_name'), answer_text)
-        print(f"  Filled: {matched['question'][:40]}... -> {result}")
-        if isinstance(result, dict) and 'error' not in result:
-            filled += 1
-        time.sleep(0.5)
-
-    if filled == 0:
-        return False, {"error": "no_questions_matched", "questions_found": len(questions)}
-
-    time.sleep(1)
-
-    # Save
-    saved = driver.execute_script("""
-        const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-        const sb = btns.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'') + ' ' + (b.value||'')));
-        if (sb) { sb.click(); return {ok: true, text: sb.innerText || sb.value}; }
-        return {ok: false};
-    """)
-    print(f"  Save: {saved}")
-    time.sleep(5)
-
-    return saved.get('ok', False), {"filled": filled, "save": saved}
-
-
-def write_receipt(action, data, success=True):
-    receipts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
-    os.makedirs(receipts_dir, exist_ok=True)
-    receipt = {"action": action, "success": success, "timestamp": datetime.now(timezone.utc).isoformat(), **data}
-    rpath = os.path.join(receipts_dir, f"{action}_{receipt['timestamp'].replace(':','-')}.json")
-    with open(rpath, "w") as f:
-        json.dump(receipt, f, indent=2)
-    return rpath
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Post interview answers to RentMasseur")
-    parser.add_argument("--answers", required=False, help="JSON array of {question, answer}")
-    parser.add_argument("--file", required=False, help="JSON file with answers array")
-    args = parser.parse_args()
-
-    if args.file:
-        with open(args.file, "r") as f:
-            answers = json.load(f)
-    elif args.answers:
-        answers = json.loads(args.answers)
-    else:
-        print("Error: --answers or --file required")
-        sys.exit(1)
-
-    if isinstance(answers, dict):
-        answers = [answers]
-
-    print(f"Answers to post: {len(answers)}")
-
-    options = uc.ChromeOptions()
-    options.add_argument("--window-size=1280,900")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-
-    driver = uc.Chrome(options=options, version_main=149)
-
-    try:
-        print("\n[1] Login...")
-        if not login(driver):
-            print("  Login failed!")
-            sys.exit(1)
-
-        print("\n[2] Posting interview answers...")
-        success, details = post_interview(driver, answers)
-
-        rpath = write_receipt("post_interview", {"answers_count": len(answers), "details": details}, success)
-        if success:
-            print(f"\n=== INTERVIEW POSTED === Receipt: {rpath}")
-        else:
-            print(f"\n=== INTERVIEW POST FAILED === Receipt: {rpath}")
-            sys.exit(1)
-
-    finally:
-        driver.quit()
-        print("\nDone.")
-
-
-if __name__ == "__main__":
-    main()
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-14T21:33:11Z",
+  "run_id": "29369652505",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
 ```
 
-login_page.html:
+kpi_2026-07-22T13-14-27.964374-00-00.json:
 ```
-<html lang="en"><head><meta http-equiv="origin-trial" content="3NNj0GXVktLOmVKwWUDendk4Vq2qgMVDBDX+Sni48ATJl9JBj+zF+9W2HGB3pvt6qowOihTbQgTeBm9SKbdTwYAAABfeyJvcmlnaW4iOiJodHRwczovL3JlY2FwdGNoYS5uZXQ6NDQzIiwiZmVhdHVyZSI6IlRwY2QiLCJleHBpcnkiOjE3MzUzNDM5OTksImlzVGhpcmRQYXJ0eSI6dHJ1ZX0="><meta http-equiv="origin-trial" content="A6iYDRdcg1LVww9DNZEU+JUx2g1IJxSxk4P6F+LimR0ElFa38FydBqtz/AmsKdGr11ZooRgDPCInHJfGzwtR+A4AAACXeyJvcmlnaW4iOiJodHRwczovL3d3dy5yZWNhcHRjaGEubmV0OjQ0MyIsImZlYXR1cmUiOiJEaXNhYmxlVGhpcmRQYXJ0eVN0b3JhZ2VQYXJ0aXRpb25pbmczIiwiZXhwaXJ5IjoxNzU3OTgwODAwLCJpc1N1YmRvbWFpbiI6dHJ1ZSwiaXNUaGlyZFBhcnR5Ijp0cnVlfQ==">
-    <title>CrowdSec Captcha</title>
-    <meta content="text/html; charset=utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>/*! tailwindcss v3.2.7 | MIT License | https://tailwindcss.com*/*,:after,:before{border:0 solid #e5e7eb;box-sizing:border-box}:after,:before{--tw-content:""}html{-webkit-text-size-adjust:100%;font-feature-settings:normal;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,Noto Sans,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;line-height:1.5;-moz-tab-size:4;-o-tab-size:4;tab-size:4}body{line-height:inherit;margin:0}hr{border-top-width:1px;color:inherit;height:0}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:initial}sub{bottom:-.25em}sup{top:-.5em}table{border-collapse:collapse;border-color:inherit;text-indent:0}button,input,optgroup,select,textarea{color:inherit;font-family:inherit;font-size:100%;font-weight:inherit;line-height:inherit;margin:0;padding:0}button,select{text-transform:none}[type=button],[type=reset],[type=submit],button{-webkit-appearance:button;background-color:initial;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:initial}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{color:#9ca3af;opacity:1}input::placeholder,textarea::placeholder{color:#9ca3af;opacity:1}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{height:auto;max-width:100%}[hidden]{display:none}*,::backdrop,:after,:before{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:#3b82f680;--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: }.fixed{position:fixed}.right-0{right:0}.top-0{top:0}.flex{display:flex}.h-24{height:6rem}.h-3\/5{height:60%}.h-6{height:1.5rem}.h-full{height:100%}.h-screen{height:100vh}.w-24{width:6rem}.w-6{width:1.5rem}.w-full{width:100%}.w-screen{width:100vw}.flex-col{flex-direction:column}.items-center{align-items:center}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-bottom:calc(.25rem*var(--tw-space-y-reverse));margin-top:calc(.25rem*(1 - var(--tw-space-y-reverse)))}.space-y-4>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-bottom:calc(1rem*var(--tw-space-y-reverse));margin-top:calc(1rem*(1 - var(--tw-space-y-reverse)))}.rounded-xl{border-radius:.75rem}.border-2{border-width:2px}.border-black{--tw-border-opacity:1;border-color:rgb(0 0 0/var(--tw-border-opacity))}.p-4{padding:1rem}.text-2xl{font-size:1.5rem;line-height:2rem}.text-sm{font-size:.875rem;line-height:1.25rem}.text-xl{font-size:1.25rem;line-height:1.75rem}.dark .dark\:border-white{--tw-border-opacity:1;border-color:rgb(255 255 255/var(--tw-border-opacity))}.dark .dark\:bg-slate-900{--tw-bg-opacity:1;background-color:rgb(15 23 42/var(--tw-bg-opacity))}.dark .dark\:text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity))}@media (min-width:640px){.sm\:w-2\/3{width:66.666667%}}@media (min-width:768px){.md\:h-2\/5{height:40%}.md\:flex-row{flex-direction:row}.md\:text-2xl{font-size:1.5rem;line-height:2rem}.md\:text-lg{font-size:1.125rem;line-height:1.75rem}}@media (min-width:1024px){.lg\:w-1\/2{width:50%}.lg\:text-3xl{font-size:1.875rem;line-height:2.25rem}.lg\:text-xl{font-size:1.25rem;line-height:1.75rem}}@media (min-width:1280px){.xl\:text-4xl{font-size:2.25rem;line-height:2.5rem}}</style>
-    <script type="text/javascript" async="" charset="utf-8" src="https://www.gstatic.com/recaptcha/releases/MerVUtRoajKEbP7pLiGXkL28/recaptcha__en.js" crossorigin="anonymous" integrity="sha384-m1PC1ygjfLmGwsDY9jhFKKTk4uAMPEO34ag12kE5Ljsj7EXMzvB24pLZaON7S8Ds"></script><script src="https://www.recaptcha.net/recaptcha/api.js" async="" defer=""></script>
-</head>
-<body class="h-screen w-screen dark">
-  <div class="h-full w-full flex flex-col justify-center items-center dark:bg-slate-900 dark:text-white">
-    <div class="flex flex-col justify-between items-center border-2 border-black dark:border-white rounded-xl p-4 h-3/5 md:h-2/5 w-full sm:w-2/3 lg:w-1/2">
-      <div class="fixed p-4 top-0 right-0 dark-mode-toggle"><svg class="h-6 w-6" viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="M3 12H5M5.00006 19L7.00006 17M12 19V21M17 17L19 19M5 5L7 7M19 12H21M16.9999 7L18.9999 5M12 3V5M15 12C15 13.6569 13.6569 15 12 15C10.3431 15 9 13.6569 9 12C9 10.3431 10.3431 9 12 9C13.6569 9 15 10.3431 15 12Z" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
-      <div class="flex flex-col items-center space-y-4">
-        <svg fill="white" class="h-24 w-24" aria-hidden="true" focusable="false" data-prefix="fas" data-icon="exclamation-triangle" role="img" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512">
-          <path d="M569.517 440.013C587.975 472.007 564.806 512 527.94 512H48.054c-36.937 0-59.999-40.055-41.577-71.987L246.423 23.985c18.467-32.009 64.72-31.951 83.154 0l239.94 416.028zM288 354c-25.405 0-46 20.595-46 46s20.595 46 46 46 46-20.595 46-46-20.595-46-46-46zm-43.673-165.346l7.418 136c.347 6.364 5.609 11.346 11.982 11.346h48.546c6.373 0 11.635-4.982 11.982-11.346l7.418-136c.375-6.874-5.098-12.654-11.982-12.654h-63.383c-6.884 0-12.356 5.78-11.981 12.654z"></path>
-        </svg>
-        <h1 class="text-2xl lg:text-3xl xl:text-4xl">CrowdSec Captcha</h1>
-        <form action="" method="POST" class="flex flex-col space-y-1" id="captcha-form">
-          <div id="captcha" class="g-recaptcha" data-sitekey="6Le2q64qAAAAAJEgw2HU_tXf5dhJtlfKfTUhimF8" data-callback="captchaCallback"><div style="width: 304px; height: 78px;"><div><iframe title="reCAPTCHA" width="304" height="78" role="presentation" name="a-blnui3a8jt5w" frameborder="0" scrolling="no" sandbox="allow-forms allow-popups allow-same-origin allow-scripts allow-top-navigation allow-modals allow-popups-to-escape-sandbox allow-storage-access-by-user-activation" src="https://www.recaptcha.net/recaptcha/api2/anchor?ar=1&amp;k=6Le2q64qAAAAAJEgw2HU_tXf5dhJtlfKfTUhimF8&amp;co=aHR0cHM6Ly9yZW50bWFzc2V1ci5jb206NDQz&amp;hl=en&amp;v=MerVUtRoajKEbP7pLiGXkL28&amp;size=normal&amp;anchor-ms=20000&amp;execute-ms=30000&amp;cb=diwexlvtnhcx"></iframe></div><textarea id="g-recaptcha-response" name="g-recaptcha-response" class="g-recaptcha-response" style="width: 250px; height: 40px; border: 1px solid rgb(193, 193, 193); margin: 10px 25px; padding: 0px; resize: none; display: none;"></textarea></div><iframe style="display: none;"></iframe></div>
-        </form>
-      </div>
-      <div class="flex-col md:flex-row text-sm flex items-center">
-        <p>
-          This security check has been powered by
-        </p>
-        <a href="https://crowdsec.net/" target="_blank" rel="noopener" class="flex flex-col items-center">
-          <svg fill="white" width="33.92" height="33.76" viewBox="0 0 254.4 253.2">
-          <defs>
-            <clipPath id="a">
-              <path d="M0 52h84v201.2H0zm0 0"></path>
-            </clipPath>
-            <clipPath id="b">
-              <path d="M170 52h84.4v201.2H170zm0 0"></path>
-            </clipPath>
-          </defs>
-          <path d="M59.3 128.4c1.4 2.3 2.5 4.6 3.4 7-1-4.1-2.3-8.1-4.3-12-3.1-6-7.8-5.8-10.7 0-2 4-3.2 8-4.3 12.1 1-2.4 2-4.8 3.4-7.1 3.4-5.8 8.8-6 12.5 0M207.8 128.4a42.9 42.9 0 013.4 7c-1-4.1-2.3-8.1-4.3-12-3.2-6-7.8-5.8-10.7 0-2 4-3.3 8-4.3 12.1.9-2.4 2-4.8 3.4-7.1 3.4-5.8 8.8-6 12.5 0M134.6 92.9c2 3.5 3.6 7 4.8 10.7-1.3-5.4-3-10.6-5.6-15.7-4-7.5-9.7-7.2-13.3 0a75.4 75.4 0 00-5.6 16c1.2-3.8 2.7-7.4 4.7-11 4.1-7.2 10.6-7.5 15 0M43.8 136.8c.9 4.6 3.7 8.3 7.3 9.2 0 2.7 0 5.5.2 8.2.3 3.3.4 6.6 1 9.6.3 2.3 1 2.2 1.3 0 .5-3 .6-6.3 1-9.6l.2-8.2c3.5-1 6.4-4.6 7.2-9.2a17.8 17.8 0 01-9 2.4c-3.5 0-6.6-1-9.2-2.4M192.4 136.8c.8 4.6 3.7 8.3 7.2 9.2 0 2.7 0 5.5.3 8.2.3 3.3.4 6.6 1 9.6.3 2.3.9 2.2 1.2 0 .6-3 .7-6.3 1-9.6.2-2.7.3-5.5.2-8.2 3.6-1 6.4-4.6 7.3-9.2a17.8 17.8 0 01-9.1 2.4c-3.4 0-6.6-1-9.1-2.4M138.3 104.6c-3.1 1.9-7 3-11.3 3-4.3 0-8.2-1.1-11.3-3 1 5.8 4.5 10.3 9 11.5 0 3.4 0 6.8.3 10.2.4 4.1.5 8.2 1.2 12 .4 2.9 1.2 2.7 1.6 0 .7-3.8.8-7.9 1.2-12 .3-3.4.3-6.8.3-10.2 4.5-1.2 8-5.7 9-11.5"></path>
-          <path d="M51 146c0 2.7.1 5.5.3 8.2.3 3.3.4 6.6 1 9.6.3 2.3 1 2.2 1.3 0 .5-3 .6-6.3 1-9.6l.2-8.2c3.5-1 6.4-4.6 7.2-9.2a17.8 17.8 0 01-9 2.4c-3.5 0-6.6-1-9.2-2.4.9 4.6 3.7 8.3 7.3 9.2M143.9 105c-1.9-.4-3.5-1.2-4.9-2.3 1.4 5.6 2.5 11.3 4 17 1.2 5 2 10 2.4 15 .6 7.8-4.5 14.5-10.9 14.5h-15c-6.4 0-11.5-6.7-11-14.5.5-5 1.3-10 2.6-15 1.3-5.3 2.3-10.5 3.6-15.7-2.2 1.2-4.8 1.9-7.7 2-4.7.1-9.4-.3-14-1-4-.4-6.7-3-8-6.7-1.3-3.4-2-7-3.3-10.4-.5-1.5-1.6-2.8-2.4-4.2-.4-.6-.8-1.2-.9-1.8v-7.8a77 77 0 0124.5-3c6.1 0 12 1 17.8 3.2 4.7 1.7 9.7 1.8 14.4 0 9-3.4 18.2-3.8 27.5-3 4.9.5 9.8 1.6 14.8 2.4v8.2c0 .6-.3 1.5-.7 1.7-2 .9-2.2 2.7-2.7 4.5-.9 3.2-1.8 6.4-2.9 9.5a11 11 0 01-8.8 7.7 40.6 40.6 0 01-18.4-.2m29.4 80.6c-3.2-26.8-6.4-50-8.9-60.7a14.3 14.3 0 0014.1-14h.4a9 9 0 005.6-16.5 14.3 14.3 0 00-3.7-27.2 9 9 0 00-6.9-14.6c2.4-1.1 4.5-3 5.8-5 3.4-5.3 4-29-8-44.4-5-6.3-9.8-2.5-10 1.8-1 13.2-1.1 23-4.5 34.3a9 9 0 00-16-4.1 14.3 14.3 0 00-28.4 0 9 9 0 00-16 4.1c-3.4-11.2-3.5-21.1-4.4-34.3-.3-4.3-5.2-8-10-1.8-12 15.3-11.5 39-8.1 44.4 1.3 2 3.4 3.9 5.8 5a9 9 0 00-7 14.6 14.3 14.3 0 00-3.6 27.2A9 9 0 0075 111h.5a14.5 14.5 0 0014.3 14c-4 17.2-10 66.3-15 111.3l-1.3 13.4a1656.4 1656.4 0 01106.6 0l-1.4-12.7-5.4-51.3"></path>
-          <g clip-path="url(#a)">
-            <path d="M83.5 136.6l-2.3.7c-5 1-9.8 1-14.8-.2-1.4-.3-2.7-1-3.8-1.9l3.1 13.7c1 4 1.7 8 2 12 .5 6.3-3.6 11.6-8.7 11.6H46.9c-5.1 0-9.2-5.3-8.7-11.6.3-4 1-8 2-12 1-4.2 1.8-8.5 2.9-12.6-1.8 1-3.9 1.5-6.3 1.6a71 71 0 01-11.1-.7 7.7 7.7 0 01-6.5-5.5c-1-2.7-1.6-5.6-2.6-8.3-.4-1.2-1.3-2.3-2-3.4-.2-.4-.6-1-.6-1.4v-6.3c6.4-2 13-2.6 19.6-2.5 4.9.1 9.6 1 14.2 2.6 3.9 1.4 7.9 1.5 11.7 0 1.8-.7 3.6-1.2 5.5-1.6a13 13 0 01-1.6-15.5A18.3 18.3 0 0159 73.1a11.5 11.5 0 00-17.4 8.1 7.2 7.2 0 00-12.9 3.3c-2.7-9-2.8-17-3.6-27.5-.2-3.4-4-6.5-8-1.4C7.5 67.8 7.9 86.9 10.6 91c1.1 1.7 2.8 3.1 4.7 4a7.2 7.2 0 00-5.6 11.7 11.5 11.5 0 00-2.9 21.9 7.2 7.2 0 004.5 13.2h.3c0 .6 0 1.1.2 1.7.9 5.4 5.6 9.5 11.3 9.5A1177.2 1177.2 0 0010 253.2c18.1-1.5 38.1-2.6 59.5-3.4.4-4.6.8-9.3 1.4-14 1.2-11.6 3.3-30.5 5.7-49.7 2.2-18 4.7-36.3 7-49.5"></path>
-          </g>
-          <g clip-path="url(#b)">
-            <path d="M254.4 118.2c0-5.8-4.2-10.5-9.7-11.4a7.2 7.2 0 00-5.6-11.7c2-.9 3.6-2.3 4.7-4 2.7-4.2 3.1-23.3-6.5-35.5-4-5.1-7.8-2-8 1.4-.8 10.5-.9 18.5-3.6 27.5a7.2 7.2 0 00-12.8-3.3 11.5 11.5 0 00-17.8-7.9 18.4 18.4 0 01-4.5 22 13 13 0 01-1.3 15.2c2.4.5 4.8 1 7.1 2 3.8 1.3 7.8 1.4 11.6 0 7.2-2.8 14.6-3 22-2.4 4 .4 7.9 1.2 12 1.9l-.1 6.6c0 .5-.2 1.2-.5 1.3-1.7.7-1.8 2.2-2.2 3.7l-2.3 7.6a8.8 8.8 0 01-7 6.1c-5 1-10 1-14.9-.2-1.5-.3-2.8-1-3.9-1.9 1.2 4.5 2 9.1 3.2 13.7 1 4 1.6 8 2 12 .4 6.3-3.6 11.6-8.8 11.6h-12c-5.2 0-9.3-5.3-8.8-11.6.4-4 1-8 2-12 1-4.2 1.9-8.5 3-12.6-1.8 1-4 1.5-6.3 1.6-3.7 0-7.5-.3-11.2-.7a7.7 7.7 0 01-3.7-1.5c3.1 18.4 7.1 51.2 12.5 100.9l.6 5.3.8 7.9c21.4.7 41.5 1.9 59.7 3.4L243 243l-4.4-41.2a606 606 0 00-7-48.7 11.5 11.5 0 0011.2-11.2h.4a7.2 7.2 0 004.4-13.2c4-1.8 6.8-5.8 6.8-10.5"></path>
-          </g>
-          <path d="M180 249.6h.4a6946 6946 0 00-7.1-63.9l5.4 51.3 1.4 12.6M164.4 125c2.5 10.7 5.7 33.9 8.9 60.7a570.9 570.9 0 00-8.9-60.7M74.8 236.3l-1.4 13.4 1.4-13.4"></path>
-        </svg>
-        <span>
-          CrowdSec
-        </span>
-      </a>
-    </div>
-    </div>
-  </div>
-  <script>
-    const moonSvgString = '<svg fill="black" class="h-6 w-6" viewBox="0 0 35 35" data-name="Layer 2" id="Layer_2" xmlns="http://www.w3.org/2000/svg"><path d="M18.44,34.68a18.22,18.22,0,0,1-2.94-.24,18.18,18.18,0,0,1-15-20.86A18.06,18.06,0,0,1,9.59.63,2.42,2.42,0,0,1,12.2.79a2.39,2.39,0,0,1,1,2.41L11.9,3.1l1.23.22A15.66,15.66,0,0,0,23.34,21h0a15.82,15.82,0,0,0,8.47.53A2.44,2.44,0,0,1,34.47,25,18.18,18.18,0,0,1,18.44,34.68ZM10.67,2.89a15.67,15.67,0,0,0-5,22.77A15.66,15.66,0,0,0,32.18,24a18.49,18.49,0,0,1-9.65-.64A18.18,18.18,0,0,1,10.67,2.89Z"/></svg>'
-    const sunSvgString = '<svg class="h-6 w-6" viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="M3 12H5M5.00006 19L7.00006 17M12 19V21M17 17L19 19M5 5L7 7M19 12H21M16.9999 7L18.9999 5M12 3V5M15 12C15 13.6569 13.6569 15 12 15C10.3431 15 9 13.6569 9 12C9 10.3431 10.3431 9 12 9C13.6569 9 15 10.3431 15 12Z" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
-    const svg = Array.from(document.querySelectorAll('svg'));
-    const button = document.querySelector('.dark-mode-toggle');
-    window.onload = () => {
-      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-        document.body.classList.add('dark');
-        svg.forEach(element => {
-          element.setAttribute('fill', 'white');
-        });
-        button.innerHTML = sunSvgString;
-      } else {
-        button.innerHTML = moonSvgString;
+{
+  "id": "kpi_1784726067",
+  "timestamp": "2026-07-22T13:14:27.964374+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-22T13:14:27.964295+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+rotation_20260723_193340.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-23T19:33:40Z",
+  "run_id": "30037862060",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "30037862060"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? content/blog_posts/20260723_massage_myths_busted.md ?? content/interview_questions/20260723_philosophy_of_touch.md ?? production_control_loop ?? receipts/rotation_20260723_193340.json ",
+  "status": "completed"
+}
+
+```
+
+rotation_20260718_103120.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-18T10:31:20Z",
+  "run_id": "29640715294",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29640715294"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260718_103120.json ",
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-05T14-11-12.813617-00-00.json:
+```
+{
+  "id": "kpi_1783260672",
+  "timestamp": "2026-07-05T14:11:12.813617+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-05T14:11:12.813545+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260701_152437.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-01T15:24:37.153477+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+pipeline_20260710_011927.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-10T01:19:27Z",
+  "run_id": "29061919860",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+pipeline_20260713_044800.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-13T04:48:00Z",
+  "run_id": "29224607520",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+metrics_20260718_091311.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-18T09:13:11.519659+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+metrics_20260703_103213.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-03T10:32:13.983253+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-09T05-34-03.136039-00-00.json:
+```
+{
+  "id": "kpi_1783575243",
+  "timestamp": "2026-07-09T05:34:03.136039+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-09T05:34:03.135962+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260716_142322.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-16T14:23:22.354631+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-07T01-18-14.254281-00-00.json:
+```
+{
+  "id": "kpi_1783387094",
+  "timestamp": "2026-07-07T01:18:14.254281+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-07T01:18:14.254133+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+rotation_20260711_191948.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-11T19:19:48Z",
+  "run_id": "29164807042",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29164807042"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260711_191948.json ",
+  "status": "completed"
+}
+
+```
+
+metrics_20260724_011032.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-24T01:10:32.420093+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+rotation_20260704_161745.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-04T16:17:45Z",
+  "run_id": "28711916368",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28711916368"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260704_161745.json ",
+  "status": "completed"
+}
+
+```
+
+kpi_2026-06-30T13-04-43.863030-00-00.json:
+```
+{
+  "id": "kpi_1782824683",
+  "timestamp": "2026-06-30T13:04:43.863030+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-30T13:04:43.862951+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-07-25T12-01-36.725476-00-00.json:
+```
+{
+  "id": "kpi_1784980896",
+  "timestamp": "2026-07-25T12:01:36.725476+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-25T12:01:36.725393+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-07-12T16-38-00.020602-00-00.json:
+```
+{
+  "id": "kpi_1783874280",
+  "timestamp": "2026-07-12T16:38:00.020602+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-12T16:38:00.020506+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-07-13T07-58-22.460310-00-00.json:
+```
+{
+  "id": "kpi_1783929502",
+  "timestamp": "2026-07-13T07:58:22.460310+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-13T07:58:22.460211+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260725_092507.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-25T09:25:07Z",
+  "run_id": "30152634072",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+kpi_2026-07-05T22-33-11.938925-00-00.json:
+```
+{
+  "id": "kpi_1783290791",
+  "timestamp": "2026-07-05T22:33:11.938925+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-05T22:33:11.938829+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260708_185726.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-08T18:57:26Z",
+  "run_id": "28967710510",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+pipeline_20260725_175639.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-25T17:56:39Z",
+  "run_id": "30168448517",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
+
+```
+
+metrics_20260711_223416.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-11T22:34:16.940800+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+rotation_20260629_153228.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-06-29T15:32:28Z",
+  "run_id": "28383058953",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28383058953"
+},
+  "availability_step": "skipped_in_dry_run_or_disabled_for_platform_safety",
+  "content_changed": " M content/decisions/latest_decision.json ?? content/blog_posts/20260629_couples_massage_etiquette.md ?? content/interview_questions/20260629_travel_adventure.md ?? production_control_loop ?? receipts/rotation_20260629_153228.json ",
+  "status": "completed"
+}
+
+```
+
+kpi_2026-06-26T18-53-24.441865-00-00.json:
+```
+{
+  "id": "kpi_1782500004",
+  "timestamp": "2026-06-26T18:53:24.441865+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-26T18:53:24.441227+00:00",
+    "immortality": {
+      "score": 0.8375,
+      "grade": "IMMORTAL",
+      "components": {
+        "days_online": 964,
+        "views_per_day": 81.0,
+        "profile_age_score": 0.964,
+        "views_per_day_trend": 0.5,
+        "visibility_persistence": 1.0,
+        "availability_stability": 1.0,
+        "retention_score": 0.81
       }
-      button.addEventListener('click', function() {
-        document.body.classList.toggle('dark');
-        svg.forEach(element => {
-          element.getAttribute('fill') === 'black' ? element.setAttribute('fill', 'white') : element.setAttribute('fill', 'black');
-        });
-        if (document.body.classList.contains('dark')) {
-            button.innerHTML = sunSvgString;
-          } else {
-            button.innerHTML = moonSvgString;
-          }
-      });
-    };
-    function captchaCallback () {
-      setTimeout(() => {
-        document.querySelector('#captcha-form').submit();
-      }, 500);
-    }
-  </script>
+    },
+    "virality": {
+      "score": 0.1072,
+      "grade": "STAGNANT",
+      "components": {
+        "profile_views": 2802,
+        "views_velocity": 0,
+        "views_acceleration": 0,
+        "contact_clicks": 135,
+        "contact_click_velocity": 0,
+        "new_visits": 31,
+        "new_visitor_rate": 0.0111,
+        "online_bookmarks": 1,
+        "bookmark_rate": 0.0004,
+        "new_emails": 0,
+        "email_rate": 0.0,
+        "contact_click_rate": 0.0482
+      }
+    },
+    "metrics_snapshots_used": 1
+  }
+}
+```
 
+pipeline_20260717_131001.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-17T13:10:01Z",
+  "run_id": "29582625864",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
+```
+
+metrics_20260712_213633.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-12T21:36:33.167061+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-13T17-53-11.826166-00-00.json:
+```
+{
+  "id": "kpi_1783965191",
+  "timestamp": "2026-07-13T17:53:11.826166+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-13T17:53:11.826072+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```

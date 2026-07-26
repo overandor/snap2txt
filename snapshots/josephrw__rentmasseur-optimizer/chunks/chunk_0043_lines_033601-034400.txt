@@ -1,800 +1,800 @@
-        run: |
-          python3 rentmasseur_availability.py --headless true || echo "Availability keeper failed (possibly CAPTCHA) - will retry next run"
-
-      - name: Ingest manual metrics if provided
-        if: ${{ github.event.inputs.manual_metrics != '' }}
-        run: |
-          mkdir -p content
-          echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source\":\"manual_upload\",\"body\":${{ github.event.inputs.manual_metrics }}}" >> content/metrics_ingest.jsonl
-          echo "Manual metrics ingested."
-
-      - name: Fetch metrics from HF Space
-        run: |
-          mkdir -p content
-          curl -s "https://josephrw-rentmasseur-optimizer.hf.space/api/report" -o content/hf_report.json || true
-          echo "HF Space report fetched."
-
-      - name: Process metrics and update state
-        run: |
-          python3 metrics_collector.py --process
-
-      - name: Write proof file
-        run: |
-          python3 metrics_collector.py --proof
-
-      - name: Commit and push state + proof
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add content/ || true
-          git add availability.json || true
-          git add receipts/ || true
-          if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "Metrics + availability keeper: $(date -u +%Y-%m-%d-%H:%M)"
-            git push
-          else
-            echo "No changes to commit"
-          fi
-
-      - name: Upload debug artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: metrics-debug
-          path: |
-            content/
-            receipts/
-          retention-days: 7
-
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
 ```
 
-master-rotator.yml:
-```
-name: RentMasseur Master Rotator
-
-on:
-  schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Dry run (no profile changes)'
-        required: false
-        default: 'true'
-      components:
-        description: 'Comma-separated: bio,photo,price,interview,blog,all'
-        required: false
-        default: 'all'
-
-jobs:
-  rotate:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      RENTMASSEUR_USERNAME: ${{ secrets.RENTMASSEUR_USERNAME }}
-      RENTMASSEUR_PASSWORD: ${{ secrets.RENTMASSEUR_PASSWORD }}
-      REBRANDLY_LINK: ${{ secrets.REBRANDLY_LINK }}
-      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      GROQ_MODEL: llama-3.3-70b-versatile
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
-
-      - name: Build production control loop (C++)
-        run: |
-          g++ -O3 -std=c++17 -Wall -Wextra -pedantic production_control_loop.cpp -o production_control_loop
-
-      - name: Preflight gate — production control loop
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event.inputs.dry_run || 'true' }}" = "true" ]; then
-            echo "Dry run: using placeholder link for proof-only preflight. No profile changes allowed."
-            REBRANDLY_LINK="https://rebrand.ly/dry-run-placeholder" ./production_control_loop --preflight
-          else
-            ./production_control_loop --preflight
-          fi
-
-      - name: Collect RL stats
-        run: |
-          python3 rl_feedback.py || true
-
-      - name: Generate fresh content
-        run: |
-          python3 content_generator.py || true
-          python3 interview_rotator.py || true
-          python3 blog_rotator.py || true
-
-      - name: Run full rotation in proof mode
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event.inputs.dry_run || 'true' }}" = "true" ]; then
-            python3 orchestrator.py --all --dry-run || true
-          else
-            python3 orchestrator.py --all
-          fi
-
-      - name: Production gate — evaluate candidates or block safely
-        run: |
-          set -euo pipefail
-          mkdir -p content/decisions
-          if [ -f content/live_metrics.json ] && [ -f content/candidates.tsv ]; then
-            ./production_control_loop \
-              --evaluate \
-              --metrics content/live_metrics.json \
-              --candidates content/candidates.tsv \
-              --ledger content/experiment_ledger.jsonl \
-              --decision content/decisions/latest_decision.json
-          else
-            cat > content/decisions/latest_decision.json <<DECISION
-          {
-            "status": "blocked_missing_real_inputs",
-            "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
-            "live_update_allowed": false,
-            "dry_run": "${{ github.event.inputs.dry_run || 'true' }}",
-            "run_id": "${{ github.run_id }}"
-          }
-          DECISION
-          fi
-          echo "=== Production gate decision ==="
-          cat content/decisions/latest_decision.json
-
-      - name: Live availability step guard
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event.inputs.dry_run || 'true' }}" = "true" ]; then
-            echo "Dry run: live account availability step skipped."
-            exit 0
-          fi
-          echo "Live account step disabled unless a clean manual path is approved."
-          exit 0
-
-      - name: Write proof file (what it saw, chose, changed, won/lost)
-        run: |
-          mkdir -p receipts
-          cat > receipts/rotation_$(date -u +%Y%m%d_%H%M%S).json <<PROOF
-          {
-            "action": "master-rotator",
-            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "run_id": "${{ github.run_id }}",
-            "dry_run": "${{ github.event.inputs.dry_run || 'true' }}",
-            "components": "${{ github.event.inputs.components || 'all' }}",
-            "preflight_passed": true,
-            "gate_decision": $(cat content/decisions/latest_decision.json 2>/dev/null || echo '{}'),
-            "availability_step": "skipped_in_dry_run_or_disabled_for_platform_safety",
-            "content_changed": "$(git status --porcelain | tr '\n' ' ')",
-            "status": "completed"
-          }
-          PROOF
-          echo "=== Proof file written ==="
-          cat receipts/rotation_*.json | tail -40
-
-      - name: Commit and push state + content + proof
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add content/ || true
-          git add receipts/ || true
-          if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "Autonomous rotation proof: bio/photo/price/interview/blog + gate $(date -u +%Y-%m-%d-%H:%M)"
-            git push
-          else
-            echo "No changes to commit"
-          fi
-
-      - name: Upload debug artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rotation-debug
-          path: |
-            debug/
-            content/decisions/
-            receipts/
-          retention-days: 7
-
-```
-
-rentmasseur-daemon.service:
-```
-[Unit]
-Description=RentMasseur Optimizer Daemon
-After=network.target
-
-[Service]
-Type=simple
-User=alep
-WorkingDirectory=/Users/alep/Downloads/rentmasseur-optimizer
-EnvironmentFile=/Users/alep/Downloads/rentmasseur-optimizer/.env
-ExecStart=/usr/bin/env python3 /Users/alep/Downloads/rentmasseur-optimizer/daemon.py
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-
-```
-
-debug_login_no_password_20260626_053649.png:
-```
-Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
-```
-
-debug_login_no_password_20260626_053649.html:
-```
-<html lang="en"><head>
-    <title>CrowdSec Captcha</title>
-    <meta content="text/html; charset=utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>/*! tailwindcss v3.2.7 | MIT License | https://tailwindcss.com*/*,:after,:before{border:0 solid #e5e7eb;box-sizing:border-box}:after,:before{--tw-content:""}html{-webkit-text-size-adjust:100%;font-feature-settings:normal;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,Noto Sans,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;line-height:1.5;-moz-tab-size:4;-o-tab-size:4;tab-size:4}body{line-height:inherit;margin:0}hr{border-top-width:1px;color:inherit;height:0}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:initial}sub{bottom:-.25em}sup{top:-.5em}table{border-collapse:collapse;border-color:inherit;text-indent:0}button,input,optgroup,select,textarea{color:inherit;font-family:inherit;font-size:100%;font-weight:inherit;line-height:inherit;margin:0;padding:0}button,select{text-transform:none}[type=button],[type=reset],[type=submit],button{-webkit-appearance:button;background-color:initial;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:initial}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{color:#9ca3af;opacity:1}input::placeholder,textarea::placeholder{color:#9ca3af;opacity:1}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{height:auto;max-width:100%}[hidden]{display:none}*,::backdrop,:after,:before{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:#3b82f680;--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: }.fixed{position:fixed}.right-0{right:0}.top-0{top:0}.flex{display:flex}.h-24{height:6rem}.h-3\/5{height:60%}.h-6{height:1.5rem}.h-full{height:100%}.h-screen{height:100vh}.w-24{width:6rem}.w-6{width:1.5rem}.w-full{width:100%}.w-screen{width:100vw}.flex-col{flex-direction:column}.items-center{align-items:center}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-bottom:calc(.25rem*var(--tw-space-y-reverse));margin-top:calc(.25rem*(1 - var(--tw-space-y-reverse)))}.space-y-4>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-bottom:calc(1rem*var(--tw-space-y-reverse));margin-top:calc(1rem*(1 - var(--tw-space-y-reverse)))}.rounded-xl{border-radius:.75rem}.border-2{border-width:2px}.border-black{--tw-border-opacity:1;border-color:rgb(0 0 0/var(--tw-border-opacity))}.p-4{padding:1rem}.text-2xl{font-size:1.5rem;line-height:2rem}.text-sm{font-size:.875rem;line-height:1.25rem}.text-xl{font-size:1.25rem;line-height:1.75rem}.dark .dark\:border-white{--tw-border-opacity:1;border-color:rgb(255 255 255/var(--tw-border-opacity))}.dark .dark\:bg-slate-900{--tw-bg-opacity:1;background-color:rgb(15 23 42/var(--tw-bg-opacity))}.dark .dark\:text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity))}@media (min-width:640px){.sm\:w-2\/3{width:66.666667%}}@media (min-width:768px){.md\:h-2\/5{height:40%}.md\:flex-row{flex-direction:row}.md\:text-2xl{font-size:1.5rem;line-height:2rem}.md\:text-lg{font-size:1.125rem;line-height:1.75rem}}@media (min-width:1024px){.lg\:w-1\/2{width:50%}.lg\:text-3xl{font-size:1.875rem;line-height:2.25rem}.lg\:text-xl{font-size:1.25rem;line-height:1.75rem}}@media (min-width:1280px){.xl\:text-4xl{font-size:2.25rem;line-height:2.5rem}}</style>
-    <script type="text/javascript" async="" charset="utf-8" src="https://www.gstatic.com/recaptcha/releases/MerVUtRoajKEbP7pLiGXkL28/recaptcha__en.js" crossorigin="anonymous" integrity="sha384-m1PC1ygjfLmGwsDY9jhFKKTk4uAMPEO34ag12kE5Ljsj7EXMzvB24pLZaON7S8Ds"></script><script src="https://www.recaptcha.net/recaptcha/api.js" async="" defer=""></script>
-</head>
-<body class="h-screen w-screen dark">
-  <div class="h-full w-full flex flex-col justify-center items-center dark:bg-slate-900 dark:text-white">
-    <div class="flex flex-col justify-between items-center border-2 border-black dark:border-white rounded-xl p-4 h-3/5 md:h-2/5 w-full sm:w-2/3 lg:w-1/2">
-      <div class="fixed p-4 top-0 right-0 dark-mode-toggle"><svg class="h-6 w-6" viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="M3 12H5M5.00006 19L7.00006 17M12 19V21M17 17L19 19M5 5L7 7M19 12H21M16.9999 7L18.9999 5M12 3V5M15 12C15 13.6569 13.6569 15 12 15C10.3431 15 9 13.6569 9 12C9 10.3431 10.3431 9 12 9C13.6569 9 15 10.3431 15 12Z" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
-      <div class="flex flex-col items-center space-y-4">
-        <svg fill="white" class="h-24 w-24" aria-hidden="true" focusable="false" data-prefix="fas" data-icon="exclamation-triangle" role="img" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512">
-          <path d="M569.517 440.013C587.975 472.007 564.806 512 527.94 512H48.054c-36.937 0-59.999-40.055-41.577-71.987L246.423 23.985c18.467-32.009 64.72-31.951 83.154 0l239.94 416.028zM288 354c-25.405 0-46 20.595-46 46s20.595 46 46 46 46-20.595 46-46-20.595-46-46-46zm-43.673-165.346l7.418 136c.347 6.364 5.609 11.346 11.982 11.346h48.546c6.373 0 11.635-4.982 11.982-11.346l7.418-136c.375-6.874-5.098-12.654-11.982-12.654h-63.383c-6.884 0-12.356 5.78-11.981 12.654z"></path>
-        </svg>
-        <h1 class="text-2xl lg:text-3xl xl:text-4xl">CrowdSec Captcha</h1>
-        <form action="" method="POST" class="flex flex-col space-y-1" id="captcha-form">
-          <div id="captcha" class="g-recaptcha" data-sitekey="6Le2q64qAAAAAJEgw2HU_tXf5dhJtlfKfTUhimF8" data-callback="captchaCallback"><div style="width: 304px; height: 78px;"><div><iframe title="reCAPTCHA" width="304" height="78" role="presentation" name="a-w5byruq7m84p" frameborder="0" scrolling="no" sandbox="allow-forms allow-popups allow-same-origin allow-scripts allow-top-navigation allow-modals allow-popups-to-escape-sandbox allow-storage-access-by-user-activation" src="https://www.recaptcha.net/recaptcha/api2/anchor?ar=1&amp;k=6Le2q64qAAAAAJEgw2HU_tXf5dhJtlfKfTUhimF8&amp;co=aHR0cHM6Ly9yZW50bWFzc2V1ci5jb206NDQz&amp;hl=en&amp;v=MerVUtRoajKEbP7pLiGXkL28&amp;size=normal&amp;anchor-ms=20000&amp;execute-ms=30000&amp;cb=9ksd5ijab2s1"></iframe></div><textarea id="g-recaptcha-response" name="g-recaptcha-response" class="g-recaptcha-response" style="width: 250px; height: 40px; border: 1px solid rgb(193, 193, 193); margin: 10px 25px; padding: 0px; resize: none; display: none;"></textarea></div><iframe style="display: none;"></iframe></div>
-        </form>
-      </div>
-      <div class="flex-col md:flex-row text-sm flex items-center">
-        <p>
-          This security check has been powered by
-        </p>
-        <a href="https://crowdsec.net/" target="_blank" rel="noopener" class="flex flex-col items-center">
-          <svg fill="white" width="33.92" height="33.76" viewBox="0 0 254.4 253.2">
-          <defs>
-            <clipPath id="a">
-              <path d="M0 52h84v201.2H0zm0 0"></path>
-            </clipPath>
-            <clipPath id="b">
-              <path d="M170 52h84.4v201.2H170zm0 0"></path>
-            </clipPath>
-          </defs>
-          <path d="M59.3 128.4c1.4 2.3 2.5 4.6 3.4 7-1-4.1-2.3-8.1-4.3-12-3.1-6-7.8-5.8-10.7 0-2 4-3.2 8-4.3 12.1 1-2.4 2-4.8 3.4-7.1 3.4-5.8 8.8-6 12.5 0M207.8 128.4a42.9 42.9 0 013.4 7c-1-4.1-2.3-8.1-4.3-12-3.2-6-7.8-5.8-10.7 0-2 4-3.3 8-4.3 12.1.9-2.4 2-4.8 3.4-7.1 3.4-5.8 8.8-6 12.5 0M134.6 92.9c2 3.5 3.6 7 4.8 10.7-1.3-5.4-3-10.6-5.6-15.7-4-7.5-9.7-7.2-13.3 0a75.4 75.4 0 00-5.6 16c1.2-3.8 2.7-7.4 4.7-11 4.1-7.2 10.6-7.5 15 0M43.8 136.8c.9 4.6 3.7 8.3 7.3 9.2 0 2.7 0 5.5.2 8.2.3 3.3.4 6.6 1 9.6.3 2.3 1 2.2 1.3 0 .5-3 .6-6.3 1-9.6l.2-8.2c3.5-1 6.4-4.6 7.2-9.2a17.8 17.8 0 01-9 2.4c-3.5 0-6.6-1-9.2-2.4M192.4 136.8c.8 4.6 3.7 8.3 7.2 9.2 0 2.7 0 5.5.3 8.2.3 3.3.4 6.6 1 9.6.3 2.3.9 2.2 1.2 0 .6-3 .7-6.3 1-9.6.2-2.7.3-5.5.2-8.2 3.6-1 6.4-4.6 7.3-9.2a17.8 17.8 0 01-9.1 2.4c-3.4 0-6.6-1-9.1-2.4M138.3 104.6c-3.1 1.9-7 3-11.3 3-4.3 0-8.2-1.1-11.3-3 1 5.8 4.5 10.3 9 11.5 0 3.4 0 6.8.3 10.2.4 4.1.5 8.2 1.2 12 .4 2.9 1.2 2.7 1.6 0 .7-3.8.8-7.9 1.2-12 .3-3.4.3-6.8.3-10.2 4.5-1.2 8-5.7 9-11.5"></path>
-          <path d="M51 146c0 2.7.1 5.5.3 8.2.3 3.3.4 6.6 1 9.6.3 2.3 1 2.2 1.3 0 .5-3 .6-6.3 1-9.6l.2-8.2c3.5-1 6.4-4.6 7.2-9.2a17.8 17.8 0 01-9 2.4c-3.5 0-6.6-1-9.2-2.4.9 4.6 3.7 8.3 7.3 9.2M143.9 105c-1.9-.4-3.5-1.2-4.9-2.3 1.4 5.6 2.5 11.3 4 17 1.2 5 2 10 2.4 15 .6 7.8-4.5 14.5-10.9 14.5h-15c-6.4 0-11.5-6.7-11-14.5.5-5 1.3-10 2.6-15 1.3-5.3 2.3-10.5 3.6-15.7-2.2 1.2-4.8 1.9-7.7 2-4.7.1-9.4-.3-14-1-4-.4-6.7-3-8-6.7-1.3-3.4-2-7-3.3-10.4-.5-1.5-1.6-2.8-2.4-4.2-.4-.6-.8-1.2-.9-1.8v-7.8a77 77 0 0124.5-3c6.1 0 12 1 17.8 3.2 4.7 1.7 9.7 1.8 14.4 0 9-3.4 18.2-3.8 27.5-3 4.9.5 9.8 1.6 14.8 2.4v8.2c0 .6-.3 1.5-.7 1.7-2 .9-2.2 2.7-2.7 4.5-.9 3.2-1.8 6.4-2.9 9.5a11 11 0 01-8.8 7.7 40.6 40.6 0 01-18.4-.2m29.4 80.6c-3.2-26.8-6.4-50-8.9-60.7a14.3 14.3 0 0014.1-14h.4a9 9 0 005.6-16.5 14.3 14.3 0 00-3.7-27.2 9 9 0 00-6.9-14.6c2.4-1.1 4.5-3 5.8-5 3.4-5.3 4-29-8-44.4-5-6.3-9.8-2.5-10 1.8-1 13.2-1.1 23-4.5 34.3a9 9 0 00-16-4.1 14.3 14.3 0 00-28.4 0 9 9 0 00-16 4.1c-3.4-11.2-3.5-21.1-4.4-34.3-.3-4.3-5.2-8-10-1.8-12 15.3-11.5 39-8.1 44.4 1.3 2 3.4 3.9 5.8 5a9 9 0 00-7 14.6 14.3 14.3 0 00-3.6 27.2A9 9 0 0075 111h.5a14.5 14.5 0 0014.3 14c-4 17.2-10 66.3-15 111.3l-1.3 13.4a1656.4 1656.4 0 01106.6 0l-1.4-12.7-5.4-51.3"></path>
-          <g clip-path="url(#a)">
-            <path d="M83.5 136.6l-2.3.7c-5 1-9.8 1-14.8-.2-1.4-.3-2.7-1-3.8-1.9l3.1 13.7c1 4 1.7 8 2 12 .5 6.3-3.6 11.6-8.7 11.6H46.9c-5.1 0-9.2-5.3-8.7-11.6.3-4 1-8 2-12 1-4.2 1.8-8.5 2.9-12.6-1.8 1-3.9 1.5-6.3 1.6a71 71 0 01-11.1-.7 7.7 7.7 0 01-6.5-5.5c-1-2.7-1.6-5.6-2.6-8.3-.4-1.2-1.3-2.3-2-3.4-.2-.4-.6-1-.6-1.4v-6.3c6.4-2 13-2.6 19.6-2.5 4.9.1 9.6 1 14.2 2.6 3.9 1.4 7.9 1.5 11.7 0 1.8-.7 3.6-1.2 5.5-1.6a13 13 0 01-1.6-15.5A18.3 18.3 0 0159 73.1a11.5 11.5 0 00-17.4 8.1 7.2 7.2 0 00-12.9 3.3c-2.7-9-2.8-17-3.6-27.5-.2-3.4-4-6.5-8-1.4C7.5 67.8 7.9 86.9 10.6 91c1.1 1.7 2.8 3.1 4.7 4a7.2 7.2 0 00-5.6 11.7 11.5 11.5 0 00-2.9 21.9 7.2 7.2 0 004.5 13.2h.3c0 .6 0 1.1.2 1.7.9 5.4 5.6 9.5 11.3 9.5A1177.2 1177.2 0 0010 253.2c18.1-1.5 38.1-2.6 59.5-3.4.4-4.6.8-9.3 1.4-14 1.2-11.6 3.3-30.5 5.7-49.7 2.2-18 4.7-36.3 7-49.5"></path>
-          </g>
-          <g clip-path="url(#b)">
-            <path d="M254.4 118.2c0-5.8-4.2-10.5-9.7-11.4a7.2 7.2 0 00-5.6-11.7c2-.9 3.6-2.3 4.7-4 2.7-4.2 3.1-23.3-6.5-35.5-4-5.1-7.8-2-8 1.4-.8 10.5-.9 18.5-3.6 27.5a7.2 7.2 0 00-12.8-3.3 11.5 11.5 0 00-17.8-7.9 18.4 18.4 0 01-4.5 22 13 13 0 01-1.3 15.2c2.4.5 4.8 1 7.1 2 3.8 1.3 7.8 1.4 11.6 0 7.2-2.8 14.6-3 22-2.4 4 .4 7.9 1.2 12 1.9l-.1 6.6c0 .5-.2 1.2-.5 1.3-1.7.7-1.8 2.2-2.2 3.7l-2.3 7.6a8.8 8.8 0 01-7 6.1c-5 1-10 1-14.9-.2-1.5-.3-2.8-1-3.9-1.9 1.2 4.5 2 9.1 3.2 13.7 1 4 1.6 8 2 12 .4 6.3-3.6 11.6-8.8 11.6h-12c-5.2 0-9.3-5.3-8.8-11.6.4-4 1-8 2-12 1-4.2 1.9-8.5 3-12.6-1.8 1-4 1.5-6.3 1.6-3.7 0-7.5-.3-11.2-.7a7.7 7.7 0 01-3.7-1.5c3.1 18.4 7.1 51.2 12.5 100.9l.6 5.3.8 7.9c21.4.7 41.5 1.9 59.7 3.4L243 243l-4.4-41.2a606 606 0 00-7-48.7 11.5 11.5 0 0011.2-11.2h.4a7.2 7.2 0 004.4-13.2c4-1.8 6.8-5.8 6.8-10.5"></path>
-          </g>
-          <path d="M180 249.6h.4a6946 6946 0 00-7.1-63.9l5.4 51.3 1.4 12.6M164.4 125c2.5 10.7 5.7 33.9 8.9 60.7a570.9 570.9 0 00-8.9-60.7M74.8 236.3l-1.4 13.4 1.4-13.4"></path>
-        </svg>
-        <span>
-          CrowdSec
-        </span>
-      </a>
-    </div>
-    </div>
-  </div>
-  <script>
-    const moonSvgString = '<svg fill="black" class="h-6 w-6" viewBox="0 0 35 35" data-name="Layer 2" id="Layer_2" xmlns="http://www.w3.org/2000/svg"><path d="M18.44,34.68a18.22,18.22,0,0,1-2.94-.24,18.18,18.18,0,0,1-15-20.86A18.06,18.06,0,0,1,9.59.63,2.42,2.42,0,0,1,12.2.79a2.39,2.39,0,0,1,1,2.41L11.9,3.1l1.23.22A15.66,15.66,0,0,0,23.34,21h0a15.82,15.82,0,0,0,8.47.53A2.44,2.44,0,0,1,34.47,25,18.18,18.18,0,0,1,18.44,34.68ZM10.67,2.89a15.67,15.67,0,0,0-5,22.77A15.66,15.66,0,0,0,32.18,24a18.49,18.49,0,0,1-9.65-.64A18.18,18.18,0,0,1,10.67,2.89Z"/></svg>'
-    const sunSvgString = '<svg class="h-6 w-6" viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="M3 12H5M5.00006 19L7.00006 17M12 19V21M17 17L19 19M5 5L7 7M19 12H21M16.9999 7L18.9999 5M12 3V5M15 12C15 13.6569 13.6569 15 12 15C10.3431 15 9 13.6569 9 12C9 10.3431 10.3431 9 12 9C13.6569 9 15 10.3431 15 12Z" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
-    const svg = Array.from(document.querySelectorAll('svg'));
-    const button = document.querySelector('.dark-mode-toggle');
-    window.onload = () => {
-      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-        document.body.classList.add('dark');
-        svg.forEach(element => {
-          element.setAttribute('fill', 'white');
-        });
-        button.innerHTML = sunSvgString;
-      } else {
-        button.innerHTML = moonSvgString;
-      }
-      button.addEventListener('click', function() {
-        document.body.classList.toggle('dark');
-        svg.forEach(element => {
-          element.getAttribute('fill') === 'black' ? element.setAttribute('fill', 'white') : element.setAttribute('fill', 'black');
-        });
-        if (document.body.classList.contains('dark')) {
-            button.innerHTML = sunSvgString;
-          } else {
-            button.innerHTML = moonSvgString;
-          }
-      });
-    };
-    function captchaCallback () {
-      setTimeout(() => {
-        document.querySelector('#captcha-form').submit();
-      }, 500);
-    }
-  </script>
-
-
-<div style="background-color: rgb(255, 255, 255); border: 1px solid rgb(204, 204, 204); box-shadow: rgba(0, 0, 0, 0.2) 2px 2px 3px; position: absolute; transition: visibility linear 0.3s, opacity 0.3s linear; opacity: 0; visibility: hidden; z-index: 2000000000; left: 0px; top: -10000px;"><div style="width: 100%; height: 100%; position: fixed; top: 0px; left: 0px; z-index: 2000000000; background-color: rgb(255, 255, 255); opacity: 0.05;"></div><div class="g-recaptcha-bubble-arrow" style="border: 11px solid transparent; width: 0px; height: 0px; position: absolute; pointer-events: none; margin-top: -11px; z-index: 2000000000;"></div><div class="g-recaptcha-bubble-arrow" style="border: 10px solid transparent; width: 0px; height: 0px; position: absolute; pointer-events: none; margin-top: -10px; z-index: 2000000000;"></div><div style="z-index: 2000000000; position: relative;"><iframe title="recaptcha challenge expires in two minutes" name="c-w5byruq7m84p" frameborder="0" scrolling="no" sandbox="allow-forms allow-popups allow-same-origin allow-scripts allow-top-navigation allow-modals allow-popups-to-escape-sandbox allow-storage-access-by-user-activation" src="https://www.recaptcha.net/recaptcha/api2/bframe?hl=en&amp;v=MerVUtRoajKEbP7pLiGXkL28&amp;k=6Le2q64qAAAAAJEgw2HU_tXf5dhJtlfKfTUhimF8&amp;bft=0dAFcWeA5z5gYqUQyOtKjt9BlQduknDFftMdHQlP1goq_FBDo6XT8yWhKp_QHEtUH98SyNHgiAIJiArrVLn38GhXa9W90xOg5N7g" style="width: 100%; height: 100%;"></iframe></div></div></body></html>
-```
-
-package.json:
+metrics_20260725_000057.json:
 ```
 {
-  "name": "rentmasseur-vercel-backend",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "dev": "vercel dev",
-    "deploy": "vercel --prod"
-  },
-  "dependencies": {}
+  "action": "metrics-collector",
+  "timestamp": "2026-07-25T00:00:57.811161+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+metrics_20260630_225513.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-06-30T22:55:13.756649+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-07T13-38-54.965086-00-00.json:
+```
+{
+  "id": "kpi_1783431534",
+  "timestamp": "2026-07-07T13:38:54.965086+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-07T13:38:54.964990+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+metrics_20260710_051347.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-10T05:13:47.872912+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-03T21-42-31.057057-00-00.json:
+```
+{
+  "id": "kpi_1783114951",
+  "timestamp": "2026-07-03T21:42:31.057057+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-03T21:42:31.056975+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+kpi_2026-07-05T23-39-57.460051-00-00.json:
+```
+{
+  "id": "kpi_1783294797",
+  "timestamp": "2026-07-05T23:39:57.460051+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-05T23:39:57.459950+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+pipeline_20260711_144848.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-11T14:48:48Z",
+  "run_id": "29156645097",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
 }
 
 ```
 
-README.md:
+pipeline_20260718_033709.json:
 ```
-# RentMasseur Vercel Backend
-
-Serverless functions that collect metrics and proxy data to the Hugging Face Space OS.
-
-## Deploy
-
-```bash
-cd vercel
-vercel --prod
-```
-
-## Environment Variables
-
-- `HF_SPACE_URL` — URL of the Hugging Face Space (e.g., `https://your-username-rentmasseur-optimizer.hf.space`)
-- `HF_TOKEN` — optional HF token for private spaces
-
-## Functions
-
-- `POST /api/collect` — ingest metrics from extension
-- `GET /api/report` — full OS report
-- `GET /api/bios` — bio candidates
-- `GET /api/competitors` — competitor intelligence
-
-```
-
-competitors.js:
-```
-/*
- * Vercel Serverless Function: /api/competitors
- * Fetches competitor intelligence from the HF Space OS backend.
- */
-
-export default async function handler(req, res) {
-  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
-  try {
-    if (!HF_SPACE_URL) {
-      return res.status(200).json({ competitors: [], note: 'HF_SPACE_URL not set' });
-    }
-    const resp = await fetch(`${HF_SPACE_URL}/api/os/competitors`);
-    const data = await resp.json();
-    return res.status(200).json(data);
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
-  }
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-18T03:37:09Z",
+  "run_id": "29628992209",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
 }
 
 ```
 
-report.js:
+pipeline_20260723_214645.json:
 ```
-/*
- * Vercel Serverless Function: /api/report
- * Returns the full RentMasseur OS report from the HF Space backend.
- */
-
-export default async function handler(req, res) {
-  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
-  try {
-    if (!HF_SPACE_URL) {
-      return res.status(200).json({ note: 'HF_SPACE_URL not set' });
-    }
-    const resp = await fetch(`${HF_SPACE_URL}/api/os/report`);
-    const data = await resp.json();
-    return res.status(200).json(data);
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
-  }
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-23T21:46:45Z",
+  "run_id": "30047186110",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
 }
 
 ```
 
-collect.js:
+metrics_20260630_164237.json:
 ```
-/*
- * Vercel Serverless Function: /api/collect
- * Collects metrics from the RentMasseur Chrome extension or any client
- * and forwards them to the Hugging Face Space OS backend.
- */
-
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-06-30T16:42:37.644131+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
   }
+}
+```
 
-  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
-  const HF_TOKEN = process.env.HF_TOKEN || '';
-
-  try {
-    const payload = req.body;
-    const enriched = {
-      ...payload,
-      source: 'vercel',
-      vercel_region: process.env.VERCEL_REGION || 'unknown',
-      collected_at: new Date().toISOString(),
-    };
-
-    // Forward to HF Space
-    if (HF_SPACE_URL) {
-      await fetch(`${HF_SPACE_URL}/api/os/ingest`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(HF_TOKEN ? { Authorization: `Bearer ${HF_TOKEN}` } : {}),
-        },
-        body: JSON.stringify(enriched),
-      });
-    }
-
-    // Also store in Vercel KV or just return
-    return res.status(200).json({
-      status: 'collected',
-      payload: enriched,
-      hf_forwarded: Boolean(HF_SPACE_URL),
-    });
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
-  }
+pipeline_20260717_194928.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-17T19:49:28Z",
+  "run_id": "29608654045",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
 }
 
 ```
 
-bios.js:
+pipeline_20260719_101809.json:
 ```
-/*
- * Vercel Serverless Function: /api/bios
- * Returns top-scoring bio candidates from the HF Space OS backend.
- */
-
-export default async function handler(req, res) {
-  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
-  try {
-    if (!HF_SPACE_URL) {
-      return res.status(200).json({ bios: [], note: 'HF_SPACE_URL not set' });
-    }
-    const resp = await fetch(`${HF_SPACE_URL}/api/os/bios`);
-    const data = await resp.json();
-    return res.status(200).json(data);
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
-  }
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-19T10:18:09Z",
+  "run_id": "29682965449",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
 }
 
 ```
 
-requirements.txt:
+metrics_20260723_072034.json:
 ```
-fastapi==0.104.1
-uvicorn==0.24.0
-python-multipart==0.0.6
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-23T07:20:34.829154+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+kpi_2026-07-23T07-20-34.746121-00-00.json:
+```
+{
+  "id": "kpi_1784791234",
+  "timestamp": "2026-07-23T07:20:34.746121+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-23T07:20:34.746048+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
+
+rotation_20260702_020614.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-02T02:06:14Z",
+  "run_id": "28560017748",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28560017748"
+},
+  "availability_step": "skipped_in_dry_run_or_disabled_for_platform_safety",
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260702_020614.json ",
+  "status": "completed"
+}
 
 ```
 
-LLMFileProxyBar:
+kpi_2026-07-21T20-38-51.800669-00-00.json:
 ```
-Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
+{
+  "id": "kpi_1784666331",
+  "timestamp": "2026-07-21T20:38:51.800669+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-21T20:38:51.800579+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
 ```
 
-JorkiBar:
+metrics_20260708_015257.json:
 ```
-Error reading file: 'utf-8' codec can't decode byte 0xcf in position 0: invalid continuation byte
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-08T01:52:57.824494+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
 ```
 
-llm_proxy.py:
+rotation_20260716_030527.json:
 ```
-#!/usr/bin/env python3
-"""
-LLM File Proxy — Content-Addressed Progressive Disclosure (CAPD) Protocol
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-16T03:05:27Z",
+  "run_id": "29467785545",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29467785545"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260716_030527.json ",
+  "status": "completed"
+}
 
-Serves any file (up to 1GB+) to LLMs WITHOUT uploading the full file.
-The LLM navigates the file like a database: metadata → summary → search → chunks.
+```
 
-Protocol endpoints:
-  GET /            — Landing page (human + LLM readable, JSON if Accept: application/json)
-  GET /meta        — File metadata + Merkle root + endpoint map
-  GET /summary     — First/last 4KB + line count + structure hints
-  GET /head?n=N    — First N lines (default 100)
-  GET /tail?n=N    — Last N lines (default 100)
-  GET /chunk/{i}   — Chunk i (64KB default), with Merkle proof header
-  GET /range?s=X&e=Y — Arbitrary byte range [X, Y)
-  GET /search?q=...&context=N — Server-side grep, returns matching lines + context
-  GET /merkle      — Full Merkle tree (just hashes, small)
-  GET /stream      — Full file stream (only if explicitly requested)
-  GET /health      — Health check
+kpi_2026-06-29T23-55-10.226906-00-00.json:
+```
+{
+  "id": "kpi_1782777310",
+  "timestamp": "2026-06-29T23:55:10.226906+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-06-29T23:55:10.226819+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-Usage:
-  python3 llm_proxy.py /path/to/file [--port 8765] [--chunk-size 65536]
-"""
+metrics_20260705_233957.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-05T23:39:57.526323+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-import argparse
-import hashlib
-import json
-import mimetypes
-import os
-import re
-import sys
-import threading
-import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+pipeline_20260722_204803.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-22T20:48:03Z",
+  "run_id": "29956284547",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
-# ---------------------------------------------------------------------------
-# Merkle Tree (lazy computation, memory-efficient)
-# ---------------------------------------------------------------------------
+```
 
-class MerkleTree:
-    """Lazy Merkle tree over file chunks. Hashes computed on demand."""
+pipeline_20260712_071850.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-12T07:18:50Z",
+  "run_id": "29183888838",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
-    def __init__(self, filepath: str, chunk_size: int = 65536):
-        self.filepath = filepath
-        self.chunk_size = chunk_size
-        self.file_size = os.path.getsize(filepath)
-        self.num_chunks = (self.file_size + chunk_size - 1) // chunk_size
-        self._leaf_hashes: list[str | None] = [None] * self.num_chunks
-        self._lock = threading.Lock()
-        self._root: str | None = None
+```
 
-    def _compute_leaf(self, index: int) -> str:
-        if self._leaf_hashes[index] is not None:
-            return self._leaf_hashes[index]
-        with open(self.filepath, "rb") as f:
-            f.seek(index * self.chunk_size)
-            data = f.read(self.chunk_size)
-        h = hashlib.sha256(data).hexdigest()
-        self._leaf_hashes[index] = h
-        return h
+rotation_20260724_140324.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-24T14:03:24Z",
+  "run_id": "30098814936",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "30098814936"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? content/blog_posts/20260724_why_you_should_call_right_now.md ?? content/interview_questions/20260724_funny_misunderstanding.md ?? production_control_loop ?? receipts/rotation_20260724_140324.json ",
+  "status": "completed"
+}
 
-    def get_chunk_hash(self, index: int) -> str:
-        return self._compute_leaf(index)
+```
 
-    def get_root(self) -> str:
-        if self._root:
-            return self._root
-        with self._lock:
-            if self._root:
-                return self._root
-            # Compute all leaves
-            for i in range(self.num_chunks):
-                self._compute_leaf(i)
-            # Build tree
-            level = [h for h in self._leaf_hashes if h is not None]
-            while len(level) > 1:
-                next_level = []
-                for i in range(0, len(level), 2):
-                    left = level[i]
-                    right = level[i + 1] if i + 1 < len(level) else left
-                    next_level.append(hashlib.sha256(
-                        (left + right).encode()
-                    ).hexdigest())
-                level = next_level
-            self._root = level[0] if level else hashlib.sha256(b"").hexdigest()
-            return self._root
+metrics_20260703_214231.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-03T21:42:31.133552+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-    def get_proof(self, index: int) -> list[dict]:
-        """Return Merkle proof for chunk at index."""
-        self.get_root()  # ensure all leaves computed
-        level = [h for h in self._leaf_hashes if h is not None]
-        proof = []
-        idx = index
-        while len(level) > 1:
-            if idx % 2 == 0:
-                sibling_idx = idx + 1 if idx + 1 < len(level) else idx
-                proof.append({"position": "right", "hash": level[sibling_idx]})
-            else:
-                sibling_idx = idx - 1
-                proof.append({"position": "left", "hash": level[sibling_idx]})
-            # Build next level
-            next_level = []
-            for i in range(0, len(level), 2):
-                left = level[i]
-                right = level[i + 1] if i + 1 < len(level) else left
-                next_level.append(hashlib.sha256(
-                    (left + right).encode()
-                ).hexdigest())
-            level = next_level
-            idx //= 2
-        return proof
+pipeline_20260703_214231.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-03T21:42:31Z",
+  "run_id": "28684430562",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
-    def get_all_leaves(self) -> list[str]:
-        self.get_root()
-        return [h for h in self._leaf_hashes if h is not None]
+```
 
+pipeline_20260709_190351.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-09T19:03:51Z",
+  "run_id": "29042669323",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
-# ---------------------------------------------------------------------------
-# File Profiler (structure hints)
-# ---------------------------------------------------------------------------
+```
 
-def detect_file_type(filepath: str) -> dict:
-    """Detect file type and structure hints without loading full file."""
-    size = os.path.getsize(filepath)
-    name = os.path.basename(filepath)
-    mime, _ = mimetypes.guess_type(name)
+metrics_20260718_055544.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-18T05:55:44.467242+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-    hints = {
-        "filename": name,
-        "size_bytes": size,
-        "size_human": _human_size(size),
-        "mime_type": mime or "application/octet-stream",
-        "extension": os.path.splitext(name)[1],
-    }
+kpi_2026-07-12T22-33-44.789929-00-00.json:
+```
+{
+  "id": "kpi_1783895624",
+  "timestamp": "2026-07-12T22:33:44.789929+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-12T22:33:44.789849+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-    # Sample first 4KB for structure detection
-    with open(filepath, "rb") as f:
-        sample = f.read(4096)
+pipeline_20260719_035443.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-19T03:54:43Z",
+  "run_id": "29672355421",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
-    sample_text = sample.decode("utf-8", errors="replace")
+```
 
-    # Detect format
-    stripped = sample_text.lstrip()
-    if stripped.startswith("{") or stripped.startswith("["):
-        hints["format"] = "json"
-    elif stripped.startswith("<?xml") or stripped.startswith("<"):
-        hints["format"] = "xml"
-    elif stripped.startswith("#!"):
-        hints["format"] = "script"
-    elif re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*\s*=', sample_text):
-        hints["format"] = "config"
-    elif "," in sample_text and "\n" in sample_text:
-        # CSV heuristic
-        first_line = sample_text.split("\n")[0]
-        if first_line.count(",") > 2:
-            hints["format"] = "csv"
-    elif sample_text.startswith("PK"):
-        hints["format"] = "zip"
-    else:
-        hints["format"] = "text"
+rotation_20260630_085930.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-06-30T08:59:30Z",
+  "run_id": "28432207385",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28432207385"
+},
+  "availability_step": "skipped_in_dry_run_or_disabled_for_platform_safety",
+  "content_changed": " M content/decisions/latest_decision.json ?? content/blog_posts/20260630_why_price_doesnt_equal_value.md ?? content/interview_questions/20260630_industry_secrets.md ?? content/interview_questions/20260630_off_the_grid_life.md ?? production_control_loop ?? receipts/rotation_20260630_085930.json ",
+  "status": "completed"
+}
 
-    # Count lines in sample for estimate
-    sample_lines = sample_text.count("\n")
-    if len(sample) > 0:
-        avg_line_len = len(sample) / max(sample_lines, 1)
-        hints["estimated_lines"] = int(size / max(avg_line_len, 1))
-    else:
-        hints["estimated_lines"] = 0
+```
 
-    # Check if binary
-    try:
-        sample.decode("utf-8")
-        hints["encoding"] = "utf-8"
-        hints["is_binary"] = False
-    except UnicodeDecodeError:
-        hints["encoding"] = "binary"
-        hints["is_binary"] = True
+metrics_20260701_001321.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-01T00:13:21.541546+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-    return hints
+pipeline_20260724_071321.json:
+```
+{
+  "action": "pipeline-24-7",
+  "timestamp": "2026-07-24T07:13:21Z",
+  "run_id": "30074473265",
+  "availability_enforced": true,
+  "metrics_collected": true,
+  "kpis_computed": true,
+  "status": "completed"
+}
 
+```
 
-def _human_size(n: int) -> str:
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} PB"
+kpi_2026-07-02T20-55-30.375457-00-00.json:
+```
+{
+  "id": "kpi_1783025730",
+  "timestamp": "2026-07-02T20:55:30.375457+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-02T20:55:30.375380+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
+metrics_20260706_100132.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-06T10:01:32.131063+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-# ---------------------------------------------------------------------------
-# HTTP Handler
-# ---------------------------------------------------------------------------
+kpi_2026-07-21T17-54-52.087734-00-00.json:
+```
+{
+  "id": "kpi_1784656492",
+  "timestamp": "2026-07-21T17:54:52.087734+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-21T17:54:52.087615+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-class CAPDHandler(BaseHTTPRequestHandler):
-    """Content-Addressed Progressive Disclosure handler."""
+kpi_2026-07-25T07-35-26.929056-00-00.json:
+```
+{
+  "id": "kpi_1784964926",
+  "timestamp": "2026-07-25T07:35:26.929056+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-25T07:35:26.928976+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-    # Class-level config set by main()
-    filepath: str = ""
-    chunk_size: int = 65536
-    merkle: MerkleTree | None = None
-    file_info: dict = {}
-    start_time: float = 0
+metrics_20260716_033803.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-16T03:38:03.952838+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
 
-    def log_message(self, format, *args):
-        # Minimal logging
-        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {args[0]}\n")
+kpi_2026-07-07T23-52-31.425806-00-00.json:
+```
+{
+  "id": "kpi_1783468351",
+  "timestamp": "2026-07-07T23:52:31.425806+00:00",
+  "action": "hourly_kpi_computation",
+  "data": {
+    "packet_type": "rm_hourly_kpis",
+    "timestamp": "2026-07-07T23:52:31.425719+00:00",
+    "immortality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "virality": {
+      "score": 0,
+      "grade": "NO_DATA",
+      "components": {}
+    },
+    "metrics_snapshots_used": 0
+  }
+}
+```
 
-    def _send_json(self, data: dict, status: int = 200):
-        body = json.dumps(data, indent=2).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+rotation_20260704_192949.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-04T19:29:49Z",
+  "run_id": "28717003806",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28717003806"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260704_192949.json ",
+  "status": "completed"
+}
 
-    def _send_text(self, text: str, status: int = 200, content_type: str = "text/plain"):
-        body = text.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+```
 
-    def _send_bytes(self, data: bytes, status: int = 200,
-                    content_type: str = "application/octet-stream",
-                    extra_headers: dict | None = None):
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        if extra_headers:
-            for k, v in extra_headers.items():
-                self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(data)
+rotation_20260708_165137.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-08T16:51:37Z",
+  "run_id": "28959690732",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28959690732"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260708_165137.json ",
+  "status": "completed"
+}
 
-    def _wants_json(self) -> bool:
-        accept = self.headers.get("Accept", "")
-        return "application/json" in accept or "json" in accept
+```
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        qs = parse_qs(parsed.query)
+rotation_20260713_221013.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-13T22:10:13Z",
+  "run_id": "29288409709",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "29288409709"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260713_221013.json ",
+  "status": "completed"
+}
 
-        try:
-            if path == "/" or path == "/meta":
-                self.handle_meta()
-            elif path == "/summary":
-                self.handle_summary()
-            elif path == "/head":
-                n = int(qs.get("n", ["100"])[0])
-                self.handle_head(n)
-            elif path == "/tail":
-                n = int(qs.get("n", ["100"])[0])
-                self.handle_tail(n)
-            elif path.startswith("/chunk/"):
-                idx = int(path.split("/chunk/")[1])
-                self.handle_chunk(idx)
-            elif path == "/range":
-                start = int(qs.get("s", ["0"])[0])
-                end = int(qs.get("e", [str(self.chunk_size)])[0])
-                self.handle_range(start, end)
-            elif path == "/search":
-                q = qs.get("q", [""])[0]
-                context = int(qs.get("context", ["2"])[0])
-                max_results = int(qs.get("max", ["50"])[0])
-                self.handle_search(q, context, max_results)
-            elif path == "/merkle":
-                self.handle_merkle()
-            elif path == "/stream":
-                self.handle_stream()
-            elif path == "/health":
-                self._send_json({"status": "ok", "uptime_s": time.time() - self.start_time})
-            else:
-                self._send_json({"error": "not found", "path": path}, 404)
-        except Exception as e:
-            self._send_json({"error": str(e)}, 500)
+```
 
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, Range")
-        self.end_headers()
-
-    # --- Endpoint handlers ---
-
-    def handle_meta(self):
-        """File metadata + Merkle root + endpoint map."""
-        root = self.merkle.get_root()
-        meta = {
+metrics_20260716_121238.json:
+```
+{

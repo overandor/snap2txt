@@ -1,800 +1,800 @@
-
-Reply in JSON format:
-{{"ranked_actions": [{{"action": "name", "reason": "why", "priority": 1}}]}}
-
-Pick the top 3 actions with highest impact. Action must be one of: {', '.join(sorted(VALID_ACTIONS))}"""
-
-    response = generate_with_fallback(prompt, max_tokens=500)
-    ranked: List[Dict] = []
-
-    if response:
-        try:
-            import re
-            json_match = re.search(r'\{[^{}]*"ranked_actions"[^{}]*\[.*?\][^{}]*\}', response, re.DOTALL)
-            if json_match:
-                parsed = json.loads(json_match.group())
-                ranked = parsed.get("ranked_actions", [])
-        except Exception:
-            pass
-
-        # Validate LLM output — only accept known action names
-        ranked = [a for a in ranked if a.get("action", "") in VALID_ACTIONS]
-
-        if not ranked:
-            ranked = [
-                {"action": "refresh_availability", "reason": "maintain visibility", "priority": 1},
-                {"action": "send_messages", "reason": f"{funnel['unread']} unread emails", "priority": 2},
-                {"action": "update_bio", "reason": "improve CTR" if funnel['ctr'] < 5 else "maintain", "priority": 3},
-            ]
-
-        conn = mdb()
-        conn.execute(
-            "INSERT INTO llm_revenue_decisions (ts, cycle_num, prompt, response, ranked_actions, provider, tokens) VALUES (?,?,?,?,?,?,?)",
-            (datetime.now(timezone.utc).isoformat(), 0, prompt[:500], response[:500], json.dumps(ranked), "fallback", len(prompt.split()) + len(response.split()))
-        )
-        conn.commit()
-        conn.close()
-    else:
-        ranked = [
-            {"action": "refresh_availability", "reason": "fallback_no_llm", "priority": 1},
-            {"action": "send_messages", "reason": "fallback_no_llm", "priority": 2},
-        ]
-
-    return response or "", ranked
-
-
-# ---------------------------------------------------------------------------
-# Execute Revenue Actions
-# ---------------------------------------------------------------------------
-
-def execute_revenue_action(api: RentMasseurAPI, action_name: str, signals: Dict, funnel: Dict) -> Dict:
-    """Execute a single revenue action. Tracks real metrics only — no fabricated dollar amounts."""
-    result: Dict = {"action": action_name, "executed": False, "impact": {}, "detail": ""}
-
-    if action_name == "refresh_availability":
-        avail = api.get_availability()
-        option = avail.get("option", 0)
-        if option != 1:
-            api.set_availability(option=1, duration=5)
-            result["executed"] = True
-            result["detail"] = "set to Available"
-            result["impact"] = {"availability": 0, "availability_after": 1}
-        else:
-            result["detail"] = "already available"
-            result["impact"] = {"availability": 1, "availability_after": 1}
-
-    elif action_name == "update_bio":
-        about = api.get_about()
-        assets = about.get("userProps", {}).get("assets", {})
-        current_h = assets.get("headline", "")
-        current_d = assets.get("description", "")
-        prompt = f"""Current headline: "{current_h}"
-CTR: {funnel['ctr']}% (industry benchmark: 5-8%)
-Views: {funnel['views']}, Contacts: {funnel['contacts']}
-Generate a new headline that would increase CTR. Reply with ONLY the headline (max 80 chars)."""
-        new_h = generate_with_fallback(prompt, max_tokens=100)
-        if new_h:
-            new_h = new_h.strip().strip('"').strip("'")[:80]
-            if new_h and new_h != current_h:
-                try:
-                    api.set_about(new_h, current_d)
-                    result["executed"] = True
-                    result["detail"] = f"headline: {current_h[:40]} → {new_h[:40]}"
-                    result["impact"] = {"headline_changed": True, "old_headline": current_h[:60], "new_headline": new_h[:60]}
-                except Exception as api_err:
-                    result["detail"] = f"bio update rejected by API: {str(api_err)[:60]}"
-                    result["impact"] = {"headline_changed": False, "api_error": str(api_err)[:100]}
-            else:
-                result["detail"] = "no change needed"
-                result["impact"] = {"headline_changed": False}
-        else:
-            result["detail"] = "LLM unavailable"
-            result["impact"] = {"headline_changed": False, "llm_available": False}
-
-    elif action_name == "send_messages":
-        try:
-            from .engagement_engine import get_visitors_to_message, mark_messaged, generate_message_for_visitor, EngagementBrowser
-            visitors = get_visitors_to_message(limit=3)
-            if not visitors:
-                result["detail"] = "no visitors to message"
-                result["impact"] = {"visitors_available": 0}
-                return result
-            browser = EngagementBrowser()
-            browser.start()
-            try:
-                browser.login()
-                sent = 0
-                for v in visitors:
-                    uname = v["username"]
-                    subject, body, provider, model = generate_message_for_visitor(uname)
-                    ok, status_code, detail, screenshot = browser.send_message(uname, subject, body)
-                    mark_messaged(uname, subject, body, provider, model, ok, status_code, detail, screenshot_path=screenshot)
-                    if ok:
-                        sent += 1
-                    time.sleep(3)
-                result["executed"] = sent > 0
-                result["detail"] = f"sent {sent}/{len(visitors)} messages"
-                result["impact"] = {"messages_sent": sent, "visitors_targeted": len(visitors)}
-            finally:
-                browser.stop()
-        except Exception as e:
-            result["detail"] = f"error: {e}"
-            result["impact"] = {"error": str(e)[:100]}
-
-    elif action_name == "visit_profiles":
-        try:
-            from .engagement_engine import get_profiles_to_visit, mark_visited_back, EngagementBrowser
-            profiles = get_profiles_to_visit(limit=5)
-            if not profiles:
-                result["detail"] = "no profiles to visit"
-                result["impact"] = {"profiles_available": 0}
-                return result
-            browser = EngagementBrowser()
-            browser.start()
-            try:
-                browser.login()
-                visited = 0
-                for p in profiles:
-                    uname = p["username"]
-                    status, bytes_recv, ok, screenshot = browser.visit_profile(uname)
-                    mark_visited_back(uname, status, bytes_recv, ok, screenshot_path=screenshot)
-                    if ok:
-                        visited += 1
-                    time.sleep(2)
-                result["executed"] = visited > 0
-                result["detail"] = f"visited {visited}/{len(profiles)}"
-                result["impact"] = {"profiles_visited": visited, "profiles_targeted": len(profiles)}
-            finally:
-                browser.stop()
-        except Exception as e:
-            result["detail"] = f"error: {e}"
-            result["impact"] = {"error": str(e)[:100]}
-
-    elif action_name == "adjust_rates":
-        rates = signals.get("rates", [])
-        if not rates:
-            result["detail"] = "no rates to adjust"
-            result["impact"] = {"rates_available": 0}
-            return result
-        ctr = funnel['ctr']
-        booking_inquiries = funnel.get('booking_inquiries', 0)
-        prompt = f"""Current rates: {json.dumps(rates, default=str)[:300]}
-CTR: {ctr}%, Booking inquiries: {booking_inquiries}
-Views: {funnel['views']}, Contacts: {funnel['contacts']}, Emails: {funnel['emails']}
-Should I raise rates (high demand) or lower rates (low demand)? Reply with JSON: {{"adjust": "raise/lower/keep", "amount": 10}}"""
-        response = generate_with_fallback(prompt, max_tokens=100)
-        result["detail"] = f"LLM rate analysis: {(response or 'unavailable')[:100]}"
-        result["executed"] = True
-        result["impact"] = {"llm_analysis": bool(response), "current_rates": len(rates)}
-
-    elif action_name == "extend_availability":
-        avail = api.get_availability()
-        option = avail.get("option", 0)
-        if option == 1:
-            api.set_availability(option=1, duration=5)
-            result["executed"] = True
-            result["detail"] = "extended availability to 6h"
-            result["impact"] = {"availability_extended": True}
-        else:
-            result["detail"] = "not currently available"
-            result["impact"] = {"availability_extended": False}
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Money Cycle
-# ---------------------------------------------------------------------------
-
-def run_money_cycle(api: RentMasseurAPI, cycle_num: int) -> Dict:
-    """Run one complete money optimization cycle."""
-    ts = datetime.now(timezone.utc).isoformat()
-    log.info("  ═══ MONEY LOOP CYCLE %d ═══", cycle_num)
-
-    # 1. Collect revenue signals
-    log.info("  ⌁ Collecting revenue signals...")
-    signals = collect_revenue_signals(api, cycle_num)
-    log.info("  ◉ Views=%s Contacts=%s Emails=%s Unread=%s Premium=%s",
-             signals.get("total_views", 0), signals.get("total_contacts", 0),
-             signals.get("emails_count", 0), signals.get("unread_emails", 0),
-             signals.get("premium_senders", 0))
-
-    # 2. Calculate funnel
-    log.info("  ⌁ Calculating conversion funnel...")
-    funnel = calculate_funnel(signals)
-    log.info("  ◉ CTR=%.2f%% EmailRate=%.2f%% BookingInquiries=%d",
-             funnel['ctr'], funnel['email_rate'], funnel.get('booking_inquiries', 0))
-
-    # 3. Get last cycle for delta calculation
-    conn = mdb()
-    last_row = conn.execute("SELECT * FROM money_cycles ORDER BY id DESC LIMIT 1").fetchone()
-    conn.close()
-    last_cycle = dict(last_row) if last_row else None
-
-    # 4. LLM revenue optimizer
-    log.info("  ⌁ LLM revenue optimization...")
-    llm_response, ranked_actions = llm_revenue_optimize(signals, funnel, last_cycle)
-    for i, a in enumerate(ranked_actions[:3]):
-        log.info("  ⟡ #%d %s — priority=%s — %s",
-                 i + 1, a.get("action", "?"), a.get("priority", "?"), a.get("reason", "")[:60])
-
-    # 5. Execute top 3 actions
-    log.info("  ⌁ Executing revenue actions...")
-    action_results = []
-    for a in ranked_actions[:3]:
-        action_name = a.get("action", "")
-        if not action_name:
-            continue
-        log.info("  ⌁ Executing: %s", action_name)
-        result = execute_revenue_action(api, action_name, signals, funnel)
-        result["priority"] = a.get("priority", 0)
-        action_results.append(result)
-        log.info("  %s %s — %s",
-                 "◆" if result["executed"] else "◌",
-                 action_name, result["detail"][:60])
-        time.sleep(1)
-
-    # 6. Calculate real deltas from API metrics (not fabricated dollar amounts)
-    views_delta = funnel['views'] - (last_cycle.get('views', 0) if last_cycle else 0)
-    contacts_delta = funnel['contacts'] - (last_cycle.get('contact_clicks', 0) if last_cycle else 0)
-    emails_delta = funnel['emails'] - (last_cycle.get('emails_count', 0) if last_cycle else 0)
-    ctr_delta = round(funnel['ctr'] - (last_cycle.get('ctr', 0) if last_cycle else 0), 2)
-
-    # 7. Track LLM token usage (real cost metric)
-    llm_tokens = len(llm_response.split()) if llm_response else 0
-
-    # 8. Store attribution
-    conn = mdb()
-    for r in action_results:
-        conn.execute(
-            "INSERT INTO action_attribution (ts, cycle_num, action_name, funnel_after, estimated_revenue_impact, llm_weight) VALUES (?,?,?,?,?,?)",
-            (ts, cycle_num, r["action"], json.dumps(funnel, default=str)[:300], 0.0, r.get("priority", 0))
-        )
-    conn.commit()
-    conn.close()
-
-    # 9. Store cycle
-    receipt_data = json.dumps({"signals": signals, "funnel": funnel, "actions": action_results}, default=str)
-    receipt_hash = hashlib.sha256(receipt_data.encode()).hexdigest()[:16]
-
-    top_action = ranked_actions[0]["action"] if ranked_actions else "none"
-
-    conn = mdb()
-    conn.execute(
-        """INSERT INTO money_cycles (ts, cycle_num, views, contact_clicks, emails_count, unread_emails, premium_senders, ctr, email_rate, booking_rate, estimated_revenue, revenue_delta, llm_cost_tokens, roi, actions_executed, top_action, llm_decision, bio_headline, search_rank, availability_option, receipt_hash)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (ts, cycle_num, funnel['views'], funnel['contacts'], funnel['emails'],
-         funnel['unread'], funnel['premium_senders'], funnel['ctr'], funnel['email_rate'],
-         0.0, 0.0, 0.0,
-         llm_tokens, 0.0, len([r for r in action_results if r["executed"]]),
-         top_action, (llm_response or "")[:200], signals.get("headline", ""),
-         signals.get("search_rank", 0), signals.get("availability_option", 0), receipt_hash)
+        FOREIGN KEY(conversation_id) REFERENCES client_conversations(id)
     )
-    conn.commit()
-    conn.close()
-
-    # 10. Write state
-    cycle_summary = {
-        "cycle_num": cycle_num, "timestamp": ts,
-        "funnel": funnel,
-        "signals": {k: v for k, v in signals.items() if k != "daily_views"},
-        "actions": [{"action": r["action"], "executed": r["executed"], "detail": r["detail"], "impact": r.get("impact", {})} for r in action_results],
-        "deltas": {"views": views_delta, "contacts": contacts_delta, "emails": emails_delta, "ctr": ctr_delta},
-        "llm_tokens": llm_tokens,
-        "receipt_hash": receipt_hash,
-    }
-    MONEY_STATE.write_text(json.dumps(cycle_summary, indent=2, default=str))
-
-    log.info("  ◆ Money cycle %d complete: views=%d contacts=%d emails=%d booking_inquiries=%d actions=%d tokens=%d",
-             cycle_num, funnel['views'], funnel['contacts'], funnel['emails'],
-             funnel.get('booking_inquiries', 0),
-             len([r for r in action_results if r["executed"]]), llm_tokens)
-    return cycle_summary
-
-
-def get_money_stats() -> Dict:
-    """Get money loop statistics — real metrics only."""
-    conn = mdb()
-    cycles = conn.execute("SELECT * FROM money_cycles ORDER BY id DESC LIMIT 20").fetchall()
-    total_cycles = conn.execute("SELECT COUNT(*) FROM money_cycles").fetchone()[0]
-    total_views = conn.execute("SELECT COALESCE(SUM(views),0) FROM money_cycles").fetchone()[0]
-    total_contacts = conn.execute("SELECT COALESCE(SUM(contact_clicks),0) FROM money_cycles").fetchone()[0]
-    total_emails = conn.execute("SELECT COALESCE(SUM(emails_count),0) FROM money_cycles").fetchone()[0]
-    avg_ctr = conn.execute("SELECT COALESCE(AVG(ctr),0) FROM money_cycles").fetchone()[0]
-    total_tokens = conn.execute("SELECT COALESCE(SUM(llm_cost_tokens),0) FROM money_cycles").fetchone()[0]
-    total_actions = conn.execute("SELECT COALESCE(SUM(actions_executed),0) FROM money_cycles").fetchone()[0]
-    booking_emails = conn.execute("SELECT COUNT(*) FROM email_signals WHERE classification='booking'").fetchone()[0]
-    attr = conn.execute("SELECT action_name, COUNT(*) as runs FROM action_attribution GROUP BY action_name ORDER BY runs DESC").fetchall()
-    conn.close()
-    return {
-        "total_cycles": total_cycles,
-        "total_views": total_views, "total_contacts": total_contacts,
-        "total_emails": total_emails, "booking_emails": booking_emails,
-        "avg_ctr": round(avg_ctr, 2),
-        "total_tokens": total_tokens, "total_actions": total_actions,
-        "recent_cycles": [dict(c) for c in cycles],
-        "action_attribution": [dict(a) for a in attr],
-    }
-
-
-def get_api() -> Optional[RentMasseurAPI]:
-    api = RentMasseurAPI(min_request_interval=2.0)
-    auth = AuthSession(api, session_file=str(Path(__file__).parent / "session.json"))
-    username = os.environ.get("RM_USER", "")
-    password = os.environ.get("RM_PASS", "")
-    if not username or not password:
-        log.error("RM credentials not set"); return None
-    if not auth.login(username, password):
-        log.error("RM login failed"); return None
-    return api
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(description="RM Money Loop — closed-loop revenue optimization")
-    parser.add_argument("--once", action="store_true", help="Run one money cycle")
-    parser.add_argument("--daemon", action="store_true", help="Run continuously")
-    parser.add_argument("--stats", action="store_true", help="Show money statistics")
-    parser.add_argument("--interval", type=int, default=3600, help="Seconds between cycles (daemon)")
-    args = parser.parse_args()
-
-    init_db()
-
-    if args.stats:
-        s = get_money_stats()
-        print("  ═══ MONEY LOOP STATS ═══")
-        print(f"  Total cycles: {s['total_cycles']}")
-        print(f"  Total estimated revenue: ${s['total_revenue']}")
-        print(f"  Total revenue delta: ${s['total_delta']}")
-        print(f"  Avg CTR: {s['avg_ctr']}%")
-        print(f"  Avg ROI: {s['avg_roi']}")
-        print(f"  Total emails tracked: {s['total_emails']}")
-        print(f"  Booking emails: {s['booking_emails']}")
-        print(f"\n  Action attribution:")
-        for a in s.get("action_attribution", []):
-            print(f"    {a['action_name']:25s} runs={a['runs']:3d} revenue=${a['revenue']:.2f}")
-        return
-
-    if args.once or args.daemon:
-        api = get_api()
-        if not api:
-            sys.exit(1)
-        cycle = 0
-        while True:
-            cycle += 1
-            run_money_cycle(api, cycle)
-            if not args.daemon:
-                break
-            log.info("  ⧖ Next money cycle in %ds...", args.interval)
-            time.sleep(args.interval)
-        return
-
-    parser.print_help()
-
-
-if __name__ == "__main__":
-    main()
-
-```
-
-data.zip:
-```
-version https://git-lfs.github.com/spec/v1
-oid sha256:bcc015cf01168bfd09b8909c40ba49aa0351a45ce57b9b2b52e583a6071f8233
-size 127354778
-
-```
-
-booking_ir.py:
-```
-#!/usr/bin/env python3
-"""
-BookingIR — Canonical business state for the revenue pipeline.
-
-The product is not traffic. The product is conversion.
-
-Core object: RevenueEvent (a lead → booking → payment → repeat journey)
-Secondary: LeadRecord, DraftReply, BookingRecord
-
-Hard revenue metrics replace vanity metrics:
-  qualified_leads, reply_rate, booking_request_rate, booking_confirm_rate,
-  show_rate, collected_revenue, average_booking_value, repeat_rate,
-  time_to_reply, source_roi, compliance_incidents
-"""
-
-import hashlib
-import json
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
-
-
-# ─── Lead classification ───────────────────────────────────────────
-
-LEAD_CLASSIFICATIONS = [
-    "booking_ready",      # explicit request for session, time, location
-    "inquiry",            # asking questions, price, availability
-    "low_intent",         # vague, "maybe", "just looking"
-    "spam",               # promotional, irrelevant
-    "competitor",         # another masseur fishing
-    "unsafe",             # suspicious, potentially harmful
-    "out_of_area",        # too far, won't travel
-    "repeat_client",      # has booked before
-    "already_active",     # conversation already in progress
-]
-
-
-@dataclass
-class LeadRecord:
-    """One person who showed up in the mailbox or visitor list."""
-    person_id_hash: str = ""          # SHA-256 of username (privacy)
-    username: str = ""                # kept locally only, never committed
-    source: str = "rentmasseur"       # rentmasseur / referral / direct
-    first_seen_at: str = ""
-    last_message_at: str = ""
-    classification: str = "unclassified"
-    intent_score: float = 0.0         # 0.0 to 1.0
-    location_match: bool = False
-    budget_match: Optional[bool] = None
-    is_premium: bool = False
-    is_repeat: bool = False
-    message_received: str = ""        # last inbound message text
-    message_sent: str = ""            # last outbound message text
-    consent_status: str = "unknown"   # unknown / opted_in / opted_out
-    cooldown_until: str = ""          # ISO timestamp, no contact before this
-    suppressed: bool = False          # permanently suppressed
-
-
-@dataclass
-class DraftReply:
-    """AI-drafted reply awaiting human approval."""
-    person_id_hash: str = ""
-    username: str = ""
-    draft_text: str = ""
-    includes_price: bool = False
-    includes_availability: bool = False
-    includes_location: bool = False
-    includes_boundary: bool = False   # professional boundary statement
-    includes_next_step: bool = False  # clear call to action
-    compliance_ok: bool = True
-    approval_status: str = "pending"  # pending / approved / rejected / sent
-    created_at: str = ""
-    approved_at: str = ""
-    sent_at: str = ""
-    risk_flags: List[str] = field(default_factory=list)
-
-
-@dataclass
-class BookingRecord:
-    """The money table. One row per booking attempt."""
-    person_id_hash: str = ""
-    username: str = ""
-    booking_status: str = "inquiry"   # inquiry / requested / confirmed / completed / cancelled / no_show
-    requested_time: str = ""
-    confirmed_time: str = ""
-    session_duration: str = ""
-    session_value: float = 0.0        # agreed price
-    amount_collected: float = 0.0     # actually paid
-    source: str = "rentmasseur"
-    attributed_action: str = ""       # which pipeline action led to this
-    created_at: str = ""
-    updated_at: str = ""
-
-
-@dataclass
-class RevenueEvent:
-    """The center of the system. Tracks a person from lead to revenue."""
-    event_id: str = ""
-    person_id_hash: str = ""
-    source: str = "rentmasseur"
-    first_seen_at: str = ""
-    consent_status: str = "unknown"
-    intent_score: float = 0.0
-    location_match: bool = False
-    budget_match: Optional[bool] = None
-    requested_time: str = ""
-    message_received: str = ""
-    message_sent: str = ""
-    booking_requested: bool = False
-    booking_confirmed: bool = False
-    session_completed: bool = False
-    amount_collected: float = 0.0
-    repeat_client: bool = False
-    attribution_action_id: str = ""
-
-
-@dataclass
-class RevenueMetrics:
-    """Hard revenue metrics. These are what matter."""
-    qualified_leads: int = 0
-    total_leads: int = 0
-    reply_rate: float = 0.0           # % of leads we replied to
-    booking_request_rate: float = 0.0  # % of qualified leads that requested booking
-    booking_confirm_rate: float = 0.0  # % of requested that confirmed
-    show_rate: float = 0.0            # % of confirmed that completed
-    collected_revenue: float = 0.0
-    average_booking_value: float = 0.0
-    repeat_rate: float = 0.0
-    time_to_reply_hours: float = 0.0
-    source_roi: Dict[str, float] = field(default_factory=dict)
-    compliance_incidents: int = 0
-    drafts_pending: int = 0
-    drafts_approved: int = 0
-    drafts_sent: int = 0
-
-    # Secondary (upstream, not revenue)
-    total_views: int = 0
-    total_contacts: int = 0
-    ctr: float = 0.0
-    search_rank: int = 0
-
-    def compute(self, leads: List[LeadRecord], bookings: List[BookingRecord],
-                drafts: List[DraftReply]):
-        self.total_leads = len(leads)
-        self.qualified_leads = sum(1 for l in leads if l.classification in ("booking_ready", "inquiry", "repeat_client"))
-        replied = sum(1 for l in leads if l.message_sent)
-        self.reply_rate = round(replied / self.total_leads * 100, 1) if self.total_leads else 0.0
-
-        requested = sum(1 for b in bookings if b.booking_status in ("requested", "confirmed", "completed"))
-        self.booking_request_rate = round(requested / self.qualified_leads * 100, 1) if self.qualified_leads else 0.0
-
-        confirmed = sum(1 for b in bookings if b.booking_status in ("confirmed", "completed"))
-        self.booking_confirm_rate = round(confirmed / requested * 100, 1) if requested else 0.0
-
-        completed = sum(1 for b in bookings if b.booking_status == "completed")
-        self.show_rate = round(completed / confirmed * 100, 1) if confirmed else 0.0
-
-        self.collected_revenue = sum(b.amount_collected for b in bookings if b.booking_status == "completed")
-        paid_bookings = [b for b in bookings if b.booking_status == "completed" and b.amount_collected > 0]
-        self.average_booking_value = round(sum(b.amount_collected for b in paid_bookings) / len(paid_bookings), 2) if paid_bookings else 0.0
-
-        repeat_clients = sum(1 for l in leads if l.is_repeat)
-        self.repeat_rate = round(repeat_clients / self.total_leads * 100, 1) if self.total_leads else 0.0
-
-        self.drafts_pending = sum(1 for d in drafts if d.approval_status == "pending")
-        self.drafts_approved = sum(1 for d in drafts if d.approval_status == "approved")
-        self.drafts_sent = sum(1 for d in drafts if d.approval_status == "sent")
-
-        self.compliance_incidents = sum(1 for d in drafts if not d.compliance_ok)
-
-
-@dataclass
-class ProfileSnapshot:
-    """Read-only profile state. Secondary signal, not revenue."""
-    headline: str = ""
-    availability_option: int = 0
-    availability_label: str = ""
-    is_visible: bool = True
-    search_rank: int = 0
-    search_total: int = 0
-    active_rates: List[Dict] = field(default_factory=list)
-    avg_rate: float = 0.0
-
-
-@dataclass
-class BookingIR:
-    """The canonical business state object.
-
-    Centered on revenue events, not activity counts.
-    Every lane reads and writes this object.
+    """,
     """
-    timestamp: str = ""
-    cycle_num: int = 0
-    login_ok: bool = False
-    login_error: str = ""
+    CREATE TABLE IF NOT EXISTS profile_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        field_name TEXT NOT NULL,
+        label TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'draft',
+        activated_at TEXT,
+        retired_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS metrics_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_at TEXT NOT NULL,
+        profile_version_label TEXT,
+        profile_views INTEGER NOT NULL DEFAULT 0,
+        repeat_visitors INTEGER NOT NULL DEFAULT 0,
+        contact_actions INTEGER NOT NULL DEFAULT 0,
+        inbound_messages INTEGER NOT NULL DEFAULT 0,
+        booking_requests INTEGER NOT NULL DEFAULT 0,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS policy_rules (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS outbox_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        draft_id INTEGER NOT NULL,
+        visitor_key TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'queued',
+        policy_decision TEXT NOT NULL DEFAULT 'pending',
+        policy_reason TEXT NOT NULL DEFAULT '',
+        next_action_at TEXT,
+        exported_path TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(draft_id) REFERENCES message_drafts(id),
+        FOREIGN KEY(visitor_key) REFERENCES visitors(visitor_key)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS revenue_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        visitor_key TEXT,
+        event_type TEXT NOT NULL,
+        amount_cents INTEGER NOT NULL DEFAULT 0,
+        currency TEXT NOT NULL DEFAULT 'USD',
+        event_at TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'manual',
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS receipts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        receipt_type TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_visitor_events_key_time
+    ON visitor_events(visitor_key, event_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_message_drafts_key_status
+    ON message_drafts(visitor_key, status)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_profile_versions_label
+    ON profile_versions(label)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_conversations_key_status
+    ON client_conversations(visitor_key, status)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_outbox_state_time
+    ON outbox_items(state, next_action_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_revenue_events_key_time
+    ON revenue_events(visitor_key, event_at)
+    """,
+)
 
-    # Lane 1: Observe — what we see
-    profile: ProfileSnapshot = field(default_factory=ProfileSnapshot)
-    leads: List[LeadRecord] = field(default_factory=list)
-    mailbox_raw: List[Dict] = field(default_factory=list)
-
-    # Lane 2: Qualify — classification results
-    metrics: RevenueMetrics = field(default_factory=RevenueMetrics)
-
-    # Lane 3: Draft — AI-drafted replies
-    drafts: List[DraftReply] = field(default_factory=list)
-
-    # Lane 4: Approve/Send — what was approved and sent
-    drafts_sent: List[DraftReply] = field(default_factory=list)
-
-    # Lane 5: Outcome — booking tracking
-    bookings: List[BookingRecord] = field(default_factory=list)
-
-    # Lane 6: Learn — what actions led to revenue
-    attribution: Dict[str, float] = field(default_factory=dict)
-    learnings: List[str] = field(default_factory=list)
-
-    # Receipt
-    receipt_hash: str = ""
-    status: str = "GREEN"  # GREEN / YELLOW / RED
-
-    # Raw API (never committed)
-    _raw: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self):
-        if not self.timestamp:
-            self.timestamp = datetime.now(timezone.utc).isoformat()
-
-    def compute_receipt(self) -> str:
-        data = self.to_json(include_raw=False)
-        self.receipt_hash = hashlib.sha256(data.encode()).hexdigest()[:16]
-        return self.receipt_hash
-
-    def to_json(self, include_raw: bool = False) -> str:
-        d = asdict(self)
-        if not include_raw:
-            d.pop("_raw", None)
-        return json.dumps(d, indent=2, default=str, sort_keys=True)
-
-    def to_dict(self, include_raw: bool = False) -> Dict:
-        d = asdict(self)
-        if not include_raw:
-            d.pop("_raw", None)
-        return d
-
-    def summary(self) -> str:
-        m = self.metrics
-        lines = [
-            f"BookingIR — {self.timestamp}",
-            f"Status: {self.status}",
-            f"Login: {'OK' if self.login_ok else 'FAILED'}",
-            f"",
-            f"Revenue Metrics:",
-            f"  Qualified leads: {m.qualified_leads}/{m.total_leads}",
-            f"  Reply rate: {m.reply_rate}%",
-            f"  Booking request rate: {m.booking_request_rate}%",
-            f"  Booking confirm rate: {m.booking_confirm_rate}%",
-            f"  Show rate: {m.show_rate}%",
-            f"  Collected revenue: ${m.collected_revenue}",
-            f"  Avg booking value: ${m.average_booking_value}",
-            f"  Repeat rate: {m.repeat_rate}%",
-            f"  Compliance incidents: {m.compliance_incidents}",
-            f"",
-            f"Drafts: {m.drafts_pending} pending, {m.drafts_approved} approved, {m.drafts_sent} sent",
-            f"",
-            f"Secondary (upstream):",
-            f"  Views: {m.total_views} (CTR: {m.ctr}%)",
-            f"  Search rank: #{m.search_rank}",
-            f"  Availability: {self.profile.availability_label}",
-            f"",
-            f"Leads: {len(self.leads)} total",
-            f"Bookings tracked: {len(self.bookings)}",
-            f"Learnings: {len(self.learnings)}",
-            f"",
-            f"Receipt: {self.receipt_hash}",
-        ]
-        return "\n".join(lines)
-
-```
-
-approval_queue.py:
-```
-"""
-Approval Queue — formal interface for content drafts awaiting approval.
-"""
-
-from .db import (
-    get_conn,
-    upsert_content_variant,
-    set_variant_status,
-    get_variant_history,
-    get_active_variant,
-    now_iso,
+DEFAULT_POLICY: tuple[tuple[str, str, str], ...] = (
+    ("manual_approval_required", "true", "Drafts must be approved by a human before handoff."),
+    ("min_hours_between_outbound", "24", "Cooldown per record before another outbound handoff."),
+    ("quiet_hours_start", "21", "Local hour when outbound handoff should stop."),
+    ("quiet_hours_end", "8", "Local hour when outbound handoff may resume."),
+    ("max_outbox_per_day", "20", "Operator review capacity cap; not an auto-send quota."),
 )
 
 
-def submit_draft(variant_id: str, kind: str, headline: str, description: str,
-                 title: str = "", body: str = "", hypothesis: str = "") -> str:
-    """Submit a draft to the approval queue."""
-    upsert_content_variant(variant_id, kind, headline, description, title, body,
-                         status="pending_approval", hypothesis=hypothesis)
-    return variant_id
+def connect(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
-def approve_draft(variant_id: str) -> bool:
-    """Mark a draft as approved."""
-    set_variant_status(variant_id, "approved")
-    return True
+def seed_default_policy(conn: sqlite3.Connection) -> None:
+    for key, value, description in DEFAULT_POLICY:
+        conn.execute(
+            """
+            INSERT INTO policy_rules(key, value, description)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO NOTHING
+            """,
+            (key, value, description),
+        )
 
 
-def reject_draft(variant_id: str) -> bool:
-    """Reject a draft."""
-    set_variant_status(variant_id, "rejected")
-    return True
+def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        for stmt in SCHEMA:
+            conn.execute(stmt)
+        seed_default_policy(conn)
+        conn.commit()
 
 
-def list_pending(kind: str = None) -> list:
-    """List pending drafts."""
-    conn = get_conn()
-    if kind:
-        rows = conn.execute(
-            "SELECT * FROM content_variants WHERE kind=? AND status='pending_approval' ORDER BY created_at DESC",
-            (kind,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM content_variants WHERE status='pending_approval' ORDER BY created_at DESC"
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def list_approved(kind: str = None) -> list:
-    """List approved drafts."""
-    conn = get_conn()
-    if kind:
-        rows = conn.execute(
-            "SELECT * FROM content_variants WHERE kind=? AND status='approved' ORDER BY created_at DESC",
-            (kind,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM content_variants WHERE status='approved' ORDER BY created_at DESC"
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict]:
+    return [dict(row) for row in rows]
 
 ```
 
-fetch_all_views.py:
+policy.py:
 ```
-import json, re, time
-from pathlib import Path
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-import requests
+"""Policy gate for provider growth operations.
 
-RAW = Path("rm_traffic/data/real_bios.jsonl")
-OUT = Path("rm_traffic/data/real_bios_with_views.jsonl")
-RANKED = Path("rm_traffic/data/real_bios_ranked.txt")
+The policy gate decides whether an approved draft may be exported for manual
+handoff. It never sends messages. It only returns allow/block decisions with
+reasons and receipts.
+"""
 
-bios = [json.loads(l) for l in RAW.open()]
-print(f"Loaded {len(bios)} real bios")
+from __future__ import annotations
 
-headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
 
-def fetch_views(username):
-    if not username:
-        return {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
-    try:
-        r = requests.get(f"https://rentmasseur.com/{username}", headers=headers, timeout=12)
-        if r.status_code != 200:
-            return {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
-        member = re.search(r'Member Since:</div><div class="value">([^<]+)</div>', r.text)
-        member_since = member.group(1).strip() if member else ""
-        visit_values = [int(v) for v in re.findall(r'"visits":(\d+)', r.text) if v != "0"]
-        visits = max(visit_values) if visit_values else 0
-        days_online = 0
-        if member_since:
-            try:
-                joined = datetime.strptime(member_since, "%b %d, %Y")
-                days_online = max(1, (datetime.now() - joined).days)
-            except Exception:
-                days_online = 0
-        views_per_day = visits / days_online if days_online else 0
+from .db import DEFAULT_DB_PATH, connect, init_db
+from .receipts import write_receipt
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    allowed: bool
+    decision: str
+    reason: str
+    next_action_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
         return {
-            "visits": visits,
-            "member_since": member_since,
-            "days_online": days_online,
-            "views_per_day": views_per_day,
+            "allowed": self.allowed,
+            "decision": self.decision,
+            "reason": self.reason,
+            "next_action_at": self.next_action_at,
         }
-    except Exception:
-        return {"visits": 0, "member_since": "", "days_online": 0, "views_per_day": 0}
 
-usernames = [b.get("username") for b in bios]
-print(f"Fetching views for {len(usernames)} profiles with 32 workers...")
 
-done = 0
-with ThreadPoolExecutor(max_workers=32) as pool:
-    results = list(pool.map(fetch_views, usernames))
-    view_map = dict(zip(usernames, results))
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-for b in bios:
-    b.update(view_map.get(b.get("username"), {}))
 
-bios.sort(key=lambda x: x.get("views_per_day", 0), reverse=True)
+def get_policy(db_path: str = DEFAULT_DB_PATH) -> dict[str, str]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT key, value FROM policy_rules").fetchall()
+    return {row["key"]: row["value"] for row in rows}
 
-with OUT.open("w") as f:
+
+def set_policy(key: str, value: str, description: str = "", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO policy_rules(key, value, description, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, description=excluded.description, updated_at=CURRENT_TIMESTAMP
+            """,
+            (key, value, description),
+        )
+        conn.commit()
+    receipt = write_receipt("policy_updated", "policy", key, {"key": key, "value": value, "description": description}, db_path=db_path)
+    return {"key": key, "value": value, "receipt_hash": receipt["payload_hash"]}
+
+
+def evaluate_draft(draft_id: int, db_path: str = DEFAULT_DB_PATH) -> PolicyDecision:
+    """Return whether a draft is allowed to enter the manual handoff outbox."""
+    init_db(db_path)
+    policy = get_policy(db_path)
+    with connect(db_path) as conn:
+        draft = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        if not draft:
+            return PolicyDecision(False, "blocked", "draft_not_found")
+        record = conn.execute("SELECT * FROM visitors WHERE visitor_key = ?", (draft["visitor_key"],)).fetchone()
+        if not record:
+            return PolicyDecision(False, "blocked", "record_not_found")
+        conversation = conn.execute(
+            "SELECT * FROM client_conversations WHERE visitor_key = ? ORDER BY updated_at DESC LIMIT 1",
+            (draft["visitor_key"],),
+        ).fetchone()
+
+    if bool(record["do_not_contact"]):
+        return PolicyDecision(False, "blocked", "record_marked_do_not_contact")
+    if conversation and bool(conversation["do_not_contact"]):
+        return PolicyDecision(False, "blocked", "conversation_marked_do_not_contact")
+    if policy.get("manual_approval_required", "true").lower() == "true" and draft["status"] != "approved":
+        return PolicyDecision(False, "needs_approval", "draft_requires_human_approval")
+    if draft["status"] in {"exported", "sent", "skipped"}:
+        return PolicyDecision(False, "blocked", f"draft_already_{draft['status']}")
+
+    # This is intentionally conservative: quiet hours only affect handoff timing,
+    # not content generation. Real timezone scheduling belongs in a later adapter.
+    now_hour = datetime.now().hour
+    start = int(policy.get("quiet_hours_start", "21"))
+    end = int(policy.get("quiet_hours_end", "8"))
+    if start > end and (now_hour >= start or now_hour < end):
+        return PolicyDecision(False, "defer", "quiet_hours_active")
+
+    return PolicyDecision(True, "allowed", "approved_for_manual_handoff")
+
+
+def evaluate_and_receipt(draft_id: int, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    decision = evaluate_draft(draft_id, db_path=db_path)
+    receipt = write_receipt("policy_decision", "draft", str(draft_id), decision.to_dict(), db_path=db_path)
+    out = decision.to_dict()
+    out["receipt_hash"] = receipt["payload_hash"]
+    return out
+
+```
+
+receipts.py:
+```
+"""Audit receipts for owner-operated growth workflows."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db
+
+DEFAULT_RECEIPT_LOG = "data/provider_growth_receipts.jsonl"
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def stable_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_payload(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()
+
+
+def write_receipt(
+    receipt_type: str,
+    entity_type: str,
+    entity_id: str,
+    payload: dict[str, Any],
+    db_path: str = DEFAULT_DB_PATH,
+    receipt_log: str = DEFAULT_RECEIPT_LOG,
+) -> dict[str, Any]:
+    """Persist a JSON receipt to SQLite and JSONL."""
+    init_db(db_path)
+    enriched = {
+        "receipt_type": receipt_type,
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "created_at": utc_now(),
+        "payload": payload,
+    }
+    payload_hash = sha256_payload(enriched)
+    enriched["payload_hash"] = payload_hash
+
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO receipts(receipt_type, entity_type, entity_id, payload_hash, payload_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (receipt_type, entity_type, entity_id, payload_hash, stable_json(enriched)),
+        )
+        conn.commit()
+
+    log_path = Path(receipt_log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(enriched, ensure_ascii=False, sort_keys=True) + "\n")
+    return enriched
+
+```
+
+profile_content.py:
+```
+"""Profile content versioning and experiment labels."""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
+
+VALID_FIELDS = {"bio", "blog", "interview", "availability_note", "headline"}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def add_version(field_name: str, label: str, content: str, reason: str = "", status: str = "draft", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    if field_name not in VALID_FIELDS:
+        raise ValueError(f"field_name must be one of {sorted(VALID_FIELDS)}")
+    init_db(db_path)
+    h = content_hash(content)
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO profile_versions(field_name, label, content_hash, content, reason, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (field_name, label, h, content, reason, status),
+        )
+        version_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("profile_version_created", "profile_version", str(version_id), {"field_name": field_name, "label": label, "content_hash": h, "reason": reason, "status": status}, db_path=db_path)
+    return {"version_id": version_id, "field_name": field_name, "label": label, "content_hash": h, "status": status, "receipt_hash": receipt["payload_hash"]}
+
+
+def activate_version(version_id: int, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM profile_versions WHERE id = ?", (version_id,)).fetchone()
+        if not row:
+            raise ValueError(f"version not found: {version_id}")
+        conn.execute("UPDATE profile_versions SET status = 'retired', retired_at = ? WHERE field_name = ? AND status = 'active'", (now, row["field_name"]))
+        conn.execute("UPDATE profile_versions SET status = 'active', activated_at = ? WHERE id = ?", (now, version_id))
+        conn.commit()
+    receipt = write_receipt("profile_version_activated", "profile_version", str(version_id), {"activated_at": now, "field_name": row["field_name"], "label": row["label"]}, db_path=db_path)
+    return {"version_id": version_id, "status": "active", "activated_at": now, "receipt_hash": receipt["payload_hash"]}
+
+
+def list_versions(field_name: str | None = None, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        if field_name:
+            rows = conn.execute("SELECT * FROM profile_versions WHERE field_name = ? ORDER BY created_at DESC", (field_name,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM profile_versions ORDER BY created_at DESC").fetchall()
+    return rows_to_dicts(rows)
+
+```
+
+experiments.py:
+```
+"""Simple conversion experiment metrics."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def add_snapshot(
+    profile_version_label: str | None = None,
+    profile_views: int = 0,
+    repeat_visitors: int = 0,
+    contact_actions: int = 0,
+    inbound_messages: int = 0,
+    booking_requests: int = 0,
+    metadata: dict[str, Any] | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO metrics_snapshots(snapshot_at, profile_version_label, profile_views, repeat_visitors, contact_actions, inbound_messages, booking_requests, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (now, profile_version_label, profile_views, repeat_visitors, contact_actions, inbound_messages, booking_requests, json.dumps(metadata or {}, sort_keys=True)),
+        )
+        snapshot_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("metrics_snapshot", "metrics_snapshot", str(snapshot_id), {"snapshot_at": now, "profile_version_label": profile_version_label}, db_path=db_path)
+    return {"snapshot_id": snapshot_id, "snapshot_at": now, "receipt_hash": receipt["payload_hash"]}
+
+
+def summarize_by_version(db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+              COALESCE(profile_version_label, 'unlabeled') AS profile_version_label,
+              COUNT(*) AS snapshots,
+              SUM(profile_views) AS profile_views,
+              SUM(repeat_visitors) AS repeat_visitors,
+              SUM(contact_actions) AS contact_actions,
+              SUM(inbound_messages) AS inbound_messages,
+              SUM(booking_requests) AS booking_requests
+            FROM metrics_snapshots
+            GROUP BY COALESCE(profile_version_label, 'unlabeled')
+            ORDER BY booking_requests DESC, inbound_messages DESC, contact_actions DESC
+            """
+        ).fetchall()
+    out = rows_to_dicts(rows)
+    for row in out:
+        views = row.get("profile_views") or 0
+        contacts = row.get("contact_actions") or 0
+        bookings = row.get("booking_requests") or 0
+        row["contact_rate"] = round(contacts / views, 4) if views else 0.0
+        row["booking_rate"] = round(bookings / views, 4) if views else 0.0
+    return out
+
+```
+
+outbox.py:
+```
+"""Manual outbox state machine.
+
+The outbox is a queue of approved drafts ready for human review and local
+handoff. It does not send messages.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .policy import evaluate_draft
+from .receipts import write_receipt
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def enqueue_draft(draft_id: int, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    decision = evaluate_draft(draft_id, db_path=db_path)
+    with connect(db_path) as conn:
+        draft = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        if not draft:
+            raise ValueError(f"draft not found: {draft_id}")
+        cur = conn.execute(
+            """
+            INSERT INTO outbox_items(draft_id, visitor_key, channel, state, policy_decision, policy_reason, next_action_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                draft_id,
+                draft["visitor_key"],
+                draft["channel"],
+                "ready" if decision.allowed else "blocked",
+                decision.decision,
+                decision.reason,
+                decision.next_action_at,
+            ),
+        )
+        outbox_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("outbox_enqueued", "outbox", str(outbox_id), {"draft_id": draft_id, "decision": decision.to_dict()}, db_path=db_path)
+    return {"outbox_id": outbox_id, "state": "ready" if decision.allowed else "blocked", "policy": decision.to_dict(), "receipt_hash": receipt["payload_hash"]}
+
+
+def export_ready_item(outbox_id: int, output_dir: str = "data/manual_outbox", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        item = conn.execute("SELECT * FROM outbox_items WHERE id = ?", (outbox_id,)).fetchone()
+        if not item:
+            raise ValueError(f"outbox item not found: {outbox_id}")
+        if item["state"] != "ready":
+            raise ValueError(f"outbox item must be ready, got {item['state']}")
+        draft = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (item["draft_id"],)).fetchone()
+        if not draft:
+            raise ValueError("linked draft not found")
+
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"outbox_{outbox_id}_draft_{item['draft_id']}.txt"
+        path.write_text(draft["body"], encoding="utf-8")
+        conn.execute(
+            "UPDATE outbox_items SET state = 'exported', exported_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (str(path), outbox_id),
+        )
+        conn.execute(
+            "UPDATE message_drafts SET status = 'exported' WHERE id = ?",
+            (item["draft_id"],),
+        )
+        conn.commit()
+    receipt = write_receipt("outbox_exported", "outbox", str(outbox_id), {"path": str(path)}, db_path=db_path)
+    return {"outbox_id": outbox_id, "path": str(path), "receipt_hash": receipt["payload_hash"]}
+
+
+def mark_completed(outbox_id: int, outcome: str = "manual_completed", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    if outcome not in {"manual_completed", "skipped", "failed"}:
+        raise ValueError("outcome must be manual_completed, skipped, or failed")
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute("UPDATE outbox_items SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (outcome, outbox_id))
+        conn.commit()
+    receipt = write_receipt("outbox_completed", "outbox", str(outbox_id), {"outcome": outcome, "at": utc_now()}, db_path=db_path)
+    return {"outbox_id": outbox_id, "state": outcome, "receipt_hash": receipt["payload_hash"]}
+
+
+def list_outbox(state: str | None = None, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        if state:
+            rows = conn.execute("SELECT * FROM outbox_items WHERE state = ? ORDER BY created_at DESC", (state,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM outbox_items ORDER BY created_at DESC").fetchall()
+    return rows_to_dicts(rows)
+
+```
+
+kpi.py:
+```
+"""Revenue liquidity and funnel KPIs."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def add_revenue_event(
+    event_type: str,
+    amount_cents: int = 0,
+    visitor_key: str | None = None,
+    currency: str = "USD",
+    source: str = "manual",
+    notes: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    if event_type not in {"inquiry", "quote", "booking_request", "confirmed_booking", "completed_booking", "cancelled"}:
+        raise ValueError("unsupported revenue event type")
+    init_db(db_path)
+    now = utc_now()
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO revenue_events(visitor_key, event_type, amount_cents, currency, event_at, source, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (visitor_key, event_type, amount_cents, currency, now, source, notes),
+        )
+        event_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("revenue_event", "revenue_event", str(event_id), {"event_type": event_type, "amount_cents": amount_cents, "currency": currency, "at": now}, db_path=db_path)
+    return {"event_id": event_id, "event_type": event_type, "amount_cents": amount_cents, "receipt_hash": receipt["payload_hash"]}
+
+
+def revenue_summary(db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        events = rows_to_dicts(conn.execute("SELECT * FROM revenue_events ORDER BY event_at DESC").fetchall())
+        outbox = rows_to_dicts(conn.execute("SELECT state, COUNT(*) AS count FROM outbox_items GROUP BY state").fetchall())
+        drafts = rows_to_dicts(conn.execute("SELECT status, COUNT(*) AS count FROM message_drafts GROUP BY status").fetchall())
+        snapshots = rows_to_dicts(conn.execute("SELECT SUM(profile_views) AS views, SUM(contact_actions) AS contacts, SUM(inbound_messages) AS inbound, SUM(booking_requests) AS bookings FROM metrics_snapshots").fetchall())
+
+    totals: dict[str, int] = {}
+    amount_confirmed = 0
+    amount_completed = 0
+    for ev in events:
+        totals[ev["event_type"]] = totals.get(ev["event_type"], 0) + 1
+        if ev["event_type"] == "confirmed_booking":
+            amount_confirmed += int(ev["amount_cents"])
+        if ev["event_type"] == "completed_booking":
+            amount_completed += int(ev["amount_cents"])
+
+    snap = snapshots[0] if snapshots else {"views": 0, "contacts": 0, "inbound": 0, "bookings": 0}
+    views = snap.get("views") or 0
+    bookings = snap.get("bookings") or 0
+    contacts = snap.get("contacts") or 0
+
+    return {
+        "events_by_type": totals,
+        "confirmed_pipeline_usd": round(amount_confirmed / 100, 2),
+        "completed_revenue_usd": round(amount_completed / 100, 2),
+        "outbox_by_state": {row["state"]: row["count"] for row in outbox},
+        "drafts_by_status": {row["status"]: row["count"] for row in drafts},
+        "views": views,
+        "contacts": contacts,
+        "booking_requests": bookings,
+        "contact_rate": round(contacts / views, 4) if views else 0.0,
+        "booking_request_rate": round(bookings / views, 4) if views else 0.0,
+    }
+
+```
+
+engagement.py:
+```
+"""Manual engagement records for authorized account operations.
+
+All records are operator-entered or imported from sources the operator is
+authorized to use. This module does not collect hidden data or perform outbound
+actions.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def record_key(identifier: str) -> str:
+    return hashlib.sha256(identifier.strip().lower().encode("utf-8")).hexdigest()[:24]
+
+
+def score_record(repeat_count: int = 1, recent: bool = True, cooldown: bool = False, blocked: bool = False) -> int:
+    score = 0
+    if repeat_count >= 2:
+        score += 3
+    if repeat_count >= 3:
+        score += 2
+    if recent:
+        score += 2
+    if cooldown:
+        score -= 5
+    if blocked:
+        score -= 100
+    return score
+
+
+def upsert_record(identifier: str, display_name: str | None = None, source: str = "manual", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    key = record_key(identifier)
+    with connect(db_path) as conn:
+        existing = conn.execute("SELECT * FROM visitors WHERE visitor_key = ?", (key,)).fetchone()
+        if existing:
+            count = int(existing["visit_count"]) + 1
+            score = score_record(count, recent=True, blocked=bool(existing["do_not_contact"]))
+            conn.execute(
+                "UPDATE visitors SET display_name = COALESCE(?, display_name), last_seen = ?, visit_count = ?, lead_score = ?, updated_at = CURRENT_TIMESTAMP WHERE visitor_key = ?",
+                (display_name, now, count, score, key),
+            )
+        else:
+            count = 1
+            score = score_record(count, recent=True)
+            conn.execute(
+                "INSERT INTO visitors(visitor_key, display_name, profile_url, first_seen, last_seen, visit_count, lead_score) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (key, display_name, identifier, now, now, count, score),
+            )
+        conn.execute(
+            "INSERT INTO visitor_events(visitor_key, event_type, source, event_at, metadata_json) VALUES (?, ?, ?, ?, '{}')",
+            (key, "manual_record", source, now),
+        )
+        conn.commit()
+    receipt = write_receipt("engagement_record", "record", key, {"source": source, "at": now}, db_path=db_path)
+    return {"record_key": key, "repeat_count": count, "score": score, "receipt_hash": receipt["payload_hash"]}
+
+
+def list_priority_records(min_score: int = 3, limit: int = 25, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT visitor_key AS record_key, display_name, last_seen, visit_count AS repeat_count, lead_score AS score, status FROM visitors WHERE lead_score >= ? AND do_not_contact = 0 ORDER BY lead_score DESC, last_seen DESC LIMIT ?",
+            (min_score, limit),
+        ).fetchall()
+    return rows_to_dicts(rows)
+
+```
+
+hf_report.json:
+```
+{"status":"real_data_present","rl_state":{"status":"missing_real_data","name":"rl_state","path":"./content/rl_state.json"},"ga_state":{"status":"missing_real_data","name":"ga_state","path":"./content/ga_rl_state.json"},"availability":{
+  "availability_enforced": false,
+  "automated_login": true,
+  "availability_updated": false,
+  "timestamp": "2026-07-25T23:19:21.049081Z",
+  "reason": "login_failed"
+},"content_counts":{"bios":0,"receipts":1307},"live_profile_update_allowed":false,"timestamp":"2026-07-26T00:28:17Z"}
+```
+
+mass_analysis_20260626.md:
+```
+## Comprehensive Report
+### 1. Top 5 Bios Ranked by Conversion Potential
+Based on the generated bios, the top 5 bios ranked by conversion potential are:
+1. **night_owl** (1243 chars): This bio has a high conversion potential due to its unique approach to targeting clients who are active at night, showcasing the therapist's ability to cater to different schedules.
+2. **discrete_confidential** (1274 chars): This bio highlights the importance of discretion and confidentiality, which is a major concern for many clients, making it an attractive option for those seeking a private and secure experience.
+3. **luxury_concierge** (1023 chars): This bio offers a high-end experience, which can attract clients who are looking for a premium service, increasing the conversion potential.
+4. **therapeutic_expert** (1103 chars): This bio showcases the therapist's expertise in clinical therapeutic massage, which can attract clients who are seeking a professional and effective service.
+5. **athlete_recovery** (1243 chars): This bio targets a specific niche (athletes and gym-goers), which can increase the conversion potential by appealing to a specific audience with tailored services.
+
+### 2. Top 5 Blog Posts Ranked by SEO and Engagement Potential
+Unfortunately, there are no generated blog posts to analyze. However, it is essential to create blog posts that target relevant keywords, provide valuable information, and encourage engagement to improve SEO and conversion rates.
+
+### 3. Top 5 Interview Question Sets Ranked by PR Value
+Unfortunately, there are no generated interview question sets to analyze. However, it is crucial to develop interview questions that showcase the therapist's expertise, unique approach, and values to increase PR value and attract potential clients.
+
+### 4. Cross-Strategy Themes that Perform Best
+Based on the generated bios, the following themes perform well:
+* **Targeted services**: Bios that target specific niches or audiences (e.g., athletes, couples, LGBTQ+) tend to perform well.
+* **Unique selling points**: Bios that highlight unique selling points, such as discretion, luxury, or expertise, can attract clients who are seeking a specific experience.
+* **Emotional connections**: Bios that create an emotional connection with potential clients, such as emphasizing relaxation, stress relief, or personal growth, can increase conversion potential.
+
+### 5. Recommended Posting Schedule for the Week
+Without blog posts and interview question sets, it is challenging to provide a comprehensive posting schedule. However, it is essential to post content regularly to maintain a consistent online presence and engage with potential clients. A recommended posting schedule could include:
+* Posting a new bio or updating an existing one every 2-3 days to keep the content fresh and attract new clients.
+* Creating and publishing blog posts at least once a week to provide valuable information and improve SEO.
+* Sharing interview question sets or featured interviews on social media platforms to increase PR value and attract potential clients.
+
+### 6. Best Bio to Use on the Profile Right Now
+Based on the analysis, the **night_owl** bio is the best option to use on the profile right now. This bio has a high conversion potential, targets a specific audience, and showcases the therapist's ability to cater to different schedules. However, it is essential to regularly update and refresh the bio to keep the content fresh and attract new clients.
+```
+
+experiment_ledger.json:
+```
+{
+  "experiment_id": "exp_20260626_bio_ab_test",
+  "status": "staged",
+  "start_date": "2026-06-26",
+  "description": "Bio A/B test — 4 archetypes, 1 deployed at a time, 6h minimum exposure",
+  "variants": [
+    {
+      "bio_id": "bio_A_clinical_recovery",
+      "label": "Clinical Recovery",
+      "file": "content/bios/bio_A_clinical_recovery.md",
+      "archetype": "therapeutic_expert"
+    },
+    {
+      "bio_id": "bio_B_karpathian_wolf",
+      "label": "Karpathian Wolf (controlled brand)",
+      "file": "content/bios/bio_B_karpathian_wolf.md",
+      "archetype": "dominant_identity_clean"
+    },
+    {
+      "bio_id": "bio_C_luxury_concierge",
+      "label": "Luxury Concierge",
+      "file": "content/bios/bio_C_luxury_concierge.md",
+      "archetype": "luxury_hotel_outcall"
+    },

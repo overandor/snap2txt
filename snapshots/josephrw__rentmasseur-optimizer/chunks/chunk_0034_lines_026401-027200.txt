@@ -1,800 +1,800 @@
-    """, (contact, limit)).fetchall()
-    conn.close()
+        <div class="pipe">workflow_dispatch
+  → self-hosted macOS ARM64 runner
+  → compile guardian.mm
+  → build AI-RAM-Guardian.dmg
+  → collect safe Metal/hardware receipt
+  → upload DMG + sha256 + receipt artifact</div>
+      </section>
 
-    results = []
-    for r in rows:
-        d = dict(r)
-        d["date_iso"] = apple_epoch_to_iso(d.get("date", 0))
-        results.append(d)
-    return results
+      <section class="card">
+        <h3>Why local?</h3>
+        <p>GitHub-hosted Macs can build software. They cannot observe your real Devin, Windsurf, Claude, Cursor, and Metal workload. A self-hosted runner turns your actual machine into the lab without sending private documents or prompts to the cloud.</p>
+      </section>
 
+      <section class="card">
+        <h3>What gets collected?</h3>
+        <p>Only hardware/build telemetry: machine model, OS version, memory size, Metal/GPU summary, build hash, and explicit Guardian receipts. No chats, prompts, browser data, documents, secrets, or app content.</p>
+      </section>
 
-def check_rm_related(contact: str) -> bool:
-    """Check if a contact identifier appears in the RM visitor DB."""
-    if not ENGAGEMENT_DB.exists():
-        return False
-    try:
-        conn = sqlite3.connect(str(ENGAGEMENT_DB))
-        # Check if contact matches any visitor username
-        row = conn.execute(
-            "SELECT username FROM visitors WHERE username LIKE ? OR username LIKE ?",
-            (f"%{contact}%", f"%{contact.replace('+', '')}%")
-        ).fetchone()
-        conn.close()
-        return row is not None
-    except Exception:
-        return False
+      <section class="card full">
+        <h3>Runner labels</h3>
+        <p class="muted">Register your Mac as a GitHub self-hosted runner with these labels:</p>
+        <div><span class="badge">self-hosted</span><span class="badge">macOS</span><span class="badge">ARM64</span><span class="badge">metal</span></div>
+      </section>
 
+      <section class="card full">
+        <h3>Workflow</h3>
+        <div class="code">.github/workflows/ai-ram-guardian-local-mac-metal.yml</div>
+        <p class="muted">Run it manually from GitHub Actions. It will fail honestly until <code>ai-ram-guardian/guardian.mm</code> is committed.</p>
+      </section>
 
-def get_rm_related_conversations() -> list:
-    """Get conversations that are likely RM-related (by keyword or contact match)."""
-    convs = get_conversations(200)
-    rm_convs = []
-
-    for c in convs:
-        if c.get("is_rm_related"):
-            rm_convs.append(c)
-            continue
-
-        # Check message content for RM keywords
-        messages = get_conversation_messages(c["contact"], limit=10)
-        for msg in messages:
-            text_lower = (msg.get("text") or "").lower()
-            if any(kw in text_lower for kw in RM_KEYWORDS):
-                c["is_rm_related"] = True
-                c["matched_keyword"] = next(
-                    (kw for kw in RM_KEYWORDS if kw in text_lower), None
-                )
-                break
-
-        if c.get("is_rm_related"):
-            rm_convs.append(c)
-
-    return rm_convs
-
-
-# ─── Sync to Engagement DB ───────────────────────────────────────────
-
-def init_imessage_table():
-    if not ENGAGEMENT_DB.exists():
-        return
-    conn = sqlite3.connect(str(ENGAGEMENT_DB))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS imessage_sync (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            contact TEXT NOT NULL,
-            msg_id INTEGER,
-            text TEXT,
-            date_iso TEXT,
-            is_from_me INTEGER,
-            synced_at TEXT NOT NULL,
-            is_rm_related INTEGER DEFAULT 0,
-            matched_visitor TEXT,
-            UNIQUE(msg_id)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def sync_messages(limit: int = 500):
-    """Sync recent iMessages to the engagement DB."""
-    init_imessage_table()
-
-    conn = get_imessage_conn()
-    if not conn:
-        return 0
-
-    rows = conn.execute("""
-        SELECT
-            message.ROWID as msg_id,
-            message.text as text,
-            message.date as date,
-            message.is_from_me as is_from_me,
-            handle.id as contact
-        FROM message
-        LEFT JOIN handle ON message.handle_id = handle.ROWID
-        WHERE message.text IS NOT NULL
-        ORDER BY message.date DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
-    conn.close()
-
-    eng_conn = sqlite3.connect(str(ENGAGEMENT_DB))
-    synced = 0
-    for r in rows:
-        d = dict(r)
-        date_iso = apple_epoch_to_iso(d.get("date", 0))
-        is_rm = 1 if check_rm_related(d["contact"]) else 0
-
-        # Check message content for RM keywords
-        text_lower = (d.get("text") or "").lower()
-        matched_kw = None
-        if not is_rm:
-            for kw in RM_KEYWORDS:
-                if kw in text_lower:
-                    is_rm = 1
-                    matched_kw = kw
-                    break
-
-        try:
-            eng_conn.execute(
-                "INSERT OR IGNORE INTO imessage_sync "
-                "(contact, msg_id, text, date_iso, is_from_me, synced_at, is_rm_related) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (d["contact"], d["msg_id"], d["text"], date_iso,
-                 d["is_from_me"], now_iso(), is_rm)
-            )
-            synced += eng_conn.total_changes > 0
-        except Exception:
-            pass
-
-    eng_conn.commit()
-
-    # Count RM-related
-    rm_count = eng_conn.execute(
-        "SELECT COUNT(*) FROM imessage_sync WHERE is_rm_related=1"
-    ).fetchone()[0]
-    total_synced = eng_conn.execute("SELECT COUNT(*) FROM imessage_sync").fetchone()[0]
-    eng_conn.close()
-
-    log(f"Synced {len(rows)} messages ({synced} new). Total: {total_synced}, RM-related: {rm_count}")
-    return synced
-
-
-# ─── Reply Drafting with Ollama ──────────────────────────────────────
-
-def draft_reply(contact: str, context_messages: int = 20) -> str:
-    """Generate a reply draft for a contact using Ollama."""
-    messages = get_conversation_messages(contact, limit=context_messages)
-    if not messages:
-        return "(no messages found for this contact)"
-
-    # Build conversation context
-    messages.reverse()  # chronological order
-    conversation = ""
-    for msg in messages:
-        sender = "Me" if msg["is_from_me"] else "Client"
-        conversation += f"{sender}: {msg['text']}\n"
-
-    prompt = f"""You are a professional massage therapist on RentMasseur.com responding to a client via iMessage.
-Based on the conversation below, draft a short, friendly, professional reply.
-
-Conversation:
-{conversation}
-
-Rules:
-- Keep it under 200 characters
-- Be warm but professional
-- If they're asking about booking, mention availability
-- If they're asking about location, mention Manhattan incall
-- Do not use emoji
-- Write only the reply message, nothing else
-
-Reply:"""
-
-    import requests
-    try:
-        resp = requests.post(OLLAMA_URL, json={
-            "model": "llama3.1",
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0.7, "num_predict": 150}
-        }, timeout=60)
-        resp.raise_for_status()
-        draft = resp.json().get("response", "").strip()
-        return draft
-    except Exception as e:
-        log(f"Ollama error: {e}", "ERROR")
-        return f"(draft generation failed: {e})"
-
-
-# ─── Match Visitors to iMessage Contacts ─────────────────────────────
-
-def match_visitors_to_contacts() -> list:
-    """Try to match RM visitor usernames to iMessage contacts."""
-    if not ENGAGEMENT_DB.exists():
-        return []
-
-    eng_conn = sqlite3.connect(str(ENGAGEMENT_DB))
-    visitors = eng_conn.execute("SELECT username FROM visitors").fetchall()
-    eng_conn.close()
-
-    im_conn = get_imessage_conn()
-    if not im_conn:
-        return []
-
-    # Get all iMessage contacts
-    contacts = im_conn.execute("SELECT DISTINCT id FROM handle").fetchall()
-    im_conn.close()
-
-    matches = []
-    visitor_names = [v[0].lower() for v in visitors]
-    contact_list = [c[0] for c in contacts]
-
-    for vname in visitor_names:
-        for contact in contact_list:
-            # Match by partial phone number or email
-            contact_clean = contact.replace("+", "").replace("-", "").replace(" ", "").lower()
-            if vname in contact_clean or contact_clean in vname:
-                matches.append({"visitor": vname, "contact": contact})
-            # Also check if contact email contains username
-            elif "@" in contact and vname in contact.lower():
-                matches.append({"visitor": vname, "contact": contact})
-
-    log(f"Matched {len(matches)} visitors to iMessage contacts")
-    return matches
-
-
-# ─── Main ────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(description="RM iMessage Bridge")
-    parser.add_argument("--sync", action="store_true", help="Sync recent messages to DB")
-    parser.add_argument("--conversations", action="store_true", help="List all conversations")
-    parser.add_argument("--rm-conversations", action="store_true", help="List RM-related conversations only")
-    parser.add_argument("--draft", action="store_true", help="Draft a reply for a contact")
-    parser.add_argument("--contact", help="Contact ID for drafting")
-    parser.add_argument("--match-visitors", action="store_true", help="Match visitors to iMessage contacts")
-    parser.add_argument("--limit", type=int, default=50, help="Max results")
-    args = parser.parse_args()
-
-    if not IMESSAGE_DB.exists():
-        log(f"iMessage DB not found: {IMESSAGE_DB}", "ERROR")
-        log("This script only works on macOS with iMessage enabled.", "ERROR")
-        sys.exit(1)
-
-    if args.sync:
-        sync_messages(limit=args.limit * 10)
-        return
-
-    if args.conversations:
-        convs = get_conversations(args.limit)
-        print(f"\n{'Contact':30s} {'Msgs':>5s} {'Sent':>5s} {'Recv':>5s} {'Last Message':20s} {'RM':>3s}")
-        print("-" * 80)
-        for c in convs:
-            print(f"{c['contact']:30s} {c['msg_count']:5d} {c['sent_by_me']:5d} "
-                  f"{c['sent_by_them']:5d} {c['last_msg_iso'][:19]:20s} {'✓' if c['is_rm_related'] else '—':3s}")
-        return
-
-    if args.rm_conversations:
-        convs = get_rm_related_conversations()
-        print(f"\nRM-related conversations ({len(convs)}):")
-        for c in convs:
-            print(f"\n  {c['contact']} ({c['msg_count']} msgs, last: {c['last_msg_iso'][:19]})")
-            if c.get("matched_keyword"):
-                print(f"    Matched keyword: {c['matched_keyword']}")
-            # Show last 3 messages
-            msgs = get_conversation_messages(c["contact"], limit=3)
-            for m in reversed(msgs):
-                sender = "Me" if m["is_from_me"] else "Them"
-                print(f"    [{m['date_iso'][:19]}] {sender}: {m['text'][:80]}")
-        return
-
-    if args.draft:
-        if not args.contact:
-            log("--contact required for --draft", "ERROR")
-            sys.exit(1)
-        draft = draft_reply(args.contact)
-        print(f"\nDraft reply for {args.contact}:")
-        print(f"  \"{draft}\"")
-        return
-
-    if args.match_visitors:
-        matches = match_visitors_to_contacts()
-        if matches:
-            print(f"\nVisitor → iMessage contact matches:")
-            for m in matches:
-                print(f"  {m['visitor']} → {m['contact']}")
-        else:
-            print("\nNo matches found")
-        return
-
-    parser.print_help()
-
-
-if __name__ == "__main__":
-    main()
+      <section class="card full">
+        <h3>Future Metal/ML loop</h3>
+        <p>The valuable dataset is machine behavior, not private content: available memory, pressure trend, thermal state, helper RSS, intervention type, before/after deltas, build version, and hardware profile hash. That supports small on-device models: Kalman pressure filters, learned anomaly baselines, local policy tuning, and release regression detection.</p>
+        <a class="btn" href="https://github.com/overandor/rentmasseur-extension/actions/workflows/ai-ram-guardian-local-mac-metal.yml">Open the local Mac workflow</a>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
 
 ```
 
-daily_evidence.py:
+index.html:
 ```
-#!/usr/bin/env python3
-"""
-Daily Evidence Packet — joins bio version → traffic → contact clicks → booking/revenue.
-
-This is the single joined revenue loop. One packet per day. No theater.
-
-Flow:
-1. Snapshot live profile (dashboard stats + about/bio)
-2. Load current bio variant ID from experiment ledger
-3. Compute deltas from last snapshot
-4. Apply decision rules (KEEP_CURRENT, TEST_NEXT_BIO, BLOCK_NO_SIGNAL, etc.)
-5. Write daily evidence packet JSON
-6. Write receipt
-
-Decision labels:
-  KEEP_CURRENT       — bio has conversion signal, keep it
-  TEST_NEXT_BIO      — bio has 0 signals after min exposure, rotate
-  BLOCK_NO_SIGNAL    — not enough data (<100 views or <24h)
-  BLOCK_LOW_EXPOSURE — profile hidden or unavailable
-  WINNER_FOUND       — bio significantly outperforms baseline
-  NEEDS_HUMAN_REVIEW — ambiguous result, manual decision needed
-
-Minimum sample rules:
-  - Do not judge before 100 profile views OR 24 hours, whichever comes later
-  - If traffic is low, extend to 48 hours
-  - If contact clicks drop hard (>50% decline), revert early
-"""
-
-import json
-import os
-import sqlite3
-import sys
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Optional
-
-sys.path.insert(0, str(Path("/Users/alep/Downloads/rentmasseur-optimizer/rm_pri/py")))
-from api_client import RentMasseurAPI
-
-from dotenv import load_dotenv
-
-# Paths
-EXT_DIR = Path(__file__).parent
-CONTENT_DIR = EXT_DIR / "content"
-BIOS_DIR = CONTENT_DIR / "bios"
-RECEIPTS_DIR = EXT_DIR / "receipts"
-LEDGER_PATH = CONTENT_DIR / "experiment_ledger.json"
-EVIDENCE_DIR = CONTENT_DIR / "evidence"
-TRAFFIC_DB = Path("/Users/alep/Downloads/windsurf-smoke/rm_traffic/traffic.db")
-SNAPSHOTS_DIR = Path("/Users/alep/Downloads/windsurf-smoke/rm_traffic/data/profile_snapshots")
-
-# 3 approved test variants only
-TEST_VARIANTS = {
-    "A_clinical": {
-        "id": "bio_A_clinical_recovery",
-        "file": "bio_A_clinical_recovery.md",
-        "strategy": "clinical_recovery",
-        "headline": "KARPATHIAN WOLF — Professional Therapeutic Massage",
-    },
-    "B_wolf": {
-        "id": "bio_W_winning_production",
-        "file": "bio_W_winning_production.md",
-        "strategy": "controlled_wolf",
-        "headline": "KARPATHIAN WOLF — Targeted Recovery in Manhattan",
-    },
-    "C_luxury": {
-        "id": "bio_C_luxury_concierge",
-        "file": "bio_C_luxury_concierge.md",
-        "strategy": "luxury_concierge",
-        "headline": "KARPATHIAN WOLF — Manhattan's Private Recovery Specialist",
-    },
-}
-
-REBRANDLY_LINK = "rebrand.ly/carpathianwolf"
-
-# Minimum sample rules
-MIN_VIEWS = 100
-MIN_HOURS = 24
-LOW_TRAFFIC_EXTEND_HOURS = 48
-HARD_DROP_THRESHOLD = 0.50  # 50% decline in contact clicks = revert
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def load_ledger() -> dict:
-    if LEDGER_PATH.exists():
-        return json.loads(LEDGER_PATH.read_text())
-    return {
-        "current_bio_id": None,
-        "current_bio_started_at": None,
-        "current_bio_start_views": 0,
-        "current_bio_start_clicks": 0,
-        "history": [],
-        "baseline_ctr": None,
-    }
-
-
-def save_ledger(ledger: dict):
-    LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LEDGER_PATH.write_text(json.dumps(ledger, indent=2))
-
-
-def snapshot_profile(api: RentMasseurAPI) -> dict:
-    """Capture live profile state."""
-    dash = api.get_dashboard()
-    stats = api.get_ad_statistics()
-    about = api.get_about()
-    keep = api.get_keeponline()
-
-    # Extract key metrics
-    profile_stats = stats.get("profileStatistics", {}) if isinstance(stats, dict) else {}
-    user_settings = dash.get("userSetting", {}) if isinstance(dash, dict) else {}
-
-    total_views = profile_stats.get("totalPageViews", 0)
-    total_clicks = profile_stats.get("totalContactClicks", 0)
-    new_visits = keep.get("newVisits", 0) if isinstance(keep, dict) else 0
-    new_emails = keep.get("newEmails", 0) if isinstance(keep, dict) else 0
-
-    visibility = user_settings.get("visibility", 0)
-    availability = user_settings.get("availability", {})
-    is_available = availability.get("available", 0) if isinstance(availability, dict) else 0
-    avail_message = availability.get("message", "") if isinstance(availability, dict) else ""
-
-    # Current bio
-    assets = about.get("userProps", {}).get("assets", {}) if isinstance(about, dict) else {}
-    headline = assets.get("headline", "")
-    description = assets.get("description", "")
-    rebrandly_present = REBRANDLY_LINK in description
-
-    return {
-        "timestamp": now_iso(),
-        "total_page_views": total_views,
-        "total_contact_clicks": total_clicks,
-        "new_visits": new_visits,
-        "new_emails": new_emails,
-        "visibility": visibility,
-        "is_available": is_available,
-        "availability_message": avail_message,
-        "headline": headline,
-        "bio_length": len(description),
-        "rebrandly_present": rebrandly_present,
-        "bio_preview": description[:300],
-    }
-
-
-def compute_deltas(snapshot: dict, ledger: dict) -> dict:
-    """Compute deltas since current bio started."""
-    start_views = ledger.get("current_bio_start_views", 0)
-    start_clicks = ledger.get("current_bio_start_clicks", 0)
-
-    delta_views = snapshot["total_page_views"] - start_views
-    delta_clicks = snapshot["total_contact_clicks"] - start_clicks
-    delta_ctr = (delta_clicks / delta_views * 100) if delta_views > 0 else 0.0
-
-    started_at = ledger.get("current_bio_start_started_at")
-    hours_exposed = 0
-    if started_at:
-        try:
-            started = datetime.fromisoformat(started_at)
-            hours_exposed = (datetime.now(timezone.utc) - started).total_seconds() / 3600
-        except Exception:
-            pass
-
-    return {
-        "delta_views": delta_views,
-        "delta_clicks": delta_clicks,
-        "delta_ctr": round(delta_ctr, 2),
-        "hours_exposed": round(hours_exposed, 1),
-    }
-
-
-def decide(snapshot: dict, deltas: dict, ledger: dict) -> str:
-    """Apply decision rules. Returns one of the 6 labels."""
-    # Rule 1: Profile hidden or unavailable → block
-    if snapshot["visibility"] != 1:
-        return "BLOCK_LOW_EXPOSURE"
-    if snapshot["is_available"] != 1:
-        return "BLOCK_LOW_EXPOSURE"
-
-    # Rule 2: Not enough data yet
-    if deltas["delta_views"] < MIN_VIEWS and deltas["hours_exposed"] < MIN_HOURS:
-        return "BLOCK_NO_SIGNAL"
-
-    # Rule 3: Enough time but low traffic → extend
-    if deltas["delta_views"] < MIN_VIEWS and deltas["hours_exposed"] < LOW_TRAFFIC_EXTEND_HOURS:
-        return "BLOCK_NO_SIGNAL"
-
-    # Rule 4: Has signals (contact clicks) → keep
-    if deltas["delta_clicks"] > 0:
-        baseline_ctr = ledger.get("baseline_ctr")
-        if baseline_ctr and deltas["delta_ctr"] > baseline_ctr * 1.5:
-            return "WINNER_FOUND"
-        if baseline_ctr and deltas["delta_ctr"] < baseline_ctr * HARD_DROP_THRESHOLD:
-            return "TEST_NEXT_BIO"
-        return "KEEP_CURRENT"
-
-    # Rule 5: Enough views but zero clicks → test next
-    if deltas["delta_views"] >= MIN_VIEWS and deltas["delta_clicks"] == 0:
-        return "TEST_NEXT_BIO"
-
-    # Rule 6: Ambiguous
-    return "NEEDS_HUMAN_REVIEW"
-
-
-def build_evidence_packet(snapshot: dict, deltas: dict, decision: str, ledger: dict) -> dict:
-    """Build the daily evidence packet."""
-    return {
-        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "timestamp": now_iso(),
-        "bio_id": ledger.get("current_bio_id", "unknown"),
-        "bio_started_at": ledger.get("current_bio_started_at"),
-        "metrics": {
-            "total_page_views": snapshot["total_page_views"],
-            "total_contact_clicks": snapshot["total_contact_clicks"],
-            "new_visits": snapshot["new_visits"],
-            "new_emails": snapshot["new_emails"],
-            "delta_views": deltas["delta_views"],
-            "delta_clicks": deltas["delta_clicks"],
-            "delta_ctr": deltas["delta_ctr"],
-            "hours_exposed": deltas["hours_exposed"],
-        },
-        "profile_state": {
-            "visibility": snapshot["visibility"],
-            "is_available": snapshot["is_available"],
-            "availability_message": snapshot["availability_message"],
-            "rebrandly_present": snapshot["rebrandly_present"],
-        },
-        "current_headline": snapshot["headline"],
-        "bio_length": snapshot["bio_length"],
-        "decision": decision,
-        "baseline_ctr": ledger.get("baseline_ctr"),
-        "min_sample_rules": {
-            "min_views": MIN_VIEWS,
-            "min_hours": MIN_HOURS,
-            "low_traffic_extend_hours": LOW_TRAFFIC_EXTEND_HOURS,
-            "hard_drop_threshold": HARD_DROP_THRESHOLD,
-        },
-    }
-
-
-def write_evidence_packet(packet: dict):
-    """Write daily evidence packet."""
-    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
-    date_str = packet["date"]
-    path = EVIDENCE_DIR / f"daily_{date_str}.json"
-    path.write_text(json.dumps(packet, indent=2))
-    print(f"Evidence packet written: {path}")
-
-    # Also write latest.json for HF/GitHub promotion
-    latest = EVIDENCE_DIR / "latest.json"
-    latest.write_text(json.dumps(packet, indent=2))
-    print(f"Latest evidence: {latest}")
-
-
-def write_receipt(packet: dict, decision: str):
-    """Write receipt for the evidence cycle."""
-    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    receipt = {
-        "action": "daily_evidence_packet",
-        "timestamp": now_iso(),
-        "decision": decision,
-        "bio_id": packet["bio_id"],
-        "delta_views": packet["metrics"]["delta_views"],
-        "delta_clicks": packet["metrics"]["delta_clicks"],
-        "delta_ctr": packet["metrics"]["delta_ctr"],
-        "hours_exposed": packet["metrics"]["hours_exposed"],
-    }
-    path = RECEIPTS_DIR / f"evidence_{ts}.json"
-    path.write_text(json.dumps(receipt, indent=2))
-    print(f"Receipt: {path}")
-
-
-def main():
-    print("=" * 60)
-    print("DAILY EVIDENCE PACKET")
-    print("bio_id → traffic → contact_clicks → decision")
-    print("=" * 60)
-
-    load_dotenv(EXT_DIR / ".env")
-    username = os.environ.get("RENTMASSEUR_USERNAME")
-    password = os.environ.get("RENTMASSEUR_PASSWORD")
-
-    if not username or not password or username == "REDACTED_ROTATE_ME":
-        print("ERROR: No valid credentials in .env")
-        sys.exit(1)
-
-    # Login
-    print(f"\nLogging in as {username}...")
-    api = RentMasseurAPI(min_request_interval=2.0)
-    if not api.login(username, password):
-        print("ERROR: Login failed")
-        sys.exit(1)
-    print("Login successful")
-
-    # Snapshot
-    print("\nSnapshotting live profile...")
-    snapshot = snapshot_profile(api)
-    print(f"  Total views: {snapshot['total_page_views']}")
-    print(f"  Total clicks: {snapshot['total_contact_clicks']}")
-    print(f"  New visits: {snapshot['new_visits']}")
-    print(f"  New emails: {snapshot['new_emails']}")
-    print(f"  Visibility: {snapshot['visibility']}")
-    print(f"  Available: {snapshot['is_available']} ({snapshot['availability_message']})")
-    print(f"  Headline: {snapshot['headline']}")
-    print(f"  Rebrandly: {'YES' if snapshot['rebrandly_present'] else 'NO'}")
-    print(f"  Bio length: {snapshot['bio_length']} chars")
-
-    # Load ledger
-    ledger = load_ledger()
-    print(f"\nCurrent bio: {ledger.get('current_bio_id', 'none')}")
-    print(f"Started at: {ledger.get('current_bio_started_at', 'none')}")
-
-    # Compute deltas
-    deltas = compute_deltas(snapshot, ledger)
-    print(f"\nDeltas:")
-    print(f"  Views since bio start: {deltas['delta_views']}")
-    print(f"  Clicks since bio start: {deltas['delta_clicks']}")
-    print(f"  CTR since bio start: {deltas['delta_ctr']}%")
-    print(f"  Hours exposed: {deltas['hours_exposed']}")
-
-    # Decide
-    decision = decide(snapshot, deltas, ledger)
-    print(f"\nDECISION: {decision}")
-
-    # Build packet
-    packet = build_evidence_packet(snapshot, deltas, decision, ledger)
-
-    # Write
-    write_evidence_packet(packet)
-    write_receipt(packet, decision)
-
-    # If baseline CTR not set, set it from first snapshot
-    if ledger.get("baseline_ctr") is None and snapshot["total_page_views"] > 0:
-        baseline = (snapshot["total_contact_clicks"] / snapshot["total_page_views"]) * 100
-        ledger["baseline_ctr"] = round(baseline, 2)
-        print(f"\nBaseline CTR set: {ledger['baseline_ctr']}%")
-        save_ledger(ledger)
-
-    print("\n" + "=" * 60)
-    print("EVIDENCE PACKET COMPLETE")
-    print(f"Decision: {decision}")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    main()
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#06101d" />
+  <meta name="description" content="AI RAM Guardian is a native macOS glass utility for AI-heavy workstations. Local-first memory, thermal, and Metal receipts. No fake boosts." />
+  <meta property="og:title" content="AI RAM Guardian — Your Mac should show its work" />
+  <meta property="og:description" content="Native macOS glass utility for Devin, Windsurf, Claude, Cursor, and Codex. Every memory and thermal intervention has a receipt." />
+  <meta property="og:type" content="website" />
+  <title>AI RAM Guardian — Your Mac should show its work</title>
+  <style>
+    :root{color-scheme:dark;--bg:#03060b;--bg2:#06101d;--ink:rgba(247,251,255,.96);--muted:rgba(247,251,255,.66);--faint:rgba(247,251,255,.38);--line:rgba(255,255,255,.14);--glass:rgba(255,255,255,.082);--glass2:rgba(255,255,255,.13);--blue:#8bd7ff;--violet:#bca7ff;--teal:#8fffe3;--amber:#ffd08a;--rose:#ff8aa3;--shadow:0 44px 120px rgba(0,0,0,.52);--r:30px}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;min-height:100vh;font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue",Arial,sans-serif;color:var(--ink);background:radial-gradient(circle at 12% 8%,rgba(139,215,255,.22),transparent 34rem),radial-gradient(circle at 86% 8%,rgba(188,167,255,.18),transparent 32rem),radial-gradient(circle at 50% 78%,rgba(143,255,227,.12),transparent 42rem),linear-gradient(180deg,var(--bg2),var(--bg) 76%);overflow-x:hidden}.noise{position:fixed;inset:0;pointer-events:none;opacity:.16;mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140' viewBox='0 0 140 140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.42'/%3E%3C/svg%3E")}.wrap{width:min(1180px,calc(100% - 40px));margin:0 auto}.nav{position:sticky;top:14px;z-index:20;padding:14px 0}.bar{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:12px 14px;border:1px solid var(--line);border-radius:24px;background:rgba(7,14,26,.62);backdrop-filter:blur(24px) saturate(1.45);-webkit-backdrop-filter:blur(24px) saturate(1.45);box-shadow:var(--shadow)}a{color:inherit;text-decoration:none}.brand{display:flex;align-items:center;gap:11px;font-weight:760;letter-spacing:-.025em}.mark{width:32px;height:32px;border-radius:13px;background:radial-gradient(circle at 34% 23%,rgba(255,255,255,.88),transparent 18%),linear-gradient(145deg,var(--blue),var(--violet) 56%,var(--teal));box-shadow:0 16px 46px rgba(139,215,255,.25)}.links{display:flex;align-items:center;gap:14px}.links a{font-size:14px;color:var(--muted)}.btn{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 18px;border:1px solid rgba(255,255,255,.16);border-radius:999px;background:rgba(255,255,255,.095);color:var(--ink);font-weight:730;box-shadow:0 18px 50px rgba(0,0,0,.25)}.btn.primary{background:linear-gradient(135deg,var(--blue),var(--violet));color:#06101d;border-color:transparent}.hero{padding:86px 0 58px}.hero-grid{display:grid;grid-template-columns:1.02fr .98fr;gap:46px;align-items:center}.eyebrow{color:var(--teal);font-size:12px;font-weight:820;letter-spacing:.16em;text-transform:uppercase}.h1{margin:16px 0 18px;font-size:clamp(50px,8.2vw,108px);line-height:.88;letter-spacing:-.08em}.lead{color:var(--muted);font-size:clamp(18px,2vw,23px);line-height:1.45;max-width:760px}.actions{display:flex;gap:13px;flex-wrap:wrap;margin-top:30px}.fine{margin-top:18px;color:var(--faint);font-size:13px}.device{min-height:560px;display:grid;place-items:center;perspective:1200px}.panel{width:min(455px,100%);padding:18px;border:1px solid var(--line);border-radius:36px;background:linear-gradient(145deg,rgba(255,255,255,.14),rgba(255,255,255,.052));backdrop-filter:blur(34px) saturate(1.35);-webkit-backdrop-filter:blur(34px) saturate(1.35);box-shadow:var(--shadow);transform:rotateX(5deg) rotateY(-9deg) rotateZ(-1.5deg)}.panelbar{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;font-weight:820;letter-spacing:.09em;text-transform:uppercase}.orb{width:262px;height:262px;margin:24px auto 18px;border-radius:46% 54% 48% 52%/54% 45% 55% 46%;background:radial-gradient(circle at 36% 26%,rgba(255,255,255,.92),transparent 16%),radial-gradient(circle at 58% 62%,rgba(143,255,227,.48),transparent 35%),linear-gradient(135deg,rgba(139,215,255,.88),rgba(188,167,255,.58) 55%,rgba(255,138,163,.25));box-shadow:0 48px 150px rgba(139,215,255,.27),inset 0 0 82px rgba(255,255,255,.12);animation:breathe 7s ease-in-out infinite;display:grid;place-items:center;text-align:center}@keyframes breathe{0%,100%{transform:scale(1);border-radius:46% 54% 48% 52%/54% 45% 55% 46%}50%{transform:scale(1.035) rotate(2deg);border-radius:57% 43% 53% 47%/43% 58% 42% 57%}}.orb b{display:block;font-size:46px;letter-spacing:-.075em}.orb span{display:block;color:rgba(255,255,255,.72);font-size:13px;margin-top:4px}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.mini{padding:15px;border:1px solid rgba(255,255,255,.115);border-radius:21px;background:rgba(255,255,255,.068)}.mini b{display:block;font-size:22px;letter-spacing:-.045em}.mini span{display:block;color:var(--faint);font-size:12px;margin-top:3px}.receipt{margin-top:12px;padding:13px 14px;border-radius:18px;background:rgba(143,255,227,.09);border:1px solid rgba(143,255,227,.16);color:rgba(247,251,255,.78);font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.strip{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:18px 0 0}.proof{border:1px solid var(--line);border-radius:24px;background:rgba(255,255,255,.055);padding:18px}.proof b{display:block;font-size:25px;letter-spacing:-.05em}.proof span{color:var(--faint);font-size:12px}section{padding:62px 0}.title{font-size:clamp(36px,5vw,76px);line-height:.92;letter-spacing:-.065em;margin:0 0 18px}.copy{color:var(--muted);font-size:18px;line-height:1.55;max-width:790px}.kicker{color:var(--blue);font:12px ui-monospace,SFMono-Regular,Menlo,monospace;text-transform:uppercase;letter-spacing:.15em;margin-bottom:16px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:28px}.card{min-height:232px;padding:24px;border:1px solid var(--line);border-radius:var(--r);background:linear-gradient(145deg,rgba(255,255,255,.105),rgba(255,255,255,.045));box-shadow:0 24px 80px rgba(0,0,0,.22)}.card h3{margin:0 0 12px;font-size:22px;letter-spacing:-.04em}.card p{margin:0;color:var(--muted);line-height:1.56}.ledger{margin-top:28px;border:1px solid var(--line);border-radius:32px;overflow:hidden;background:rgba(255,255,255,.055)}.row{display:grid;grid-template-columns:140px 112px 1fr;gap:16px;padding:17px 20px;border-bottom:1px solid rgba(255,255,255,.08);color:var(--muted);font:13px ui-monospace,SFMono-Regular,Menlo,monospace}.row:last-child{border-bottom:0}.row b{color:var(--ink)}.blue{color:var(--blue)!important}.teal{color:var(--teal)!important}.amber{color:var(--amber)!important}.rose{color:var(--rose)!important}.pipeline{margin-top:28px;padding:24px;border:1px solid var(--line);border-radius:32px;background:rgba(255,255,255,.055);font:14px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--teal);line-height:1.8;white-space:pre-wrap}.download{margin-top:38px;padding:30px;border:1px solid rgba(255,255,255,.15);border-radius:36px;background:linear-gradient(145deg,rgba(139,215,255,.14),rgba(188,167,255,.085)),rgba(255,255,255,.055);display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}.download h2{margin:0 0 8px;font-size:36px;letter-spacing:-.05em}.download p{margin:0;color:var(--muted)}footer{padding:54px 0 72px;color:var(--faint);font-size:13px}.tag{display:inline-flex;border:1px solid rgba(143,255,227,.2);background:rgba(143,255,227,.075);color:var(--teal);border-radius:999px;padding:8px 12px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;margin:0 8px 8px 0}@media(max-width:920px){.hero-grid,.grid,.strip{grid-template-columns:1fr}.device{min-height:auto}.panel{transform:none}.links{display:none}.row{grid-template-columns:1fr;gap:5px}.h1{font-size:clamp(48px,14vw,78px)}}
+  </style>
+</head>
+<body>
+  <div class="noise"></div>
+  <header class="nav"><nav class="bar wrap"><a class="brand" href="#top"><span class="mark"></span><span>AI RAM Guardian</span></a><div class="links"><a href="#receipts">Receipts</a><a href="#automation">Automation</a><a href="./metal.html">Metal CI</a><a href="#download">Download</a><a class="btn" href="https://github.com/overandor/rentmasseur-extension/tree/main/ai-ram-guardian">GitHub</a></div></nav></header>
+  <main id="top">
+    <section class="hero wrap"><div class="hero-grid"><div><div class="eyebrow">Native macOS · local-first · receipt-backed</div><h1 class="h1">Your Mac should show its work.</h1><p class="lead">AI RAM Guardian is a glass menu-bar and desktop utility for Devin, Windsurf, Claude, Cursor, VS Code, and Codex. It watches memory, heat, focus, and helper processes — then writes a receipt for every intervention.</p><div class="actions"><a class="btn primary" href="#download">Build the DMG</a><a class="btn" href="./metal.html">Local Mac Metal CI</a></div><div class="fine">No fake boosts. No simulated savings. No killing whole apps. The proudest state is an empty ledger.</div></div><div class="device"><div class="panel"><div class="panelbar"><span>Guardian</span><span>Active · Flow</span></div><div class="orb"><div><b>6.5G</b><span>free · 54° · −82 ±14 MB/min</span></div></div><div class="metrics"><div class="mini"><b>41 GB</b><span>reclaimed</span></div><div class="mini"><b>18</b><span>receipts</span></div><div class="mini"><b>−4.4°</b><span>thermal proof</span></div></div><div class="receipt">PROOF · language_server: 71.2°C → 66.8°C · observational</div></div></div></div><div class="strip"><div class="proof"><b>Native</b><span>No Electron. One Mac binary.</span></div><div class="proof"><b>Local</b><span>Your Mac builds and measures.</span></div><div class="proof"><b>Metal</b><span>Hardware receipts for ML policy tuning.</span></div><div class="proof"><b>Honest</b><span>Every number has context.</span></div></div></section>
+    <section id="receipts" class="wrap"><div class="kicker">The anti-mock utility</div><h2 class="title">Every claim has a receipt.</h2><p class="copy">The product is not a RAM button. It is an auditable machine ledger: observe, decide, intervene gently, re-measure, persist proof, and make the uncertainty visible.</p><div class="ledger"><div class="row"><span>Jul 03 12:41</span><b class="teal">RECLAIM</b><span>Available memory +892 MB after 90 seconds.</span></div><div class="row"><span>Jul 03 12:36</span><b class="amber">SOOTHE</b><span>Demoted CPU-hot extension helper; proof scheduled in 5 minutes.</span></div><div class="row"><span>Jul 03 12:14</span><b class="blue">FLOW</b><span>Focus Claude — eased Devin helper processes, restored Claude helpers.</span></div><div class="row"><span>Jul 03 11:58</span><b class="rose">ANOMALY</b><span>Windsurf RSS exceeded its learned baseline by more than 3σ.</span></div></div></section>
+    <section id="automation" class="wrap"><div class="kicker">Glass outside. Discipline inside.</div><h2 class="title">Built for the agent desktop.</h2><p class="copy">AI coding tools changed the Mac workload: helper processes, language servers, local agents, indexers, renderers, and thermal spikes. Guardian treats the machine as a measured system, not a trash can to empty.</p><div class="grid"><article class="card"><h3>FLOW</h3><p>The machine follows your attention. Non-focused AI helpers ease down; focused helpers restore. Event-driven from macOS focus changes, not polling theater.</p></article><article class="card"><h3>SOOTHE</h3><p>When thermal state is serious, Guardian can demote the hottest eligible helper and re-measure later. Thermal receipts are labeled observational.</p></article><article class="card"><h3>Kalman pressure</h3><p>Memory pressure forecast with visible uncertainty. Warnings fire only when the trend clears its own error bar.</p></article><article class="card"><h3>Anomaly learning</h3><p>Per-app RSS baselines are learned on-device. Each AI tool is compared against its own normal, not a fake universal threshold.</p></article><article class="card"><h3>Whisper HUD</h3><p>A tiny glass receipt appears under the menu bar when an action lands, then disappears. The guardian is visible only when it matters.</p></article><article class="card"><h3>Self-audit</h3><p>The app publishes its own RAM and CPU cost in the UI. Efficiency claims are measured beside the workload they supervise.</p></article></div></section>
+    <section class="wrap"><div class="kicker">New CI loop</div><h2 class="title">GitHub triggers. Your Mac proves.</h2><p class="copy">The local Mac Metal CI/CD workflow turns GitHub into the control plane while your own Apple Silicon machine builds the DMG and writes safe hardware telemetry receipts.</p><div class="pipeline">workflow_dispatch
+  → self-hosted macOS ARM64 metal runner
+  → compile guardian.mm
+  → package AI-RAM-Guardian.dmg locally
+  → write Metal / hardware telemetry receipt
+  → upload DMG + sha256 + safe JSON receipt</div><div style="margin-top:18px"><span class="tag">self-hosted</span><span class="tag">macOS</span><span class="tag">ARM64</span><span class="tag">metal</span></div></section>
+    <section id="download" class="wrap"><div class="download"><div><h2>Direct DMG first.</h2><p>The full intervention engine is built for Developer ID + notarized DMG distribution. The App Store path is a read-only Ledger edition and share-card funnel.</p></div><div class="actions"><a class="btn primary" href="https://github.com/overandor/rentmasseur-extension/actions/workflows/ai-ram-guardian-local-mac-metal.yml">Run local Mac CI</a><a class="btn" href="https://github.com/overandor/rentmasseur-extension/actions/workflows/ai-ram-guardian-pages.yml">Deploy Pages</a></div></div></section>
+  </main>
+  <footer class="wrap">AI RAM Guardian · built for AI-heavy Macs · every number measured · every intervention receipt-backed · no fake boosts.</footer>
+</body>
+</html>
 
 ```
 
-checker.py:
+.nojekyll:
 ```
-#!/usr/bin/env python3
-"""RentMasseur availability checker.
 
-This script fetches provider profile pages and records whether each provider
-appears to be available. It is designed to run in CI/CD on a schedule.
+```
 
-Usage:
-    python3 checker.py                    # live scrape
-    python3 checker.py --mock           # demo with synthetic data
-    python3 checker.py --output data/availability.json
+create_dmg.sh:
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="AI RAM Guardian"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_DIR="$ROOT_DIR/build"
+DIST_DIR="$ROOT_DIR/dist"
+APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
+CONTENTS="$APP_BUNDLE/Contents"
+MACOS="$CONTENTS/MacOS"
+RESOURCES="$CONTENTS/Resources"
+DMG_PATH="$DIST_DIR/AI-RAM-Guardian.dmg"
+TMP_DMG="$DIST_DIR/AI-RAM-Guardian.tmp.dmg"
+VOLUME_NAME="AI RAM Guardian"
+
+cd "$ROOT_DIR"
+
+if [[ ! -f guardian.mm ]]; then
+  echo "error: ai-ram-guardian/guardian.mm is missing. Commit the production source before packaging." >&2
+  exit 2
+fi
+
+mkdir -p "$MACOS" "$RESOURCES" "$DIST_DIR"
+rm -rf "$APP_BUNDLE" "$TMP_DMG" "$DMG_PATH"
+mkdir -p "$MACOS" "$RESOURCES"
+
+if [[ -f Info.plist ]]; then
+  cp Info.plist "$CONTENTS/Info.plist"
+else
+  cat > "$CONTENTS/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>guardian</string>
+  <key>CFBundleIdentifier</key><string>com.overandor.airamguardian</string>
+  <key>CFBundleName</key><string>AI RAM Guardian</string>
+  <key>CFBundleDisplayName</key><string>AI RAM Guardian</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+fi
+
+clang++ -std=gnu++17 -O2 -Wall -Wextra -fobjc-arc \
+  -framework Cocoa -framework QuartzCore -framework IOKit \
+  guardian.mm -o "$MACOS/guardian"
+
+chmod +x "$MACOS/guardian"
+
+SIGN_IDENTITY="${DEVELOPER_ID_APP:-}"
+if [[ -n "$SIGN_IDENTITY" ]]; then
+  echo "Signing with: $SIGN_IDENTITY"
+  codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
+else
+  echo "No DEVELOPER_ID_APP set; using ad-hoc signature for local testing."
+  codesign --force --deep --sign - "$APP_BUNDLE"
+fi
+
+STAGING="$BUILD_DIR/dmg-staging"
+rm -rf "$STAGING"
+mkdir -p "$STAGING"
+cp -R "$APP_BUNDLE" "$STAGING/"
+ln -s /Applications "$STAGING/Applications"
+
+hdiutil create \
+  -volname "$VOLUME_NAME" \
+  -srcfolder "$STAGING" \
+  -ov \
+  -format UDRW \
+  "$TMP_DMG" >/dev/null
+
+hdiutil convert "$TMP_DMG" -format UDZO -imagekey zlib-level=9 -o "$DMG_PATH" >/dev/null
+rm -f "$TMP_DMG"
+
+if [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
+  echo "Submitting DMG for notarization..."
+  xcrun notarytool submit "$DMG_PATH" \
+    --apple-id "$APPLE_ID" \
+    --team-id "$APPLE_TEAM_ID" \
+    --password "$APPLE_APP_PASSWORD" \
+    --wait
+  xcrun stapler staple "$DMG_PATH"
+else
+  echo "Skipping notarization: APPLE_ID, APPLE_TEAM_ID, or APPLE_APP_PASSWORD not set."
+fi
+
+shasum -a 256 "$DMG_PATH" | tee "$DMG_PATH.sha256"
+
+echo "Created: $DMG_PATH"
+
+```
+
+PROVIDER_GROWTH_CRM_PRODUCTION_NOTES.md:
+```
+# Provider Growth CRM Production Notes
+
+This branch is no longer just a toy CRM scaffold. It now has a production-shaped local operator model:
+
+1. Local SQLite ledger.
+2. Default policy seed.
+3. Manual approval gate.
+4. Quiet-hour gate.
+5. Do-not-contact gates.
+6. Manual outbox state machine.
+7. Approved local handoff export.
+8. Conversation event receipts.
+9. Profile content versioning.
+10. Funnel and revenue liquidity KPIs.
+
+## Non-negotiable constraints
+
+The system is not an auto-sender. It is a local operator queue. The operator remains responsible for reviewing and performing any outbound action.
+
+The system is not a hidden-data collector. Records must come from sources the operator owns, controls, or is authorized to manage.
+
+The system is not a challenge/captcha bypass tool.
+
+## Real operating loop
+
+```text
+record demand signal
+→ score record
+→ create draft
+→ approve draft
+→ evaluate policy
+→ enqueue outbox item
+→ export manual handoff
+→ operator reviews on Mac/iMac
+→ operator completes/skips/fails item
+→ log conversation note
+→ update metrics snapshot
+→ log revenue event
+→ inspect revenue summary
+```
+
+## Why this is more serious
+
+The previous version stored records and drafts. This version adds operational control:
+
+- policy decisions are explicit
+- handoff has a state machine
+- revenue events are separate from vanity metrics
+- every important action can create a receipt
+- tests exercise the full approved outbox path
+
+## Next production layer
+
+To become production-grade, add:
+
+- migration files instead of schema-in-code only
+- encrypted local storage for sensitive aliases
+- desktop UI or menu bar wrapper
+- signed receipt chain
+- calendar availability integration
+- explicit consent/authorization intake for any managed account
+- test fixtures with synthetic data
+- macOS notification-only adapter
+- backup/export command
+
+```
+
+PROVIDER_GROWTH_CRM.md:
+```
+# Provider Growth CRM
+
+Provider Growth CRM turns the availability script into a local operator console for account-owned growth workflows.
+
+It is manual-first, receipt-backed, and policy-gated. It stores engagement records, profile content versions, draft suggestions, outbox state, iMac/Mac handoff files, conversion snapshots, revenue events, and receipts. It does not bypass access controls, collect hidden data, or transmit outbound content without human approval.
+
+## Modules
+
+- `provider_growth/db.py` — SQLite schema, default policy seed, indexes.
+- `provider_growth/receipts.py` — JSONL + SQLite audit receipts.
+- `provider_growth/engagement.py` — manual engagement records and scoring.
+- `provider_growth/drafts.py` — reviewable draft queue.
+- `provider_growth/policy.py` — approval, quiet-hour, and do-not-contact policy gate.
+- `provider_growth/outbox.py` — manual outbox state machine: queued, ready, blocked, exported, completed.
+- `provider_growth/kpi.py` — revenue events and funnel liquidity summary.
+- `provider_growth/profile_content.py` — bio, blog, interview, headline, and availability-note versions.
+- `provider_growth/experiments.py` — daily conversion snapshots and version summaries.
+- `provider_growth/imac_relay.py` — local manual handoff files for Mac review workflows.
+- `provider_growth_cli.py` — command-line console.
+
+## Production-shaped workflow
+
+```bash
+python provider_growth_cli.py init-db
+python provider_growth_cli.py policy
+python provider_growth_cli.py add-record "manual-client-handle" --name "Client"
+python provider_growth_cli.py priority-records
+python provider_growth_cli.py draft <record_key> --template same_day --name "Client" --channel imessage
+python provider_growth_cli.py evaluate-draft <draft_id>
+python provider_growth_cli.py approve-draft <draft_id>
+python provider_growth_cli.py enqueue <draft_id>
+python provider_growth_cli.py outbox --state ready
+python provider_growth_cli.py export-outbox <outbox_id>
+python provider_growth_cli.py complete-outbox <outbox_id> --outcome manual_completed
+python provider_growth_cli.py add-version bio bio_v1 "Profile text here" --reason "trust-focused version"
+python provider_growth_cli.py activate-version <version_id>
+python provider_growth_cli.py snapshot --version bio_v1 --views 50 --repeat 6 --contacts 4 --inbound 3 --bookings 1
+python provider_growth_cli.py revenue-event confirmed_booking --amount-cents 20000 --record-key <record_key>
+python provider_growth_cli.py revenue-summary
+```
+
+## State model
+
+Draft states:
+
+```text
+draft -> approved -> queued/outbox -> exported -> manual_completed
+                  \-> blocked
+                  \-> skipped
+                  \-> failed
+```
+
+Policy decisions:
+
+```text
+needs_approval
+allowed
+blocked
+defer
+```
+
+Revenue events:
+
+```text
+inquiry
+quote
+booking_request
+confirmed_booking
+completed_booking
+cancelled
+```
+
+## Compliance boundary
+
+Allowed:
+
+- account-owner records
+- manual imports
+- human-reviewed drafts
+- opt-out / do-not-contact handling
+- local receipts
+- content versioning
+- conversion measurement
+- approved local handoff files
+- manually logged revenue events
+
+Not allowed:
+
+- automated spam
+- hidden data collection
+- account access without authorization
+- challenge/captcha bypass
+- sending without explicit human approval
+- fake availability
+
+## Revenue loop
+
+Availability keeps the profile open for demand. Engagement records identify warm demand. Drafts keep conversations organized. Policy gates prevent sloppy action. Outbox creates an operator queue. iMac handoff turns an approved draft into a local review file. Profile versions test positioning. Metrics show which content creates contact actions and bookings. Revenue events turn conversations into pipeline. Receipts prove what happened.
+
+```
+
+canonicalization.py:
+```
+"""Stage 2 — Multimodal canonicalization.
+
+Normalize representation without pretending that normalization
+establishes truth. Every transformation produces the raw representation,
+the canonical representation, transformation history, input and output
+hashes, confidence, arbitration trace, receipt version, and explicit
+loss accounting.
+
+Canonicalization precedes interpretation, but canonicalization does not
+manufacture truth.
 """
 
-import argparse
-import json
-import os
-import random
+from __future__ import annotations
+
+import hashlib
 import re
-import sys
-import time
-from datetime import datetime, timezone
-from urllib.parse import urljoin
-
-import requests
-try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-    HAS_PLAYWRIGHT = True
-except ImportError:
-    HAS_PLAYWRIGHT = False
-    PlaywrightTimeoutError = TimeoutError
-
-DEFAULT_PROVIDERS = "providers.json"
-DEFAULT_OUTPUT = "availability.json"
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
-)
+import unicodedata
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 
-def load_providers(path):
-    with open(path, "r") as f:
-        data = json.load(f)
-    if isinstance(data, dict) and "providers" in data:
-        return data["providers"]
-    return data
+@dataclass
+class TransformationStep:
+    """A single transformation applied during canonicalization."""
+    name: str
+    description: str
+    input_hash: str
+    output_hash: str
+    loss: str = "none"  # none | whitespace | encoding | ocr | boilerplate | privacy
 
 
-def fetch_profile(url, timeout=20):
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://rentmasseur.com/",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
-    time.sleep(random.uniform(1.5, 3.5))
-    resp = requests.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp.text
+@dataclass
+class CanonicalForm:
+    """The output of canonicalization."""
+    raw: str
+    canonical: str
+    raw_hash: str
+    canonical_hash: str
+    transformations: list[TransformationStep] = field(default_factory=list)
+    confidence: float = 1.0
+    arbitration_trace: list[str] = field(default_factory=list)
+    receipt_version: str = "1.0"
+    loss_accounting: list[str] = field(default_factory=list)
 
-
-def extract_availability(html):
-    text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.S | re.I)
-    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.S | re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-
-    body_lower = text.lower()
-    is_available = bool(
-        re.search(r"available now|available today|open now", body_lower)
-    )
-
-    rate_match = re.search(r"\$\d+(?:/hr| per hour|\.\d{2})", text)
-    rate = rate_match.group(0) if rate_match else ""
-
-    location_match = re.search(
-        r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)?,\s*(?:NY|NJ|CA|TX|FL|IL|PA|OH|GA|NC|MI))",
-        text,
-    )
-    location = location_match.group(1) if location_match else ""
-
-    name = ""
-    title_match = re.search(r"<title>([^<]+)</title>", html, flags=re.I)
-    if title_match:
-        title = title_match.group(1).strip()
-        name_match = re.match(r"^(.+?)\s*[-|]", title)
-        name = name_match.group(1).strip() if name_match else title
-
-    status = "available" if is_available else "unknown"
-    return {
-        "name": name,
-        "status": status,
-        "rate": rate,
-        "location": location,
-        "sample_text": text[:200],
-    }
-
-
-def check_provider(provider, mock=False):
-    url = provider.get("url")
-    slug = provider.get("slug") or url.rstrip("/").split("/")[-1]
-    if not url:
-        raise ValueError(f"Provider missing URL: {provider}")
-
-    if mock:
+    def to_dict(self) -> dict:
         return {
-            "slug": slug,
-            "url": url,
-            "name": provider.get("name", "Mock Provider"),
-            "status": provider.get("mock_status", "available"),
-            "rate": provider.get("rate", "$150/hr"),
-            "location": provider.get("location", "New York, NY"),
-            "checked_at": datetime.now(timezone.utc).isoformat(),
-            "mode": "mock",
+            "raw_hash": self.raw_hash,
+            "canonical_hash": self.canonical_hash,
+            "transformations": [
+                {"name": t.name, "description": t.description, "loss": t.loss,
+                 "input_hash": t.input_hash, "output_hash": t.output_hash}
+                for t in self.transformations
+            ],
+            "confidence": self.confidence,
+            "arbitration_trace": self.arbitration_trace,
+            "receipt_version": self.receipt_version,
+            "loss_accounting": self.loss_accounting,
+            "canonical": self.canonical,
         }
 
-    html = fetch_profile(url)
-    result = extract_availability(html)
-    result["slug"] = slug
-    result["url"] = url
-    result["checked_at"] = datetime.now(timezone.utc).isoformat()
-    result["mode"] = "live"
-    return result
+
+class Canonicalizer:
+    """Normalize input through a governed transformation pipeline."""
+
+    # Homoglyph ranges to normalize (Latin lookalikes)
+    HOMOGLYPH_MAP = {
+        "\u0430": "a",  # Cyrillic a
+        "\u0435": "e",  # Cyrillic e
+        "\u043e": "o",  # Cyrillic o
+        "\u0440": "p",  # Cyrillic p
+        "\u0441": "c",  # Cyrillic c
+        "\u0445": "x",  # Cyrillic x
+        "\u0443": "y",  # Cyrillic y
+        "\uff21": "A",  # Fullwidth A
+        "\uff22": "B",  # Fullwidth B
+    }
+
+    # Bidi control characters to strip
+    BIDI_CONTROLS = {
+        "\u200e", "\u200f",  # LRM, RLM
+        "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",  # LRE, RLE, PDF, LRO, RLO
+        "\u2066", "\u2067", "\u2068", "\u2069",  # LRI, RLI, FSI, PDI
+    }
+
+    def __init__(self, enable_privacy: bool = False):
+        self.enable_privacy = enable_privacy
+
+    def _sha256(self, text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _step(self, name: str, desc: str, before: str, after: str, loss: str = "none") -> TransformationStep:
+        return TransformationStep(
+            name=name,
+            description=desc,
+            input_hash=self._sha256(before),
+            output_hash=self._sha256(after),
+            loss=loss,
+        )
+
+    def canonicalize(self, raw: str) -> CanonicalForm:
+        """Apply the full canonicalization pipeline."""
+        raw_hash = self._sha256(raw)
+        steps: list[TransformationStep] = []
+        arbitration: list[str] = []
+        losses: list[str] = []
+
+        current = raw
+
+        # 1. Unicode normalization (NFC)
+        normalized = unicodedata.normalize("NFC", current)
+        if normalized != current:
+            steps.append(self._step("unicode_nfc", "Unicode NFC normalization", current, normalized, "encoding"))
+            losses.append("unicode_normalization: combining characters composed")
+            current = normalized
+
+        # 2. Strip bidi control characters
+        stripped = "".join(c for c in current if c not in self.BIDI_CONTROLS)
+        if stripped != current:
+            steps.append(self._step("strip_bidi", "Remove bidirectional control characters", current, stripped, "encoding"))
+            losses.append("bidi_controls_removed: invisible formatting stripped")
+            current = stripped
+
+        # 3. Homoglyph normalization
+        homoglyphed = current
+        for src, dst in self.HOMOGLYPH_MAP.items():
+            homoglyphed = homoglyphed.replace(src, dst)
+        if homoglyphed != current:
+            steps.append(self._step("homoglyph_normalize", "Normalize homoglyph lookalikes", current, homoglyphed, "encoding"))
+            losses.append("homoglyphs_normalized: visual lookalikes mapped to ASCII")
+            arbitration.append("homoglyph: Cyrillic/fullwidth lookalikes detected and normalized")
+            current = homoglyphed
+
+        # 4. Whitespace stabilization
+        ws_stabilized = re.sub(r"[ \t]+", " ", current)
+        ws_stabilized = re.sub(r"\r\n?", "\n", ws_stabilized)
+        ws_stabilized = re.sub(r"\n{3,}", "\n\n", ws_stabilized)
+        ws_stabilized = ws_stabilized.strip()
+        if ws_stabilized != current:
+            steps.append(self._step("whitespace_stabilize", "Collapse runs, normalize newlines, strip edges", current, ws_stabilized, "whitespace"))
+            losses.append("whitespace_normalized: multiple spaces/tabs collapsed, CRLF→LF, trailing whitespace stripped")
+            current = ws_stabilized
+
+        # 5. Boilerplate isolation (detect and mark common boilerplate)
+        boilerplate_patterns = [
+            (r"(?i)^(disclaimer:|note:|warning:|caution:)\s.*$", "boilerplate_disclaimer"),
+            (r"(?i)^-{5,}$", "boilerplate_separator"),
+            (r"(?i)^={5,}$", "boilerplate_separator"),
+        ]
+        boilerplate_lines = []
+        for line in current.split("\n"):
+            for pattern, label in boilerplate_patterns:
+                if re.match(pattern, line.strip()):
+                    boilerplate_lines.append(line.strip())
+                    break
+        if boilerplate_lines:
+            arbitration.append(f"boilerplate_detected: {len(boilerplate_lines)} boilerplate lines identified (not removed, marked)")
+
+        # 6. Privacy transformations (if enabled)
+        if self.enable_privacy:
+            # Redact email addresses
+            redacted = re.sub(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b", "[EMAIL_REDACTED]", current)
+            if redacted != current:
+                steps.append(self._step("privacy_email_redact", "Redact email addresses", current, redacted, "privacy"))
+                losses.append("email_redacted: email addresses replaced with [EMAIL_REDACTED]")
+                current = redacted
+
+            # Redact phone numbers
+            redacted = re.sub(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b", "[PHONE_REDACTED]", current)
+            if redacted != current:
+                steps.append(self._step("privacy_phone_redact", "Redact phone numbers", current, redacted, "privacy"))
+                losses.append("phone_redacted: phone numbers replaced with [PHONE_REDACTED]")
+                current = redacted
+
+        canonical_hash = self._sha256(current)
+
+        # Confidence: reduced by each lossy transformation
+        confidence = 1.0
+        lossy_count = sum(1 for s in steps if s.loss != "none")
+        confidence = max(0.5, 1.0 - (lossy_count * 0.05))
+
+        return CanonicalForm(
+            raw=raw,
+            canonical=current,
+            raw_hash=raw_hash,
+            canonical_hash=canonical_hash,
+            transformations=steps,
+            confidence=confidence,
+            arbitration_trace=arbitration,
+            receipt_version="1.0",
+            loss_accounting=losses,
+        )
+
+```
+
+__init__.py:
+```
+"""Artifact Continuity Runtime — 11-stage pipeline for disciplined AI execution.
+
+Stages:
+  1. Evidence ingestion
+  2. Multimodal canonicalization
+  3. Semantic glyph compilation
+  4. Anti-overcompute gate
+  5. Minimum-evidence retrieval
+  6. Shadow Self (local resolution)
+  7. Model router
+  8. Frontier execution
+  9. Verification
+ 10. Shadow learning
+ 11. Cost receipt
+
+Every terminal path produces a receipt. Intelligence already purchased
+becomes reusable state. The executor is temporary; preserved state is
+authoritative.
+"""
+
+from .runtime import ArtifactContinuityRuntime, RuntimeResult
+from .evidence import Evidence, EvidenceStore
+from .canonicalization import Canonicalizer, CanonicalForm
+from .glyph_compiler import GlyphCompiler, TaskSignature
+from .overcompute_gate import OvercomputeGate, CacheEntry
+from .retrieval import EvidenceRetriever
+from .shadow_self import ShadowSelf
+from .model_router import ModelRouter, Route
+from .frontier import FrontierExecutor
+from .verification import Verifier
+from .shadow_learning import ShadowLearner, LearningClass
+from .cost_receipt import CostReceipt
+from .artifact_registry import ArtifactRegistry
+
+__version__ = "0.1.0"
+
+```
+
+evidence.py:
+```
+"""Stage 1 — Evidence ingestion.
+
+Preserve raw bytes before interpretation. Record source, timestamp,
+tenant, media type, acquisition method, access boundary, and content hash.
+
+The original evidence must remain available even when later stages
+produce a cleaner representation.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
 
 
-def run_check(providers_path, output_path, mock=False):
-    providers = load_providers(providers_path)
-    results = []
-    errors = []
-    for provider in providers:
-        try:
-            result = check_provider(provider, mock=mock)
-            results.append(result)
-        except Exception as e:
-            errors.append({"provider": provider, "error": str(e)})
+@dataclass
+class Evidence:
+    """A single piece of preserved evidence."""
+    id: str
+    source: str
+    timestamp: str
+    tenant: str
+    media_type: str
+    acquisition_method: str
+    access_boundary: str
+    content_hash: str
+    raw_bytes: bytes = b""
+    metadata: dict = field(default_factory=dict)
+    size: int = 0
 
-    record = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "mock" if mock else "live",
-        "count": len(results),
-        "providers": results,
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "source": self.source,
+            "timestamp": self.timestamp,
+            "tenant": self.tenant,
+            "media_type": self.media_type,
+            "acquisition_method": self.acquisition_method,
+            "access_boundary": self.access_boundary,
+            "content_hash": self.content_hash,
+            "size": self.size,
+            "metadata": self.metadata,
+        }
+
+
+class EvidenceStore:
+    """SQLite-backed evidence store. Raw bytes preserved on disk."""
+
+    def __init__(self, db_path: Path | str = "artifacts/acr/evidence.db"):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.blob_dir = self.db_path.parent / "evidence_blobs"
+        self.blob_dir.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(str(self.db_path))
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS evidence (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                tenant TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                acquisition_method TEXT NOT NULL,
+                access_boundary TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                blob_path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                metadata TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_evidence_hash ON evidence(content_hash);
+            CREATE INDEX IF NOT EXISTS idx_evidence_source ON evidence(source);
+            CREATE INDEX IF NOT EXISTS idx_evidence_ts ON evidence(timestamp);
+        """)
+        conn.commit()
+        conn.close()
+
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _sha256(self, data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    def ingest(
+        self,
+        source: str,
+        data: bytes | str,
+        media_type: str = "text/plain",
+        tenant: str = "default",
+        acquisition_method: str = "direct",
+        access_boundary: str = "local",
+        metadata: Optional[dict] = None,
+    ) -> Evidence:
+        """Ingest raw evidence and return the Evidence record."""
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        content_hash = self._sha256(data)
+        ts = self._now_iso()
+        ev_id = f"ev_{content_hash[:16]}_{int(time.time())}"
+
+        blob_path = self.blob_dir / f"{ev_id}.bin"
+        blob_path.write_bytes(data)
+
+        ev = Evidence(
+            id=ev_id,
+            source=source,
+            timestamp=ts,
+            tenant=tenant,
+            media_type=media_type,
+            acquisition_method=acquisition_method,
+            access_boundary=access_boundary,
+            content_hash=content_hash,
+            raw_bytes=data,
+            size=len(data),
+            metadata=metadata or {},
+        )
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute(
+            """INSERT OR REPLACE INTO evidence
+               (id, source, timestamp, tenant, media_type, acquisition_method,
+                access_boundary, content_hash, blob_path, size, metadata)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (ev_id, source, ts, tenant, media_type, acquisition_method,
+             access_boundary, content_hash, str(blob_path), len(data),
+             json.dumps(metadata or {})),
+        )
+        conn.commit()
+        conn.close()
+        return ev
+
+    def get(self, ev_id: str) -> Optional[Evidence]:
+        conn = sqlite3.connect(str(self.db_path))
+        row = conn.execute("SELECT * FROM evidence WHERE id = ?", (ev_id,)).fetchone()
+        conn.close()
+        if not row:
+            return None
+        blob_path = Path(row[8])
+        raw = blob_path.read_bytes() if blob_path.exists() else b""
+        return Evidence(
+            id=row[0], source=row[1], timestamp=row[2], tenant=row[3],
+            media_type=row[4], acquisition_method=row[5], access_boundary=row[6],
+            content_hash=row[7], raw_bytes=raw, size=row[9],
+            metadata=json.loads(row[10]) if row[10] else {},
+        )
+
+    def by_hash(self, content_hash: str) -> list[Evidence]:
+        conn = sqlite3.connect(str(self.db_path))
+        rows = conn.execute("SELECT id FROM evidence WHERE content_hash = ?", (content_hash,)).fetchall()
+        conn.close()
+        return [self.get(r[0]) for r in rows if self.get(r[0])]
+
+    def recent(self, limit: int = 20) -> list[dict]:
+        conn = sqlite3.connect(str(self.db_path))
+        rows = conn.execute(
+            "SELECT id, source, timestamp, media_type, content_hash, size FROM evidence ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        conn.close()
+        return [{"id": r[0], "source": r[1], "timestamp": r[2], "media_type": r[3],
+                 "content_hash": r[4], "size": r[5]} for r in rows]
+
+```
+
+metrics_20260717_161247.json:
+```
+{
+  "action": "metrics-collector",
+  "timestamp": "2026-07-17T16:12:47.915837+00:00",
+  "source": "first_party_extension_or_manual",
+  "automated_login": false,
+  "captcha_bypassed": false,
+  "metrics_processed": 0,
+  "availability_updated": false,
+  "status": "completed",
+  "summary": {
+    "status": "no_data",
+    "message": "No metrics ingested yet."
+  }
+}
+```
+
+rotation_20260708_084507.json:
+```
+{
+  "action": "master-rotator",
+  "timestamp": "2026-07-08T08:45:07Z",
+  "run_id": "28929228535",
+  "dry_run": "true",
+  "components": "all",
+  "preflight_passed": true,
+  "gate_decision": {
+  "status": "blocked_missing_real_inputs",
+  "reason": "Real first-party metrics and candidate TSV are required before a live profile decision.",
+  "live_update_allowed": false,
+  "dry_run": "true",
+  "run_id": "28929228535"
+},
+  "content_changed": " M content/decisions/latest_decision.json ?? production_control_loop ?? receipts/rotation_20260708_084507.json ",

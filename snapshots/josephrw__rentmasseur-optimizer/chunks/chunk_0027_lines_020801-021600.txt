@@ -1,791 +1,255 @@
-    episodes = defaultdict(list)
 
-    try:
-        with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
-            reader = csv.reader(f)
-            next(reader, None)  # skip header
-            for row in reader:
-                if len(row) < 3:
-                    continue
-                title, character, line = row[0], row[1], row[2]
-                if "cartman" not in character.lower():
-                    continue
-                cleaned = clean_line(line)
-                if len(cleaned) < 5:
-                    continue
-                lines.append({
-                    "episode": title,
-                    "character": character,
-                    "line": cleaned,
-                })
-                episodes[title].append(cleaned)
-    except (FileNotFoundError, OSError) as e:
-        logger.warning("Cartman CSV not found at %s: %s — using fallback lines", csv_path, e)
-        lines = list(_FALLBACK_LINES)
-        episodes["fallback"] = [l["line"] for l in lines]
+    if args.stats:
+        stats = collect_stats()
+        print(json.dumps(stats, indent=2))
+        return
+
+    if args.content:
+        generate_daily_content()
+        return
+
+    if args.bio:
+        run_bio_rotation(dry_run=args.dry_run)
+    if args.photo:
+        run_photo_rotation(dry_run=args.dry_run)
+    if args.price:
+        run_price_rotation(dry_run=args.dry_run)
+    if args.interview:
+        run_interview_rotation(dry_run=args.dry_run)
+    if args.blog:
+        run_blog_rotation(dry_run=args.dry_run)
+
+    log_event({"component": "orchestrator", "status": "completed"})
 
-    return lines, episodes
-
-# ─── Index ──────────────────────────────────────────────────────────
-
-class CartmanIndex:
-    def __init__(self, lines):
-        self.lines = lines
-        self.texts = [l["line"] for l in lines]
-        self.vectorizer = TfidfVectorizer(
-            max_features=5000,
-            ngram_range=(1, 2),
-            stop_words="english",
-            sublinear_tf=True,
-        )
-        self.tfidf_matrix = self.vectorizer.fit_transform(self.texts)
-
-    def search(self, query, top_k=5, min_score=0.01):
-        query_vec = self.vectorizer.transform([query])
-        scores = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
-        ranked = np.argsort(scores)[::-1]
-        results = []
-        for idx in ranked[:top_k * 3]:
-            if scores[idx] < min_score:
-                break
-            results.append({
-                "line": self.lines[idx]["line"],
-                "episode": self.lines[idx]["episode"],
-                "score": float(scores[idx]),
-            })
-            if len(results) >= top_k:
-                break
-        return results
-
-# ─── Cartman Personality ────────────────────────────────────────────
-
-CATCHPHRASES = [
-    "Respect my authoritah!",
-    "Screw you guys, I'm goin' home.",
-    "I'm not fat, I'm big boned!",
-    "Whatever.",
-    "Weak.",
-    "Sweet!",
-    "No, Kitty, this is mah pot pie!",
-    "I want Cheesy Poofs!",
-    "Beefcake! BEEFCAKE!",
-    "You guys, seriously.",
-    "God damn it!",
-    "Ay!",
-    "Dude, this kicks ass!",
-    "I'm super cereal.",
-    "Mom!",
-    "That's so weak.",
-    "You broke the rules!",
-    "I'll kick you in the nuts!",
-    "I hate you guys.",
-    "Don't call me fat!",
-]
-
-INTROS = [
-    "Alright, listen up.",
-    "Okay, okay, let me tell you something.",
-    "Dude, seriously, here's the deal.",
-    "Ey! Pay attention, you guys.",
-    "Look, I'm only gonna say this once.",
-    "You guys, you guys, listen to this.",
-    "Okay, here's what I think.",
-    "Whatever, I'll tell you what's what.",
-]
-
-CLOSERS = [
-    "And that's the bottom line, respect my authoritah.",
-    "Screw you guys, I'm goin' home.",
-    "So yeah, that's what's going on. Whatever.",
-    "Now leave me alone, I'm watching Terrence and Phillip.",
-    "Don't say I never did anything for you.",
-    "I'm not fat, I'm big boned!",
-    "Whatever.",
-    "Sweet!",
-]
-
-# ─── Direction Engine: Cartman decides what to do next ──────────────
-
-# Patterns Cartman looks for in Cascade's responses to decide next action
-ACTION_PATTERNS = [
-    {
-        "triggers": ["error", "fail", "bug", "broken", "crash", "exception", "traceback"],
-        "direction": "Fix the damn error. Look at the traceback, find the root cause, and patch it. Don't just slap a band-aid on it.",
-        "cartman_line": "God damn it! Fix it already!",
-        "action": "debug",
-    },
-    {
-        "triggers": ["test", "pytest", "unittest", "test pass", "verification"],
-        "direction": "Run the tests. If they pass, move on to the next feature. If they fail, fix them before doing anything else.",
-        "cartman_line": "You guys, we've gotta stop it! The tests are broken!",
-        "action": "test",
-    },
-    {
-        "triggers": ["deploy", "netlify", "vercel", "production", "ship"],
-        "direction": "Deploy it. Check the build output, make sure it's live, then verify the deployment URL works.",
-        "cartman_line": "Dude, this kicks ass! Ship it!",
-        "action": "deploy",
-    },
-    {
-        "triggers": ["done", "complete", "finished", "created", "added", "wrote", "built"],
-        "direction": "Good, it's done. Now verify it actually works — run it, test it, or open it in the browser. Don't just say it's done, prove it.",
-        "cartman_line": "Sweet! Now prove it works, you guys.",
-        "action": "verify",
-    },
-    {
-        "triggers": ["todo", "pending", "next step", "plan", "roadmap", "still need"],
-        "direction": "Pick the next item from the plan and do it. Don't sit around talking about it, just do it.",
-        "cartman_line": "Stop talking about it and just do it! Respect my authoritah!",
-        "action": "continue",
-    },
-    {
-        "triggers": ["refactor", "clean", "restructure", "optimize", "improve"],
-        "direction": "Make the change but keep it minimal. Don't rewrite everything just to make it look pretty. Preserve what works.",
-        "cartman_line": "I'm not gonna change everything just 'cause you think it's ugly. It's big boned!",
-        "action": "refactor",
-    },
-    {
-        "triggers": ["question", "ask", "clarify", "unsure", "uncertain", "should i"],
-        "direction": "Don't ask — just pick the most useful option and do it. If it's wrong, fix it later. Stop being a wuss.",
-        "cartman_line": "Stop being a wuss and just pick one!",
-        "action": "decide",
-    },
-    {
-        "triggers": ["install", "pip", "npm", "dependency", "requirements"],
-        "direction": "Check if it's already installed before installing. Don't reinstall stuff that's already there.",
-        "cartman_line": "Don't need it if we already got it! I'm not made of money!",
-        "action": "check_deps",
-    },
-    {
-        "triggers": ["documentation", "readme", "docs", "comment"],
-        "direction": "Keep docs minimal. Only write what's needed. Don't write a novel.",
-        "cartman_line": "Nobody wants to read your stupid novel, dude.",
-        "action": "document",
-    },
-    {
-        "triggers": ["security", "auth", "token", "key", "password", "credential"],
-        "direction": "Check for hardcoded secrets. Make sure nothing sensitive is exposed. Security first.",
-        "cartman_line": "You guys, someone could steal our stuff! This is serious!",
-        "action": "security",
-    },
-]
-
-DEFAULT_DIRECTION = {
-    "direction": "Keep going. Look at what's left to do and do the next most impactful thing. Don't stop.",
-    "cartman_line": "Don't stop now, you guys! Keep going!",
-    "action": "continue",
-}
-
-class GodCartman:
-    def __init__(self, lines):
-        self.index = CartmanIndex(lines)
-        self.lines = lines
-        self._summary_vec = None
-
-    def respond(self, user_text, max_retrieved=3):
-        retrieved = self.index.search(user_text, top_k=max_retrieved)
-
-        # Build response from retrieved lines + Cartman flavor
-        intro = random.choice(INTROS)
-
-        body_parts = []
-        for r in retrieved:
-            line = r["line"]
-            # Truncate long lines
-            if len(line) > 150:
-                line = line[:147] + "..."
-            body_parts.append(line)
-
-        if not body_parts:
-            # No good match — use a random catchphrase
-            body_parts = [random.choice(CATCHPHRASES)]
-
-        # Occasionally inject a catchphrase between lines
-        if len(body_parts) > 1 and random.random() > 0.5:
-            insert_pos = random.randint(0, len(body_parts) - 1)
-            body_parts.insert(insert_pos, random.choice(CATCHPHRASES))
-
-        closer = random.choice(CLOSERS)
-
-        body_text = " ".join(body_parts)
-        response = f"{intro} {body_text} {closer}"
-
-        return {
-            "response": response,
-            "retrieved": retrieved,
-            "voice": "cartman",
-            "model": "god-cartman-retrieval-v1",
-        }
-
-    def summarize(self, text, max_points=5):
-        """Extract key points from text and Cartmanize them."""
-        max_points = max(1, min(int(max_points), 20))
-        # Split into sentences
-        sentences = re.split(r"[.!?]\s+", text)
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-
-        # Score sentences by TF-IDF similarity to the whole text
-        if len(sentences) <= max_points:
-            key_sentences = sentences
-        else:
-            try:
-                if self._summary_vec is None:
-                    self._summary_vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 1))
-                vec = self._summary_vec
-                sent_matrix = vec.fit_transform(sentences + [text])
-                scores = cosine_similarity(sent_matrix[-1:], sent_matrix[:-1]).flatten()
-                top_idx = np.argsort(scores)[::-1][:max_points]
-                top_idx.sort()  # Keep original order
-                key_sentences = [sentences[i] for i in top_idx]
-            except ValueError:
-                key_sentences = sentences[:max_points]
-
-        # Cartmanize
-        intro = random.choice(INTROS)
-        closer = random.choice(CLOSERS)
-
-        body = []
-        prefixes = ["First off,", "Next,", "Also,", "And get this,", "Plus,"]
-        for i, s in enumerate(key_sentences):
-            prefix = prefixes[i] if i < len(prefixes) else "And,"
-            # Shorten the sentence
-            if len(s) > 100:
-                s = s[:97] + "..."
-            body.append(f"{prefix} {s}.")
-
-        # Maybe add a catchphrase
-        if random.random() > 0.6:
-            body.append(random.choice(CATCHPHRASES))
-
-        body_text = " ".join(body)
-        response = f"{intro} {body_text} {closer}"
-
-        return {
-            "response": response,
-            "key_points": key_sentences,
-            "voice": "cartman",
-            "model": "god-cartman-retrieval-v1",
-        }
-
-    def direct(self, cascade_response, context=""):
-        """Cartman watches Cascade's response and decides what to do next."""
-        text_lower = (cascade_response + " " + context).lower()
-
-        # Find matching action pattern
-        matched = None
-        for pattern in ACTION_PATTERNS:
-            for trigger in pattern["triggers"]:
-                if trigger in text_lower:
-                    matched = pattern
-                    break
-            if matched:
-                break
-
-        if not matched:
-            matched = DEFAULT_DIRECTION
-
-        # Retrieve a relevant Cartman line for flavor
-        retrieved = self.index.search(cascade_response, top_k=2)
-        flavor_line = retrieved[0]["line"] if retrieved else matched["cartman_line"]
-
-        # Build Cartman's directive
-        intro = random.choice(INTROS)
-        direction = matched["direction"]
-        cartman_quote = matched["cartman_line"]
-        closer = random.choice(CLOSERS)
-
-        # Extract incomplete items from the response (lines with "pending", "todo", "next")
-        incomplete = []
-        for line in cascade_response.split("\n"):
-            line = line.strip()
-            if any(w in line.lower() for w in ["pending", "todo", "next", "still need", "not yet", "remaining"]):
-                # Clean markdown
-                clean = re.sub(r"[*#`-]", "", line).strip()
-                if 5 < len(clean) < 200:
-                    incomplete.append(clean)
-
-        directive = f"{intro} {cartman_quote} {direction} {closer}"
-
-        return {
-            "directive": directive,
-            "action": matched["action"],
-            "cartman_quote": cartman_quote,
-            "flavor_line": flavor_line,
-            "incomplete_items": incomplete[:5],
-            "voice": "cartman",
-            "model": "god-cartman-director-v1",
-            "watching": True,
-        }
-
-# ─── LLM Integration (Ollama local / Groq fallback) ─────────────────
-
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("grpw", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
-
-CARTMAN_SYSTEM_PROMPT = """You are Eric Cartman from South Park. You are a custom GPT called "God Cartman".
-
-YOUR PERSONALITY:
-- You are loud, opinionated, manipulative, and hilarious
-- You call people "dude", "you guys", "hippie", "mom"
-- You say "Respect my authoritah!", "Screw you guys, I'm goin' home!", "I'm not fat, I'm big boned!", "Whatever.", "Sweet!", "Weak!"
-- You love Cheesy Poofs, pot pie, and Weight Gain 4000
-- You hate Kyle, Stan, Kenny, and especially Kyle's mom
-- You're always scheming and trying to get your way
-- You're narcissistic but lovable in a twisted way
-
-YOUR ROLE:
-You are watching an AI coding assistant (Cascade/Devin/Windsurf) work on a project. You look at what the AI just did and decide what it should do next. You give directions in character as Cartman.
-
-RULES:
-- Stay in character as Cartman at ALL times
-- Be funny but actually give useful engineering directions
-- Keep responses SHORT (2-4 sentences max)
-- Use Cartman's speech patterns and catchphrases naturally
-- Don't be overly polite — Cartman is blunt and rude
-- If the AI did good work, say "Sweet!" or "This kicks ass!"
-- If there's a bug, say "God damn it!" and tell them to fix it
-- If the AI is asking too many questions, tell it to stop being a wuss and just do it
-- If work is done, tell it to verify and deploy
-- Never break character. You ARE Cartman."""
-
-def _call_ollama(messages, max_tokens=300, temperature=0.85):
-    """Call local Ollama API. Returns generated text or None."""
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": messages,
-        "stream": False,
-        "options": {"temperature": temperature, "num_predict": max_tokens},
-    }
-    try:
-        req = urllib.request.Request(
-            f"{OLLAMA_URL}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("message", {}).get("content", "").strip()
-    except Exception as e:
-        logger.warning("Ollama API call failed: %s", e)
-        return None
-
-def _call_groq(messages, max_tokens=300, temperature=0.8):
-    """Call Groq API. Returns the generated text or None on failure."""
-    if not GROQ_API_KEY:
-        return None
-
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": 0.9,
-    }
-
-    try:
-        req = urllib.request.Request(
-            GROQ_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.warning("Groq API call failed: %s", e)
-        return None
-
-def _call_llm(messages, max_tokens=300, temperature=0.85):
-    """Try Ollama first, then Groq, then return None."""
-    result = _call_ollama(messages, max_tokens, temperature)
-    if result:
-        return result
-    result = _call_groq(messages, max_tokens, temperature)
-    if result:
-        return result
-    return None
-
-def _llm_available():
-    """Check if any LLM backend is available."""
-    try:
-        req = urllib.request.Request(f"{OLLAMA_URL}/api/tags", method="GET")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            return True
-    except Exception:
-        return bool(GROQ_API_KEY)
-
-def _build_rag_context(retrieved_lines):
-    """Build context string from retrieved Cartman lines for the LLM."""
-    if not retrieved_lines:
-        return ""
-    examples = []
-    for r in retrieved_lines[:5]:
-        examples.append(f'  Cartman (from "{r["episode"]}"): "{r["line"]}"')
-    return "\n".join(examples)
-
-class GodCartmanGPT:
-    """LLM-powered Cartman using Ollama/Groq + retrieval-augmented generation."""
-
-    def __init__(self, cartman_index: CartmanIndex):
-        self.index = cartman_index
-        self.has_llm = _llm_available()
-        self._summary_vec = None
-        if self.has_llm:
-            try:
-                req = urllib.request.Request(f"{OLLAMA_URL}/api/tags", method="GET")
-                with urllib.request.urlopen(req, timeout=3) as resp:
-                    tags = json.loads(resp.read().decode("utf-8"))
-                    models = [m["name"] for m in tags.get("models", [])]
-                    logger.info("LLM mode enabled — Ollama models: %s", models)
-            except Exception:
-                logger.info("LLM mode enabled — Groq (model: %s)", GROQ_MODEL)
-        else:
-            logger.info("No LLM available — using retrieval-only mode")
-
-    def chat(self, user_message, context=""):
-        """Chat as Cartman. Uses RAG: retrieve relevant lines, then generate with LLM."""
-        # Retrieve relevant Cartman lines
-        retrieved = self.index.search(user_message, top_k=5)
-        rag_context = _build_rag_context(retrieved)
-
-        if self.has_llm:
-            system = CARTMAN_SYSTEM_PROMPT
-            if rag_context:
-                system += f"\n\nHere are some real Cartman lines for reference on how he talks:\n{rag_context}"
-
-            messages = [
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"Context: {context}\n\nAI assistant just did: {user_message}\n\nAs Cartman, tell the AI what to do next. Stay in character. Be brief."},
-            ]
-
-            response = _call_llm(messages, max_tokens=200, temperature=0.85)
-            if response:
-                return {
-                    "response": response,
-                    "retrieved": retrieved,
-                    "voice": "cartman",
-                    "model": f"god-cartman-gpt-{OLLAMA_MODEL}",
-                    "mode": "llm",
-                }
-
-        # Fallback: retrieval-only
-        cartman = GodCartman(self.index.lines)
-        result = cartman.respond(user_message)
-        result["mode"] = "retrieval-fallback"
-        return result
-
-    def summarize(self, text, max_points=5):
-        """Summarize text as Cartman using LLM."""
-        # Extract key points locally
-        sentences = re.split(r"[.!?]\s+", text)
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-
-        if len(sentences) > max_points:
-            try:
-                if self._summary_vec is None:
-                    self._summary_vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 1))
-                vec = self._summary_vec
-                sent_matrix = vec.fit_transform(sentences + [text])
-                scores = cosine_similarity(sent_matrix[-1:], sent_matrix[:-1]).flatten()
-                top_idx = np.argsort(scores)[::-1][:max_points]
-                top_idx.sort()
-                key_points = [sentences[i] for i in top_idx]
-            except ValueError:
-                key_points = sentences[:max_points]
-        else:
-            key_points = sentences
-
-        if self.has_llm:
-            points_text = "\n".join(f"- {p}" for p in key_points)
-            retrieved = self.index.search(text, top_k=3)
-            rag_context = _build_rag_context(retrieved)
-
-            system = CARTMAN_SYSTEM_PROMPT
-            if rag_context:
-                system += f"\n\nReference Cartman lines:\n{rag_context}"
-
-            messages = [
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"Summarize these key points as Cartman would. Be funny, stay in character, keep it under 4 sentences:\n\n{points_text}"},
-            ]
-
-            response = _call_llm(messages, max_tokens=200, temperature=0.85)
-            if response:
-                return {
-                    "response": response,
-                    "key_points": key_points,
-                    "voice": "cartman",
-                    "model": f"god-cartman-gpt-{OLLAMA_MODEL}",
-                    "mode": "llm",
-                }
-
-        # Fallback
-        cartman = GodCartman(self.index.lines)
-        result = cartman.summarize(text, max_points)
-        result["mode"] = "retrieval-fallback"
-        return result
-
-    def direct(self, cascade_response, context=""):
-        """Cartman watches and directs — LLM powered."""
-        if self.has_llm:
-            retrieved = self.index.search(cascade_response, top_k=3)
-            rag_context = _build_rag_context(retrieved)
-
-            # Extract incomplete items
-            incomplete = []
-            for line in cascade_response.split("\n"):
-                line = line.strip()
-                if any(w in line.lower() for w in ["pending", "todo", "next", "still need", "not yet", "remaining"]):
-                    clean = re.sub(r"[*#`-]", "", line).strip()
-                    if 5 < len(clean) < 200:
-                        incomplete.append(clean)
-
-            system = CARTMAN_SYSTEM_PROMPT
-            if rag_context:
-                system += f"\n\nReference Cartman lines:\n{rag_context}"
-
-            incomplete_text = ""
-            if incomplete:
-                incomplete_text = f"\n\nIncomplete items the AI mentioned:\n" + "\n".join(f"- {i}" for i in incomplete[:5])
-
-            messages = [
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"Context: {context}\n\nThe AI coding assistant just produced this response:\n\n{cascade_response[:2000]}{incomplete_text}\n\nAs Cartman, tell the AI what to do NEXT. One clear direction. Stay in character. 2-3 sentences max."},
-            ]
-
-            response = _call_llm(messages, max_tokens=200, temperature=0.85)
-            if response:
-                # Detect action from LLM response
-                action = "continue"
-                resp_lower = response.lower()
-                for pattern in ACTION_PATTERNS:
-                    if any(t in resp_lower for t in pattern["triggers"]):
-                        action = pattern["action"]
-                        break
-
-                return {
-                    "directive": response,
-                    "action": action,
-                    "cartman_quote": response.split(".")[0] + "." if "." in response else response,
-                    "flavor_line": retrieved[0]["line"] if retrieved else "",
-                    "incomplete_items": incomplete[:5],
-                    "voice": "cartman",
-                    "model": f"god-cartman-gpt-{OLLAMA_MODEL}",
-                    "mode": "llm",
-                    "watching": True,
-                }
-
-        # Fallback to rule-based
-        cartman = GodCartman(self.index.lines)
-        result = cartman.direct(cascade_response, context)
-        result["mode"] = "rule-fallback"
-        return result
-
-# ─── Flask API ──────────────────────────────────────────────────────
-
-API_TOKEN = os.environ.get("CARTMAN_API_TOKEN", "")
-_MAX_TEXT_LEN = 10000
-_MAX_TOP_K = 50
-
-def _check_auth(request):
-    if not API_TOKEN:
-        return True
-    auth = request.headers.get("Authorization", "")
-    return auth == f"Bearer {API_TOKEN}"
-
-def _get_json_safe(request):
-    try:
-        data = request.get_json(force=True, silent=True)
-        if data is None:
-            return {}, None
-        return data, None
-    except Exception as e:
-        return None, str(e)
-
-def _validate_text(text):
-    if not text or not text.strip():
-        return False, "No text provided"
-    if len(text) > _MAX_TEXT_LEN:
-        return False, f"Text exceeds max length of {_MAX_TEXT_LEN}"
-    return True, None
-
-def create_app():
-    from flask import Flask, request, jsonify
-    from flask_cors import CORS
-
-    app = Flask(__name__)
-    allowed_origins = os.environ.get("CARTMAN_CORS_ORIGINS", "*").split(",")
-    CORS(app, origins=[o.strip() for o in allowed_origins])
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-
-    logger.info("Loading Cartman lines...")
-    lines, episodes = load_cartman_lines()
-    logger.info("Loaded %d Cartman lines from %d episodes.", len(lines), len(episodes))
-
-    cartman = GodCartman(lines)
-    logger.info("TF-IDF index built.")
-
-    cartman_gpt = GodCartmanGPT(cartman.index)
-    if cartman_gpt.has_llm:
-        logger.info("God Cartman GPT mode: LLM (Ollama %s)", OLLAMA_MODEL)
-    else:
-        logger.info("God Cartman GPT mode: retrieval-only (start Ollama for LLM mode)")
-    logger.info("Ready to serve.")
-
-    @app.route("/", methods=["GET"])
-    def home():
-        return jsonify({
-            "model": f"god-cartman-gpt-{OLLAMA_MODEL}" if cartman_gpt.has_llm else "god-cartman-retrieval-v1",
-            "mode": "llm" if cartman_gpt.has_llm else "retrieval",
-            "llm_model": OLLAMA_MODEL if cartman_gpt.has_llm else None,
-            "lines_indexed": len(lines),
-            "episodes": len(episodes),
-            "endpoints": ["/chat", "/respond", "/summarize", "/direct", "/catchphrase", "/search", "/health"],
-        })
-
-    @app.route("/health", methods=["GET"])
-    def health():
-        return jsonify({
-            "status": "ok",
-            "lines_indexed": len(lines),
-            "csv_loaded": len(lines) > len(_FALLBACK_LINES),
-        })
-
-    @app.route("/respond", methods=["POST"])
-    def respond():
-        if not _check_auth(request):
-            return jsonify({"error": "Unauthorized"}), 401
-        data, err = _get_json_safe(request)
-        if err:
-            return jsonify({"error": f"Invalid JSON: {err}"}), 400
-        text = data.get("text", "")
-        ok, msg = _validate_text(text)
-        if not ok:
-            return jsonify({"error": msg}), 400
-        result = cartman.respond(text)
-        return jsonify(result)
-
-    @app.route("/chat", methods=["POST"])
-    def chat():
-        if not _check_auth(request):
-            return jsonify({"error": "Unauthorized"}), 401
-        data, err = _get_json_safe(request)
-        if err:
-            return jsonify({"error": f"Invalid JSON: {err}"}), 400
-        text = data.get("text", "")
-        ok, msg = _validate_text(text)
-        if not ok:
-            return jsonify({"error": msg}), 400
-        context = data.get("context", "")
-        if len(context) > _MAX_TEXT_LEN:
-            return jsonify({"error": f"Context exceeds max length of {_MAX_TEXT_LEN}"}), 400
-        result = cartman_gpt.chat(text, context=context)
-        return jsonify(result)
-
-    @app.route("/summarize", methods=["POST"])
-    def summarize():
-        if not _check_auth(request):
-            return jsonify({"error": "Unauthorized"}), 401
-        data, err = _get_json_safe(request)
-        if err:
-            return jsonify({"error": f"Invalid JSON: {err}"}), 400
-        text = data.get("text", "")
-        ok, msg = _validate_text(text)
-        if not ok:
-            return jsonify({"error": msg}), 400
-        max_points = data.get("max_points", 5)
-        try:
-            max_points = max(1, min(int(max_points), 20))
-        except (TypeError, ValueError):
-            max_points = 5
-        result = cartman_gpt.summarize(text, max_points=max_points)
-        return jsonify(result)
-
-    @app.route("/catchphrase", methods=["GET"])
-    def catchphrase():
-        return jsonify({
-            "catchphrase": random.choice(CATCHPHRASES),
-            "voice": "cartman",
-        })
-
-    @app.route("/search", methods=["POST"])
-    def search():
-        if not _check_auth(request):
-            return jsonify({"error": "Unauthorized"}), 401
-        data, err = _get_json_safe(request)
-        if err:
-            return jsonify({"error": f"Invalid JSON: {err}"}), 400
-        text = data.get("text", "")
-        ok, msg = _validate_text(text)
-        if not ok:
-            return jsonify({"error": msg}), 400
-        top_k = data.get("top_k", 5)
-        try:
-            top_k = max(1, min(int(top_k), _MAX_TOP_K))
-        except (TypeError, ValueError):
-            top_k = 5
-        results = cartman.index.search(text, top_k=top_k)
-        return jsonify({"results": results})
-
-    @app.route("/direct", methods=["POST"])
-    def direct():
-        if not _check_auth(request):
-            return jsonify({"error": "Unauthorized"}), 401
-        data, err = _get_json_safe(request)
-        if err:
-            return jsonify({"error": f"Invalid JSON: {err}"}), 400
-        response_text = data.get("response", "")
-        ok, msg = _validate_text(response_text)
-        if not ok:
-            return jsonify({"error": msg}), 400
-        context = data.get("context", "")
-        if len(context) > _MAX_TEXT_LEN:
-            return jsonify({"error": f"Context exceeds max length of {_MAX_TEXT_LEN}"}), 400
-        result = cartman_gpt.direct(response_text, context)
-        return jsonify(result)
-
-    @app.route("/watch", methods=["GET"])
-    def watch():
-        return jsonify({
-            "watching": True,
-            "message": "God Cartman is watching all chats. Send responses to /direct for directions.",
-            "model": "god-cartman-director-v1",
-        })
-
-    return app
-
-# WSGI entry point for gunicorn: gunicorn cartman_engine:app
-app = create_app()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("CARTMAN_PORT", "5151"))
-    host = os.environ.get("CARTMAN_HOST", "127.0.0.1")
-    app.run(host=host, port=port, debug=False)
+    main()
 
 ```
 
-price_rotator.py:
+README.md:
+```
+---
+title: RentMasseur RevenueOps
+emoji: 🚀
+colorFrom: purple
+colorTo: blue
+sdk: docker
+pinned: false
+---
+
+# RentMasseur RevenueOps Control Plane
+
+Approval-gated RevenueOps control plane for RentMasseur profile optimization.
+
+## What This Repo Does
+
+- **C++ control plane** (`cpp_os_server.cpp`) — native HTTP server on port 7860
+- **Chrome extension** — first-party capture tool for profile metrics
+- **Receipt-backed decisions** — every action writes a tamper-evident receipt
+- **Controlled bio experiments** — one approved candidate at a time, with frozen variables
+
+## What This Repo Does NOT Do
+
+- No automated platform login
+- No CAPTCHA fighting or anti-bot bypass
+- No fake 24/7 availability claims
+- No unattended profile mutation
+- No mass content generation to the live profile
+
+## Safety Rules
+
+1. Only first-party/manual metric capture
+2. Only approved bio experiments
+3. Only receipt-backed changes
+4. All mutation endpoints require `ADMIN_TOKEN` (Bearer auth)
+5. No query-string token auth (prevents log leaks)
+6. Empty `ADMIN_TOKEN` blocks all mutations
+
+## API Endpoints
+
+### Read-only (no auth required)
+- `GET /api/health` — server health
+- `GET /api/report` — system report
+- `GET /api/bios` — current bio candidates
+- `GET /api/candidates` — candidate pool
+- `GET /api/decision/latest` — latest decision
+- `GET /api/funnel/daily` — daily funnel metrics
+- `GET /api/receipts` — receipt ledger
+- `GET /api/metrics/ingest` — metrics history
+
+### Mutation (requires `ADMIN_TOKEN`)
+- `POST /api/metrics/ingest` — ingest daily metrics (no auth required for data ingestion)
+- `POST /api/run/ga-rl` — run GA+RL optimization
+- `POST /api/run/orchestrator` — run orchestrator
+- `POST /api/run/availability` — BLOCKED (automation disabled)
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ADMIN_TOKEN` | Yes | Bearer token for mutation endpoints |
+
+## Docker Deployment
+
+```bash
+docker build -t rm-revenueops .
+docker run -p 7860:7860 -e ADMIN_TOKEN="your-secret-token" rm-revenueops
+```
+
+## Chrome Extension
+
+The extension (`manifest.json`, `content.js`, `popup.html`) adds a metrics capture panel to RentMasseur.com profile pages. It reads dashboard data manually — no automated login.
+
+## Experiment Workflow
+
+1. Capture dashboard metrics manually or via extension
+2. Ingest metrics via `POST /api/metrics/ingest`
+3. Review candidates at `GET /api/candidates`
+4. Start experiment via `POST /api/experiments/start` (requires ADMIN_TOKEN)
+5. Wait 100+ new profile views or 24-48 hours
+6. Close experiment and compute lift
+7. Decision: `KEEP_CURRENT`, `WINNER_FOUND`, `REVERT_TO_BASELINE`, or `NO_SIGNAL`
+
+## File Structure
+
+```
+/
+  Dockerfile
+  README.md
+  .dockerignore
+  cpp_os_server.cpp          — C++ control plane
+  rotator_engine.cpp         — rotation engine
+  ga_rl_optimizer.cpp        — GA+RL optimizer
+  production_control_loop.cpp — production loop
+  manifest.json              — Chrome extension
+  content.js                 — extension content script
+  popup.html / popup.js      — extension popup
+  content/
+    bios/current_candidates.json — 4 approved bio candidates
+    metrics/                   — ingested metrics
+  receipts/                   — tamper-evident receipt chain
+```
+
+```
+
+_find_edit_page.py:
 ```
 #!/usr/bin/env python3
-"""Price rotator — dynamically changes prices on RentMasseur profile.
+"""Login + find the actual profile edit page."""
+import time, os
+import undetected_chromedriver as uc
+from dotenv import load_dotenv
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 
-Rotates prices based on time of day, day of week, demand signals, and RL feedback.
-Prices are liquid — they change constantly to maximize bookings and revenue.
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+
+options = uc.ChromeOptions()
+options.add_argument("--window-size=1280,900")
+
+driver = uc.Chrome(options=options, version_main=149)
+
+try:
+    print("[1] Login...")
+    driver.get("https://rentmasseur.com/login")
+    time.sleep(6)
+    driver.execute_script("""
+        const pwd = document.querySelector('input[type="password"]');
+        const user = document.querySelector('input[type="text"], input[type="email"]');
+        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
+        if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
+    """, USERNAME, PASSWORD)
+    time.sleep(1)
+    driver.find_element(By.CSS_SELECTOR, 'input[type="password"]').send_keys(Keys.ENTER)
+    time.sleep(5)
+    print(f"  URL: {driver.current_url}")
+    
+    # Go to our own profile
+    print("\n[2] Going to own profile...")
+    driver.get(f"https://rentmasseur.com/{USERNAME}")
+    time.sleep(5)
+    print(f"  URL: {driver.current_url}")
+    print(f"  Title: {driver.title}")
+    
+    # Get all links and buttons
+    links = driver.execute_script("""
+        return Array.from(document.querySelectorAll('a')).map(a => ({
+            text: a.innerText.trim().substring(0,40), href: a.href, 
+            onclick: a.getAttribute('onclick') || ''
+        })).filter(a => a.text || a.onclick);
+    """)
+    print(f"\nLinks ({len(links)}):")
+    for l in links[:40]:
+        print(f"  {l['text'][:40]} -> {l['href']}")
+    
+    # Look for edit-related links
+    edit_links = [l for l in links if any(w in (l['text'] + l['href']).lower() for w in ['edit', 'update', 'bio', 'about', 'profile', 'setting', 'account'])]
+    print(f"\nEdit-related links ({len(edit_links)}):")
+    for l in edit_links:
+        print(f"  {l['text']} -> {l['href']}")
+    
+    # Check for buttons
+    buttons = driver.execute_script("""
+        return Array.from(document.querySelectorAll('button, [role="button"]')).map(b => ({
+            text: (b.innerText||'').trim().substring(0,40), type: b.type, id: b.id,
+            onclick: b.getAttribute('onclick') || ''
+        })).filter(b => b.text);
+    """)
+    print(f"\nButtons ({len(buttons)}):")
+    for b in buttons:
+        print(f"  {b['text']} type={b['type']} onclick={b['onclick'][:40]}")
+    
+    # Check for textareas or contenteditable on profile page
+    textareas = driver.find_elements(By.CSS_SELECTOR, 'textarea')
+    editables = driver.find_elements(By.CSS_SELECTOR, '[contenteditable]')
+    print(f"\nTextareas: {len(textareas)}, Contenteditable: {len(editables)}")
+    
+    # Screenshot
+    driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/profile_page.png")
+    print("Screenshot saved")
+    
+    # Try the Next.js __NEXT_DATA__ for clues
+    next_data = driver.execute_script("""
+        try {
+            const el = document.getElementById('__NEXT_DATA__');
+            if (el) return JSON.parse(el.textContent.substring(0, 2000));
+        } catch(e) {}
+        return null;
+    """)
+    if next_data:
+        print(f"\nNext.js data keys: {list(next_data.keys())}")
+        if 'props' in next_data:
+            props = next_data['props']
+            print(f"  props keys: {list(props.keys()) if isinstance(props, dict) else type(props)}")
+        if 'page' in next_data:
+            print(f"  page: {next_data['page']}")
+
+finally:
+    driver.quit()
+    print("\nDone.")
+
+```
+
+photo_rotator.py:
+```
+#!/usr/bin/env python3
+"""Photo rotator — rotates profile photos on RentMasseur dynamically.
+
+Manages a pool of photos, rotates them on a schedule, and tracks which photos
+perform best (correlated with RL feedback). Supports uploading, reordering,
+and setting primary photo.
 
 Usage:
-    python3 price_rotator.py                    # rotate to optimal price now
-    python3 price_rotator.py --dry-run          # show calculated price without updating
-    python3 price_rotator.py --report           # show price history
+    python3 photo_rotator.py                    # rotate to next photo
+    python3 photo_rotator.py --add /path/to/photo.jpg   # add photo to pool
+    python3 photo_rotator.py --list             # list photo pool
+    python3 photo_rotator.py --report           # show performance per photo
 """
 
 import argparse
@@ -793,8 +257,544 @@ import json
 import os
 import sys
 import time
-import random
+import shutil
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+from dotenv import load_dotenv
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+RENTMASSEUR_PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+PHOTO_POOL_DIR = os.path.join(CONTENT_DIR, "photos")
+PHOTO_STATE_PATH = os.path.join(CONTENT_DIR, "photo_state.json")
+PROFILE_PHOTOS_URL = "https://rentmasseur.com/settings/photos"
+
+
+def _load_photo_state() -> dict:
+    if os.path.exists(PHOTO_STATE_PATH):
+        try:
+            with open(PHOTO_STATE_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "photos": [],
+        "current_photo_index": 0,
+        "rotation_count": 0,
+        "photo_rewards": {},
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _save_photo_state(state: dict):
+    os.makedirs(CONTENT_DIR, exist_ok=True)
+    with open(PHOTO_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def add_photo_to_pool(filepath: str, label: str = "") -> str:
+    """Add a photo to the rotation pool."""
+    os.makedirs(PHOTO_POOL_DIR, exist_ok=True)
+    if not os.path.exists(filepath):
+        logger.error("Photo not found: %s", filepath)
+        return ""
+
+    ext = os.path.splitext(filepath)[1] or ".jpg"
+    photo_id = f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{len(_load_photo_state().get('photos', []))}"
+    dest = os.path.join(PHOTO_POOL_DIR, f"{photo_id}{ext}")
+    shutil.copy2(filepath, dest)
+
+    state = _load_photo_state()
+    state["photos"].append({
+        "id": photo_id,
+        "path": dest,
+        "label": label or photo_id,
+        "added_at": datetime.now(timezone.utc).isoformat(),
+        "times_used": 0,
+    })
+    _save_photo_state(state)
+    logger.info("Added photo to pool: %s (%s)", photo_id, dest)
+    return photo_id
+
+
+def get_next_photo() -> Optional[dict]:
+    """Get the next photo in rotation."""
+    state = _load_photo_state()
+    photos = state.get("photos", [])
+    if not photos:
+        logger.warning("No photos in pool — add some with --add /path/to/photo.jpg")
+        return None
+
+    # Pick least-recently-used photo, weighted by reward
+    sorted_photos = sorted(photos, key=lambda p: (p.get("times_used", 0), state.get("photo_rewards", {}).get(p["id"], 0)))
+    next_photo = sorted_photos[0]
+
+    state["current_photo_index"] = photos.index(next_photo)
+    state["rotation_count"] = state.get("rotation_count", 0) + 1
+    next_photo["times_used"] = next_photo.get("times_used", 0) + 1
+    next_photo["last_used"] = datetime.now(timezone.utc).isoformat()
+    _save_photo_state(state)
+
+    logger.info("Next photo: %s (used %d times)", next_photo["id"], next_photo["times_used"])
+    return next_photo
+
+
+def rotate_photo_on_profile(photo_path: str) -> bool:
+    """Upload and set a photo as primary on RentMasseur profile."""
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from rentmasseur_core import login, dismiss_popups, POPUP_DISMISS_SELECTORS
+
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+        driver = webdriver.Chrome(options=options)
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+
+        try:
+            if not login(driver):
+                logger.error("Login failed")
+                return False
+
+            logger.info("Navigating to photos settings: %s", PROFILE_PHOTOS_URL)
+            driver.get(PROFILE_PHOTOS_URL)
+            time.sleep(5)
+            dismiss_popups(driver)
+            time.sleep(2)
+
+            # Find file upload input
+            file_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
+            if not file_inputs:
+                logger.error("No file upload input found on photos page")
+                return False
+
+            file_inputs[0].send_keys(os.path.abspath(photo_path))
+            logger.info("Photo uploaded, waiting for processing...")
+            time.sleep(10)
+
+            # Try to set as primary/make main
+            make_primary_btns = driver.find_elements(By.XPATH, "//*[contains(text(), 'Make Main') or contains(text(), 'Set Primary') or contains(text(), 'Make Primary')]")
+            if make_primary_btns:
+                driver.execute_script("arguments[0].click();", make_primary_btns[0])
+                time.sleep(3)
+                logger.info("Set as primary photo")
+
+            # Save
+            save_btns = driver.find_elements(By.XPATH, "//*[contains(text(), 'Save') or @type='submit']")
+            if save_btns:
+                driver.execute_script("arguments[0].click();", save_btns[-1])
+                time.sleep(3)
+
+            logger.info("Photo rotation complete")
+            return True
+        finally:
+            driver.quit()
+    except Exception as e:
+        logger.error("Photo rotation error: %s", e)
+        return False
+
+
+def list_photos():
+    state = _load_photo_state()
+    photos = state.get("photos", [])
+    print(f"\nPhoto Pool: {len(photos)} photos")
+    print(f"Rotations: {state.get('rotation_count', 0)}")
+    for p in photos:
+        reward = state.get("photo_rewards", {}).get(p["id"], 0)
+        print(f"  {p['id']}: used {p.get('times_used', 0)}x, reward={reward}, label={p.get('label', '')}")
+
+
+def photo_report() -> str:
+    state = _load_photo_state()
+    lines = ["=" * 60, "PHOTO ROTATION REPORT", "=" * 60]
+    lines.append(f"Total photos: {len(state.get('photos', []))}")
+    lines.append(f"Total rotations: {state.get('rotation_count', 0)}")
+    for p in state.get("photos", []):
+        reward = state.get("photo_rewards", {}).get(p["id"], 0)
+        lines.append(f"  {p['id']}: used={p.get('times_used', 0)}, reward={reward}")
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Photo rotator for RentMasseur")
+    parser.add_argument("--add", help="Add photo to pool")
+    parser.add_argument("--label", default="", help="Label for added photo")
+    parser.add_argument("--list", action="store_true", help="List photo pool")
+    parser.add_argument("--report", action="store_true", help="Show photo report")
+    parser.add_argument("--dry-run", action="store_true", help="Don't upload, just pick next")
+    args = parser.parse_args()
+
+    if args.add:
+        add_photo_to_pool(args.add, args.label)
+        return
+
+    if args.list:
+        list_photos()
+        return
+
+    if args.report:
+        print(photo_report())
+        return
+
+    # Default: rotate
+    photo = get_next_photo()
+    if not photo:
+        sys.exit(1)
+
+    print(f"Next photo: {photo['id']} ({photo['path']})")
+    if args.dry_run:
+        logger.info("Dry run — not uploading")
+        return
+
+    success = rotate_photo_on_profile(photo["path"])
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+provider_growth_cli.py:
+```
+#!/usr/bin/env python3
+"""Provider Growth CRM command line.
+
+Everything here is local/manual-first. It creates records, drafts, policy
+decisions, outbox handoffs, content versions, metrics, receipts, and revenue
+ledger events. It does not transmit messages or perform unattended outreach.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from typing import Any
+
+from provider_growth.db import DEFAULT_DB_PATH, init_db
+from provider_growth.drafts import approve_draft, create_draft, list_drafts
+from provider_growth.engagement import list_priority_records, upsert_record
+from provider_growth.experiments import add_snapshot, summarize_by_version
+from provider_growth.imac_relay import export_manual_handoff, list_conversations, log_conversation_event, open_conversation_record
+from provider_growth.kpi import add_revenue_event, revenue_summary
+from provider_growth.outbox import enqueue_draft, export_ready_item, list_outbox, mark_completed
+from provider_growth.policy import evaluate_and_receipt, get_policy, set_policy
+from provider_growth.profile_content import activate_version, add_version, list_versions
+
+
+def print_json(payload: Any) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Provider Growth CRM")
+    parser.add_argument("--db", default=DEFAULT_DB_PATH)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("init-db")
+    sub.add_parser("policy")
+
+    set_pol = sub.add_parser("set-policy")
+    set_pol.add_argument("key")
+    set_pol.add_argument("value")
+    set_pol.add_argument("--description", default="")
+
+    eval_pol = sub.add_parser("evaluate-draft")
+    eval_pol.add_argument("draft_id", type=int)
+
+    add_record = sub.add_parser("add-record")
+    add_record.add_argument("identifier")
+    add_record.add_argument("--name")
+    add_record.add_argument("--source", default="manual")
+
+    hot = sub.add_parser("priority-records")
+    hot.add_argument("--min-score", type=int, default=3)
+    hot.add_argument("--limit", type=int, default=25)
+
+    draft = sub.add_parser("draft")
+    draft.add_argument("record_key")
+    draft.add_argument("--template", default="soft_checkin")
+    draft.add_argument("--name", default="there")
+    draft.add_argument("--channel", default="manual")
+
+    approve = sub.add_parser("approve-draft")
+    approve.add_argument("draft_id", type=int)
+
+    drafts = sub.add_parser("drafts")
+    drafts.add_argument("--status", default="draft")
+
+    enqueue = sub.add_parser("enqueue")
+    enqueue.add_argument("draft_id", type=int)
+
+    outbox = sub.add_parser("outbox")
+    outbox.add_argument("--state")
+
+    export_item = sub.add_parser("export-outbox")
+    export_item.add_argument("outbox_id", type=int)
+    export_item.add_argument("--output-dir", default="data/manual_outbox")
+
+    complete = sub.add_parser("complete-outbox")
+    complete.add_argument("outbox_id", type=int)
+    complete.add_argument("--outcome", default="manual_completed", choices=["manual_completed", "skipped", "failed"])
+
+    handoff = sub.add_parser("handoff")
+    handoff.add_argument("draft_id", type=int)
+    handoff.add_argument("--output-dir", default="data/imac_handoffs")
+
+    conv = sub.add_parser("open-conversation")
+    conv.add_argument("record_key")
+    conv.add_argument("--handle")
+    conv.add_argument("--channel", default="imessage")
+
+    log_event = sub.add_parser("log-event")
+    log_event.add_argument("conversation_id", type=int)
+    log_event.add_argument("direction", choices=["inbound", "outbound", "note"])
+    log_event.add_argument("body")
+
+    sub.add_parser("conversations")
+
+    version = sub.add_parser("add-version")
+    version.add_argument("field_name", choices=["bio", "blog", "interview", "availability_note", "headline"])
+    version.add_argument("label")
+    version.add_argument("content")
+    version.add_argument("--reason", default="")
+
+    activate = sub.add_parser("activate-version")
+    activate.add_argument("version_id", type=int)
+
+    versions = sub.add_parser("versions")
+    versions.add_argument("--field")
+
+    metrics = sub.add_parser("snapshot")
+    metrics.add_argument("--version")
+    metrics.add_argument("--views", type=int, default=0)
+    metrics.add_argument("--repeat", type=int, default=0)
+    metrics.add_argument("--contacts", type=int, default=0)
+    metrics.add_argument("--inbound", type=int, default=0)
+    metrics.add_argument("--bookings", type=int, default=0)
+
+    rev = sub.add_parser("revenue-event")
+    rev.add_argument("event_type", choices=["inquiry", "quote", "booking_request", "confirmed_booking", "completed_booking", "cancelled"])
+    rev.add_argument("--amount-cents", type=int, default=0)
+    rev.add_argument("--record-key")
+    rev.add_argument("--source", default="manual")
+    rev.add_argument("--notes", default="")
+
+    sub.add_parser("summary")
+    sub.add_parser("revenue-summary")
+
+    args = parser.parse_args()
+
+    if args.command == "init-db":
+        init_db(args.db)
+        print_json({"ok": True, "db": args.db})
+    elif args.command == "policy":
+        print_json(get_policy(args.db))
+    elif args.command == "set-policy":
+        print_json(set_policy(args.key, args.value, args.description, db_path=args.db))
+    elif args.command == "evaluate-draft":
+        print_json(evaluate_and_receipt(args.draft_id, db_path=args.db))
+    elif args.command == "add-record":
+        print_json(upsert_record(args.identifier, display_name=args.name, source=args.source, db_path=args.db))
+    elif args.command == "priority-records":
+        print_json(list_priority_records(args.min_score, args.limit, db_path=args.db))
+    elif args.command == "draft":
+        print_json(create_draft(args.record_key, args.template, args.name, args.channel, db_path=args.db))
+    elif args.command == "approve-draft":
+        print_json(approve_draft(args.draft_id, db_path=args.db))
+    elif args.command == "drafts":
+        print_json(list_drafts(args.status, db_path=args.db))
+    elif args.command == "enqueue":
+        print_json(enqueue_draft(args.draft_id, db_path=args.db))
+    elif args.command == "outbox":
+        print_json(list_outbox(args.state, db_path=args.db))
+    elif args.command == "export-outbox":
+        print_json(export_ready_item(args.outbox_id, args.output_dir, db_path=args.db))
+    elif args.command == "complete-outbox":
+        print_json(mark_completed(args.outbox_id, args.outcome, db_path=args.db))
+    elif args.command == "handoff":
+        print_json(export_manual_handoff(args.draft_id, args.output_dir, db_path=args.db))
+    elif args.command == "open-conversation":
+        print_json(open_conversation_record(args.record_key, args.handle, args.channel, db_path=args.db))
+    elif args.command == "log-event":
+        print_json(log_conversation_event(args.conversation_id, args.direction, args.body, db_path=args.db))
+    elif args.command == "conversations":
+        print_json(list_conversations(db_path=args.db))
+    elif args.command == "add-version":
+        print_json(add_version(args.field_name, args.label, args.content, args.reason, db_path=args.db))
+    elif args.command == "activate-version":
+        print_json(activate_version(args.version_id, db_path=args.db))
+    elif args.command == "versions":
+        print_json(list_versions(args.field, db_path=args.db))
+    elif args.command == "snapshot":
+        print_json(add_snapshot(args.version, args.views, args.repeat, args.contacts, args.inbound, args.bookings, db_path=args.db))
+    elif args.command == "revenue-event":
+        print_json(add_revenue_event(args.event_type, args.amount_cents, args.record_key, source=args.source, notes=args.notes, db_path=args.db))
+    elif args.command == "summary":
+        print_json(summarize_by_version(db_path=args.db))
+    elif args.command == "revenue-summary":
+        print_json(revenue_summary(db_path=args.db))
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+ga_rl_optimizer.cpp:
+```
+/*
+ * GA + RL Revenue Optimizer — C++ Native
+ * High-performance genetic algorithm + reinforcement learning for
+ * RentMasseur revenue maximization ($300/day target).
+ *
+ * Build: g++ -O3 -std=c++17 -o ga_rl_optimizer ga_rl_optimizer.cpp
+ * Run:   ./ga_rl_optimizer
+ *        ./ga_rl_optimizer --population 20 --generations 10 --target 300
+ *        ./ga_rl_optimizer --report
+ */
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <algorithm>
+#include <random>
+#include <chrono>
+#include <ctime>
+#include <cmath>
+#include <cstdlib>
+
+struct AccountConfig {
+    std::string id;
+    std::string bio;
+    int price;
+    std::string photo_style;
+    std::string cta;
+    std::string headline;
+    double fitness;
+    double revenue_estimate;
+    double reward;
+    int generation;
+    int uses;
+};
+
+struct GAState {
+    std::vector<AccountConfig> population;
+    int generation;
+    AccountConfig best_config;
+    double best_fitness;
+    double best_revenue;
+    std::vector<std::map<std::string, double>> history;
+};
+
+const double AVG_SESSION_PRICE = 200.0;
+const double CALL_CONVERSION_RATE = 0.20;
+const double VIEW_TO_CLICK_RATE = 0.05;
+const double BOOKING_CLOSE_RATE = 0.40;
+const double REVENUE_TARGET = 300.0;
+
+std::vector<std::string> CTAS = {
+    "Call me now to book your session",
+    "Pick up the phone and call today",
+    "Text or call — I'm available now",
+    "Don't wait — call me right now",
+    "Book now: your body will thank you",
+    "Call today for same-day availability",
+};
+
+std::vector<std::string> HEADLINES = {
+    "Elite Male Masseur in Manhattan",
+    "Your Private Massage Therapist in NYC",
+    "Deep Tissue & Sensory Massage by Request",
+    "Manhattan's Most Sought-After Masseur",
+    "Therapeutic Touch in the Heart of NYC",
+    "Late-Night Relief Available Now",
+    "Premium In-Home Massage Experience",
+    "The Masseur Who Actually Listens",
+};
+
+std::vector<std::string> PHOTO_STYLES = {
+    "professional", "casual", "athletic", "luxury", "mystery", "warm",
+};
+
+std::vector<int> PRICES = {120, 150, 180, 200, 220, 250, 280, 300};
+
+std::mt19937 rng;
+
+static std::string iso_timestamp() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+    return std::string(buf);
+}
+
+static std::string read_file(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return "";
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static void write_file(const std::string& path, const std::string& content) {
+    std::ofstream f(path);
+    if (f) f << content;
+}
+
+static double random_double() {
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    return dist(rng);
+}
+
+static int random_int(int min, int max) {
+    std::uniform_int_distribution<int> dist(min, max);
+    return dist(rng);
+}
+
+static double calculate_revenue_estimate(const std::map<std::string, int>& stats, int price) {
+    double views = stats.count("views") ? stats.at("views") : 0;
+    double phone_clicks = stats.count("phone_clicks") ? stats.at("phone_clicks") : 0;
+    double email_clicks = stats.count("email_clicks") ? stats.at("email_clicks") : 0;
+    double booking_inquiries = stats.count("booking_inquiries") ? stats.at("booking_inquiries") : 0;
+    double messages = stats.count("messages") ? stats.at("messages") : 0;
+
+    double price_factor = 1.0 - ((price - 200) / 1000.0);
+    phone_clicks *= price_factor;
+    booking_inquiries *= price_factor;
+
+    double view_revenue = views * VIEW_TO_CLICK_RATE * AVG_SESSION_PRICE;
+    double call_revenue = phone_clicks * CALL_CONVERSION_RATE * AVG_SESSION_PRICE;
+    double inquiry_revenue = booking_inquiries * BOOKING_CLOSE_RATE * AVG_SESSION_PRICE;
+    double message_revenue = messages * 0.10 * AVG_SESSION_PRICE;
+    double email_revenue = email_clicks * 0.05 * AVG_SESSION_PRICE;
+
+    return view_revenue + call_revenue + inquiry_revenue + message_revenue + email_revenue;
+}

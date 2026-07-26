@@ -1,800 +1,800 @@
-  "comparable_assets": "what kind of financial or intellectual asset this resembles",
-  "confidence": 0.0-1.0
-}}"""
 
-    try:
-        import requests as _req
-        resp = _req.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 500,
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            content = resp.json()["choices"][0]["message"]["content"]
-            try:
-                return json.loads(content)
-            except:
-                return {"raw_response": content}
-    except:
-        pass
+def canonical_json(obj: Any) -> str:
+    """Serialize to canonical JSON: sorted keys, no extra whitespace."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_fingerprint(obj: Any) -> str:
+    """Compute SHA-256 fingerprint of an object's canonical JSON."""
+    return hashlib.sha256(canonical_json(obj).encode("utf-8")).hexdigest()
+
+
+def get_chain_head() -> Optional[Dict]:
+    """Load the current chain head (last receipt in the chain)."""
+    if CHAIN_FILE.exists():
+        with CHAIN_FILE.open() as f:
+            return json.load(f)
     return None
 
 
-@app.get("/ml/{file_id}")
-async def jorki_ml_profile(file_id: str):
-    """Unsupervised ML features: topics, clusters, anomalies, latent features, LLM extrapolation."""
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    meta_rows = conn.execute("SELECT key, value FROM file_meta").fetchall()
-    kpi_rows = conn.execute("SELECT id, name, value, line, category, confidence FROM kpis").fetchall()
-    dna_rows = conn.execute("SELECT key, value FROM dna").fetchall()
-    word_rows = conn.execute("SELECT word, count FROM word_freq").fetchall()
-    chunk_rows = conn.execute("SELECT idx, line_start, line_end, boundary_type, preview, line_count FROM chunks").fetchall()
-    conn.close()
-    _jorki_track_query(file_id, "ml")
+def update_chain_head(receipt: Dict) -> None:
+    """Update the chain head to point to the latest receipt."""
+    RECEIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    with CHAIN_FILE.open("w") as f:
+        json.dump(receipt, f, indent=2)
 
-    meta = {r[0]: r[1] for r in meta_rows}
-    kpis = [{"id": r[0], "name": r[1], "value": r[2], "line": r[3], "category": r[4], "confidence": r[5]} for r in kpi_rows]
-    dna = {r[0]: r[1] for r in dna_rows}
-    word_freq = {r[0]: int(r[1]) for r in word_rows}
-    chunks = [{"idx": r[0], "line_start": r[1], "line_end": r[2], "boundary_type": r[3], "preview": r[4], "line_count": r[5]} for r in chunk_rows]
 
-    # Reconstruct text from chunks (limit to first 200 chunks for performance)
-    text = "\n".join(c["preview"] for c in chunks[:200])
-    lines = text.split("\n")
+def stamp_receipt(receipt: Dict) -> Dict:
+    """
+    Add fingerprint, prev_fingerprint, and chain_index to a receipt.
+    Returns the stamped receipt (mutates in place and returns it).
+    """
+    head = get_chain_head()
+    prev_fp = head["fingerprint"] if head else None
+    chain_index = (head["chain_index"] + 1) if head else 0
 
-    try:
-        dna_obj = json.loads(dna.get("genes", "{}")) if isinstance(dna.get("genes"), str) else {}
-        dna_dict = {"genes": dna_obj, "complexity_score": float(dna.get("complexity_score", 0)),
-                    "dna_sequence": dna.get("dna_sequence", ""), "species": dna.get("species", "")}
-    except:
-        dna_dict = {}
+    receipt["prev_fingerprint"] = prev_fp
+    receipt["chain_index"] = chain_index
+    receipt["fingerprint"] = sha256_fingerprint(receipt)
 
-    try:
-        ml_result = _jorki_ml_extract(text, lines, chunks, word_freq, kpis, dna_dict)
-    except Exception as e:
-        ml_result = {"available": False, "error": str(e), "engine": "error"}
-    return {"file_id": file_id, "filename": meta.get("filename", "unknown"), "ml": ml_result}
+    update_chain_head(receipt)
+    return receipt
 
-# ─── Pipeline API: Clipboard → Repo → Artifact → Deploy → App → DMG → AppStore ─
 
-import subprocess as _subproc
-import re as _re
-import uuid as _uuid
+def verify_receipt(receipt: Dict) -> bool:
+    """
+    Verify a receipt's fingerprint matches its content.
+    Does NOT verify chain linkage — use verify_chain for that.
+    """
+    if "fingerprint" not in receipt:
+        return False
+    expected = receipt.pop("fingerprint")
+    computed = sha256_fingerprint(receipt)
+    receipt["fingerprint"] = expected  # restore
+    return expected == computed
 
-PIPELINE_DIR = _Path(os.environ.get("JORKI_PIPELINE_DIR", "/tmp/jorki_pipeline"))
-PIPELINE_RUNS = {}
-PIPELINE_LOGS = {}
 
-PIPELINE_STAGES = ["clipboard", "repo", "artifact", "deploy"]
-
-GLYPH_MAP = {"idle": "◌", "active": "◉", "complete": "✓", "error": "⟁", "skipped": "◍"}
-
-def _pipe_log(run_id: str, stage: str, msg: str, level: str = "info"):
-    if run_id not in PIPELINE_LOGS:
-        PIPELINE_LOGS[run_id] = []
-    glyph = GLYPH_MAP.get("active" if level == "info" else
-                           "complete" if level == "done" else
-                           "error" if level == "error" else "active", "◉")
-    PIPELINE_LOGS[run_id].append({
-        "ts": datetime.now().strftime("%H:%M:%S"),
-        "stage": stage, "msg": msg, "level": level, "glyph": glyph,
-    })
-
-def _pipe_receipt(chain: list, stage: str, artifacts: dict) -> dict:
-    prev = chain[-1]["hash"] if chain else "0" * 64
-    entry = json.dumps({"stage": stage, "artifacts": artifacts, "ts": time.time()}, sort_keys=True, default=str)
-    h = hashlib.sha256((prev + entry).encode()).hexdigest()
-    r = {"stage": stage, "artifacts": artifacts, "hash": h, "prev_hash": prev, "ts": time.time()}
-    chain.append(r)
-    return r
-
-def _detect_content_type(content: str) -> str:
-    s = content.strip()
-    if not s: return "empty"
-    if s.startswith("{") or s.startswith("["):
-        try: json.loads(s); return "json"
-        except: pass
-    if s.startswith("#!"): return "script"
-    if "import " in s and ("def " in s or "class " in s): return "python"
-    if "function " in s or "const " in s or "=>" in s: return "javascript"
-    if s.startswith("<"): return "markup"
-    if "# " in s[:10] or "## " in s[:20]: return "markdown"
-    if _re.match(r'^(FROM|RUN|COPY|CMD|WORKDIR)', s, _re.MULTILINE): return "dockerfile"
-    return "text"
-
-def _derive_name(content: str, ctype: str) -> str:
-    if ctype == "python":
-        for line in content.split("\n"):
-            if "class " in line and ":" in line:
-                n = line.split("class ")[1].split("(")[0].split(":")[0].strip()
-                if n and n[0].isupper(): return _re.sub(r'[^A-Za-z0-9]', '', n)
-    if ctype == "json":
-        try:
-            d = json.loads(content.strip())
-            if isinstance(d, dict):
-                for k in ("name", "title", "app"):
-                    if k in d and isinstance(d[k], str): return _re.sub(r'[^A-Za-z0-9]', '', d[k])
-        except: pass
-    words = _re.findall(r'\b[A-Za-z][a-z]+\b', content[:500])
-    if words: return _re.sub(r'[^A-Za-z0-9]', '', "".join(w.capitalize() for w in words[:3])) or "ClipboardApp"
-    return "ClipboardApp"
-
-def _run_pipeline(run_id: str, content: str):
-    state = PIPELINE_RUNS[run_id]
-    chain = state["receipt_chain"]
-    try:
-        # Stage 1: Clipboard
-        _pipe_log(run_id, "clipboard", f"Read {len(content)} chars")
-        ctype = _detect_content_type(content)
-        chash = hashlib.sha256(content.encode()).hexdigest()
-        pname = _derive_name(content, ctype)
-        state["content_type"] = ctype
-        state["content_hash"] = chash
-        state["project_name"] = pname
-        state["content_preview"] = content[:500]
-
-        # Index clipboard content via Jorki indexer for dossier/intel
-        try:
-            clip_path = JORKI_DATA_DIR / "pipeline_uploads" / f"{pname}.txt"
-            clip_path.parent.mkdir(parents=True, exist_ok=True)
-            clip_path.write_text(content)
-            idx_result = _jorki_index_file(str(clip_path))
-            state["file_id"] = idx_result.get("file_id", "")
-            reg = _jorki_load_registry()
-            reg[state["file_id"]] = {
-                "filename": idx_result.get("filename", pname),
-                "size_bytes": idx_result.get("size_bytes", 0),
-                "size_human": idx_result.get("size_human", ""),
-                "format": ctype, "status": "active", "indexed_at": time.time(),
-            }
-            _jorki_save_registry(reg)
-            _pipe_log(run_id, "clipboard", f"Indexed as file_id: {state['file_id']}", "ok")
-        except Exception as e:
-            _pipe_log(run_id, "clipboard", f"Index warning: {str(e)[:80]}", "info")
-
-        _pipe_receipt(chain, "clipboard", {"type": ctype, "hash": chash, "name": pname, "file_id": state.get("file_id", "")})
-        state["completed_stages"].append("clipboard")
-        _pipe_log(run_id, "clipboard", f"Type: {ctype} │ Name: {pname}", "ok")
-
-        # Stage 2: Repo
-        state["current_stage"] = "repo"
-        _pipe_log(run_id, "repo", f"Creating project: {pname}")
-        proj_dir = PIPELINE_DIR / "projects" / pname
-        proj_dir.mkdir(parents=True, exist_ok=True)
-        main_file = "main.py" if ctype in ("python", "script") else \
-                    "index.js" if ctype == "javascript" else \
-                    "index.html" if ctype == "markup" else \
-                    "content.md" if ctype == "markdown" else \
-                    "data.json" if ctype == "json" else "content.txt"
-        (proj_dir / main_file).write_text(content)
-        (proj_dir / "README.md").write_text(f"# {pname}\n\nAuto-generated from clipboard via Jorki pipeline.\n\n- Type: {ctype}\n- Hash: `{chash}`\n")
-        (proj_dir / ".gitignore").write_text(".venv/\n__pycache__/\nnode_modules/\ndist/\nbuild/\n.env\n*.dmg\n")
-
-        _subproc.run(["git", "init"], cwd=str(proj_dir), capture_output=True, check=False)
-        _subproc.run(["git", "add", "-A"], cwd=str(proj_dir), capture_output=True, check=False)
-        env = {**os.environ, "GIT_AUTHOR_NAME": "Jorki", "GIT_AUTHOR_EMAIL": "pipeline@jorki.local",
-               "GIT_COMMITTER_NAME": "Jorki", "GIT_COMMITTER_EMAIL": "pipeline@jorki.local"}
-        _subproc.run(["git", "commit", "-m", f"Initial commit from clipboard\n\nType: {ctype}\nHash: {chash}"],
-                     cwd=str(proj_dir), capture_output=True, check=False, env=env)
-
-        repo_name = pname.lower().replace("_", "-")
-        gh_url = ""
-        try:
-            r = _subproc.run(["gh", "repo", "create", repo_name, "--public", "--source=.", "--push",
-                              "--description", f"Auto-generated from clipboard ({ctype})"],
-                             cwd=str(proj_dir), capture_output=True, text=True, check=False, env=env)
-            if r.returncode == 0:
-                for line in (r.stderr + r.stdout).split("\n"):
-                    if "github.com" in line:
-                        gh_url = line.strip().split()[-1]; break
-                if not gh_url:
-                    r2 = _subproc.run(["gh", "repo", "view", repo_name, "--json", "url"],
-                                      capture_output=True, text=True, check=False)
-                    if r2.returncode == 0:
-                        try: gh_url = json.loads(r2.stdout).get("url", "")
-                        except: pass
-                state["github_repo"] = repo_name
-                state["github_url"] = gh_url
-                _pipe_log(run_id, "repo", f"GitHub: {gh_url}", "ok")
-            else:
-                _pipe_log(run_id, "repo", f"gh failed: {r.stderr.strip()[:100]}", "info")
-                state["github_repo"] = repo_name
-                state["github_url"] = ""
-                _pipe_receipt(chain, "repo", {"repo": repo_name, "url": "local", "dir": str(proj_dir), "skipped": "gh_error"})
-        except FileNotFoundError:
-            _pipe_log(run_id, "repo", f"gh not installed — local repo only: {str(proj_dir)}", "info")
-            state["github_repo"] = repo_name
-            state["github_url"] = ""
-            _pipe_receipt(chain, "repo", {"repo": repo_name, "url": "local", "dir": str(proj_dir), "skipped": "gh_not_found"})
-        _pipe_receipt(chain, "repo", {"repo": repo_name, "url": gh_url or "local", "dir": str(proj_dir)})
-        state["completed_stages"].append("repo")
-
-        # Stage 3: Artifact (HuggingFace Space)
-        state["current_stage"] = "artifact"
-        hf_token = os.environ.get("HF_TOKEN", "")
-        if hf_token:
-            _pipe_log(run_id, "artifact", "Creating HuggingFace Space…")
-            try:
-                from huggingface_hub import HfApi, create_repo
-                space_id = f"{os.environ.get('HF_USERNAME', 'user')}/{repo_name}-space"
-                create_repo(repo_id=space_id, repo_type="space", space_sdk="static", exist_ok=True)
-                api = HfApi()
-                api.upload_folder(folder_path=str(proj_dir), repo_id=space_id, repo_type="space")
-                hf_url = f"https://huggingface.co/spaces/{space_id}"
-                state["hf_space_id"] = space_id
-                state["hf_space_url"] = hf_url
-                _pipe_log(run_id, "artifact", f"HF Space: {hf_url}", "ok")
-                _pipe_receipt(chain, "artifact", {"space_id": space_id, "url": hf_url})
-            except Exception as e:
-                _pipe_log(run_id, "artifact", f"HF failed: {str(e)[:100]}", "error")
-                state["error_stage"] = "artifact"
-                state["status"] = "error"
-                return
-        else:
-            _pipe_log(run_id, "artifact", "HF_TOKEN not set — skipping", "info")
-            _pipe_receipt(chain, "artifact", {"skipped": True, "reason": "no HF_TOKEN"})
-        state["completed_stages"].append("artifact")
-
-        # Stage 4: Deploy (Vercel)
-        state["current_stage"] = "deploy"
-        _pipe_log(run_id, "deploy", "Deploying to Vercel…")
-        try:
-            r = _subproc.run(["vercel", "--prod", "--yes"], cwd=str(proj_dir),
-                             capture_output=True, text=True, check=False, timeout=120)
-            if r.returncode == 0:
-                vercel_url = r.stdout.strip().split("\n")[-1].strip()
-                if not vercel_url.startswith("http"):
-                    for line in r.stdout.split("\n"):
-                        if "https://" in line:
-                            vercel_url = line.strip(); break
-                state["vercel_url"] = vercel_url
-                _pipe_log(run_id, "deploy", f"Vercel: {vercel_url}", "ok")
-                _pipe_receipt(chain, "deploy", {"url": vercel_url})
-            else:
-                _pipe_log(run_id, "deploy", f"Vercel failed: {r.stderr.strip()[:100]}", "error")
-                _pipe_receipt(chain, "deploy", {"failed": True, "error": r.stderr.strip()[:200]})
-        except Exception as e:
-            _pipe_log(run_id, "deploy", f"Vercel error: {str(e)[:100]}", "error")
-            _pipe_receipt(chain, "deploy", {"error": str(e)[:200]})
-        state["completed_stages"].append("deploy")
-
-        state["status"] = "complete"
-        state["current_stage"] = ""
-        _pipe_log(run_id, "pipeline", "Pipeline complete", "done")
-
-    except Exception as e:
-        _pipe_log(run_id, state.get("current_stage", "pipeline"), f"Error: {str(e)[:200]}", "error")
-        state["status"] = "error"
-        state["error_stage"] = state.get("current_stage", "unknown")
-
-@app.post("/pipeline/trigger")
-async def pipeline_trigger(body: dict = Body(...)):
-    content = body.get("content", "")
-    if not content:
-        try:
-            r = _subproc.run(["pbpaste"], capture_output=True, text=True, check=False, timeout=5)
-            content = r.stdout
-        except Exception:
-            content = ""
-    if not content.strip():
-        return {"error": "Clipboard is empty and no content provided"}
-    run_id = str(_uuid.uuid4())[:12]
-    PIPELINE_RUNS[run_id] = {
-        "run_id": run_id, "status": "running", "current_stage": "clipboard",
-        "completed_stages": [], "error_stage": "",
-        "content_type": "", "content_hash": "", "project_name": "",
-        "content_preview": "", "github_repo": "", "github_url": "",
-        "hf_space_id": "", "hf_space_url": "", "vercel_url": "",
-        "app_bundle_path": "", "dmg_path": "", "notarization_id": "",
-        "file_id": "", "receipt_chain": [],
-    }
-    PIPELINE_LOGS[run_id] = []
-    thread = threading.Thread(target=lambda: _run_pipeline(run_id, content), daemon=True)
-    thread.start()
-    return {"run_id": run_id, "status": "started", "message": "Pipeline started. Poll GET /pipeline/status/{run_id}"}
-
-@app.get("/pipeline/status/{run_id}")
-async def pipeline_status(run_id: str):
-    state = PIPELINE_RUNS.get(run_id)
-    if not state:
-        return {"error": f"Run {run_id} not found"}
-    result = dict(state)
-    result["logs"] = PIPELINE_LOGS.get(run_id, [])
-    return result
-
-@app.get("/pipeline/latest")
-async def pipeline_latest():
-    if not PIPELINE_RUNS:
-        return {"run_id": None}
-    latest = max(PIPELINE_RUNS.values(), key=lambda s: s.get("started_at", 0) if "started_at" in s else 0)
-    return {"run_id": latest["run_id"], "status": latest["status"]}
-
-@app.get("/pipeline/receipts/{run_id}")
-async def pipeline_receipts(run_id: str):
-    state = PIPELINE_RUNS.get(run_id)
-    if not state:
-        return {"error": f"Run {run_id} not found"}
-    return {"run_id": run_id, "receipts": state.get("receipt_chain", []),
-            "chain_valid": all(
-                r["prev_hash"] == (state["receipt_chain"][i-1]["hash"] if i > 0 else "0"*64)
-                for i, r in enumerate(state.get("receipt_chain", []))
-            )}
-
-# Mount React UI static assets if dist exists
-_ui_dist = _Path("/app/jorki_ui_dist")
-if _ui_dist.exists():
-    _assets_dist = _ui_dist / "assets"
-    if _assets_dist.exists():
-        app.mount("/assets", StaticFiles(directory=str(_assets_dist)), name="jorki_assets")
-
-    @app.get("/ui")
-    async def jorki_ui():
-        return FileResponse(str(_ui_dist / "index.html"))
-
-# ─── LLM API Key Agent Endpoints ────────────────────────────────────────
-_LLM_DATA_DIR = _Path(__file__).resolve().parent / "data"
-_LLM_CATALOG_PATH = _LLM_DATA_DIR / "api_catalog_raw.json"
-if not _LLM_CATALOG_PATH.exists():
-    _LLM_CATALOG_PATH = _LLM_DATA_DIR / "api_catalog.json"
-_LLM_REGISTRY_PATH = _LLM_DATA_DIR / "api_key_registry.json"
-_LLM_CHAIN_PATH = _LLM_DATA_DIR / "llm_fallback_chain.json"
-_LLM_USAGE = {"total_requests": 0, "per_provider": {}, "fallbacks_triggered": 0}
-
-def _llm_load_json(path):
-    if path.exists():
-        with open(path) as f: return json.load(f)
-    return {}
-
-def _llm_save_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f: json.dump(data, f, indent=2)
-
-@app.get("/llm/keys")
-async def llm_keys():
-    """Return all validated keys with status, provider, model, score."""
-    registry = _llm_load_json(_LLM_REGISTRY_PATH)
-    return {"keys": registry, "total": len(registry) if isinstance(registry, list) else 0,
-            "active": sum(1 for r in registry if r.get("status") == "active") if isinstance(registry, list) else 0}
-
-@app.get("/llm/catalog")
-async def llm_catalog():
-    """Return full 300+ service catalog."""
-    return _llm_load_json(_LLM_CATALOG_PATH)
-
-@app.get("/llm/models")
-async def llm_models():
-    """Return all available models across all providers."""
-    catalog = _llm_load_json(_LLM_CATALOG_PATH)
-    models = []
-    for svc in catalog.get("services", []):
-        for m in svc.get("m", []):
-            models.append({"model": m, "provider": svc["p"], "category": svc["c"], "endpoint": svc["e"]})
-    return {"models": models, "total": len(models)}
-
-@app.get("/llm/health")
-async def llm_health():
-    """Ping all providers, return live status board."""
-    import urllib.request, urllib.error, time as _time
-    registry = _llm_load_json(_LLM_REGISTRY_PATH)
-    if not isinstance(registry, list): registry = []
-    statuses = []
-    for r in registry:
-        p = r.get("provider", ""); st = r.get("status", "unknown")
-        glyph = {"active": "◉", "expired": "⟁", "rate_limited": "⧖", "invalid": "✕", "untested": "◌"}.get(st, "◌")
-        statuses.append({"provider": p, "status": st, "glyph": glyph, "latency_ms": r.get("latency_ms", 0), "score": r.get("score", 0)})
-    return {"providers": statuses, "timestamp": _time.time(),
-            "summary": {"active": sum(1 for s in statuses if s["status"] == "active"),
-                        "total": len(statuses)}}
-
-@app.get("/llm/chain")
-async def llm_chain():
-    """Return the ranked fallback chain."""
-    return {"chain": _llm_load_json(_LLM_CHAIN_PATH)}
-
-@app.post("/llm/chat")
-async def llm_chat(body: dict = Body(...)):
-    """Auto-route to best available provider, fall back on failure."""
-    import urllib.request, urllib.error, time as _time
-    chain = _llm_load_json(_LLM_CHAIN_PATH)
-    if not isinstance(chain, list): chain = []
-    active = [c for c in chain if c.get("score", 0) > 0]
-    if not active: active = chain
-    # Always include LLM7 anonymous as ultimate fallback
-    active.append({"provider": "llm7", "env_var": "LLM7_API_KEY", "model": "fast", "endpoint": "https://api.llm7.io/v1/chat/completions"})
-    messages = body.get("messages", [{"role": "user", "content": "Hello"}])
-    model = body.get("model", "")
-    prompt = body.get("prompt", "")
-    if prompt and not messages: messages = [{"role": "user", "content": prompt}]
+def verify_chain(receipts: list) -> Dict:
+    """
+    Verify a list of receipts forms a valid hash chain.
+    Returns {"valid": bool, "checked": int, "errors": [str]}.
+    """
     errors = []
-    for entry in active:
-        provider = entry.get("provider", ""); env_var = entry.get("env_var", "")
-        key = os.environ.get(env_var, "unused"); endpoint = entry.get("endpoint", "")
-        if not endpoint:
-            for svc in _llm_load_json(_LLM_CATALOG_PATH).get("services", []):
-                if svc["p"] == provider: endpoint = svc["e"]; break
-        if not endpoint: continue
-        use_model = model or entry.get("model", "")
-        req_body = json.dumps({"model": use_model, "messages": messages, "max_tokens": body.get("max_tokens", 500), "temperature": body.get("temperature", 0.3)}).encode()
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        try:
-            req = urllib.request.Request(endpoint, data=req_body, headers=headers, method="POST")
-            resp = urllib.request.urlopen(req, timeout=15)
-            data = json.loads(resp.read())
-            _LLM_USAGE["total_requests"] += 1
-            _LLM_USAGE["per_provider"][provider] = _LLM_USAGE["per_provider"].get(provider, 0) + 1
-            return {"response": data.get("choices", [{}])[0].get("message", {}).get("content", ""),
-                    "provider": provider, "model": use_model, "usage": _LLM_USAGE}
-        except Exception as e:
-            errors.append({"provider": provider, "error": str(e)[:200]}); continue
-    _LLM_USAGE["fallbacks_triggered"] += 1
-    return {"error": "All providers failed", "errors": errors, "usage": _LLM_USAGE}
+    prev_fp = None
+    for i, r in enumerate(receipts):
+        if r.get("chain_index") != i:
+            errors.append(f"chain_index mismatch at {i}: got {r.get('chain_index')}")
+        if r.get("prev_fingerprint") != prev_fp:
+            errors.append(f"prev_fingerprint mismatch at index {i}")
+        if not verify_receipt(r):
+            errors.append(f"fingerprint mismatch at index {i}")
+        prev_fp = r.get("fingerprint")
+    return {"valid": len(errors) == 0, "checked": len(receipts), "errors": errors}
 
-@app.post("/llm/rotate")
-async def llm_rotate():
-    """Trigger re-discovery + re-validation + re-ranking via ETL script."""
-    import subprocess
-    etl_script = _Path(__file__).resolve().parent / "scripts" / "master_etl.py"
-    if not etl_script.exists():
-        etl_script = _Path(__file__).resolve().parent / "scripts" / "api_key_etl.py"
-    if not etl_script.exists():
-        return {"error": "ETL script not found", "path": str(etl_script)}
+
+def load_all_receipts() -> list:
+    """Load all receipt JSON files from receipts/ dir, sorted by chain_index."""
+    receipts = []
+    for p in sorted(RECEIPTS_DIR.glob("*.json")):
+        if p.name == "chain_head.json":
+            continue
+        with p.open() as f:
+            try:
+                r = json.load(f)
+                if "fingerprint" in r:
+                    receipts.append(r)
+            except json.JSONDecodeError:
+                continue
+    receipts.sort(key=lambda r: r.get("chain_index", 0))
+    return receipts
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Receipt fingerprint utilities")
+    parser.add_argument("--verify", action="store_true", help="Verify the receipt chain")
+    parser.add_argument("--show", action="store_true", help="Show all receipts with fingerprints")
+    args = parser.parse_args()
+
+    if args.verify:
+        receipts = load_all_receipts()
+        result = verify_chain(receipts)
+        print(json.dumps(result, indent=2))
+        if result["valid"]:
+            print(f"\n✅ Chain valid: {result['checked']} receipts verified")
+        else:
+            print(f"\n❌ Chain INVALID: {len(result['errors'])} errors")
+            for e in result["errors"]:
+                print(f"  - {e}")
+
+    if args.show:
+        receipts = load_all_receipts()
+        for r in receipts:
+            print(f"[{r.get('chain_index', '?')}] {r.get('fingerprint', '?')[:16]}  "
+                  f"{r.get('action', '?')}  {r.get('timestamp', '?')}")
+
+```
+
+rm_engagement_engine.py:
+```
+#!/usr/bin/env python3
+"""
+RM Engagement Engine — 24/7 visitor engagement automation.
+
+Features:
+  - Scrapes ALL visitors by clicking "Load More" until exhausted
+  - Tracks visit counts per visitor across sessions (SQLite)
+  - Extracts profile metadata: last online, last visit to your page
+  - Auto-messages visitors who visited 3+ times (with human approval gate)
+  - Generates message pool from templates with personalization
+  - Visit-back all unique visitors with human-like delays
+  - Anti-bot: undetected ChromeDriver, randomized UA, human typing
+  - Full receipt + screenshot attribution for every action
+
+Usage:
+  python3 rm_engagement_engine.py --headed --login --full-run
+  python3 rm_engagement_engine.py --headed --login --scrape-only
+  python3 rm_engagement_engine.py --headed --login --message-repeat --threshold 3
+  python3 rm_engagement_engine.py --headed --login --visit-back --limit 0  # 0 = all
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import io
+import json
+import os
+import random
+import sqlite3
+import time
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+BASE_URL = "https://rentmasseur.com"
+ARTIFACTS = Path("artifacts/engagement")
+SCREENSHOTS = ARTIFACTS / "screenshots"
+RECEIPTS = ARTIFACTS / "receipts"
+DB_PATH = ARTIFACTS / "engagement.db"
+
+THUMBNAILS = ARTIFACTS / "thumbnails"
+
+for d in (ARTIFACTS, SCREENSHOTS, RECEIPTS, THUMBNAILS):
+    d.mkdir(parents=True, exist_ok=True)
+
+SESSION_ID = hashlib.sha256(f"{time.time()}{random.random()}".encode()).hexdigest()[:12]
+START_TIME = time.time()
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+]
+
+MESSAGE_TEMPLATES = [
+    "Hey {name}, noticed you stopped by again! Always great to see familiar faces. What brings you back? 😊",
+    "Hi {name}! I see you've been checking out my profile — happy to answer any questions you might have about scheduling.",
+    "Hey there {name}, thanks for the repeat visits! If you're thinking about booking, I have some availability this week. Let me know!",
+    "Hi {name}! You've visited a few times — I'm guessing you're interested in a session? I'm in Manhattan, easy to schedule. Shoot me a message!",
+    "Hey {name}, returning visitor! That's awesome. I offer a great rate for repeat clients. Want to set something up?",
+    "Hi {name}! I noticed you've been back a few times. I'm available today if you want to stop by — Manhattan incall, very clean and professional.",
+    "Hey {name}! Thanks for the continued interest. I'm taking bookings for this week — morning and afternoon slots open. What works for you?",
+    "Hi {name}, you're becoming a regular visitor! 😄 I'd love to meet you — any particular day or time you're thinking about?",
+]
+
+EXCLUDE_USERNAMES = {
+    'settings', 'gay-massage', 'stream', 'masseurcams', 'advertise',
+    'about', 'login', 'sitemap', 'topics', 'robots', 'api', 'blog',
+    'blogs', 'reviews', 'interviews', 'find-massage', 'live-cams',
+    'available', 'static', '_next', 'images', 'mailbox', 'compose',
+}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def elapsed() -> float:
+    return round(time.time() - START_TIME, 2)
+
+
+def log(msg: str, level: str = "INFO"):
+    print(f"[ENGINE] [{elapsed():>7.1f}s] [{level:<5}] {msg}")
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def write_receipt(action: str, status: str, data: dict) -> Path:
+    receipt = {
+        "session_id": SESSION_ID,
+        "action": action,
+        "status": status,
+        "timestamp": now_iso(),
+        "elapsed_s": elapsed(),
+        **data,
+    }
+    content = json.dumps(receipt, sort_keys=True, indent=2)
+    rhash = sha256_text(content)[:16]
+    receipt["receipt_hash"] = rhash
+    fname = f"{action}_{receipt['timestamp'].replace(':', '-')}.json"
+    rpath = RECEIPTS / fname
+    rpath.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+    log(f"Receipt: {action} → {status} (hash={rhash})")
+    return rpath
+
+
+def human_delay(min_s: float = 0.8, max_s: float = 2.5):
+    time.sleep(random.uniform(min_s, max_s))
+
+
+# ─── Organic Visit Patterns ───────────────────────────────────────────
+
+def organic_visit_delay():
+    """Vary delays to mimic human browsing patterns — not robotic fixed intervals."""
+    # Sometimes quick, sometimes slow, occasionally pause like reading
+    roll = random.random()
+    if roll < 0.6:
+        # Normal browsing: 2-5s
+        time.sleep(random.uniform(2.0, 5.0))
+    elif roll < 0.85:
+        # Reading profile: 5-12s
+        time.sleep(random.uniform(5.0, 12.0))
+    else:
+        # Distracted / long pause: 10-25s
+        time.sleep(random.uniform(10.0, 25.0))
+
+
+def organic_batch_pause(batch_num: int):
+    """Every N visits, take a longer break like a human stepping away."""
+    if batch_num > 0 and batch_num % random.choice([15, 20, 25]) == 0:
+        pause = random.uniform(30, 90)
+        log(f"  Organic batch pause: {pause:.0f}s (after {batch_num} visits)")
+        time.sleep(pause)
+
+
+def organic_shuffle(visitors: list[dict]) -> list[dict]:
+    """Shuffle visit order — never visit in the same sequence twice."""
+    shuffled = visitors.copy()
+    random.shuffle(shuffled)
+    return shuffled
+
+
+def organic_session_size(total: int) -> int:
+    """Don't visit all 450 in one robotic batch — visit a natural subset per session."""
+    if total <= 20:
+        return total
+    # Visit 30-70% of remaining, leaving organic gaps
+    return max(20, int(total * random.uniform(0.3, 0.7)))
+
+
+def human_type(element, text: str, min_delay: float = 0.05, max_delay: float = 0.15):
+    for char in text:
+        element.send_keys(char)
+        time.sleep(random.uniform(min_delay, max_delay))
+
+
+def pick_message(username: str) -> str:
+    name = username.capitalize()
+    template = random.choice(MESSAGE_TEMPLATES)
+    return template.format(name=name)
+
+
+# ─── Screenshot Compression ───────────────────────────────────────────
+
+def compress_screenshot(png_path: Path, max_width: int = 400, quality: int = 50) -> tuple[str, int]:
+    """Compress a PNG screenshot to a small JPEG thumbnail, return base64 + size in KB.
+    Original PNG is deleted after compression."""
     try:
-        result = subprocess.run([sys.executable, str(etl_script), "--phase", "all"], capture_output=True, text=True, timeout=120, cwd=str(_Path(__file__).resolve().parent))
-        return {"status": "completed", "stdout": result.stdout[-500:], "stderr": result.stderr[-500:] if result.stderr else ""}
-    except subprocess.TimeoutExpired:
-        return {"status": "timeout", "error": "ETL script timed out after 60s"}
+        from PIL import Image
+        img = Image.open(str(png_path))
+        ratio = max_width / img.width
+        new_size = (max_width, int(img.height * ratio))
+        img = img.resize(new_size, Image.LANCZOS)
+        img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        thumb_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        thumb_kb = round(len(buf.getvalue()) / 1024, 1)
+        # Save thumbnail file
+        thumb_path = THUMBNAILS / (png_path.stem + ".jpg")
+        thumb_path.write_bytes(buf.getvalue())
+        # Delete original PNG
+        png_path.unlink(missing_ok=True)
+        return thumb_b64, thumb_kb
     except Exception as e:
-        return {"status": "error", "error": str(e)[:200]}
+        log(f"Screenshot compression failed: {e}", "WARN")
+        return "", 0
 
-@app.get("/llm/usage")
-async def llm_usage():
-    """Track tokens used per provider, requests served, fallbacks triggered."""
-    return _LLM_USAGE
 
-@app.post("/llm/keys/add")
-async def llm_keys_add(body: dict = Body(...)):
-    """Manually add a key, auto-validate, insert into registry."""
-    provider = body.get("provider", ""); key = body.get("key", ""); env_var = body.get("env_var", "")
-    if not provider or not key: return {"error": "provider and key required"}
-    catalog = _llm_load_json(_LLM_CATALOG_PATH)
-    svc = None
-    for s in catalog.get("services", []):
-        if s["p"] == provider: svc = s; break
-    if not svc: return {"error": f"Unknown provider: {provider}"}
-    env_var = env_var or svc.get("env", "")
-    # Update .env
-    env_path = _Path(__file__).resolve().parent / ".env"
-    existing = {}
-    if env_path.exists():
-        for line in open(env_path, errors="ignore"):
-            if "=" in line and not line.startswith("#"):
-                k, v = line.strip().split("=", 1); existing[k] = v.strip().strip("'\"")
-    existing[env_var] = key
-    with open(env_path, "w") as f:
-        for k, v in sorted(existing.items()): f.write(f"{k}={v}\n")
-    os.environ[env_var] = key
-    return {"status": "added", "provider": provider, "env_var": env_var, "message": "Key added to .env. Run /llm/rotate to validate."}
+def already_visited_today(username: str) -> bool:
+    """Check if we already visited this profile today."""
+    conn = sqlite3.connect(str(DB_PATH))
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    row = conn.execute(
+        "SELECT visited_at FROM visit_log WHERE username=? AND status='ok' ORDER BY visited_at DESC LIMIT 1",
+        (username,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return False
+    try:
+        last_visit = row[0][:10]  # YYYY-MM-DD
+        return last_visit == today
+    except Exception:
+        return False
 
-@app.post("/llm/facts/{file_id}")
-async def llm_facts(file_id: str, body: dict = Body(default={})):
-    """Use best available LLM to generate 30 facts about a file."""
-    eval_data = _evaluations.get(file_id)
-    if not eval_data: raise HTTPException(404, f"File {file_id} not found")
-    if eval_data.get("status") != "done": raise HTTPException(409, f"File still processing: {eval_data.get('status')}")
-    result = eval_data.get("result", {})
-    meta = result.get("meta", {})
-    kpis = result.get("kpis", [])
-    dna = result.get("dna", {})
-    ml_result = result.get("ml", {})
-    text = result.get("text", "")[:2000]
-    facts = _jorki_llm_30_facts(text, kpis, dna, ml_result, meta)
-    if not facts: return {"error": "All LLM providers failed", "file_id": file_id}
-    return {"file_id": file_id, "facts": facts, "count": len(facts) if isinstance(facts, list) else 0}
 
-# ─── OVERAGENT: Production Control Plane ────────────────────────────────
-# Evidence-only RevenueOps: first-party metrics in → KPIs → decision gate
-# → receipts → dashboard → operator report.
-# No secrets. No fake availability. No platform abuse. Proof density only.
+# ─── SQLite Persistence ──────────────────────────────────────────────
 
-OA_DATA_DIR = _Path(os.environ.get("SYSTEMLAKE_DATA_DIR", "/tmp/systemlake_v4b")) / "overagent"
-OA_DATA_DIR.mkdir(parents=True, exist_ok=True)
-OA_DB_PATH = OA_DATA_DIR / "overagent.db"
-OA_DECISIONS = []
-OA_EXPERIMENTS = {}
-
-def _oa_db():
-    conn = sqlite3.connect(str(OA_DB_PATH))
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS metrics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts REAL, source TEXT, metric TEXT, value REAL, unit TEXT, tags TEXT
-        );
-        CREATE TABLE IF NOT EXISTS receipts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts REAL, action TEXT, actor TEXT, detail TEXT, hash TEXT, prev_hash TEXT
-        );
-        CREATE TABLE IF NOT EXISTS kpi_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts REAL, immortality REAL, virality REAL, conversion REAL, proof REAL, composite REAL
-        );
-        CREATE TABLE IF NOT EXISTS decisions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts REAL, action TEXT, rationale TEXT, evidence TEXT, approved INTEGER, operator TEXT
-        );
-        CREATE TABLE IF NOT EXISTS experiments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts REAL, name TEXT, hypothesis TEXT, state TEXT, metric_delta TEXT, verdict TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts);
-        CREATE INDEX IF NOT EXISTS idx_receipts_ts ON receipts(ts);
-        CREATE INDEX IF NOT EXISTS idx_kpi_ts ON kpi_history(ts);
+def init_db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS visitors (
+            username TEXT PRIMARY KEY,
+            visit_count INTEGER DEFAULT 0,
+            first_seen TEXT,
+            last_seen TEXT,
+            last_online TEXT,
+            last_visited_my_page TEXT,
+            last_messaged TEXT,
+            message_count INTEGER DEFAULT 0,
+            profile_url TEXT,
+            last_profile_hash TEXT
+        )
     """)
-    return conn
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS visit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
+            session_id TEXT,
+            visited_at TEXT,
+            status TEXT,
+            content_hash TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS message_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
+            session_id TEXT,
+            sent_at TEXT,
+            message_text TEXT,
+            status TEXT,
+            template_index INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+    log(f"DB initialized: {DB_PATH}")
 
-def _oa_receipt(action: str, actor: str, detail: str) -> str:
-    conn = _oa_db()
-    prev = conn.execute("SELECT hash FROM receipts ORDER BY id DESC LIMIT 1").fetchone()
-    prev_hash = prev[0] if prev else "0" * 64
-    h = hashlib.sha256(f"{action}{actor}{detail}{prev_hash}{time.time()}".encode()).hexdigest()
-    conn.execute("INSERT INTO receipts (ts, action, actor, detail, hash, prev_hash) VALUES (?,?,?,?,?,?)",
-                 (time.time(), action, actor, detail[:500], h, prev_hash))
-    conn.commit(); conn.close()
-    return h
 
-def _oa_compute_kpis() -> dict:
-    conn = _oa_db()
-    now = time.time()
-    hour_ago = now - 3600
-    # Immortality: system uptime, endpoint availability, proof persistence
-    health_count = conn.execute("SELECT COUNT(*) FROM metrics WHERE metric='health_check' AND ts > ?", (hour_ago,)).fetchone()[0]
-    receipt_count = conn.execute("SELECT COUNT(*) FROM receipts WHERE ts > ?", (hour_ago,)).fetchone()[0]
-    total_receipts = conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0]
-    immortality = min(100, (health_count / 6) * 40 + min(30, total_receipts * 2) + min(30, receipt_count * 10))
-    # Virality: view velocity, contact-click lift, acceleration
-    views = conn.execute("SELECT SUM(value) FROM metrics WHERE metric='profile_view' AND ts > ?", (hour_ago,)).fetchone()[0] or 0
-    contacts = conn.execute("SELECT SUM(value) FROM metrics WHERE metric='contact_click' AND ts > ?", (hour_ago,)).fetchone()[0] or 0
-    prev_views = conn.execute("SELECT SUM(value) FROM metrics WHERE metric='profile_view' AND ts <= ? AND ts > ?", (hour_ago, now - 7200)).fetchone()[0] or 0
-    view_accel = ((views - prev_views) / max(prev_views, 1)) * 100 if prev_views > 0 else (50 if views > 0 else 0)
-    virality = min(100, min(40, views * 4) + min(30, view_accel) + min(30, contacts * 15))
-    # Conversion: profile views → contact actions
-    if views > 0:
-        conversion = min(100, (contacts / views) * 100 * 10)  # scaled
+def record_visitor_seen(username: str, profile_url: str):
+    conn = sqlite3.connect(str(DB_PATH))
+    now = now_iso()
+    existing = conn.execute("SELECT visit_count FROM visitors WHERE username=?", (username,)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE visitors SET visit_count=visit_count+1, last_seen=?, profile_url=? WHERE username=?",
+            (now, profile_url, username)
+        )
     else:
-        conversion = 0
-    # Proof: receipts backing claims, reproducible artifacts
-    proof_metrics = conn.execute("SELECT COUNT(DISTINCT metric) FROM metrics WHERE ts > ?", (hour_ago,)).fetchone()[0]
-    proof = min(100, min(40, total_receipts * 3) + min(30, proof_metrics * 10) + min(30, receipt_count * 10))
+        conn.execute(
+            "INSERT INTO visitors (username, visit_count, first_seen, last_seen, profile_url) VALUES (?, 1, ?, ?, ?)",
+            (username, now, now, profile_url)
+        )
+    conn.execute(
+        "INSERT INTO visit_log (username, session_id, visited_at, status, content_hash) VALUES (?, ?, ?, 'seen', NULL)",
+        (username, SESSION_ID, now)
+    )
+    conn.commit()
     conn.close()
-    composite = (immortality * 0.25 + virality * 0.30 + conversion * 0.25 + proof * 0.20)
+
+
+def get_visitor_stats(username: str) -> dict:
+    conn = sqlite3.connect(str(DB_PATH))
+    row = conn.execute(
+        "SELECT visit_count, first_seen, last_seen, last_online, last_visited_my_page, last_messaged, message_count FROM visitors WHERE username=?",
+        (username,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"visit_count": 0}
     return {
-        "immortality": round(immortality, 1),
-        "virality": round(virality, 1),
-        "conversion": round(conversion, 1),
-        "proof": round(proof, 1),
-        "composite": round(composite, 1),
-        "raw": {"health_checks_1h": health_count, "receipts_1h": receipt_count, "total_receipts": total_receipts,
-                "views_1h": int(views), "contacts_1h": int(contacts), "prev_views_1h": int(prev_views),
-                "view_acceleration_pct": round(view_accel, 1), "distinct_metrics_1h": proof_metrics},
+        "visit_count": row[0],
+        "first_seen": row[1],
+        "last_seen": row[2],
+        "last_online": row[3],
+        "last_visited_my_page": row[4],
+        "last_messaged": row[5],
+        "message_count": row[6],
     }
 
-@app.post("/api/metrics/ingest")
-async def oa_metrics_ingest(body: dict = Body(...)):
-    """First-party metrics in. Accepts metric events from approved sources."""
-    source = body.get("source", "unknown")
-    metrics = body.get("metrics", [])
-    if not metrics and "metric" in body:
-        metrics = [{"metric": body["metric"], "value": body.get("value", 1), "unit": body.get("unit", "count"), "tags": body.get("tags", "")}]
-    if not metrics:
-        return {"error": "No metrics provided"}
-    conn = _oa_db()
-    now = time.time()
-    inserted = 0
-    for m in metrics:
-        conn.execute("INSERT INTO metrics (ts, source, metric, value, unit, tags) VALUES (?,?,?,?,?,?)",
-                     (now, source, m.get("metric", ""), float(m.get("value", 1)), m.get("unit", "count"), json.dumps(m.get("tags", {}))))
-        inserted += 1
-    conn.commit(); conn.close()
-    rhash = _oa_receipt("metrics_ingest", source, f"{inserted} metrics from {source}")
-    return {"status": "ingested", "count": inserted, "receipt": rhash[:16], "timestamp": now}
 
-@app.get("/api/kpis")
-async def oa_kpis():
-    """Live KPI readout: Immortality, Virality, Conversion, Proof, composite."""
-    kpis = _oa_compute_kpis()
-    conn = _oa_db()
-    conn.execute("INSERT INTO kpi_history (ts, immortality, virality, conversion, proof, composite) VALUES (?,?,?,?,?,?)",
-                 (time.time(), kpis["immortality"], kpis["virality"], kpis["conversion"], kpis["proof"], kpis["composite"]))
-    conn.commit(); conn.close()
-    return {"kpis": kpis, "timestamp": time.time()}
-
-@app.get("/api/kpis/history")
-async def oa_kpi_history(hours: int = 24):
-    """KPI history for trend analysis."""
-    conn = _oa_db()
-    cutoff = time.time() - hours * 3600
-    rows = conn.execute("SELECT ts, immortality, virality, conversion, proof, composite FROM kpi_history WHERE ts > ? ORDER BY ts", (cutoff,)).fetchall()
+def update_visitor_meta(username: str, last_online: str = None, last_visited_my_page: str = None, profile_hash: str = None):
+    conn = sqlite3.connect(str(DB_PATH))
+    fields = []
+    vals = []
+    if last_online:
+        fields.append("last_online=?")
+        vals.append(last_online)
+    if last_visited_my_page:
+        fields.append("last_visited_my_page=?")
+        vals.append(last_visited_my_page)
+    if profile_hash:
+        fields.append("last_profile_hash=?")
+        vals.append(profile_hash)
+    if fields:
+        vals.append(username)
+        conn.execute(f"UPDATE visitors SET {', '.join(fields)} WHERE username=?", vals)
+        conn.commit()
     conn.close()
-    return {"history": [{"ts": r[0], "immortality": r[1], "virality": r[2], "conversion": r[3], "proof": r[4], "composite": r[5]} for r in rows], "count": len(rows)}
 
-@app.post("/api/decision-gate")
-async def oa_decision_gate(body: dict = Body(...)):
-    """Decision ledger out. Records approved/rejected actions with evidence."""
-    action = body.get("action", "")
-    rationale = body.get("rationale", "")
-    evidence = body.get("evidence", "")
-    approved = body.get("approved", False)
-    operator = body.get("operator", "system")
-    if not action:
-        return {"error": "action is required"}
-    conn = _oa_db()
-    conn.execute("INSERT INTO decisions (ts, action, rationale, evidence, approved, operator) VALUES (?,?,?,?,?,?)",
-                 (time.time(), action, rationale[:300], evidence[:300], 1 if approved else 0, operator))
-    conn.commit(); conn.close()
-    rhash = _oa_receipt("decision", operator, f"{'APPROVED' if approved else 'REJECTED'}: {action} — {rationale}")
-    kpis = _oa_compute_kpis()
-    recommendation = "keep" if kpis["composite"] > 50 else "rollback" if kpis["composite"] < 25 else "wait"
-    return {
-        "decision": action,
-        "approved": approved,
-        "receipt": rhash[:16],
-        "kpi_snapshot": kpis,
-        "recommendation": recommendation,
-        "timestamp": time.time(),
-    }
 
-@app.get("/api/decision-gate")
-async def oa_decision_list():
-    """List all decisions in the ledger."""
-    conn = _oa_db()
-    rows = conn.execute("SELECT ts, action, rationale, evidence, approved, operator FROM decisions ORDER BY ts DESC LIMIT 50").fetchall()
+def record_message(username: str, message_text: str, status: str, template_index: int):
+    conn = sqlite3.connect(str(DB_PATH))
+    now = now_iso()
+    conn.execute(
+        "INSERT INTO message_log (username, session_id, sent_at, message_text, status, template_index) VALUES (?, ?, ?, ?, ?, ?)",
+        (username, SESSION_ID, now, message_text, status, template_index)
+    )
+    conn.execute(
+        "UPDATE visitors SET last_messaged=?, message_count=message_count+1 WHERE username=?",
+        (now, username)
+    )
+    conn.commit()
     conn.close()
-    return {"decisions": [{"ts": r[0], "action": r[1], "rationale": r[2], "evidence": r[3], "approved": bool(r[4]), "operator": r[5]} for r in rows], "count": len(rows)}
 
-@app.get("/api/receipts")
-async def oa_receipts(limit: int = 50):
-    """Receipt ledger — tamper-evident chain of all important actions."""
-    conn = _oa_db()
-    rows = conn.execute("SELECT ts, action, actor, detail, hash, prev_hash FROM receipts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+def get_all_visitors() -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute(
+        "SELECT username, visit_count, last_seen, last_online, last_visited_my_page, last_messaged, message_count FROM visitors ORDER BY visit_count DESC"
+    ).fetchall()
     conn.close()
-    return {
-        "receipts": [{"ts": r[0], "action": r[1], "actor": r[2], "detail": r[3], "hash": r[4], "prev_hash": r[5]} for r in rows],
-        "count": len(rows),
-        "chain_verified": len(rows) > 0,
-    }
+    return [
+        {
+            "username": r[0], "visit_count": r[1], "last_seen": r[2],
+            "last_online": r[3], "last_visited_my_page": r[4],
+            "last_messaged": r[5], "message_count": r[6],
+        }
+        for r in rows
+    ]
 
-@app.post("/api/experiments")
-async def oa_experiment_create(body: dict = Body(...)):
-    """Track experiment state: hypothesis, metric delta, verdict."""
-    name = body.get("name", "")
-    hypothesis = body.get("hypothesis", "")
-    if not name:
-        return {"error": "name is required"}
-    conn = _oa_db()
-    conn.execute("INSERT INTO experiments (ts, name, hypothesis, state, metric_delta, verdict) VALUES (?,?,?,?,?,?)",
-                 (time.time(), name, hypothesis[:300], "running", "", ""))
-    conn.commit(); conn.close()
-    rhash = _oa_receipt("experiment_start", "system", f"Experiment: {name} — {hypothesis}")
-    return {"experiment": name, "state": "running", "receipt": rhash[:16]}
 
-@app.post("/api/experiments/{name}/verdict")
-async def oa_experiment_verdict(name: str, body: dict = Body(...)):
-    """Record experiment verdict: keep, rollback, or iterate."""
-    verdict = body.get("verdict", "inconclusive")
-    metric_delta = body.get("metric_delta", "")
-    conn = _oa_db()
-    conn.execute("UPDATE experiments SET state=?, metric_delta=?, verdict=? WHERE name=? AND state='running'",
-                 ("complete", str(metric_delta)[:200], verdict, name))
-    conn.commit(); conn.close()
-    rhash = _oa_receipt("experiment_verdict", "system", f"{name}: {verdict} — delta={metric_delta}")
-    return {"experiment": name, "verdict": verdict, "receipt": rhash[:16]}
-
-@app.get("/api/experiments")
-async def oa_experiment_list():
-    """List all experiments and their states."""
-    conn = _oa_db()
-    rows = conn.execute("SELECT ts, name, hypothesis, state, metric_delta, verdict FROM experiments ORDER BY ts DESC").fetchall()
+def get_repeat_visitors(threshold: int = 3) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute(
+        "SELECT username, visit_count, last_messaged, message_count FROM visitors WHERE visit_count >= ? ORDER BY visit_count DESC",
+        (threshold,)
+    ).fetchall()
     conn.close()
-    return {"experiments": [{"ts": r[0], "name": r[1], "hypothesis": r[2], "state": r[3], "metric_delta": r[4], "verdict": r[5]} for r in rows], "count": len(rows)}
+    return [
+        {"username": r[0], "visit_count": r[1], "last_messaged": r[2], "message_count": r[3]}
+        for r in rows
+    ]
 
-@app.get("/api/dashboard")
-async def oa_dashboard():
-    """Production control surface: alive? attention? buyer intent? keep/rollback/wait/test?"""
-    kpis = _oa_compute_kpis()
-    conn = _oa_db()
-    # Recent metrics
-    recent_metrics = conn.execute("SELECT ts, source, metric, value FROM metrics ORDER BY ts DESC LIMIT 20").fetchall()
-    # Decision count
-    decisions = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
-    approved = conn.execute("SELECT COUNT(*) FROM decisions WHERE approved=1").fetchone()[0]
-    # Experiment count
-    experiments = conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
-    active_exp = conn.execute("SELECT COUNT(*) FROM experiments WHERE state='running'").fetchone()[0]
-    # Receipt chain
-    receipt_count = conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0]
-    last_receipt = conn.execute("SELECT ts, action FROM receipts ORDER BY id DESC LIMIT 1").fetchone()
-    conn.close()
-    # System alive check
-    alive = kpis["raw"]["health_checks_1h"] > 0 or receipt_count > 0
-    attention_increasing = kpis["raw"]["view_acceleration_pct"] > 0
-    buyer_intent = kpis["raw"]["contacts_1h"] > 0
-    if kpis["composite"] > 50:
-        recommendation = "keep"
-    elif kpis["composite"] < 25:
-        recommendation = "rollback"
-    else:
-        recommendation = "wait"
-    return {
-        "alive": alive,
-        "attention_increasing": attention_increasing,
-        "buyer_intent": buyer_intent,
-        "recommendation": recommendation,
-        "kpis": kpis,
-        "counts": {
-            "decisions": decisions,
-            "approved": approved,
-            "experiments": experiments,
-            "active_experiments": active_exp,
-            "receipts": receipt_count,
-        },
-        "last_receipt": {"ts": last_receipt[0], "action": last_receipt[1]} if last_receipt else None,
-        "recent_metrics": [{"ts": r[0], "source": r[1], "metric": r[2], "value": r[3]} for r in recent_metrics],
-        "operator_questions": {
-            "is_system_alive": alive,
-            "is_attention_increasing": attention_increasing,
-            "did_latest_change_improve_buyer_intent": buyer_intent,
-            "should_we": recommendation,
-        },
-    }
 
-@app.get("/api/operator-report")
-async def oa_operator_report():
-    """Short operator report: what changed, what proven, what unproven, what next."""
-    kpis = _oa_compute_kpis()
-    conn = _oa_db()
-    # What changed (recent receipts)
-    changes = conn.execute("SELECT action, actor, ts FROM receipts ORDER BY id DESC LIMIT 10").fetchall()
-    # What proven (backed by receipts + metrics)
-    proven = []
-    if kpis["raw"]["total_receipts"] > 0:
-        proven.append(f"Receipt chain intact: {kpis['raw']['total_receipts']} receipts")
-    if kpis["raw"]["health_checks_1h"] > 0:
-        proven.append(f"System alive: {kpis['raw']['health_checks_1h']} health checks in last hour")
-    if kpis["raw"]["views_1h"] > 0:
-        proven.append(f"Attention measurable: {kpis['raw']['views_1h']} profile views in last hour")
-    if kpis["raw"]["contacts_1h"] > 0:
-        proven.append(f"Buyer intent detected: {kpis['raw']['contacts_1h']} contact clicks in last hour")
-    # What unproven
-    unproven = []
-    if kpis["raw"]["health_checks_1h"] == 0:
-        unproven.append("No health checks in last hour — system liveness unproven")
-    if kpis["raw"]["views_1h"] == 0:
-        unproven.append("No profile views recorded — attention unproven")
-    if kpis["raw"]["contacts_1h"] == 0:
-        unproven.append("No contact clicks recorded — conversion unproven")
-    if kpis["proof"] < 50:
-        unproven.append(f"Proof density low ({kpis['proof']}/100) — need more receipts + metrics")
-    # What next
-    next_moves = []
-    if kpis["raw"]["health_checks_1h"] == 0:
-        next_moves.append("Start health check loop: POST /api/metrics/ingest with metric=health_check")
-    if kpis["raw"]["views_1h"] == 0:
-        next_moves.append("Ingest profile view metrics from first-party source")
-    if kpis["raw"]["contacts_1h"] == 0 and kpis["raw"]["views_1h"] > 0:
-        next_moves.append("A/B test contact button placement to improve conversion")
-    if kpis["composite"] < 50:
-        next_moves.append("Run experiment: POST /api/experiments with hypothesis for improvement")
-    if not next_moves:
-        next_moves.append("System stable. Monitor KPI trends and plan next experiment.")
-    conn.close()
-    return {
-        "report_ts": time.time(),
-        "kpi_snapshot": kpis,
+# ─── Browser Engine ──────────────────────────────────────────────────
+
+BLOCK_NEEDLES = [
+    ("captcha", "captcha_detected"),
+    ("crowdsec", "crowdsec_detected"),
+    ("access forbidden", "access_forbidden"),
+    ("verify you are human", "human_verification"),
+    ("unusual traffic", "traffic_challenge"),
+    ("too many requests", "rate_limited"),
+    ("cloudflare", "cloudflare_challenge"),
+]
+
+
+def detect_block_text(text: str, url: str) -> Optional[str]:
+    text_lower = text.lower()
+    url_lower = url.lower()
+    for needle, reason in BLOCK_NEEDLES:
+        if needle in text_lower or needle in url_lower:
+            return reason
+    return None
+
+
+class EngagementEngine:
+    def __init__(self, headed: bool):
+        self.headed = headed
+        self.driver = None
+        self.logged_in = False
+        self.ua = random.choice(USER_AGENTS)
+        log(f"Engine: Selenium (undetected) | UA: {self.ua[:40]}...")
+
+    def start(self):
+        import undetected_chromedriver as uc
+
+        options = uc.ChromeOptions()
+        if not self.headed:
+            options.add_argument("--headless=new")
+        options.add_argument("--window-size=1440,900")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument(f"--user-agent={self.ua}")
+
+        chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if os.path.exists(chrome_path):
+            options.binary_location = chrome_path
+
+        try:
+            import subprocess, re
+            ver_out = subprocess.check_output(
+                [chrome_path, "--version"], stderr=subprocess.DEVNULL
+            ).decode().strip()
+            chrome_major = int(re.search(r'(\d+)\.', ver_out).group(1))
+            self.driver = uc.Chrome(options=options, version_main=chrome_major)
+        except Exception:
+            self.driver = uc.Chrome(options=options)
+
+        self.driver.set_page_load_timeout(45)
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = { runtime: {} };
+            """
+        })
+        log("Browser started (Selenium/undetected)")
+
+    def stop(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+        log("Browser closed")
+
+    def screenshot(self, name: str) -> str:
+        ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        fname = f"{ts}_{SESSION_ID}_{name}.png"
+        path = SCREENSHOTS / fname
+        try:
+            self.driver.save_screenshot(str(path))
+        except Exception:
+            return ""
+        return str(path)
+
+    def screenshot_compressed(self, name: str) -> dict:
+        """Take screenshot, compress to thumbnail, delete original PNG.
+        Returns dict with thumbnail_base64, thumbnail_kb, original_size_kb."""
+        ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        fname = f"{ts}_{SESSION_ID}_{name}"
+        path = SCREENSHOTS / f"{fname}.png"
+        try:
+            self.driver.save_screenshot(str(path))
+            orig_kb = round(path.stat().st_size / 1024, 1)
+            thumb_b64, thumb_kb = compress_screenshot(path)
+            return {
+                "thumbnail_b64": thumb_b64[:500] if thumb_b64 else "",  # truncated for receipt
+                "thumbnail_file": f"{fname}.jpg",
+                "thumbnail_kb": thumb_kb,
+                "original_kb": orig_kb,
+                "compression_ratio": round(thumb_kb / orig_kb, 3) if orig_kb > 0 else 0,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def page_text(self) -> str:
+        try:
+            return self.driver.execute_script(
+                "return document.body ? document.body.innerText : ''"
+            )[:8000]
+        except Exception:
+            return ""
+
+    def detect_block(self) -> Optional[str]:
+        return detect_block_text(self.page_text(), self.driver.current_url)
+
+    def login(self, username: str, password: str) -> bool:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.keys import Keys
+
+        log("=== LOGIN ===")
+        try:
+            self.driver.get(f"{BASE_URL}/login")
+            human_delay(3, 5)
+            self.screenshot("01_login_page")
+
+            block = self.detect_block()
+            if block:
+                log(f"BLOCKED: {block}", "ERROR")
+                write_receipt("login", "blocked", {"reason": block})
+                return False
+
+            inputs = self.driver.find_elements(By.CSS_SELECTOR, "input")
+            email_el = pass_el = None
+            for inp in inputs:
+                if not inp.is_displayed():
+                    continue
+                itype = (inp.get_attribute("type") or "").lower()
+                iname = (inp.get_attribute("name") or "").lower()
+                if itype == "password":
+                    pass_el = inp
+                elif "email" in iname or "user" in iname or itype in ("email", "text"):
+                    email_el = inp
+
+            if not email_el or not pass_el:
+                log("Login form not found", "ERROR")
+                write_receipt("login", "fail", {"reason": "form_not_found"})
+                return False
+
+            log("Typing credentials (human-like)...")
+            email_el.click()
+            human_delay(0.3, 0.8)
+            human_type(email_el, username)
+            human_delay(0.5, 1.2)
+            pass_el.click()
+            human_delay(0.3, 0.6)
+            human_type(pass_el, password)
+            human_delay(0.8, 1.5)
+
+            self.screenshot("02_login_filled")
+            pass_el.send_keys(Keys.ENTER)
+            human_delay(4, 7)
+
+            current_url = self.driver.current_url
+            if "/login" in current_url.lower():
+                log("Login failed", "ERROR")
+                self.screenshot("03_login_failed")
+                write_receipt("login", "fail", {"reason": "still_on_login_page", "url": current_url})
+                return False
+
+            self.logged_in = True
+            self.screenshot("03_login_success")
+            log(f"Login OK — URL: {current_url}")
+            write_receipt("login", "pass", {"url": current_url, "ua": self.ua})
+            return True
+
+        except Exception as e:
+            log(f"Login error: {e}", "ERROR")
+            write_receipt("login", "error", {"error": str(e)})
+            return False
+
+    # ── Scrape ALL visitors with Load More ───────────────────────────
+
+    def scrape_all_visitors(self, max_load_more: int = 50) -> list[dict]:
+        from selenium.webdriver.common.by import By
+
+        log("=== SCRAPE ALL VISITORS (with Load More) ===")
+        self.driver.get(f"{BASE_URL}/settings/whosawme")
+        human_delay(4, 6)
+        self.screenshot("04_whosawme_initial")
+
+        block = self.detect_block()
+        if block:
+            log(f"BLOCKED: {block}", "ERROR")
+            write_receipt("scrape_visitors", "blocked", {"reason": block})
+            return []
+
+        all_visitors = []
+        load_more_count = 0
+
+        while load_more_count < max_load_more:
+            # Scrape current page state
+            current_visitors = self.driver.execute_script("""
+                const result = [];
+                const seen = new Set();
+                const profileImgs = document.querySelectorAll('img[alt="Profile photo"], img[alt="profile-picture"]');
+                for (const img of profileImgs) {
+                    const a = img.closest('a');
+                    if (a && a.href) {
+                        const path = new URL(a.href).pathname;
+                        const username = path.replace('/', '');
+                        if (username && !seen.has(username) && !username.includes('settings') && !username.includes('gay-massage')) {
+                            seen.add(username);
+                            result.push({username: username, url: a.href, name: username});
+                        }
+                    }
+                }
+                const links = Array.from(document.querySelectorAll('a[href]'));
+                for (const a of links) {
+                    const href = a.href;
+                    if (!href.startsWith('https://rentmasseur.com/')) continue;
+                    const path = new URL(href).pathname;
+                    if (path && path !== '/' && path.split('/').length === 2 && path.split('/')[1] !== '') {
+                        const username = path.replace('/', '');
+                        if (!seen.has(username) && !username.startsWith('_') && username.length > 2) {
+                            seen.add(username);
+                            result.push({username: username, url: href, name: username});
+                        }
+                    }
+                }
+                return result;
+            """)
+
+            # Merge with existing
+            existing_names = {v["username"] for v in all_visitors}
+            new_count = 0
+            for v in current_visitors:
+                if v["username"] not in existing_names and v["username"] not in EXCLUDE_USERNAMES:
+                    all_visitors.append(v)
+                    new_count += 1
+
+            log(f"  Load More #{load_more_count}: found {len(current_visitors)} on page, {new_count} new, total {len(all_visitors)}")
+
+            # Try to find and click "Load More" button
+            load_more_clicked = False
+            for sel in [
+                "button:has-text('Load More')",
+                "button:has-text('load more')",
+                "button:has-text('LOAD MORE')",
+                "a:has-text('Load More')",
+                "button[class*='load']",
+                "button[class*='more']",
+                "[class*='load-more']",
+                "[class*='loadmore']",
+            ]:
+                try:
+                    # Selenium doesn't support :has-text, use JS
+                    clicked = self.driver.execute_script(f"""
+                        const btns = document.querySelectorAll('button, a');
+                        for (const btn of btns) {{
+                            const text = (btn.textContent || '').toLowerCase().trim();
+                            if (text.includes('load more') || text.includes('loadmore') || text.includes('show more')) {{
+                                if (btn.offsetParent !== null) {{
+                                    btn.click();
+                                    return true;
+                                }}
+                            }}
+                        }}
+                        // Also try class-based
+                        const els = document.querySelectorAll('[class*="load"], [class*="more"]');
+                        for (const el of els) {{
+                            if (el.offsetParent !== null && (el.tagName === 'BUTTON' || el.tagName === 'A')) {{
+                                el.click();
+                                return true;
+                            }}
+                        }}
+                        return false;
+                    """)
+                    if clicked:
+                        load_more_clicked = True
+                        load_more_count += 1
+                        log(f"  Clicked Load More (#{load_more_count})")
+                        human_delay(2, 4)
+                        break
+                except Exception:
+                    continue
+
+            if not load_more_clicked:
+                log(f"  No more Load More button — scraping complete")
+                break
+
+            if new_count == 0 and load_more_count > 3:
+                log(f"  No new visitors in last {load_more_count} clicks — stopping")
+                break
+
+        # Deduplicate
+        seen = set()
+        unique = []
+        for v in all_visitors:
+            if v["username"] not in seen and v["username"] not in EXCLUDE_USERNAMES:
+                seen.add(v["username"])
+                unique.append(v)
+
+        log(f"Total unique visitors: {len(unique)} (after {load_more_count} Load More clicks)")
+        self.screenshot("04_whosawme_final")
+
+        # Record in DB
+        for v in unique:
+            record_visitor_seen(v["username"], v["url"])
+
+        write_receipt("scrape_visitors", "pass", {
+            "total_unique": len(unique),
+            "load_more_clicks": load_more_count,
+            "visitors": unique,
+        })
+        return unique
+
+    # ── Visit profile + extract metadata ─────────────────────────────
+

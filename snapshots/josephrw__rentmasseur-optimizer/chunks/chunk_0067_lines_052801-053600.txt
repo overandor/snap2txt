@@ -1,800 +1,800 @@
-    elif target == "interview":
-        return d.discover_interview()
-    return {"error": "unknown target"}
+    href TEXT,
+    discovered_at TEXT,
+    reviews_scraped INTEGER DEFAULT 0,
+    review_count INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending'
+);
 
-```
+CREATE TABLE IF NOT EXISTS clients (
+    username TEXT PRIMARY KEY,
+    first_found_on TEXT,
+    review_count INTEGER DEFAULT 0,
+    cities_found TEXT,
+    masseurs_reviewed TEXT,
+    sample_review TEXT,
+    first_seen TEXT,
+    last_seen TEXT
+);
 
-probe3.py:
-```
-import requests, re, json
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reviewer TEXT,
+    masseur TEXT,
+    rating TEXT,
+    review_text TEXT,
+    source TEXT,
+    scraped_at TEXT,
+    UNIQUE(reviewer, masseur)
+);
 
-s = requests.Session()
-s.headers.update({
-    'User-Agent': 'Mozilla/5.0',
-    'Accept': 'application/json',
-    'Referer': 'https://rentmasseur.com/settings',
-    'Origin': 'https://rentmasseur.com',
-})
-
-r = s.get('https://rentmasseur.com/login')
-m = re.search(r'csrf["\s:=]+([A-Za-z0-9+/=]{20,})', r.text)
-csrf = m.group(1) if m else ''
-r = s.post('https://rentmasseur.com/api/v1/login', json={
-    'email': 'karpathianwolf', 'password': 'os.environ.get("RM_PASSWORD", "")', 'csrf': csrf, 'remember': True
-})
-s.headers['Authorization'] = 'Bearer ' + r.json()['accessToken']
-print('Login OK')
-
-# Probe interview endpoints
-print('\n--- INTERVIEW ---')
-for path in ['/api/v1/settings/interview', '/api/v1/account/dashboard/interview', '/api/v1/account/interview']:
-    r = s.get(f'https://rentmasseur.com{path}', timeout=5)
-    if r.status_code != 404:
-        print(f'GET {r.status_code} {path}: {r.text[:500]}')
-
-# Probe blog endpoints
-print('\n--- BLOG ---')
-for path in ['/api/v1/settings/blog', '/api/v1/account/dashboard/blog', '/api/v1/account/blog', '/api/v1/blog']:
-    r = s.get(f'https://rentmasseur.com{path}', timeout=5)
-    if r.status_code != 404:
-        print(f'GET {r.status_code} {path}: {r.text[:500]}')
-
-# Try PUT interview with sample data
-print('\n--- PUT INTERVIEW ---')
-r = s.put('https://rentmasseur.com/api/v1/settings/interview', json={
-    'interview': 'test answer'
-})
-print(f'PUT interview: {r.status_code} {r.text[:300]}')
-
-# Try PUT blog
-print('\n--- PUT/POST BLOG ---')
-r = s.post('https://rentmasseur.com/api/v1/settings/blog', json={
-    'title': 'test', 'content': 'test'
-})
-print(f'POST blog: {r.status_code} {r.text[:300]}')
-r = s.put('https://rentmasseur.com/api/v1/settings/blog', json={
-    'title': 'test', 'content': 'test'
-})
-print(f'PUT blog: {r.status_code} {r.text[:300]}')
-
-```
-
-roi_algorithm.py:
-```
-"""
-ROI Algorithm — measurable traffic improvement tracking + value-based pricing.
-
-Proves the service works and calculates what to charge each masseur.
-
-BASELINE (7 days pre-service) → OPTIMIZE (run actions) → MEASURE (weekly deltas) → PRICE (value-delivered)
-
-Pricing:
-  base_fee = $49/month (covers LLM + infra)
-  performance_cut = max(0, additional_bookings × avg_rate × 15%)
-  GUARANTEE: if improvement < 10% vs baseline, base_fee waived that month.
+CREATE TABLE IF NOT EXISTS pipeline_state (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
-import json
-import logging
-import sqlite3
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
-log = logging.getLogger("roi_algorithm")
-
-ROI_DB = Path(__file__).parent / "roi.db"
-
-BASE_FEE_MONTHLY = 49.00
-COMMISSION_RATE = 0.15
-IMPROVEMENT_GUARANTEE_THRESHOLD = 0.10
-BASELINE_DAYS = 7
-MEASUREMENT_WINDOW_DAYS = 7
-
-EMAIL_WEIGHTS = {"booking": 3.0, "inquiry": 2.0, "reply": 1.0, "spam": 0.0}
+def get_db() -> sqlite3.Connection:
+    db = sqlite3.connect(str(DB_PATH))
+    db.row_factory = sqlite3.Row
+    db.executescript(SCHEMA)
+    return db
 
 
-def _db():
-    conn = sqlite3.connect(str(ROI_DB))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+def db_set(db: sqlite3.Connection, key: str, value: str):
+    db.execute("INSERT OR REPLACE INTO pipeline_state (key, value) VALUES (?, ?)", (key, value))
+    db.commit()
 
 
-def init_db():
-    conn = _db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS tenants (
-        tenant_id TEXT PRIMARY KEY,
-        username TEXT NOT NULL,
-        display_name TEXT,
-        email TEXT,
-        city TEXT DEFAULT 'manhattan-ny',
-        avg_session_rate REAL DEFAULT 234.0,
-        subscribed_at TEXT NOT NULL,
-        baseline_captured INTEGER DEFAULT 0,
-        baseline_start_ts TEXT,
-        baseline_end_ts TEXT,
-        active INTEGER DEFAULT 1,
-        pricing_tier TEXT DEFAULT 'performance'
-    );
-    CREATE TABLE IF NOT EXISTS daily_metrics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        date TEXT NOT NULL,
-        views INTEGER DEFAULT 0,
-        contact_clicks INTEGER DEFAULT 0,
-        emails_count INTEGER DEFAULT 0,
-        unread_emails INTEGER DEFAULT 0,
-        booking_emails INTEGER DEFAULT 0,
-        inquiry_emails INTEGER DEFAULT 0,
-        premium_senders INTEGER DEFAULT 0,
-        search_rank INTEGER DEFAULT 0,
-        available_rank INTEGER DEFAULT 0,
-        availability_option INTEGER DEFAULT 0,
-        is_hidden INTEGER DEFAULT 0,
-        headline TEXT,
-        ctr REAL DEFAULT 0.0,
-        email_rate REAL DEFAULT 0.0,
-        booking_rate REAL DEFAULT 0.0,
-        client_engagement_score REAL DEFAULT 0.0,
-        UNIQUE(tenant_id, date)
-    );
-    CREATE TABLE IF NOT EXISTS action_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        ts TEXT NOT NULL,
-        cycle_num INTEGER,
-        action_name TEXT NOT NULL,
-        category TEXT NOT NULL,
-        executed INTEGER DEFAULT 0,
-        detail TEXT,
-        views_delta INTEGER DEFAULT 0,
-        contacts_delta INTEGER DEFAULT 0,
-        emails_delta INTEGER DEFAULT 0,
-        attributed_score REAL DEFAULT 0.0
-    );
-    CREATE TABLE IF NOT EXISTS roi_reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        period_start TEXT NOT NULL,
-        period_end TEXT NOT NULL,
-        baseline_views_avg REAL,
-        current_views_avg REAL,
-        views_improvement_pct REAL,
-        baseline_contacts_avg REAL,
-        current_contacts_avg REAL,
-        contacts_improvement_pct REAL,
-        baseline_emails_avg REAL,
-        current_emails_avg REAL,
-        emails_improvement_pct REAL,
-        baseline_booking_emails_avg REAL,
-        current_booking_emails_avg REAL,
-        booking_improvement_pct REAL,
-        baseline_rank INTEGER,
-        current_rank INTEGER,
-        rank_improvement INTEGER,
-        baseline_ces REAL,
-        current_ces REAL,
-        ces_improvement_pct REAL,
-        estimated_additional_bookings REAL,
-        estimated_additional_revenue REAL,
-        monthly_charge REAL,
-        base_fee_charged REAL,
-        performance_cut_charged REAL,
-        guarantee_triggered INTEGER DEFAULT 0,
-        report_json TEXT,
-        created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS attribution_matrix (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tenant_id TEXT NOT NULL,
-        action_name TEXT NOT NULL,
-        total_runs INTEGER DEFAULT 0,
-        total_views_delta INTEGER DEFAULT 0,
-        total_contacts_delta INTEGER DEFAULT 0,
-        total_emails_delta INTEGER DEFAULT 0,
-        avg_attributed_score REAL DEFAULT 0.0,
-        last_run_ts TEXT,
-        UNIQUE(tenant_id, action_name)
-    );
-    CREATE INDEX IF NOT EXISTS idx_daily_tenant_date ON daily_metrics(tenant_id, date);
-    CREATE INDEX IF NOT EXISTS idx_action_tenant ON action_log(tenant_id, ts);
-    CREATE INDEX IF NOT EXISTS idx_reports_tenant ON roi_reports(tenant_id, period_end);
-    """)
-    conn.commit()
-    conn.close()
+def db_get(db: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = db.execute("SELECT value FROM pipeline_state WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
 
 
-# ---------------------------------------------------------------------------
-# Tenant Management
-# ---------------------------------------------------------------------------
+# ── Browser helpers ──────────────────────────────────────────────────
 
-def register_tenant(tenant_id: str, username: str, display_name: str = "",
-                    email: str = "", city: str = "manhattan-ny",
-                    avg_session_rate: float = 234.0) -> Dict:
-    ts = datetime.now(timezone.utc).isoformat()
-    conn = _db()
-    conn.execute(
-        """INSERT OR REPLACE INTO tenants
-           (tenant_id, username, display_name, email, city, avg_session_rate,
-            subscribed_at, baseline_captured, active, pricing_tier)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, 'performance')""",
-        (tenant_id, username, display_name, email, city, avg_session_rate, ts)
-    )
-    conn.commit()
-    conn.close()
-    log.info("Registered tenant %s (%s)", tenant_id, username)
-    return {"tenant_id": tenant_id, "username": username, "subscribed_at": ts}
-
-
-def get_tenant(tenant_id: str) -> Optional[Dict]:
-    conn = _db()
-    row = conn.execute("SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def list_tenants(active_only: bool = True) -> List[Dict]:
-    conn = _db()
-    q = "SELECT * FROM tenants"
-    if active_only:
-        q += " WHERE active = 1"
-    q += " ORDER BY subscribed_at DESC"
-    rows = conn.execute(q).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# Daily Metrics
-# ---------------------------------------------------------------------------
-
-def _calc_ces(metrics: Dict) -> float:
-    booking = metrics.get("booking_emails", 0)
-    inquiry = metrics.get("inquiry_emails", 0)
-    reply = max(0, metrics.get("emails_count", 0) - booking - inquiry)
-    visits_back = metrics.get("visits_back", 0)
-    return booking * EMAIL_WEIGHTS["booking"] + inquiry * EMAIL_WEIGHTS["inquiry"] + reply * EMAIL_WEIGHTS["reply"] + visits_back * 0.5
-
-
-def record_daily_metrics(tenant_id: str, metrics: Dict) -> None:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    views = metrics.get("views", 0)
-    contacts = metrics.get("contact_clicks", 0)
-    emails = metrics.get("emails_count", 0)
-    bookings = metrics.get("booking_emails", 0)
-    ctr = (contacts / views * 100) if views > 0 else 0.0
-    email_rate = (emails / contacts * 100) if contacts > 0 else 0.0
-    booking_rate = (bookings / emails * 100) if emails > 0 else 0.0
-    ces = _calc_ces(metrics)
-
-    conn = _db()
-    conn.execute(
-        """INSERT OR REPLACE INTO daily_metrics
-           (tenant_id, date, views, contact_clicks, emails_count, unread_emails,
-            booking_emails, inquiry_emails, premium_senders, search_rank, available_rank,
-            availability_option, is_hidden, headline, ctr, email_rate, booking_rate,
-            client_engagement_score)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (tenant_id, today, views, contacts, emails, metrics.get("unread_emails", 0),
-         bookings, metrics.get("inquiry_emails", 0), metrics.get("premium_senders", 0),
-         metrics.get("search_rank", 0), metrics.get("available_rank", 0),
-         metrics.get("availability_option", 0), metrics.get("is_hidden", 0),
-         metrics.get("headline", ""), round(ctr, 2), round(email_rate, 2),
-         round(booking_rate, 2), round(ces, 2))
-    )
-    conn.commit()
-    conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Baseline
-# ---------------------------------------------------------------------------
-
-def is_baseline_captured(tenant_id: str) -> bool:
-    t = get_tenant(tenant_id)
-    return bool(t and t.get("baseline_captured"))
-
-
-def finalize_baseline(tenant_id: str) -> Dict:
-    conn = _db()
-    rows = conn.execute(
-        "SELECT * FROM daily_metrics WHERE tenant_id = ? ORDER BY date ASC",
-        (tenant_id,)
-    ).fetchall()
-    if len(rows) < 3:
-        conn.close()
-        return {"captured": False, "reason": f"only {len(rows)} days, need >= 3"}
-    start, end = rows[0]["date"], rows[-1]["date"]
-    conn.execute(
-        "UPDATE tenants SET baseline_captured=1, baseline_start_ts=?, baseline_end_ts=? WHERE tenant_id=?",
-        (start, end, tenant_id)
-    )
-    conn.commit()
-    conn.close()
-    n = len(rows)
-    return {
-        "captured": True, "start": start, "end": end, "days": n,
-        "avg_views": round(sum(r["views"] for r in rows) / n, 1),
-        "avg_contacts": round(sum(r["contact_clicks"] for r in rows) / n, 1),
-        "avg_emails": round(sum(r["emails_count"] for r in rows) / n, 1),
-        "avg_bookings": round(sum(r["booking_emails"] for r in rows) / n, 1),
-        "avg_ces": round(sum(r["client_engagement_score"] for r in rows) / n, 2),
-    }
-
-
-def get_baseline_metrics(tenant_id: str) -> Dict:
-    t = get_tenant(tenant_id)
-    if not t or not t.get("baseline_start_ts"):
-        return {}
-    conn = _db()
-    rows = conn.execute(
-        "SELECT * FROM daily_metrics WHERE tenant_id=? AND date>=? AND date<=? ORDER BY date ASC",
-        (tenant_id, t["baseline_start_ts"], t["baseline_end_ts"])
-    ).fetchall()
-    conn.close()
-    if not rows:
-        return {}
-    n = len(rows)
-    return {
-        "avg_views": sum(r["views"] for r in rows) / n,
-        "avg_contacts": sum(r["contact_clicks"] for r in rows) / n,
-        "avg_emails": sum(r["emails_count"] for r in rows) / n,
-        "avg_booking_emails": sum(r["booking_emails"] for r in rows) / n,
-        "avg_ctr": sum(r["ctr"] for r in rows) / n,
-        "avg_ces": sum(r["client_engagement_score"] for r in rows) / n,
-        "search_rank": rows[-1]["search_rank"],
-        "days": n,
-    }
-
-
-def get_current_metrics(tenant_id: str, days: int = MEASUREMENT_WINDOW_DAYS) -> Dict:
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-    conn = _db()
-    rows = conn.execute(
-        "SELECT * FROM daily_metrics WHERE tenant_id=? AND date>=? ORDER BY date ASC",
-        (tenant_id, cutoff)
-    ).fetchall()
-    conn.close()
-    if not rows:
-        return {}
-    n = len(rows)
-    return {
-        "avg_views": sum(r["views"] for r in rows) / n,
-        "avg_contacts": sum(r["contact_clicks"] for r in rows) / n,
-        "avg_emails": sum(r["emails_count"] for r in rows) / n,
-        "avg_booking_emails": sum(r["booking_emails"] for r in rows) / n,
-        "avg_ctr": sum(r["ctr"] for r in rows) / n,
-        "avg_ces": sum(r["client_engagement_score"] for r in rows) / n,
-        "search_rank": rows[-1]["search_rank"],
-        "days": n,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Action Attribution
-# ---------------------------------------------------------------------------
-
-def log_action(tenant_id: str, cycle_num: int, action_name: str, category: str,
-               executed: bool, detail: str = "",
-               metric_before: Dict = None, metric_after: Dict = None) -> None:
-    ts = datetime.now(timezone.utc).isoformat()
-    mb = metric_before or {}
-    ma = metric_after or {}
-    v_delta = ma.get("views", 0) - mb.get("views", 0)
-    c_delta = ma.get("contacts", 0) - mb.get("contacts", 0)
-    e_delta = ma.get("emails", 0) - mb.get("emails", 0)
-    score = float(v_delta + c_delta * 2 + e_delta * 3) if executed else 0.0
-
-    conn = _db()
-    conn.execute(
-        """INSERT INTO action_log
-           (tenant_id, ts, cycle_num, action_name, category, executed, detail,
-            views_delta, contacts_delta, emails_delta, attributed_score)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (tenant_id, ts, cycle_num, action_name, category, int(executed),
-         detail[:200], v_delta, c_delta, e_delta, score)
-    )
-    conn.execute(
-        """INSERT INTO attribution_matrix (tenant_id, action_name, total_runs,
-           total_views_delta, total_contacts_delta, total_emails_delta,
-           avg_attributed_score, last_run_ts)
-           VALUES (?, ?, 1, ?, ?, ?, ?, ?)
-           ON CONFLICT(tenant_id, action_name) DO UPDATE SET
-           total_runs=total_runs+1,
-           total_views_delta=total_views_delta+excluded.total_views_delta,
-           total_contacts_delta=total_contacts_delta+excluded.total_contacts_delta,
-           total_emails_delta=total_emails_delta+excluded.total_emails_delta,
-           avg_attributed_score=(avg_attributed_score * (total_runs-1) + excluded.avg_attributed_score) / total_runs,
-           last_run_ts=excluded.last_run_ts""",
-        (tenant_id, action_name, v_delta, c_delta, e_delta, score, ts)
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_attribution_matrix(tenant_id: str) -> List[Dict]:
-    conn = _db()
-    rows = conn.execute(
-        "SELECT * FROM attribution_matrix WHERE tenant_id=? ORDER BY avg_attributed_score DESC",
-        (tenant_id,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# ROI Report + Pricing Calculation
-# ---------------------------------------------------------------------------
-
-def _pct_delta(baseline: float, current: float) -> float:
-    if baseline == 0:
-        return 100.0 if current > 0 else 0.0
-    return ((current - baseline) / baseline) * 100.0
-
-
-def generate_roi_report(tenant_id: str) -> Dict:
-    """Generate a full ROI report with pricing calculation."""
-    tenant = get_tenant(tenant_id)
-    if not tenant:
-        return {"error": "tenant not found"}
-
-    baseline = get_baseline_metrics(tenant_id)
-    current = get_current_metrics(tenant_id)
-
-    if not baseline:
-        return {"error": "baseline not captured", "tenant_id": tenant_id}
-    if not current:
-        return {"error": "no current metrics", "tenant_id": tenant_id}
-
-    views_pct = _pct_delta(baseline["avg_views"], current["avg_views"])
-    contacts_pct = _pct_delta(baseline["avg_contacts"], current["avg_contacts"])
-    emails_pct = _pct_delta(baseline["avg_emails"], current["avg_emails"])
-    bookings_pct = _pct_delta(baseline["avg_booking_emails"], current["avg_booking_emails"])
-    ces_pct = _pct_delta(baseline["avg_ces"], current["avg_ces"])
-
-    rank_base = baseline.get("search_rank", 0)
-    rank_curr = current.get("search_rank", 0)
-    rank_improvement = (rank_base - rank_curr) if rank_base and rank_curr else 0
-
-    avg_rate = tenant.get("avg_session_rate", 234.0)
-
-    # Estimated additional bookings from improvement
-    baseline_booking_rate_pct = baseline["avg_booking_emails"] / max(baseline["avg_views"], 1) * 100
-    current_booking_rate_pct = current["avg_booking_emails"] / max(current["avg_views"], 1) * 100
-    additional_bookings = max(0.0, (current_booking_rate_pct - baseline_booking_rate_pct) / 100 * current["avg_views"] * 4.3)
-    additional_revenue = additional_bookings * avg_rate
-
-    # Pricing
-    performance_cut = additional_revenue * COMMISSION_RATE
-    overall_improvement = (views_pct + contacts_pct + emails_pct + bookings_pct) / 4
-    guarantee_triggered = overall_improvement < (IMPROVEMENT_GUARANTEE_THRESHOLD * 100)
-    base_fee_charged = 0.0 if guarantee_triggered else BASE_FEE_MONTHLY
-    monthly_charge = base_fee_charged + performance_cut
-
-    report = {
-        "tenant_id": tenant_id,
-        "tenant_name": tenant.get("display_name") or tenant.get("username"),
-        "period_start": (datetime.now(timezone.utc) - timedelta(days=MEASUREMENT_WINDOW_DAYS)).strftime("%Y-%m-%d"),
-        "period_end": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "baseline": {k: round(v, 2) for k, v in baseline.items()},
-        "current": {k: round(v, 2) for k, v in current.items()},
-        "improvement": {
-            "views_pct": round(views_pct, 1),
-            "contacts_pct": round(contacts_pct, 1),
-            "emails_pct": round(emails_pct, 1),
-            "bookings_pct": round(bookings_pct, 1),
-            "ces_pct": round(ces_pct, 1),
-            "rank_improvement": rank_improvement,
-            "overall_pct": round(overall_improvement, 1),
-        },
-        "pricing": {
-            "base_fee": BASE_FEE_MONTHLY,
-            "base_fee_charged": round(base_fee_charged, 2),
-            "performance_cut": round(performance_cut, 2),
-            "monthly_charge": round(monthly_charge, 2),
-            "guarantee_triggered": guarantee_triggered,
-            "guarantee_threshold_pct": IMPROVEMENT_GUARANTEE_THRESHOLD * 100,
-            "additional_bookings_estimated": round(additional_bookings, 1),
-            "additional_revenue_estimated": round(additional_revenue, 2),
-            "avg_session_rate": avg_rate,
-            "commission_rate": COMMISSION_RATE,
-        },
-        "attribution": get_attribution_matrix(tenant_id),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    # Persist report
-    conn = _db()
-    conn.execute(
-        """INSERT INTO roi_reports
-           (tenant_id, period_start, period_end,
-            baseline_views_avg, current_views_avg, views_improvement_pct,
-            baseline_contacts_avg, current_contacts_avg, contacts_improvement_pct,
-            baseline_emails_avg, current_emails_avg, emails_improvement_pct,
-            baseline_booking_emails_avg, current_booking_emails_avg, booking_improvement_pct,
-            baseline_rank, current_rank, rank_improvement,
-            baseline_ces, current_ces, ces_improvement_pct,
-            estimated_additional_bookings, estimated_additional_revenue,
-            monthly_charge, base_fee_charged, performance_cut_charged,
-            guarantee_triggered, report_json, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (tenant_id, report["period_start"], report["period_end"],
-         baseline["avg_views"], current["avg_views"], views_pct,
-         baseline["avg_contacts"], current["avg_contacts"], contacts_pct,
-         baseline["avg_emails"], current["avg_emails"], emails_pct,
-         baseline["avg_booking_emails"], current["avg_booking_emails"], bookings_pct,
-         rank_base, rank_curr, rank_improvement,
-         baseline["avg_ces"], current["avg_ces"], ces_pct,
-         additional_bookings, additional_revenue,
-         monthly_charge, base_fee_charged, performance_cut,
-         int(guarantee_triggered), json.dumps(report, default=str),
-         report["created_at"])
-    )
-    conn.commit()
-    conn.close()
-
-    log.info("ROI report for %s: overall=%.1f%% charge=$%.2f guarantee=%s",
-             tenant_id, overall_improvement, monthly_charge, guarantee_triggered)
-    return report
-
-
-def get_latest_report(tenant_id: str) -> Optional[Dict]:
-    conn = _db()
-    row = conn.execute(
-        "SELECT * FROM roi_reports WHERE tenant_id=? ORDER BY id DESC LIMIT 1",
-        (tenant_id,)
-    ).fetchone()
-    conn.close()
-    if not row:
-        return None
+def detect_block(page: Page) -> Optional[str]:
     try:
-        return json.loads(row["report_json"])
+        txt = page.inner_text("body")[:3000].lower()
     except Exception:
-        return dict(row)
+        txt = ""
+    url = (page.url or "").lower()
+    for needle, reason in BLOCK_NEEDLES:
+        if needle in txt or needle in url:
+            return reason
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Action Priority Algorithm
-# ---------------------------------------------------------------------------
-
-def prioritize_actions(tenant_id: str) -> List[Dict]:
-    """
-    Rank actions by historical attribution score for this tenant.
-    Actions with proven metric impact get higher priority.
-    Falls back to default priority for new tenants.
-    """
-    matrix = get_attribution_matrix(tenant_id)
-    if matrix:
-        ranked = sorted(matrix, key=lambda x: x["avg_attributed_score"], reverse=True)
-        return [{"action": r["action_name"], "score": r["avg_attributed_score"],
-                 "runs": r["total_runs"]} for r in ranked[:6]]
-
-    # Default priority for new tenants (no history yet)
-    return [
-        {"action": "refresh_availability", "score": 0.0, "runs": 0},
-        {"action": "ensure_visible", "score": 0.0, "runs": 0},
-        {"action": "send_messages", "score": 0.0, "runs": 0},
-        {"action": "visit_profiles", "score": 0.0, "runs": 0},
-        {"action": "update_bio", "score": 0.0, "runs": 0},
-        {"action": "check_search_rank", "score": 0.0, "runs": 0},
-    ]
-
-```
-
-daemon.py:
-```
-"""
-RM ProfileOps Daemon — safe, bounded, receipt-bearing account ops engine.
-
-Modes:
-    audit   — read only, change nothing
-    guard   — fix visibility + availability only
-    draft   — generate content drafts, do not publish
-    daemon  — run safe loop continuously
-
-The daemon never:
-- fakes reviews
-- fakes visits
-- auto-sends messages
-- auto-publishes blogs
-- auto-changes interview
-- makes destructive changes without backup
-"""
-
-import json
-import logging
-import os
-import sys
-import time
-from datetime import datetime, timezone
-
-from .db import init_db, write_receipt, get_latest_traffic_snapshot
-from .api_client import RentMasseurAPI
-from .auth import AuthSession
-from .state import snapshot_state, save_snapshot
-from .visibility_guard import ensure_visible
-from .availability_guard import check_availability, refresh_availability
-from .stats_collector import collect_snapshot
-from .content_optimizer import run_daily_draft_cycle
-from .blog_agent import generate_blog_drafts, save_blog_drafts_to_disk, get_blog_status
-from .interview_agent import monitor_interview, generate_interview_drafts
-
-log = logging.getLogger("profileops.daemon")
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-CHECK_INTERVAL = 5 * 60           # 5 minutes
-AVAILABILITY_CHECK_INTERVAL = 30 * 60  # 30 minutes
-DAILY_DRAFT_INTERVAL = 24 * 60 * 60      # 24 hours
+def dismiss_cookies(page: Page):
+    try:
+        btn = page.query_selector("button:has-text('ACCEPT ALL')")
+        if btn and btn.is_visible():
+            btn.click()
+            time.sleep(0.5)
+    except Exception:
+        pass
 
 
-class ProfileOpsDaemon:
-    def __init__(self, mode: str = "daemon", city: str = "manhattan-ny",
-                 session_file: str = "rm_traffic/session.json"):
-        self.mode = mode
-        self.city = city
-        self.api = RentMasseurAPI(min_request_interval=2.0)
-        self.auth = AuthSession(self.api, session_file=session_file)
-        self.running = True
-        self.last_check = 0
-        self.last_availability_check = 0
-        self.last_daily_draft = 0
+def screenshot(page: Page, name: str) -> str:
+    path = SCREENSHOTS / f"{safe_name(name)}.png"
+    try:
+        page.screenshot(path=str(path), full_page=True)
+    except Exception:
+        return ""
+    return str(path)
 
-    def login(self) -> bool:
-        ok = self.auth.login()
-        if not ok:
-            log.error("Login failed")
-        return ok
 
-    def audit(self) -> dict:
-        """Read everything. Change nothing."""
-        state = snapshot_state(self.api)
-        save_snapshot(state)
-        keep = state.get("keeponline", {})
-        avail = state.get("availability", {})
-        about = state.get("about", {})
-        assets = about.get("userProps", {}).get("assets", {})
-        stats = state.get("stats", {}).get("profileStatistics", {})
-        dashboard = state.get("dashboard", {})
+# ── Stage 1: Extract masseurs from NY search ─────────────────────────
 
-        report = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "visible": not bool(keep.get("isAdHidden", 0)),
-            "available": avail.get("selected", "unknown"),
-            "availability_countdown": avail.get("countdown", 0),
-            "views": stats.get("totalPageViews"),
-            "contact_clicks": stats.get("totalContactClicks"),
-            "new_visits": keep.get("newVisits"),
-            "new_emails": keep.get("newEmails"),
-            "online_bookmarks": dashboard.get("onlineBookmarks"),
-            "headline": assets.get("headline"),
-            "description_len": len(assets.get("description", "")),
-            "review_url": dashboard.get("reviewUrl"),
-            "is_frozen": keep.get("isFrozen"),
-            "is_ad_hidden": keep.get("isAdHidden"),
-        }
-        write_receipt("audit_v1", "audit", {}, report, verified=True)
-        return report
+def extract_masseurs(page: Page, city: str) -> list[dict]:
+    """Search a NY city and return masseur profile links."""
+    url = f"{BASE_URL}/search/{city}"
+    masseurs = []
 
-    def guard(self) -> dict:
-        """Fix low-risk operational issues only."""
-        state = snapshot_state(self.api)
-        save_snapshot(state)
+    try:
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        time.sleep(2)
+        dismiss_cookies(page)
 
-        # Visibility guard
-        visible_ok = ensure_visible(self.api)
+        block = detect_block(page)
+        if block:
+            print(f"  [BLOCKED] {city}: {block}")
+            return []
 
-        # Availability guard
-        avail_status = check_availability(self.api)
-        if avail_status["needs_refresh"]:
-            refresh_availability(self.api)
-            avail_status = check_availability(self.api)
-
-        # Stats snapshot
-        collect_snapshot(self.api)
-
-        write_receipt("guard_cycle_v1", "guard", {}, {
-            "visible_ok": visible_ok,
-            "availability": avail_status,
-        }, verified=True)
-
-        return {
-            "visible_ok": visible_ok,
-            "availability": avail_status,
-        }
-
-    def draft(self) -> dict:
-        """Generate content drafts. Do not publish."""
-        return run_daily_draft_cycle(self.api)
-
-    def run_cycle(self):
-        """One daemon cycle."""
-        now = time.time()
-        if not self.auth.is_authenticated():
-            log.info("Session not authenticated. Re-logging in...")
-            if not self.login():
-                log.error("Could not re-authenticate. Sleeping.")
-                return
-
-        # Always guard
-        result = self.guard()
-        self.last_check = now
-
-        # Availability check every 30 min
-        if now - self.last_availability_check >= AVAILABILITY_CHECK_INTERVAL:
-            self.last_availability_check = now
-
-        # Daily draft
-        if now - self.last_daily_draft >= DAILY_DRAFT_INTERVAL:
-            if self.mode != "guard":
-                bio_drafts = run_daily_draft_cycle(self.api)
-                blog_drafts = generate_blog_drafts(count=1)
-                save_blog_drafts_to_disk(blog_drafts)
-                interview_drafts = generate_interview_drafts()
-                monitor_interview(self.api)
-                log.info("Daily drafts: bio=%s blog=%s interview=%s",
-                         bio_drafts.get("bio_draft")["variant_id"] if bio_drafts.get("bio_draft") else None,
-                         [d["variant_id"] for d in blog_drafts],
-                         [d["variant_id"] for d in interview_drafts])
-            self.last_daily_draft = now
-
-    def run(self):
-        log.info("=== RM ProfileOps Daemon starting in %s mode ===", self.mode)
-        if not self.login():
-            log.error("Initial login failed")
-            return
-
-        if self.mode == "audit":
-            print(json.dumps(self.audit(), indent=2, default=str))
-            return
-
-        if self.mode == "guard":
-            print(json.dumps(self.guard(), indent=2, default=str))
-            return
-
-        if self.mode == "draft":
-            print(json.dumps(self.draft(), indent=2, default=str))
-            return
-
-        while self.running:
+        # Extract profile links from DOM
+        links = page.query_selector_all("a[href]")
+        seen = set()
+        for el in links:
             try:
-                self.run_cycle()
-            except KeyboardInterrupt:
-                log.info("Shutdown requested")
-                self.running = False
+                href = el.get_attribute("href") or ""
+                if href.startswith("/") and not any(x in href for x in [
+                    "login", "settings", "search", "blog", "reviews", "interviews",
+                    "available", "find-massage", "live-cams", "sitemap", "advertise",
+                    "mailbox", "static", "_next", "images", "api", "blogs", "404",
+                    "account", "gay-massage", "sponsor",
+                ]):
+                    parts = href.strip("/").split("/")
+                    if parts and parts[0] and len(parts) == 1 and parts[0] not in seen:
+                        seen.add(parts[0])
+                        masseurs.append({
+                            "username": parts[0],
+                            "href": href,
+                            "city": city,
+                        })
+            except Exception:
+                continue
+
+        # Also try __NEXT_DATA__
+        try:
+            nd_text = page.evaluate("() => { const el = document.getElementById('__NEXT_DATA__'); return el ? el.textContent : null; }")
+            if nd_text:
+                nd = json.loads(nd_text)
+                props = nd.get("props", {}).get("pageProps", {})
+                for key in ["masseurs", "users", "results", "profiles"]:
+                    if key in props and isinstance(props[key], list):
+                        for item in props[key]:
+                            uname = item.get("username") or ""
+                            if uname and uname not in seen:
+                                seen.add(uname)
+                                masseurs.append({
+                                    "username": uname,
+                                    "href": f"/{uname}",
+                                    "city": city,
+                                })
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"  [ERROR] search {city}: {e}")
+
+    return masseurs
+
+
+# ── Stage 2: Extract reviewers from masseur reviews page ─────────────
+
+def extract_reviewers(page: Page, masseur_username: str) -> list[dict]:
+    """Visit masseur's reviews page and extract reviewer usernames."""
+    reviewers = []
+
+    for url in [
+        f"{BASE_URL}/{masseur_username}/reviews",
+        f"{BASE_URL}/reviews/{masseur_username}",
+    ]:
+        try:
+            page.goto(url, wait_until="networkidle", timeout=20000)
+            time.sleep(1.5)
+            dismiss_cookies(page)
+
+            block = detect_block(page)
+            if block:
+                return reviewers
+
+            if "/404" in page.url or "/login" in page.url:
+                continue
+
+            body_lower = page.inner_text("body")[:5000].lower()
+            if "review" not in body_lower and "rating" not in body_lower:
+                continue
+
+            screenshot(page, f"reviews_{safe_name(masseur_username)}")
+
+            # Method 1: __NEXT_DATA__
+            try:
+                nd_text = page.evaluate("() => { const el = document.getElementById('__NEXT_DATA__'); return el ? el.textContent : null; }")
+                if nd_text:
+                    nd = json.loads(nd_text)
+                    props = nd.get("props", {}).get("pageProps", {})
+                    for key in ["reviews", "ratings", "testimonials", "feedback"]:
+                        if key in props and isinstance(props[key], list):
+                            for item in props[key]:
+                                reviewer = (
+                                    item.get("reviewer") or item.get("username") or
+                                    item.get("user") or item.get("author") or
+                                    item.get("reviewerUsername") or ""
+                                )
+                                if isinstance(reviewer, dict):
+                                    reviewer = reviewer.get("username") or reviewer.get("name") or ""
+                                if reviewer and reviewer != masseur_username:
+                                    reviewers.append({
+                                        "reviewer": reviewer,
+                                        "masseur": masseur_username,
+                                        "rating": str(item.get("rating") or item.get("stars") or ""),
+                                        "text": (item.get("text") or item.get("comment") or item.get("review") or "")[:300],
+                                        "source": f"nextdata.{key}",
+                                    })
+            except Exception:
+                pass
+
+            # Method 2: DOM links near review context
+            try:
+                links = page.query_selector_all("a[href]")
+                seen = {r["reviewer"] for r in reviewers}
+                for el in links:
+                    href = el.get_attribute("href") or ""
+                    if href.startswith("/") and not any(x in href for x in [
+                        "login", "settings", "search", "blog", "reviews", "interviews",
+                        "available", "find-massage", "live-cams", "sitemap", "advertise",
+                        "mailbox", "static", "_next", "images", "api", "blogs", "404",
+                        "account", "gay-massage", "sponsor", masseur_username,
+                    ]):
+                        parts = href.strip("/").split("/")
+                        if parts and parts[0] and len(parts) == 1 and parts[0] not in seen:
+                            seen.add(parts[0])
+                            reviewers.append({
+                                "reviewer": parts[0],
+                                "masseur": masseur_username,
+                                "rating": "",
+                                "text": "",
+                                "source": "dom_link",
+                            })
+            except Exception:
+                pass
+
+            # Method 3: Text patterns
+            try:
+                body = page.inner_text("body")
+                seen = {r["reviewer"] for r in reviewers}
+                for pattern in [
+                    r"(?:Reviewed by|By:|Review by)\s+([A-Za-z0-9_-]{3,30})",
+                    r"([A-Za-z0-9_-]{3,30})\s+(?:wrote|says|reviewed)",
+                ]:
+                    for m in re.findall(pattern, body):
+                        if m and m != masseur_username and m.lower() not in [
+                            "search", "login", "sign", "available", "massage", "book"
+                        ] and m not in seen:
+                            seen.add(m)
+                            reviewers.append({
+                                "reviewer": m,
+                                "masseur": masseur_username,
+                                "rating": "",
+                                "text": "",
+                                "source": "text_pattern",
+                            })
+            except Exception:
+                pass
+
+            if reviewers:
                 break
-            except Exception as e:
-                log.error("Cycle error: %s", e)
-                write_receipt("daemon_error_v1", "error", {}, {"error": str(e)}, verified=False)
-            time.sleep(CHECK_INTERVAL)
 
-        log.info("Daemon stopped")
+        except Exception:
+            continue
+
+    return reviewers
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# ── Worker for parallel review scraping ───────────────────────────────
 
-if __name__ == "__main__":
-    import argparse
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
-    parser = argparse.ArgumentParser(description="RM ProfileOps Daemon")
-    parser.add_argument("mode", choices=["audit", "guard", "draft", "daemon"], default="audit", nargs="?")
-    parser.add_argument("--city", default="manhattan-ny")
-    parser.add_argument("--session", default="rm_traffic/session.json")
+def review_worker(
+    worker_id: int,
+    context: BrowserContext,
+    work_queue: Queue,
+    results_queue: Queue,
+    delay: float = 1.5,
+):
+    """Worker that processes masseur usernames from queue, scrapes reviews."""
+    page = context.new_page()
+    processed = 0
+
+    while True:
+        try:
+            masseur = work_queue.get_nowait()
+        except Empty:
+            break
+
+        if masseur is None:
+            break
+
+        username = masseur["username"]
+        city = masseur.get("city", "")
+
+        try:
+            reviewers = extract_reviewers(page, username)
+            results_queue.put({
+                "masseur": username,
+                "city": city,
+                "reviewers": reviewers,
+                "worker": worker_id,
+                "ok": True,
+            })
+            processed += 1
+            print(f"  [W{worker_id}] {username}: {len(reviewers)} reviewers")
+        except Exception as e:
+            results_queue.put({
+                "masseur": username,
+                "city": city,
+                "reviewers": [],
+                "worker": worker_id,
+                "ok": False,
+                "error": str(e),
+            })
+            print(f"  [W{worker_id}] {username}: ERROR {e}")
+
+        time.sleep(delay)
+
+    try:
+        page.close()
+    except Exception:
+        pass
+    print(f"  [W{worker_id}] Done — {processed} masseurs processed")
+
+
+# ── Pipeline stages ──────────────────────────────────────────────────
+
+def stage_extract_masseurs(page: Page, db: sqlite3.Connection) -> int:
+    """Stage 1: Search NY cities, discover masseurs, store in DB."""
+    print(f"\n{'='*60}")
+    print(f"STAGE 1: Extract masseurs from NY search")
+    print(f"{'='*60}")
+
+    total_new = 0
+    for city in NY_CITIES:
+        print(f"\n  Searching {city}...")
+        masseurs = extract_masseurs(page, city)
+
+        for m in masseurs:
+            try:
+                db.execute(
+                    "INSERT OR IGNORE INTO masseurs (username, city, href, discovered_at, status) VALUES (?, ?, ?, ?, 'pending')",
+                    (m["username"], m["city"], m["href"], now_iso())
+                )
+                if db.total_changes > 0:
+                    total_new += 1
+            except Exception:
+                pass
+        db.commit()
+        print(f"    Found {len(masseurs)} masseurs ({total_new} new total)")
+        time.sleep(1)
+
+    total = db.execute("SELECT COUNT(*) FROM masseurs").fetchone()[0]
+    print(f"\n  Total masseurs in DB: {total} ({total_new} new this run)")
+    return total
+
+
+def stage_extract_reviews(
+    page: Page,
+    db: sqlite3.Connection,
+    workers: int = 4,
+    delay: float = 1.5,
+) -> int:
+    """Stage 2: Scrape reviews from each masseur sequentially."""
+    print(f"\n{'='*60}")
+    print(f"STAGE 2: Extract reviews (sequential, {delay}s delay)")
+    print(f"{'='*60}")
+
+    pending = db.execute("SELECT username, city FROM masseurs WHERE status='pending' ORDER BY city").fetchall()
+    total_pending = len(pending)
+    print(f"  Pending masseurs: {total_pending}")
+
+    if total_pending == 0:
+        print("  Nothing to do — all masseurs processed")
+        return 0
+
+    processed = 0
+    total_reviewers = 0
+    start_time = time.time()
+
+    for row in pending:
+        masseur = row["username"]
+        city = row["city"]
+
+        try:
+            reviewers = extract_reviewers(page, masseur)
+            ok = True
+        except Exception as e:
+            reviewers = []
+            ok = False
+            print(f"  ERROR {masseur}: {e}")
+
+        processed += 1
+        total_reviewers += len(reviewers)
+
+        # Update DB
+        try:
+            db.execute(
+                "UPDATE masseurs SET reviews_scraped=1, review_count=?, status=? WHERE username=?",
+                (len(reviewers), "done" if ok else "error", masseur)
+            )
+
+            for r in reviewers:
+                db.execute(
+                    "INSERT OR IGNORE INTO reviews (reviewer, masseur, rating, review_text, source, scraped_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (r["reviewer"], r["masseur"], r["rating"], r["text"], r["source"], now_iso())
+                )
+
+                existing = db.execute("SELECT * FROM clients WHERE username=?", (r["reviewer"],)).fetchone()
+                if existing:
+                    masseurs_list = existing["masseurs_reviewed"] or ""
+                    masseurs_set = set(masseurs_list.split(",") if masseurs_list else [])
+                    masseurs_set.add(masseur)
+
+                    cities_list = existing["cities_found"] or ""
+                    cities_set = set(cities_list.split(",") if cities_list else [])
+                    cities_set.add(city)
+
+                    db.execute(
+                        "UPDATE clients SET review_count=?, masseurs_reviewed=?, cities_found=?, last_seen=? WHERE username=?",
+                        (
+                            existing["review_count"] + 1,
+                            ",".join(sorted(masseurs_set)),
+                            ",".join(sorted(cities_set)),
+                            now_iso(),
+                            r["reviewer"],
+                        )
+                    )
+                else:
+                    db.execute(
+                        "INSERT INTO clients (username, first_found_on, review_count, cities_found, masseurs_reviewed, sample_review, first_seen, last_seen) VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+                        (
+                            r["reviewer"],
+                            masseur,
+                            city,
+                            masseur,
+                            r["text"][:200],
+                            now_iso(),
+                            now_iso(),
+                        )
+                    )
+
+            db.commit()
+        except Exception as e:
+            print(f"  DB error for {masseur}: {e}")
+
+        # Progress
+        elapsed = time.time() - start_time
+        rate = processed / elapsed if elapsed > 0 else 0
+        remaining = total_pending - processed
+        eta = remaining / rate if rate > 0 else 0
+        print(f"  [{processed}/{total_pending}] {masseur}: {len(reviewers)} reviewers | "
+              f"{total_reviewers} total | {elapsed:.0f}s | ETA {eta:.0f}s")
+
+        time.sleep(delay)
+
+    print(f"\n  Done: {processed} masseurs, {total_reviewers} reviewers extracted")
+    return total_reviewers
+
+
+def stage_transform_load(db: sqlite3.Connection):
+    """Stage 3: Transform + export."""
+    print(f"\n{'='*60}")
+    print(f"STAGE 3: Transform & Export")
+    print(f"{'='*60}")
+
+    # Stats
+    total_masseurs = db.execute("SELECT COUNT(*) FROM masseurs").fetchone()[0]
+    done_masseurs = db.execute("SELECT COUNT(*) FROM masseurs WHERE status='done'").fetchone()[0]
+    total_reviews = db.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+    total_clients = db.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
+
+    print(f"  Masseurs: {total_masseurs} ({done_masseurs} scraped)")
+    print(f"  Reviews: {total_reviews}")
+    print(f"  Unique clients: {total_clients}")
+
+    # Export clients to JSON
+    clients = db.execute("SELECT * FROM clients ORDER BY review_count DESC").fetchall()
+    clients_json = [dict(c) for c in clients]
+    json_path = ARTIFACTS / "clients.json"
+    json_path.write_text(json.dumps(clients_json, indent=2, default=str), encoding="utf-8")
+    print(f"  JSON: {json_path}")
+
+    # Export to CSV
+    csv_path = ARTIFACTS / "clients.csv"
+    with csv_path.open("w") as f:
+        f.write("username,review_count,first_found_on,cities_found,masseurs_reviewed,first_seen,last_seen,sample_review\n")
+        for c in clients:
+            row = dict(c)
+            f.write(f'"{row["username"]}",{row["review_count"]},"{row["first_found_on"]}",'
+                    f'"{row["cities_found"] or ""}","{row["masseurs_reviewed"] or ""}",'
+                    f'"{row["first_seen"]}","{row["last_seen"]}",'
+                    f'"{(row["sample_review"] or "").replace(chr(34), chr(39))[:200]}"\n')
+    print(f"  CSV: {csv_path}")
+
+    # Export client usernames only
+    txt_path = ARTIFACTS / "client_usernames.txt"
+    txt_path.write_text("\n".join(c["username"] for c in clients), encoding="utf-8")
+    print(f"  Usernames: {txt_path}")
+
+    # Print top clients
+    if clients:
+        print(f"\n--- Top 20 NY Client Profiles ---")
+        for c in clients[:20]:
+            print(f"  {c['username']:25s} | reviews={c['review_count']:2d} | cities={c['cities_found'] or '?'}")
+
+
+# ── Status ───────────────────────────────────────────────────────────
+
+def show_status(db: sqlite3.Connection):
+    total = db.execute("SELECT COUNT(*) FROM masseurs").fetchone()[0]
+    done = db.execute("SELECT COUNT(*) FROM masseurs WHERE status='done'").fetchone()[0]
+    pending = db.execute("SELECT COUNT(*) FROM masseurs WHERE status='pending'").fetchone()[0]
+    errors = db.execute("SELECT COUNT(*) FROM masseurs WHERE status='error'").fetchone()[0]
+    reviews = db.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+    clients = db.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
+
+    print(f"\nRM Client Mining Pipeline Status")
+    print(f"{'='*40}")
+    print(f"  DB: {DB_PATH}")
+    print(f"  Masseurs: {total} total")
+    print(f"    Done: {done}")
+    print(f"    Pending: {pending}")
+    print(f"    Errors: {errors}")
+    print(f"  Reviews: {reviews}")
+    print(f"  Unique clients: {clients}")
+
+    if total > 0:
+        pct = done / total * 100
+        print(f"  Progress: {pct:.1f}%")
+
+    # Per-city breakdown
+    print(f"\n  Per-city:")
+    rows = db.execute("SELECT city, COUNT(*) as n, SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) as done FROM masseurs GROUP BY city ORDER BY n DESC").fetchall()
+    for r in rows:
+        print(f"    {r['city']:20s} {r['done']}/{r['n']}")
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="RM Client Conversion Mining ETL")
+    parser.add_argument("--resume", action="store_true", help="Resume from existing DB")
+    parser.add_argument("--status", action="store_true", help="Show pipeline status")
+    parser.add_argument("--export", action="store_true", help="Export only, no scraping")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel browser tabs")
+    parser.add_argument("--delay", type=float, default=1.5, help="Delay between visits (seconds)")
+    parser.add_argument("--headed", action="store_true", help="Show browser (default: headless)")
     args = parser.parse_args()
 
-    init_db()
-    daemon = ProfileOpsDaemon(mode=args.mode, city=args.city, session_file=args.session)
-    daemon.run()
+    db = get_db()
+
+    if args.status:
+        show_status(db)
+        return
+
+    if args.export:
+        stage_transform_load(db)
+        return
+
+    username = os.getenv("RM_USER") or os.getenv("RENTMASSEUR_USER") or ""
+    password = os.getenv("RM_PASS") or os.getenv("RENTMASSEUR_PASS") or ""
+
+    print(f"\nRM Client Conversion Mining ETL Pipeline")
+    print(f"{'='*60}")
+    print(f"  Workers: {args.workers}")
+    print(f"  Delay: {args.delay}s")
+    print(f"  Resume: {args.resume}")
+    print(f"  DB: {DB_PATH}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=not args.headed,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+
+        storage_state = Path(".rm_storage_state.json")
+        ctx_kwargs = {
+            "viewport": {"width": 1440, "height": 1200},
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        }
+        if storage_state.exists():
+            ctx_kwargs["storage_state"] = str(storage_state)
+            print("  Using saved storage state")
+
+        context = browser.new_context(**ctx_kwargs)
+        page = context.new_page()
+
+        # Verify session
+        page.goto(f"{BASE_URL}/settings", wait_until="networkidle", timeout=30000)
+        time.sleep(2)
+
+        if "/login" in page.url:
+            if username and password:
+                print("  Logging in...")
+                try:
+                    page.goto(f"{BASE_URL}/login", wait_until="networkidle", timeout=30000)
+                    time.sleep(2)
+                    email_el = page.query_selector("input#email") or page.query_selector("input[name='email']")
+                    pass_el = page.query_selector("input#password") or page.query_selector("input[type='password']")
+                    if email_el and pass_el:
+                        email_el.fill(username)
+                        pass_el.fill(password)
+                        time.sleep(0.5)
+                        btn = page.query_selector("button:has-text('LOGIN')") or page.query_selector("button[type='submit']")
+                        if btn and btn.is_visible():
+                            btn.click()
+                        else:
+                            pass_el.press("Enter")
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                        time.sleep(3)
+                        context.storage_state(path=str(storage_state))
+                        print(f"  Login OK — {page.url}")
+                except Exception as e:
+                    print(f"  Login error: {e}")
+            else:
+                print("  No credentials — running as public")
+
+        # Stage 1: Extract masseurs (unless resuming with all already found)
+        if not args.resume:
+            stage_extract_masseurs(page, db)
+        else:
+            total = db.execute("SELECT COUNT(*) FROM masseurs").fetchone()[0]
+            if total == 0:
+                print("  No masseurs in DB — running full extract")
+                stage_extract_masseurs(page, db)
+            else:
+                print(f"  Resuming with {total} masseurs already in DB")
+
+        # Stage 2: Extract reviews sequentially
+        stage_extract_reviews(page, db, workers=args.workers, delay=args.delay)
+
+        browser.close()
+
+    # Stage 3: Transform + export
+    stage_transform_load(db)
+
+    # Final status
+    show_status(db)
+
+    db_set(db, "last_run", now_iso())
+    db.close()
+
+    print(f"\nPipeline complete. Use --status to check progress, --export to re-export.")
+
+
+if __name__ == "__main__":
+    main()
 
 ```
 
-content_policy.py:
+function_registry.yml:
+```
+functions:
+  health_check:
+    type: read
+    target: local_control_plane
+    allowed_in_ci: true
+
+  dashboard_snapshot:
+    type: read
+    target: rentmasseur_account
+    allowed_in_ci: true
+    requires_login: true
+
+  availability_read:
+    type: read
+    target: rentmasseur_account
+    allowed_in_ci: true
+    requires_login: true
+
+  bio_field_detect:
+    type: read
+    target: rentmasseur_profile_settings
+    allowed_in_ci: true
+    requires_login: true
+
+  bio_candidate_generate:
+    type: draft
+    target: local_llm_optimizer
+    allowed_in_ci: true
+
+  bio_candidate_preview:
+    type: draft
+    target: local_control_plane
+    allowed_in_ci: true
+
+  bio_apply_live:
+    type: mutation
+    target: rentmasseur_profile_settings
+    allowed_in_ci: false
+    requires_manual_approval: true
+
+  availability_set_live:
+    type: mutation
+    target: rentmasseur_account
+    allowed_in_ci: false
+    requires_manual_approval: true
+
+  metrics_ingest:
+    type: write_local
+    target: local_control_plane
+    allowed_in_ci: true
+
+  extension_popup_smoke:
+    type: browser_extension
+    target: chrome_extension
+    allowed_in_ci: true
+
+  extension_content_script_smoke:
+    type: browser_extension
+    target: rentmasseur_profile_page
+    allowed_in_ci: true
+
+```
+
+receipt_ledger.py:
+```
+"""SHA-chained JSONL receipt ledger for tamper-evident audit trail."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from pathlib import Path
+from typing import Optional
+
+
+class ReceiptLedger:
+    def __init__(self, root: Path):
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.ledger_path = self.root / "ledger.jsonl"
+        self.entries: list[dict] = []
+        if self.ledger_path.exists():
+            for line in self.ledger_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    try:
+                        self.entries.append(json.loads(line))
+                    except Exception:
+                        pass
+
+    def _prev_hash(self) -> str:
+        return self.entries[-1].get("hash", "0" * 64) if self.entries else "0" * 64
+
+    @staticmethod
+    def _sha256(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+    def write(self, action: str, status: str, data: dict) -> Path:
+        payload = {
+            "index": len(self.entries),
+            "ts": int(time.time()),
+            "prev_hash": self._prev_hash(),
+            "action": action,
+            "status": status,
+            "data": data,
+        }
+        body = json.dumps(
+            {k: v for k, v in payload.items() if k != "hash"},
+            sort_keys=True,
+            default=str,
+        )
+        payload["hash"] = self._sha256(body)
+        self.entries.append(payload)
+
+        with self.ledger_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+        safe_action = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in action)[:60]
+        receipt_path = self.root / f"{payload['index']:05d}_{safe_action}_{status}.json"
+        receipt_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        return receipt_path
+
+    def verify(self) -> bool:
+        prev = "0" * 64
+        for entry in self.entries:
+            if entry.get("prev_hash") != prev:
+                return False
+            body = json.dumps(
+                {k: v for k, v in entry.items() if k != "hash"},
+                sort_keys=True,
+                default=str,
+            )
+            if self._sha256(body) != entry.get("hash"):
+                return False
+            prev = entry["hash"]
+        return True
+
+```
+
+approval_gate.py:
+```
+"""Approval gate — blocks live mutations unless manually approved with token + candidate."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Optional
+
+
+BLOCKED_IN_CI = {

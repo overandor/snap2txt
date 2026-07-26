@@ -1,800 +1,800 @@
-    total_frames = len(scenes) * frames_per_scene
-
-    anim = animation.FuncAnimation(
-        fig, draw_frame, frames=total_frames,
-        interval=180, blit=False, repeat=True
-    )
-
-    gif_dir = JORKI_DATA_DIR / "kpi_gifs"
-    gif_dir.mkdir(parents=True, exist_ok=True)
-    gif_path = gif_dir / f"{file_id}_kpi.gif"
-
-    try:
-        writer = animation.PillowWriter(fps=6)
-        anim.save(str(gif_path), writer=writer, dpi=80)
+            "stream": False,
+            "options": {
+                "temperature": 0.8,
+                "top_p": 0.9,
+                "num_predict": 300,
+            }
+        }, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        text = data.get("response", "").strip()
+        return text
     except Exception as e:
-        plt.close(fig)
-        return {"error": f"GIF generation failed: {str(e)}"}
-
-    plt.close(fig)
-    return {"gif_path": str(gif_path), "size_bytes": gif_path.stat().st_size,
-            "scenes": len(scenes), "frames": total_frames}
+        log(f"Ollama error ({model}): {e}", "ERROR")
+        return ""
 
 
-@app.get("/kpi/{file_id}/gif")
-async def jorki_kpi_gif(file_id: str):
-    """Generate and return an animated GIF visualization of file KPIs."""
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    meta_rows = conn.execute("SELECT key, value FROM file_meta").fetchall()
-    kpi_rows = conn.execute("SELECT id, name, value, line, category, confidence FROM kpis ORDER BY confidence DESC").fetchall()
+def generate_bios(count: int = 3, models: list = None) -> list:
+    """Generate N bio candidates using Ollama."""
+    if models is None:
+        models = ["llama3.1", "mistral", "gemma2"]
+
+    candidates = []
+    prompts_to_use = BIO_PROMPTS[:count] if count <= len(BIO_PROMPTS) else BIO_PROMPTS * (count // len(BIO_PROMPTS) + 1)
+
+    for i in range(count):
+        prompt_cfg = prompts_to_use[i % len(prompts_to_use)]
+        model = models[i % len(models)]
+
+        log(f"  [{i+1}/{count}] Generating with {model} (style: {prompt_cfg['id']})...")
+        bio_text = call_ollama(prompt_cfg["prompt"], model=model)
+
+        if not bio_text:
+            log(f"  [{i+1}/{count}] Generation failed, skipping", "WARN")
+            continue
+
+        # Clean up the text
+        bio_text = bio_text.strip()
+        # Remove any leading "Here is..." or quotes
+        for prefix in ["Here is", "Here's", "Sure,", "Of course", "```"]:
+            if bio_text.startswith(prefix):
+                lines = bio_text.split("\n")
+                bio_text = "\n".join(lines[1:]).strip()
+        # Strip surrounding quotes
+        if bio_text.startswith('"') and bio_text.endswith('"'):
+            bio_text = bio_text[1:-1].strip()
+        # Truncate to 500 chars (RM limit)
+        if len(bio_text) > 500:
+            bio_text = bio_text[:497] + "..."
+
+        score = score_bio(bio_text)
+        bio_id = save_bio_candidate(bio_text, prompt_cfg["id"], model, score)
+
+        # Save to file
+        bio_file = BIOS_DIR / f"bio_{bio_id:04d}_{prompt_cfg['id']}_{model}.txt"
+        bio_file.write_text(bio_text, encoding="utf-8")
+
+        candidates.append({
+            "id": bio_id,
+            "text": bio_text,
+            "model": model,
+            "prompt_id": prompt_cfg["id"],
+            "score": score,
+            "char_count": len(bio_text),
+            "file": str(bio_file),
+        })
+        log(f"  [{i+1}/{count}] Score: {score:.2f} | {len(bio_text)} chars | saved as bio_{bio_id:04d}")
+
+    return candidates
+
+
+def score_bio(bio_text: str) -> float:
+    """Score a bio candidate. Higher is better."""
+    text_lower = bio_text.lower()
+    char_count = len(bio_text)
+
+    # Keyword score (0-40)
+    keyword_hits = sum(1 for kw in GOOD_KEYWORDS if kw in text_lower)
+    keyword_score = min(keyword_hits * 5, 40)
+
+    # Length score (0-20) — sweet spot is 200-450 chars
+    if 200 <= char_count <= 450:
+        length_score = 20
+    elif 150 <= char_count <= 500:
+        length_score = 15
+    elif 100 <= char_count <= 600:
+        length_score = 10
+    else:
+        length_score = 5
+
+    # Readability (0-20) — short sentences, no run-ons
+    sentences = bio_text.split(".")
+    avg_sentence_len = sum(len(s.split()) for s in sentences) / max(len(sentences), 1)
+    if avg_sentence_len <= 15:
+        readability = 20
+    elif avg_sentence_len <= 20:
+        readability = 15
+    elif avg_sentence_len <= 25:
+        readability = 10
+    else:
+        readability = 5
+
+    # Uniqueness (0-20) — hash-based, compare against existing bios
+    bio_hash = hashlib.sha256(bio_text.encode()).hexdigest()[:16]
+    conn = sqlite3.connect(str(BIO_DB))
+    existing = conn.execute("SELECT COUNT(*) FROM bio_experiments WHERE bio_hash=?", (bio_hash,)).fetchone()[0]
     conn.close()
-    _jorki_track_query(file_id, "kpi_gif")
+    uniqueness = 20 if existing == 0 else 5
 
-    meta = {r[0]: r[1] for r in meta_rows}
-    kpis = [{"id": r[0], "name": r[1], "value": r[2], "line": r[3], "category": r[4], "confidence": r[5]} for r in kpi_rows]
-    by_category = {}
-    for k in kpis:
-        cat = k["category"]
-        if cat not in by_category:
-            by_category[cat] = []
-        by_category[cat].append(k)
+    total = keyword_score + length_score + readability + uniqueness
+    return round(total, 2)
 
-    result = _jorki_kpi_gif(file_id, meta.get("filename", "unknown"), kpis, by_category)
-    if "error" in result:
+
+# ─── Fetch Current Bio via Selenium ──────────────────────────────────
+
+def fetch_current_bio() -> dict:
+    """Use Selenium to fetch the current bio from RM settings/about page."""
+    from rm_demo_agent import SeleniumAgent, load_env, write_receipt
+
+    load_env()
+    username = os.getenv("RM_USER") or os.getenv("RENTMASSEUR_USERNAME", "")
+    password = os.getenv("RM_PASS") or os.getenv("RENTMASSEUR_PASSWORD", "")
+
+    if not username or not password:
+        log("No credentials for bio fetch", "ERROR")
+        return {"bio": "(no credentials)", "fetched_at": now_iso(), "char_count": 0}
+
+    agent = SeleniumAgent(headed=True)
+    try:
+        agent.start()
+        if not agent.login(username, password):
+            log("Login failed for bio fetch", "ERROR")
+            return {"bio": "(login failed)", "fetched_at": now_iso(), "char_count": 0}
+
+        from selenium.webdriver.common.by import By
+        agent.driver.get(f"https://rentmasseur.com/settings/about")
+        time.sleep(4)
+
+        # Try to find the bio textarea
+        bio_text = ""
+        for sel in ["textarea", "textarea[name*='about']", "textarea[name*='bio']"]:
+            els = agent.driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in els:
+                if el.is_displayed() and len(el.get_attribute("value") or "") > 20:
+                    bio_text = el.get_attribute("value") or ""
+                    break
+            if bio_text:
+                break
+
+        # Also try reading from page text
+        if not bio_text:
+            page_text = agent.page_text()
+            # Look for bio section
+            if "About" in page_text or "Bio" in page_text:
+                lines = page_text.split("\n")
+                for i, line in enumerate(lines):
+                    if "about" in line.lower() or "bio" in line.lower():
+                        bio_text = "\n".join(lines[i+1:i+10]).strip()
+                        break
+
+        result = {
+            "bio": bio_text,
+            "fetched_at": now_iso(),
+            "char_count": len(bio_text),
+            "url": agent.driver.current_url,
+        }
+        BIO_CACHE.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        log(f"Current bio fetched: {len(bio_text)} chars")
+        write_receipt("fetch_bio", "pass", {"char_count": len(bio_text)})
         return result
 
-    return FileResponse(
-        result["gif_path"],
-        media_type="image/gif",
-        filename=f"{file_id}_kpi.gif"
-    )
+    except Exception as e:
+        log(f"Bio fetch error: {e}", "ERROR")
+        return {"bio": f"(error: {e})", "fetched_at": now_iso(), "char_count": 0}
+    finally:
+        agent.stop()
 
-# ─── DNA Endpoint ───────────────────────────────────────────────────────
 
-@app.get("/dna/{file_id}")
-async def jorki_dna(file_id: str):
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    rows = conn.execute("SELECT key, value FROM dna").fetchall()
-    conn.close()
-    _jorki_track_query(file_id, "dna")
-    dna = {r[0]: r[1] for r in rows}
-    genes_str = dna.get("genes", "{}")
+# ─── Deploy Bio via Selenium ─────────────────────────────────────────
+
+def deploy_bio_to_rm(bio_text: str, bio_id: int) -> bool:
+    """Deploy a bio to RM via Selenium."""
+    from rm_demo_agent import SeleniumAgent, load_env, write_receipt
+
+    load_env()
+    username = os.getenv("RM_USER") or os.getenv("RENTMASSEUR_USERNAME", "")
+    password = os.getenv("RM_PASS") or os.getenv("RENTMASSEUR_PASSWORD", "")
+
+    if not username or not password:
+        log("No credentials for bio deploy", "ERROR")
+        return False
+
+    agent = SeleniumAgent(headed=True)
     try:
-        genes = json.loads(genes_str)
-    except:
-        genes = {}
-    return {"file_id": file_id,
-            "dna_sequence": dna.get("dna_sequence", ""),
-            "species": dna.get("species", "unknown"),
-            "genes": genes,
-            "complexity_score": float(dna.get("complexity_score", 0)),
-            "genome_size": int(dna.get("genome_size", 0))}
+        agent.start()
+        if not agent.login(username, password):
+            log("Login failed for bio deploy", "ERROR")
+            return False
 
-# ─── Password / Access Control ──────────────────────────────────────────
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.keys import Keys
 
-@app.post("/password/{file_id}")
-async def jorki_set_password(file_id: str, body: dict = Body(...)):
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    password = body.get("password", "")
-    hint = body.get("hint", "")
-    if len(password) < 4:
-        return {"error": "Password must be at least 4 characters"}
-    salt = os.urandom(16).hex()
-    pw_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
-    conn = sqlite3.connect(str(idx_path))
-    conn.execute("DELETE FROM access_control")
-    conn.execute("INSERT INTO access_control VALUES (?,?,?,?)", (pw_hash, salt, hint, time.time()))
-    conn.commit()
-    conn.close()
-    return {"file_id": file_id, "status": "password_set", "hint": hint}
+        agent.driver.get("https://rentmasseur.com/settings/about")
+        time.sleep(4)
+        agent.screenshot(f"bio_deploy_before_{bio_id}")
 
-@app.post("/password/{file_id}/verify")
-async def jorki_verify_password(file_id: str, body: dict = Body(...)):
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    password = body.get("password", "")
-    conn = sqlite3.connect(str(idx_path))
-    row = conn.execute("SELECT password_hash, salt, hint FROM access_control").fetchone()
-    conn.close()
-    if not row:
-        return {"file_id": file_id, "protected": False, "hint": ""}
-    pw_hash, salt, hint = row
-    test_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
-    if test_hash == pw_hash:
-        return {"file_id": file_id, "protected": True, "verified": True, "hint": hint}
-    return {"file_id": file_id, "protected": True, "verified": False, "hint": hint}
+        # Find the bio textarea
+        textarea = None
+        for sel in ["textarea", "textarea[name*='about']", "textarea[name*='bio']"]:
+            els = agent.driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in els:
+                if el.is_displayed():
+                    textarea = el
+                    break
+            if textarea:
+                break
 
-@app.get("/password/{file_id}/status")
-async def jorki_password_status(file_id: str):
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    row = conn.execute("SELECT hint, created_at FROM access_control").fetchone()
-    conn.close()
-    if row:
-        return {"file_id": file_id, "protected": True, "hint": row[0], "created_at": row[1]}
-    return {"file_id": file_id, "protected": False}
+        if not textarea:
+            log("No bio textarea found", "ERROR")
+            return False
 
-# ─── Semantic Knowledge: Finance, Law, Collateral, Liquidity ─────────────
+        # Clear and type new bio
+        textarea.click()
+        time.sleep(0.5)
+        textarea.send_keys(Keys.CONTROL, "a")
+        textarea.send_keys(Keys.DELETE)
+        time.sleep(0.5)
 
-import math as _math
+        # Type bio human-like
+        for char in bio_text:
+            textarea.send_keys(char)
+            time.sleep(random.uniform(0.02, 0.06))
 
-def _jorki_compute_profile(text, lines, word_freq, kpis, dna):
-    """Build a semantic profile: accounting, finance, law, collateral, liquidity."""
-    text_lower = text.lower()
-    profile = {
-        "origin": {},
-        "accounting": {},
-        "finance": {},
-        "law": {},
-        "collateral": {},
-        "liquidity": {},
-        "risk": {},
-        "summary": "",
-    }
+        time.sleep(1)
+        agent.screenshot(f"bio_deploy_typed_{bio_id}")
 
-    # ── Origin Detection ──
-    origin_signals = {
-        "source_code": ["import ", "def ", "class ", "function ", "const ", "require("],
-        "financial_statement": ["balance sheet", "income statement", "cash flow", "p&l", "profit and loss", "assets", "liabilities", "equity", "retained earnings"],
-        "invoice": ["invoice", "bill to", "payment terms", "due date", "subtotal", "tax", "total due"],
-        "contract": ["agreement", "party", "parties", "whereas", "hereby", "terms and conditions", "obligations", "warranties"],
-        "spreadsheet": ["\t", ",", "column", "row", "cell", "sum(", "average(", "vlookup"],
-        "research_report": ["abstract", "methodology", "findings", "conclusion", "references", "hypothesis"],
-        "api_doc": ["endpoint", "request", "response", "status code", "parameters", "authentication"],
-        "audit": ["audit", "compliance", "internal control", "risk assessment", "material weakness", "sox", "gaap"],
-        "dataset": ["dataset", "features", "labels", "training", "validation", "test set", "rows", "columns"],
-    }
-    detected_origins = []
-    for origin, signals in origin_signals.items():
-        hits = sum(1 for s in signals if s in text_lower)
-        if hits >= 2:
-            detected_origins.append({"type": origin, "confidence": min(hits / len(signals), 1.0), "signals": hits})
-    profile["origin"]["detected"] = detected_origins
-    profile["origin"]["primary"] = detected_origins[0]["type"] if detected_origins else "unknown"
+        # Find and click save
+        saved = False
+        for sel in ["button[type='submit']", "button:has-text('Save')", "button:has-text('UPDATE')"]:
+            try:
+                btns = agent.driver.find_elements(By.CSS_SELECTOR, sel)
+                for btn in btns:
+                    if btn.is_displayed():
+                        agent.driver.execute_script("arguments[0].click();", btn)
+                        saved = True
+                        break
+            except Exception:
+                continue
+            if saved:
+                break
 
-    # ── Accounting Signals ──
-    acct_patterns = {
-        "gaap": r'\bGAAP\b',
-        "ifrs": r'\bIFRS\b',
-        "accrual": r'\baccrual\b',
-        "depreciation": r'\bdepreciation\b',
-        "amortization": r'\bamortization\b',
-        "revenue_recognition": r'\brevenue\s+recognition\b',
-        "accounts_receivable": r'\baccounts?\s+receivable\b|\bAR\b',
-        "accounts_payable": r'\baccounts?\s+payable\b|\bAP\b',
-        "inventory": r'\binventory\b',
-        "goodwill": r'\bgoodwill\b',
-        "deferred_revenue": r'\bdeferred\s+revenue\b',
-        "working_capital": r'\bworking\s+capital\b',
-        "ebitda": r'\bEBITDA\b',
-        "fiscal_year": r'\bfiscal\s+year\b|\bFY\d{2,4}\b',
-    }
-    acct_found = {}
-    for name, pattern in acct_patterns.items():
-        matches = re.findall(pattern, text, re.I)
-        if matches:
-            acct_found[name] = len(matches)
-    profile["accounting"]["standards_detected"] = [k for k in acct_found if k in ("gaap", "ifrs")]
-    profile["accounting"]["concepts_found"] = acct_found
-    profile["accounting"]["has_financial_statements"] = any(s in text_lower for s in ["balance sheet", "income statement", "cash flow statement"])
+        if not saved:
+            saved = agent.driver.execute_script("""
+                const btns = document.querySelectorAll('button');
+                for (const btn of btns) {
+                    const text = (btn.textContent || '').toLowerCase();
+                    if ((text.includes('save') || text.includes('update')) && btn.offsetParent !== null) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            """)
 
-    # ── Finance Signals ──
-    fin_patterns = {
-        "revenue": r'\brevenue\b',
-        "ebitda_margin": r'\bEBITDA\s+margin\b',
-        "net_income": r'\bnet\s+income\b',
-        "gross_profit": r'\bgross\s+profit\b',
-        "operating_expense": r'\boperating\s+expense\b|\bOpEx\b',
-        "capex": r'\bcapital\s+expenditure\b|\bCapEx\b',
-        "free_cash_flow": r'\bfree\s+cash\s+flow\b|\bFCF\b',
-        "wacc": r'\bWACC\b',
-        "dcf": r'\bdiscounted\s+cash\s+flow\b|\bDCF\b',
-        "npv": r'\bNPV\b',
-        "irr": r'\bIRR\b',
-        "moic": r'\bMOIC\b',
-        "roi": r'\bROI\b',
-        "roe": r'\bROE\b',
-        "roa": r'\bROA\b',
-        "debt_to_equity": r'\bdebt[- ]to[- ]equity\b|\bD/E\b',
-        "current_ratio": r'\bcurrent\s+ratio\b',
-        "quick_ratio": r'\bquick\s+ratio\b',
-    }
-    fin_found = {}
-    for name, pattern in fin_patterns.items():
-        matches = re.findall(pattern, text, re.I)
-        if matches:
-            fin_found[name] = len(matches)
-    profile["finance"]["metrics_detected"] = fin_found
+        time.sleep(3)
+        agent.screenshot(f"bio_deploy_after_{bio_id}")
 
-    # Extract monetary values from KPIs
-    monetary_kpis = [k for k in kpis if k["category"] == "financial"]
-    total_monetary = len(monetary_kpis)
-    profile["finance"]["monetary_references"] = total_monetary
-    profile["finance"]["largest_values"] = sorted(
-        [{"value": k["value"], "line": k["line"]} for k in monetary_kpis if "monetary" in k["name"] or "revenue" in k["name"]],
-        key=lambda x: x["line"]
-    )[:10]
+        if saved:
+            deploy_bio(bio_id)
+            log(f"Bio {bio_id} deployed successfully!")
+            write_receipt("deploy_bio", "pass", {"bio_id": bio_id, "char_count": len(bio_text)})
+            return True
+        else:
+            log("Could not find save button", "ERROR")
+            write_receipt("deploy_bio", "fail", {"bio_id": bio_id, "reason": "no_save_button"})
+            return False
 
-    # ── Law / Legal Signals ──
-    law_patterns = {
-        "nda": r'\bnon[- ]disclosure\b|\bNDA\b',
-        "ip_assignment": r'\bintellectual\s+property\b|\bIP\s+assignment\b',
-        "indemnification": r'\bindemnif',
-        "liability": r'\bliability\b',
-        "jurisdiction": r'\bjurisdiction\b',
-        "governing_law": r'\bgoverning\s+law\b',
-        "arbitration": r'\barbitration\b',
-        "confidentiality": r'\bconfidential',
-        "termination": r'\btermination\b',
-        "warranty": r'\bwarrant',
-        "license": r'\blicense\b|\blicens',
-        "copyright": r'\bcopyright\b',
-        "patent": r'\bpatent\b',
-        "trademark": r'\btrademark\b',
-        "compliance": r'\bcompliance\b',
-        "gdpr": r'\bGDPR\b',
-        "sox": r'\bSarbanes[- ]Oxley\b|\bSOX\b',
-        "sec_filing": r'\bSEC\b|\b10[- ]K\b|\b10[- ]Q\b|\b8[- ]K\b',
-    }
-    law_found = {}
-    for name, pattern in law_patterns.items():
-        matches = re.findall(pattern, text, re.I)
-        if matches:
-            law_found[name] = len(matches)
-    profile["law"]["legal_concepts"] = law_found
-    profile["law"]["has_contract_language"] = any(s in text_lower for s in ["whereas", "hereby", "party of the first part", "obligations of"])
-    profile["law"]["regulatory_references"] = [k for k in law_found if k in ("gdpr", "sox", "sec_filing")]
-    profile["law"]["ip_references"] = [k for k in law_found if k in ("copyright", "patent", "trademark", "license", "ip_assignment")]
-
-    # ── Collateral Assessment ──
-    collateral_signals = 0
-    collateral_items = []
-    if fin_found:
-        collateral_signals += len(fin_found)
-        collateral_items.append({"type": "financial_metrics", "count": len(fin_found), "value": "quantifiable"})
-    if acct_found:
-        collateral_signals += len(acct_found)
-        collateral_items.append({"type": "accounting_concepts", "count": len(acct_found), "value": "verifiable"})
-    if law_found:
-        collateral_signals += len(law_found)
-        collateral_items.append({"type": "legal_concepts", "count": len(law_found), "value": "enforceable"})
-    if kpis:
-        collateral_signals += len(kpis)
-        collateral_items.append({"type": "extracted_kpis", "count": len(kpis), "value": "measurable"})
-    dna_complexity = float(dna.get("complexity_score", 0)) if isinstance(dna, dict) else 0
-    if dna_complexity > 5:
-        collateral_signals += int(dna_complexity)
-        collateral_items.append({"type": "structural_complexity", "score": dna_complexity, "value": "non-trivial"})
-    if detected_origins:
-        collateral_signals += 5
-        collateral_items.append({"type": "origin_clarity", "origin": detected_origins[0]["type"], "value": "identifiable"})
-
-    # Collateral score 0-100
-    collateral_score = min(collateral_signals * 3, 100)
-    profile["collateral"]["score"] = collateral_score
-    profile["collateral"]["grade"] = "A" if collateral_score >= 80 else "B" if collateral_score >= 60 else "C" if collateral_score >= 40 else "D" if collateral_score >= 20 else "F"
-    profile["collateral"]["items"] = collateral_items
-    profile["collateral"]["signal_count"] = collateral_signals
-    profile["collateral"]["verifiable"] = collateral_score >= 40
-    profile["collateral"]["has_monetary_evidence"] = total_monetary > 0
-    profile["collateral"]["has_legal_evidence"] = bool(law_found)
-    profile["collateral"]["has_accounting_evidence"] = bool(acct_found)
-
-    # ── Liquidity Profile ──
-    liquidity_signals = 0
-    liquidity_factors = []
-
-    # Cash-related terms
-    cash_terms = ["cash", "liquid", "liquidity", "current assets", "marketable securities", "treasury"]
-    cash_hits = sum(1 for t in cash_terms if t in text_lower)
-    if cash_hits:
-        liquidity_signals += cash_hits * 5
-        liquidity_factors.append({"factor": "cash_references", "count": cash_hits})
-
-    # Time-based liquidity (mentions of days, terms, due dates)
-    time_terms = ["net 30", "net 60", "net 90", "due date", "payment terms", "maturity", "expiration"]
-    time_hits = sum(1 for t in time_terms if t in text_lower)
-    if time_hits:
-        liquidity_signals += time_hits * 4
-        liquidity_factors.append({"factor": "time_constraints", "count": time_hits})
-
-    # Marketability
-    if any(t in text_lower for t in ["market", "exchange", "tradable", "fungible"]):
-        liquidity_signals += 8
-        liquidity_factors.append({"factor": "marketability"})
-
-    # Revenue flow indicators
-    if any(t in text_lower for t in ["recurring", "subscription", "mrr", "arr", "annuity"]):
-        liquidity_signals += 10
-        liquidity_factors.append({"factor": "recurring_revenue"})
-
-    # Asset backing
-    if any(t in text_lower for t in ["collateral", "secured", "asset-backed", "tangible", "real estate", "equipment"]):
-        liquidity_signals += 8
-        liquidity_factors.append({"factor": "asset_backing"})
-
-    # Convertibility (can this be turned into cash quickly?)
-    if detected_origins and detected_origins[0]["type"] in ("financial_statement", "invoice", "contract"):
-        liquidity_signals += 6
-        liquidity_factors.append({"factor": "financial_document_type"})
-
-    liquidity_score = min(liquidity_signals * 2, 100)
-    profile["liquidity"]["score"] = liquidity_score
-    profile["liquidity"]["grade"] = "A" if liquidity_score >= 80 else "B" if liquidity_score >= 60 else "C" if liquidity_score >= 40 else "D" if liquidity_score >= 20 else "F"
-    profile["liquidity"]["factors"] = liquidity_factors
-    profile["liquidity"]["time_to_liquidate"] = "days" if liquidity_score >= 60 else "weeks" if liquidity_score >= 30 else "months" if liquidity_score >= 15 else "illiquid"
-    profile["liquidity"]["has_revenue_flow"] = any(t in text_lower for t in ["recurring", "subscription", "mrr", "arr"])
-    profile["liquidity"]["has_asset_backing"] = any(t in text_lower for t in ["collateral", "secured", "tangible", "asset"])
-
-    # ── Risk Assessment ──
-    risk_signals = []
-    risk_score = 0
-    if any(t in text_lower for t in ["confidential", "proprietary", "trade secret"]):
-        risk_signals.append("confidentiality_exposure")
-        risk_score += 15
-    if any(t in text_lower for t in ["password", "api key", "secret", "token", "credential"]):
-        risk_signals.append("secret_exposure")
-        risk_score += 25
-    if any(t in text_lower for t in ["litigation", "lawsuit", "dispute", "claim", "damages"]):
-        risk_signals.append("litigation_risk")
-        risk_score += 20
-    if any(t in text_lower for t in ["default", "bankruptcy", "insolvency", "distressed"]):
-        risk_signals.append("credit_risk")
-        risk_score += 30
-    if any(t in text_lower for t in ["forward-looking", "projection", "forecast", "guidance"]):
-        risk_signals.append("forward_looking_statements")
-        risk_score += 10
-    if any(t in text_lower for t in ["unaudited", "preliminary", "draft", "subject to change"]):
-        risk_signals.append("unverified_data")
-        risk_score += 15
-    profile["risk"]["signals"] = risk_signals
-    profile["risk"]["score"] = min(risk_score, 100)
-    profile["risk"]["level"] = "high" if risk_score >= 50 else "medium" if risk_score >= 25 else "low"
-
-    # ── Summary ──
-    parts = []
-    origin = profile["origin"]["primary"]
-    if origin != "unknown":
-        parts.append(f"Origin: {origin}")
-    if acct_found:
-        parts.append(f"Accounting: {len(acct_found)} concepts ({', '.join(list(acct_found.keys())[:3])})")
-    if fin_found:
-        parts.append(f"Finance: {len(fin_found)} metrics ({', '.join(list(fin_found.keys())[:3])})")
-    if law_found:
-        parts.append(f"Legal: {len(law_found)} concepts ({', '.join(list(law_found.keys())[:3])})")
-    parts.append(f"Collateral: {profile['collateral']['grade']} ({collateral_score})")
-    parts.append(f"Liquidity: {profile['liquidity']['grade']} ({liquidity_score})")
-    parts.append(f"Risk: {profile['risk']['level']} ({profile['risk']['score']})")
-    profile["summary"] = " · ".join(parts)
-
-    return profile
+    except Exception as e:
+        log(f"Bio deploy error: {e}", "ERROR")
+        return False
+    finally:
+        agent.stop()
 
 
-@app.get("/profile/{file_id}")
-async def jorki_profile(file_id: str):
-    """Full semantic profile: origin, accounting, finance, law, collateral, liquidity, risk."""
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    meta_rows = conn.execute("SELECT key, value FROM file_meta").fetchall()
-    kpi_rows = conn.execute("SELECT id, name, value, line, category, confidence FROM kpis").fetchall()
-    dna_rows = conn.execute("SELECT key, value FROM dna").fetchall()
-    word_rows = conn.execute("SELECT word, count FROM word_freq").fetchall()
-    chunk_rows = conn.execute("SELECT preview FROM chunks").fetchall()
-    conn.close()
-    _jorki_track_query(file_id, "profile")
+# ─── Main ────────────────────────────────────────────────────────────
 
-    meta = {r[0]: r[1] for r in meta_rows}
-    kpis = [{"id": r[0], "name": r[1], "value": r[2], "line": r[3], "category": r[4], "confidence": r[5]} for r in kpi_rows]
-    dna = {r[0]: r[1] for r in dna_rows}
-    word_freq = {r[0]: r[1] for r in word_rows}
-    text = "\n".join(r[0] for r in chunk_rows)
-    lines = text.split("\n")
+def main():
+    parser = argparse.ArgumentParser(description="RM Bio Loop — Ollama-powered bio generation")
+    parser.add_argument("--generate", action="store_true", help="Generate bio candidates")
+    parser.add_argument("--deploy", action="store_true", help="Deploy highest-scoring bio")
+    parser.add_argument("--fetch-current", action="store_true", help="Fetch current bio from RM")
+    parser.add_argument("--score-only", action="store_true", help="Re-score existing bios")
+    parser.add_argument("--evaluate", action="store_true", help="Evaluate completed bio experiments")
+    parser.add_argument("--count", type=int, default=3, help="Number of bios to generate")
+    parser.add_argument("--models", default="llama3.1,mistral,gemma2", help="Comma-separated Ollama models")
+    parser.add_argument("--list", action="store_true", help="List all bio candidates")
+    args = parser.parse_args()
 
+    init_bio_db()
+
+    if args.fetch_current:
+        bio = fetch_current_bio()
+        print(f"\nCurrent bio ({bio['char_count']} chars):")
+        print(bio["bio"][:500])
+        return
+
+    if args.generate:
+        models = args.models.split(",")
+        candidates = generate_bios(count=args.count, models=models)
+
+        log(f"\nGenerated {len(candidates)} candidates:")
+        for c in sorted(candidates, key=lambda x: x["score"], reverse=True):
+            log(f"  #{c['id']} | score={c['score']} | {c['model']} | {c['prompt_id']} | {c['char_count']} chars")
+            log(f"       Preview: {c['text'][:100]}...")
+
+        if args.deploy and candidates:
+            best = max(candidates, key=lambda x: x["score"])
+            log(f"\nDeploying best bio: #{best['id']} (score={best['score']})")
+            success = deploy_bio_to_rm(best["text"], best["id"])
+            if success:
+                log("Bio is now live!")
+            else:
+                log("Deploy failed", "ERROR")
+        return
+
+    if args.score_only:
+        bios = get_all_bios()
+        for b in bios:
+            new_score = score_bio(b["bio_text"])
+            conn = sqlite3.connect(str(BIO_DB))
+            conn.execute("UPDATE bio_experiments SET score=? WHERE id=?", (new_score, b["id"]))
+            conn.commit()
+            conn.close()
+            log(f"  #{b['id']} | score={new_score} | {b['model']}")
+        return
+
+    if args.evaluate:
+        results = evaluate_bios()
+        if not results:
+            log("No completed bio experiments with visitor data yet")
+            return
+        log(f"\nBio experiment results (sorted by visitors):")
+        for r in results:
+            log(f"  #{r['id']} | {r['visitors_during']} visitors | score={r['score']} | {r['model']}")
+            log(f"       Deployed: {r['deployed_at'][:19] if r['deployed_at'] else '?'}")
+            log(f"       Removed: {r['removed_at'][:19] if r['removed_at'] else '?'}")
+            log(f"       Preview: {r['bio_text'][:80]}...")
+        return
+
+    if args.list:
+        bios = get_all_bios()
+        log(f"\nAll bio candidates ({len(bios)}):")
+        for b in bios:
+            log(f"  #{b['id']} | {b['status']:10s} | score={b['score']:5.1f} | {b['model']:10s} | {b['prompt_id']}")
+            log(f"       {b['bio_text'][:80]}...")
+        return
+
+    # Default: generate + deploy
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+start.sh:
+```
+#!/bin/sh
+if [ -f .env ]; then
+    while IFS='=' read -r key value; do
+        case "$key" in
+            ''|\#*) continue ;;
+        esac
+        export "$key=$value"
+    done < .env
+fi
+exec ./cpp_os_server 7860
+
+```
+
+.gitattributes:
+```
+*.7z filter=lfs diff=lfs merge=lfs -text
+*.arrow filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.bz2 filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.ftz filter=lfs diff=lfs merge=lfs -text
+*.gz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.lfs.* filter=lfs diff=lfs merge=lfs -text
+*.mlmodel filter=lfs diff=lfs merge=lfs -text
+*.model filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.ot filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
+*.pb filter=lfs diff=lfs merge=lfs -text
+*.pickle filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.rar filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+saved_model/**/* filter=lfs diff=lfs merge=lfs -text
+*.tar.* filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tflite filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.xz filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.zst filter=lfs diff=lfs merge=lfs -text
+*tfevents* filter=lfs diff=lfs merge=lfs -text
+rm_pri/cpp/rm_pri filter=lfs diff=lfs merge=lfs -text
+rm_pri/cpp/rm_pri_built filter=lfs diff=lfs merge=lfs -text
+rotator_engine filter=lfs diff=lfs merge=lfs -text
+profile_debug.png filter=lfs diff=lfs merge=lfs -text
+profile_edit_page.png filter=lfs diff=lfs merge=lfs -text
+profile_page.png filter=lfs diff=lfs merge=lfs -text
+settings_avail.png filter=lfs diff=lfs merge=lfs -text
+settings_page.png filter=lfs diff=lfs merge=lfs -text
+rm_traffic/data/batch/bios_1m.jsonl filter=lfs diff=lfs merge=lfs -text
+rm_traffic/data/batch/bios_300k.jsonl filter=lfs diff=lfs merge=lfs -text
+rm_traffic/data/batch/bios_30k.jsonl filter=lfs diff=lfs merge=lfs -text
+llm_file_proxy/JorkiBar filter=lfs diff=lfs merge=lfs -text
+llm_file_proxy/LLMFileProxyBar filter=lfs diff=lfs merge=lfs -text
+llm_file_proxy/engine filter=lfs diff=lfs merge=lfs -text
+data/SouthPark_Lines.csv filter=lfs diff=lfs merge=lfs -text
+
+```
+
+server.py:
+```
+#!/usr/bin/env python3
+"""Booking availability API server.
+
+Serves the latest availability.json produced by checker.py. Also provides
+widget.html and verify.html landing pages for the extension buttons.
+"""
+
+import json
+import subprocess
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse
+
+APP_DIR = Path(__file__).resolve().parent
+AVAILABILITY_FILE = APP_DIR / "availability.json"
+
+app = FastAPI(title="RentMasseur Availability API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def load_availability():
+    if not AVAILABILITY_FILE.exists():
+        return {"generated_at": None, "mode": "none", "count": 0, "providers": []}
+    with open(AVAILABILITY_FILE, "r") as f:
+        return json.load(f)
+
+
+@app.get("/api/availability")
+def list_availability():
+    return load_availability()
+
+
+@app.get("/api/availability/{slug}")
+def get_availability(slug: str):
+    data = load_availability()
+    for provider in data.get("providers", []):
+        if provider.get("slug") == slug:
+            return provider
+    raise HTTPException(status_code=404, detail="Provider not found")
+
+
+@app.post("/api/refresh")
+def refresh(mock: bool = False):
     try:
-        dna_obj = json.loads(dna.get("genes", "{}")) if isinstance(dna.get("genes"), str) else {}
-        dna_dict = {"genes": dna_obj, "complexity_score": float(dna.get("complexity_score", 0)), "dna_sequence": dna.get("dna_sequence", ""), "species": dna.get("species", "")}
-    except:
-        dna_dict = {}
-
-    profile = _jorki_compute_profile(text, lines, word_freq, kpis, dna_dict)
-    return {"file_id": file_id, "filename": meta.get("filename", "unknown"), "profile": profile}
-
-# ─── Valuation: Production Readiness, Replacement Cost, Build Cost ───────
-
-def _jorki_valuate(text, lines, chunks, symbols, word_freq, kpis, dna, meta):
-    """Estimate production readiness, replacement cost, build cost, and purpose."""
-    text_lower = text.lower()
-    v = {
-        "purpose": {},
-        "production_readiness": {},
-        "replacement_cost": {},
-        "build_cost": {},
-        "depreciation": {},
-        "insurance_value": {},
-    }
-
-    # ── Purpose Detection ──
-    purposes = []
-    # By file extension / content patterns
-    ext = meta.get("filename", "").rsplit(".", 1)[-1].lower() if "." in meta.get("filename", "") else ""
-    purpose_map = {
-        "py": "Python application module",
-        "js": "JavaScript frontend/backend module",
-        "jsx": "React UI component",
-        "ts": "TypeScript module",
-        "tsx": "React+TypeScript component",
-        "go": "Go service/binary",
-        "rs": "Rust system/module",
-        "swift": "macOS/iOS application",
-        "cpp": "C++ system/native module",
-        "c": "C system/native module",
-        "json": "Configuration or data schema",
-        "yaml": "Infrastructure/config definition",
-        "yml": "Infrastructure/config definition",
-        "toml": "Project configuration",
-        "md": "Documentation/specification",
-        "sql": "Database schema/query",
-        "sh": "Shell automation script",
-        "html": "Web markup/template",
-        "css": "Stylesheet",
-        "csv": "Tabular data export",
-        "txt": "Plain text data",
-        "dockerfile": "Container build definition",
-    }
-    if ext in purpose_map:
-        purposes.append({"role": purpose_map[ext], "confidence": 0.8, "source": "extension"})
-
-    # By content analysis
-    if "import " in text_lower and "def " in text_lower:
-        purposes.append({"role": "library/module — reusable Python code", "confidence": 0.85, "source": "content"})
-    if "@app.get" in text_lower or "@app.post" in text_lower or "fastapi" in text_lower:
-        purposes.append({"role": "API server — HTTP endpoint provider", "confidence": 0.9, "source": "content"})
-    if "react" in text_lower or "usestate" in text_lower or "useeffect" in text_lower:
-        purposes.append({"role": "React UI — interactive frontend component", "confidence": 0.85, "source": "content"})
-    if "docker" in text_lower or "from " in text_lower and "run " in text_lower and ext == "dockerfile":
-        purposes.append({"role": "container image definition", "confidence": 0.9, "source": "content"})
-    if any(t in text_lower for t in ["balance sheet", "income statement", "cash flow", "ebitda", "revenue"]):
-        purposes.append({"role": "financial document — accounting/reporting", "confidence": 0.8, "source": "content"})
-    if any(t in text_lower for t in ["agreement", "whereas", "party", "obligations"]):
-        purposes.append({"role": "legal contract — binding agreement", "confidence": 0.8, "source": "content"})
-    if any(t in text_lower for t in ["test", "pytest", "assert", "expect", "describe"]):
-        purposes.append({"role": "test suite — quality assurance", "confidence": 0.75, "source": "content"})
-    if any(t in text_lower for t in ["readme", "documentation", "guide", "tutorial"]):
-        purposes.append({"role": "documentation — knowledge transfer", "confidence": 0.7, "source": "content"})
-
-    # Primary purpose = highest confidence
-    purposes.sort(key=lambda x: -x["confidence"])
-    v["purpose"]["detected"] = purposes
-    v["purpose"]["primary"] = purposes[0]["role"] if purposes else "unknown"
-    v["purpose"]["roles"] = [p["role"] for p in purposes]
-
-    # ── Production Readiness Score ──
-    pr_checks = []
-    pr_score = 0
-
-    # Has tests
-    has_tests = any(t in text_lower for t in ["test", "assert", "expect", "describe", "pytest"])
-    if has_tests:
-        pr_checks.append({"check": "has_tests", "status": "pass", "weight": 15})
-        pr_score += 15
-    else:
-        pr_checks.append({"check": "has_tests", "status": "fail", "weight": 0, "impact": "no test coverage detected"})
-
-    # Has error handling
-    has_errors = any(t in text_lower for t in ["try:", "except", "catch", "error", "raise", "throw"])
-    if has_errors:
-        pr_checks.append({"check": "error_handling", "status": "pass", "weight": 10})
-        pr_score += 10
-    else:
-        pr_checks.append({"check": "error_handling", "status": "fail", "weight": 0, "impact": "no error handling"})
-
-    # Has logging
-    has_logging = any(t in text_lower for t in ["log", "logger", "logging", "console.log", "print("])
-    if has_logging:
-        pr_checks.append({"check": "logging", "status": "pass", "weight": 8})
-        pr_score += 8
-    else:
-        pr_checks.append({"check": "logging", "status": "fail", "weight": 0})
-
-    # Has config separation
-    has_config = any(t in text_lower for t in ["environ", "config", "settings", ".env", "os.getenv"])
-    if has_config:
-        pr_checks.append({"check": "config_separation", "status": "pass", "weight": 10})
-        pr_score += 10
-    else:
-        pr_checks.append({"check": "config_separation", "status": "fail", "weight": 0})
-
-    # Has documentation
-    has_docs = any(t in text_lower for t in ['"""', "'''", "// ", "# ", "docstring", "readme"])
-    doc_ratio = len([l for l in lines if l.strip().startswith("#") or l.strip().startswith("//") or '"""' in l]) / max(len(lines), 1)
-    if doc_ratio > 0.05:
-        pr_checks.append({"check": "documentation", "status": "pass", "weight": 8, "ratio": round(doc_ratio, 3)})
-        pr_score += 8
-    else:
-        pr_checks.append({"check": "documentation", "status": "fail", "weight": 0})
-
-    # Has type hints / interfaces
-    has_types = any(t in text_lower for t in ["-> ", ": int", ": str", ": bool", ": float", "interface ", "type ", "typescript"])
-    if has_types:
-        pr_checks.append({"check": "type_safety", "status": "pass", "weight": 7})
-        pr_score += 7
-    else:
-        pr_checks.append({"check": "type_safety", "status": "fail", "weight": 0})
-
-    # Has security patterns
-    has_security = any(t in text_lower for t in ["auth", "password", "hash", "pbkdf2", "bcrypt", "jwt", "token", "sanitize", "validate"])
-    if has_security:
-        pr_checks.append({"check": "security_patterns", "status": "pass", "weight": 10})
-        pr_score += 10
-    else:
-        pr_checks.append({"check": "security_patterns", "status": "fail", "weight": 0})
-
-    # Complexity check (not too complex, not too simple)
-    complexity = float(dna.get("complexity_score", 0)) if isinstance(dna, dict) else 0
-    if 1 <= complexity <= 20:
-        pr_checks.append({"check": "complexity_balanced", "status": "pass", "weight": 7, "score": complexity})
-        pr_score += 7
-    elif complexity > 20:
-        pr_checks.append({"check": "complexity_balanced", "status": "warn", "weight": 3, "impact": "high complexity, hard to maintain"})
-        pr_score += 3
-    else:
-        pr_checks.append({"check": "complexity_balanced", "status": "warn", "weight": 3, "impact": "trivial code"})
-
-    # Has dependencies declared
-    has_deps = any(t in text_lower for t in ["import ", "require(", "from ", "use "])
-    if has_deps:
-        dep_count = len(re.findall(r'import |require\(|from ', text_lower))
-        pr_checks.append({"check": "dependencies_declared", "status": "pass", "weight": 5, "count": dep_count})
-        pr_score += 5
-    else:
-        pr_checks.append({"check": "dependencies_declared", "status": "fail", "weight": 0})
-
-    # Has deployment artifacts
-    has_deploy = any(t in text_lower for t in ["docker", "dockerfile", "deploy", "ci/cd", "github actions", "netlify", "vercel"])
-    if has_deploy:
-        pr_checks.append({"check": "deployment_artifacts", "status": "pass", "weight": 10})
-        pr_score += 10
-    else:
-        pr_checks.append({"check": "deployment_artifacts", "status": "fail", "weight": 0})
-
-    # Secret exposure (negative)
-    has_secrets = any(t in text_lower for t in ["api_key", "secret_key", "password =", "token ="])
-    if has_secrets:
-        pr_checks.append({"check": "no_hardcoded_secrets", "status": "fail", "weight": -15, "impact": "hardcoded secrets detected"})
-        pr_score -= 15
-    else:
-        pr_checks.append({"check": "no_hardcoded_secrets", "status": "pass", "weight": 10})
-        pr_score += 10
-
-    pr_score = max(0, min(pr_score, 100))
-    v["production_readiness"]["score"] = pr_score
-    v["production_readiness"]["grade"] = "A" if pr_score >= 80 else "B" if pr_score >= 60 else "C" if pr_score >= 40 else "D" if pr_score >= 20 else "F"
-    v["production_readiness"]["checks"] = pr_checks
-    v["production_readiness"]["distance_to_prod"] = "production ready" if pr_score >= 80 else "minor hardening needed" if pr_score >= 60 else "moderate work needed" if pr_score >= 40 else "significant work needed" if pr_score >= 20 else "not production ready"
-    v["production_readiness"]["blocking_issues"] = [c["check"] for c in pr_checks if c["status"] == "fail"]
-
-    # ── Build Cost Estimation ──
-    # Based on: lines of code, complexity, symbols, language
-    total_lines = int(meta.get("total_lines", len(lines)))
-    total_symbols = int(meta.get("total_symbols", len(symbols)))
-    total_chunks = int(meta.get("total_chunks", len(chunks)))
-
-    # Effective lines of code (non-blank, non-comment)
-    effective_loc = len([l for l in lines if l.strip() and not l.strip().startswith(("#", "//", "/*", "*"))])
-
-    # Species-aware cost model — documentation is NOT code
-    species = dna.get("species", "textus") if isinstance(dna, dict) else "textus"
-
-    # Different file types have fundamentally different cost structures
-    COST_MODEL = {
-        "pythonicus":     {"rate": 0.20, "complexity_cap": 3.0, "test_rate": 0.05, "type": "code"},
-        "javascriptus":  {"rate": 0.20, "complexity_cap": 3.0, "test_rate": 0.06, "type": "code"},
-        "golangus":      {"rate": 0.20, "complexity_cap": 3.0, "test_rate": 0.06, "type": "code"},
-        "rusticus":      {"rate": 0.20, "complexity_cap": 3.0, "test_rate": 0.07, "type": "code"},
-        "ceplusplus":    {"rate": 0.20, "complexity_cap": 3.0, "test_rate": 0.07, "type": "code"},
-        "scripticus":    {"rate": 0.15, "complexity_cap": 2.0, "test_rate": 0.03, "type": "script"},
-        "jsonicus":      {"rate": 0.02, "complexity_cap": 1.0, "test_rate": 0,    "type": "data"},
-        "markupus":      {"rate": 0.05, "complexity_cap": 1.5, "test_rate": 0,    "type": "markup"},
-        "tabularis":     {"rate": 0.03, "complexity_cap": 1.0, "test_rate": 0,    "type": "data"},
-        "configus":      {"rate": 0.08, "complexity_cap": 1.5, "test_rate": 0,    "type": "config"},
-        "textus":        {"rate": 0.000005, "complexity_cap": 1.0, "test_rate": 0,  "type": "documentation"},
-    }
-    model = COST_MODEL.get(species, COST_MODEL["textus"])
-    file_type = model["type"]
-    base_rate = model["rate"]
-    complexity_cap = model["complexity_cap"]
-
-    # Complexity factor — capped per file type
-    complexity_factor = min(1.0 + (complexity / 20.0), complexity_cap) if complexity > 0 else 1.0
-
-    # Build cost = effective LOC * rate * complexity
-    build_cost = int(effective_loc * base_rate * complexity_factor)
-
-    # Add cost for testing, docs, deployment setup (only for code)
-    test_cost = int(effective_loc * model["test_rate"]) if not has_tests and file_type == "code" else 0
-    deploy_cost = 2000 if not has_deploy and file_type == "code" else 0
-    security_audit_cost = 1500 if has_secrets and file_type in ("code", "config") else 0
-
-    total_build_cost = build_cost + test_cost + deploy_cost + security_audit_cost
-    # Hard cap at $3M
-    total_build_cost = min(total_build_cost, 3_000_000)
-
-    v["build_cost"]["estimated_usd"] = total_build_cost
-    v["build_cost"]["breakdown"] = {
-        "code_creation": build_cost,
-        "test_creation_needed": test_cost,
-        "deployment_setup_needed": deploy_cost,
-        "security_remediation_needed": security_audit_cost,
-        "effective_loc": effective_loc,
-        "rate_per_loc": base_rate,
-        "complexity_factor": round(complexity_factor, 2),
-        "file_type": file_type,
-        "species": species,
-    }
-    v["build_cost"]["time_estimate"] = {
-        "hours": round(effective_loc / 50, 1),  # ~50 LOC/hour
-        "days": round(effective_loc / 50 / 8, 1),  # 8 hour days
-        "developer_level": "mid" if complexity < 10 else "senior" if complexity < 25 else "staff",
-    }
-
-    # ── Replacement Cost ──
-    # What it would cost to rebuild from scratch (higher than build cost due to knowledge loss)
-    # Knowledge loss factor varies by file type
-    knowledge_loss_factor = 1.5 if file_type == "code" else 1.2 if file_type == "script" else 1.1
-    ramp_up_cost = 1000 if file_type == "code" else 500
-    replacement_cost = int(total_build_cost * knowledge_loss_factor) + ramp_up_cost
-    replacement_cost = min(replacement_cost, 3_000_000)
-
-    v["replacement_cost"]["estimated_usd"] = replacement_cost
-    v["replacement_cost"]["rationale"] = f"Build cost (${total_build_cost}) × knowledge loss factor ({knowledge_loss_factor}x) + ramp-up (${ramp_up_cost})"
-    v["replacement_cost"]["time_to_rebuild"] = {
-        "hours": round(effective_loc / 40, 1),  # slower due to lost context
-        "days": round(effective_loc / 40 / 8, 1),
-        "weeks": round(effective_loc / 40 / 8 / 5, 1),
-    }
-    v["replacement_cost"]["difficulty"] = "low" if complexity < 5 else "medium" if complexity < 15 else "high" if complexity < 30 else "very high"
-
-    # ── Depreciation ──
-    # Files depreciate based on: dependency staleness, code age signals, framework obsolescence
-    dep_signals = []
-    dep_score = 0  # 0 = no depreciation, 100 = fully deprecated
-
-    # Check for deprecated patterns
-    if any(t in text_lower for t in ["python 2", "print ", "xrange", "urllib2"]):
-        dep_signals.append("legacy_python2_patterns")
-        dep_score += 30
-    if any(t in text_lower for t in ["var ", "function ", "es5", "jquery"]):
-        dep_signals.append("legacy_javascript_patterns")
-        dep_score += 20
-    if any(t in text_lower for t in ["angularjs", "backbone", "ember"]):
-        dep_signals.append("deprecated_framework")
-        dep_score += 25
-    if any(t in text_lower for t in ["xml", "soap", "wsdl"]):
-        dep_signals.append("legacy_protocol")
-        dep_score += 15
-
-    # Comment ratio as maintenance signal
-    if doc_ratio < 0.02 and effective_loc > 100:
-        dep_signals.append("insufficient_documentation")
-        dep_score += 10
-
-    # No tests = harder to maintain = faster depreciation
-    if not has_tests and effective_loc > 50:
-        dep_signals.append("no_test_coverage")
-        dep_score += 15
-
-    dep_score = min(dep_score, 100)
-    v["depreciation"]["score"] = dep_score
-    v["depreciation"]["signals"] = dep_signals
-    v["depreciation"]["remaining_value_pct"] = max(0, 100 - dep_score)
-    v["depreciation"]["depreciated_value_usd"] = int(replacement_cost * (1 - dep_score / 100))
-
-    # ── Insurance Value ──
-    # What you'd insure this file for = replacement cost + business interruption
-    business_impact = 0
-    if has_security:
-        business_impact += 5000
-    if any(t in text_lower for t in ["payment", "transaction", "billing", "invoice"]):
-        business_impact += 10000
-    if any(t in text_lower for t in ["auth", "login", "password", "session"]):
-        business_impact += 8000
-    if pr_score >= 60:
-        business_impact += 3000  # production-grade = more at stake
-
-    insurance_value = min(replacement_cost + business_impact, 3_000_000)
-    v["insurance_value"]["estimated_usd"] = insurance_value
-    v["insurance_value"]["breakdown"] = {
-        "replacement_cost": replacement_cost,
-        "business_interruption_risk": business_impact,
-    }
-
-    return v
+        cmd = ["python3", str(APP_DIR / "checker.py"), "--output", str(AVAILABILITY_FILE)]
+        if mock:
+            cmd.append("--mock")
+        subprocess.run(cmd, check=True, cwd=APP_DIR)
+        return load_availability()
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"Checker failed: {e}")
 
 
-@app.get("/valuation/{file_id}")
-async def jorki_valuation(file_id: str):
-    """Production readiness, replacement cost, build cost, depreciation, insurance value."""
-    idx_path = JORKI_INDEX_DIR / f"{file_id}.idx"
-    if not idx_path.exists():
-        return {"error": f"Index not found for {file_id}"}
-    conn = sqlite3.connect(str(idx_path))
-    meta_rows = conn.execute("SELECT key, value FROM file_meta").fetchall()
-    kpi_rows = conn.execute("SELECT id, name, value, line, category, confidence FROM kpis").fetchall()
-    dna_rows = conn.execute("SELECT key, value FROM dna").fetchall()
-    word_rows = conn.execute("SELECT word, count FROM word_freq").fetchall()
-    chunk_rows = conn.execute("SELECT idx, line_start, line_end, boundary_type, preview, line_count FROM chunks").fetchall()
-    sym_rows = conn.execute("SELECT line, name, type FROM symbols").fetchall()
-    conn.close()
-    _jorki_track_query(file_id, "valuation")
+WIDGET_HTML = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Book Appointment</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a1f; color: #f0f0f5; margin: 0; padding: 40px; }
+    .card { max-width: 480px; margin: 0 auto; background: #222; padding: 24px; border-radius: 12px; border: 1px solid #333; }
+    h1 { margin-top: 0; font-size: 20px; }
+    .meta { color: #9a9aa3; font-size: 14px; margin-bottom: 16px; }
+    input, button { width: 100%; padding: 10px; margin-bottom: 10px; border-radius: 6px; border: 1px solid #444; background: #111; color: #f0f0f5; box-sizing: border-box; }
+    button { background: #cc8b4a; border: none; font-weight: 600; cursor: pointer; }
+    button:hover { background: #e09d5a; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1 id="provider">Book Appointment</h1>
+    <div class="meta" id="source"></div>
+    <form>
+      <input type="text" placeholder="Your name" required>
+      <input type="email" placeholder="Your email" required>
+      <input type="datetime-local" required>
+      <button type="submit">Request Booking</button>
+    </form>
+    <p class="meta" id="status"></p>
+  </div>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const provider = params.get('provider') || 'unknown';
+    document.getElementById('provider').textContent = 'Book: ' + provider;
+    document.getElementById('source').textContent = 'Source: ' + (params.get('source') || 'direct');
+    document.querySelector('form').addEventListener('submit', e => {
+      e.preventDefault();
+      document.getElementById('status').textContent = 'Booking request submitted (demo).';
+    });
+  </script>
+</body>
+</html>
+"""
 
-    meta = {r[0]: r[1] for r in meta_rows}
-    kpis = [{"id": r[0], "name": r[1], "value": r[2], "line": r[3], "category": r[4], "confidence": r[5]} for r in kpi_rows]
-    dna = {r[0]: r[1] for r in dna_rows}
-    word_freq = {r[0]: int(r[1]) for r in word_rows}
-    chunks = [{"idx": r[0], "line_start": r[1], "line_end": r[2], "boundary_type": r[3], "preview": r[4], "line_count": r[5]} for r in chunk_rows]
-    symbols = [{"line": r[0], "name": r[1], "type": r[2]} for r in sym_rows]
-    text = "\n".join(c["preview"] for c in chunks)
-    lines = text.split("\n")
+VERIFY_HTML = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Verify Video Call</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a1f; color: #f0f0f5; margin: 0; padding: 40px; }
+    .card { max-width: 480px; margin: 0 auto; background: #222; padding: 24px; border-radius: 12px; border: 1px solid #333; }
+    h1 { margin-top: 0; font-size: 20px; }
+    .meta { color: #9a9aa3; font-size: 14px; margin-bottom: 16px; }
+    button { width: 100%; padding: 12px; background: #8b5cf6; border: none; border-radius: 8px; color: #fff; font-weight: 600; cursor: pointer; }
+    button:hover { background: #a78bfa; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1 id="provider">Verify Video Call</h1>
+    <div class="meta" id="source"></div>
+    <button id="start">Start Verification Call</button>
+    <p class="meta" id="status"></p>
+  </div>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const provider = params.get('provider') || 'unknown';
+    document.getElementById('provider').textContent = 'Verify: ' + provider;
+    document.getElementById('source').textContent = 'Source: ' + (params.get('source') || 'direct');
+    document.getElementById('start').addEventListener('click', () => {
+      document.getElementById('status').textContent = 'Demo: verification call would start here.';
+    });
+  </script>
+</body>
+</html>
+"""
 
+
+@app.get("/widget.html", response_class=HTMLResponse)
+def widget():
+    return WIDGET_HTML
+
+
+@app.get("/verify.html", response_class=HTMLResponse)
+def verify():
+    return VERIFY_HTML
+
+
+@app.get("/demo.html", response_class=HTMLResponse)
+def demo():
+    return (APP_DIR / "demo.html").read_text()
+
+@app.get("/content.js")
+def content_js():
+    return FileResponse(APP_DIR / "content.js", media_type="application/javascript")
+
+@app.get("/content.css")
+def content_css():
+    return FileResponse(APP_DIR / "content.css", media_type="text/css")
+
+@app.get("/")
+def root():
+    return {"service": "RentMasseur Availability API", "endpoints": ["/api/availability", "/api/refresh", "/demo.html"]}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=3000)
+
+```
+
+_deploy_bio_audio_captcha.py:
+```
+#!/usr/bin/env python3
+"""
+Login + deploy bio with reCAPTCHA audio challenge solving.
+
+Strategy:
+1. Use undetected-chromedriver to minimize bot detection
+2. Switch to reCAPTCHA audio challenge
+3. Download audio file
+4. Transcribe with speech recognition
+5. Submit answer
+6. Proceed to login + bio deploy
+"""
+import time, os, sys, json, urllib.request, tempfile
+import undetected_chromedriver as uc
+from dotenv import load_dotenv
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import speech_recognition as sr
+from pydub import AudioSegment
+from datetime import datetime, timezone
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+LOGIN_URL = "https://rentmasseur.com/login"
+BIO_URL = "https://rentmasseur.com/profile/edit"
+BIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "bios", "controlled_wolf_v1.md")
+
+with open(BIO_FILE, "r") as f:
+    BIO_TEXT = f.read().strip()
+
+print(f"Username: {USERNAME}")
+print(f"Bio length: {len(BIO_TEXT)} chars")
+
+
+def solve_recaptcha_audio(driver):
+    """Solve reCAPTCHA using audio challenge + speech recognition."""
+    print("  [CAPTCHA] Attempting audio challenge...")
+    
+    # Switch to reCAPTCHA anchor iframe and click checkbox
+    frames = driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="recaptcha"][src*="anchor"]')
+    if not frames:
+        print("  [CAPTCHA] No reCAPTCHA anchor iframe found")
+        return False
+    
+    driver.switch_to.frame(frames[0])
+    time.sleep(1)
+    
+    # Click the checkbox
     try:
-        dna_obj = json.loads(dna.get("genes", "{}")) if isinstance(dna.get("genes"), str) else {}
-        dna_dict = {"genes": dna_obj, "complexity_score": float(dna.get("complexity_score", 0)),
-                    "dna_sequence": dna.get("dna_sequence", ""), "species": dna.get("species", "")}
-    except:
-        dna_dict = {}
-
-    valuation = _jorki_valuate(text, lines, chunks, symbols, word_freq, kpis, dna_dict, meta)
-    return {"file_id": file_id, "filename": meta.get("filename", "unknown"), "valuation": valuation}
-
-# ─── File Resume / Dossier Generator ─────────────────────────────────────
-
-def _jorki_generate_resume(file_id, meta, kpis, dna, word_freq, chunks, symbols, profile, valuation, ml_result):
-    """Generate a novel file resume — a complete dossier combining all analysis layers."""
-    import math as _m
-
-    r = {
-        "header": {},
-        "identity": {},
-        "structural_dna": {},
-        "kpi_summary": {},
-        "financial_profile": {},
-        "legal_profile": {},
-        "ml_insights": {},
-        "valuation_summary": {},
-        "risk_assessment": {},
-        "recommendations": [],
-        "llm_facts": [],
-        "narrative": "",
-        "dossier_text": "",
-    }
-
-    filename = meta.get("filename", "unknown")
-    size_human = meta.get("size_human", "?")
-    total_lines = int(meta.get("total_lines", 0))
-    total_words = int(meta.get("total_words", 0))
-    total_chunks = int(meta.get("total_chunks", 0))
-    total_symbols = int(meta.get("total_symbols", 0))
-    merkle = meta.get("merkle_root", "")
-    species = dna.get("species", "unknown") if isinstance(dna, dict) else "unknown"
-    dna_seq = dna.get("dna_sequence", "") if isinstance(dna, dict) else ""
-    complexity = float(dna.get("complexity_score", 0)) if isinstance(dna, dict) else 0
-
-    # ── Header ──
-    r["header"] = {
-        "title": filename,
-        "file_id": file_id,
-        "merkle_root": merkle,
-        "generated_at": time.time(),
+        checkbox = driver.find_element(By.CSS_SELECTOR, '#recaptcha-anchor')
+        checkbox.click()
+        print("  [CAPTCHA] Clicked checkbox")
+        time.sleep(3)
+    except Exception as e:
+        print(f"  [CAPTCHA] Error clicking checkbox: {e}")
+        driver.switch_to.default_content()
+        return False
+    
+    driver.switch_to.default_content()
+    time.sleep(2)
+    
+    # Now switch to the bframe (challenge iframe)
+    bframes = driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="recaptcha"][src*="bframe"]')
+    if not bframes:
+        print("  [CAPTCHA] No challenge iframe found - maybe checkbox passed?")
+        return check_response(driver)
+    
+    driver.switch_to.frame(bframes[0])
+    time.sleep(2)
+    
+    # Click "Audio" button
+    try:
+        audio_btn = driver.find_element(By.CSS_SELECTOR, '#recaptcha-audio-button')
+        audio_btn.click()
+        print("  [CAPTCHA] Clicked audio button")
+        time.sleep(3)
+    except Exception as e:
+        print(f"  [CAPTCHA] Error clicking audio button: {e}")
+        # Try alternative selectors
+        try:
+            audio_btn = driver.find_element(By.XPATH, '//button[contains(text(),"audio")]')
+            audio_btn.click()
+            time.sleep(3)
+        except:
+            print("  [CAPTCHA] Could not find audio button")
+            driver.switch_to.default_content()
+            return False
+    
+    # Get audio URL
+    for attempt in range(3):
+        try:
+            audio_link = driver.find_element(By.CSS_SELECTOR, '.rc-audiochallenge-tdownload-link a, a[href*=".mp3"]')
+            audio_url = audio_link.get_attribute("href")
+            if audio_url:
+                print(f"  [CAPTCHA] Audio URL: {audio_url}")
+                break
+        except:
+            # Try to find audio element
+            try:
+                audio_el = driver.find_element(By.CSS_SELECTOR, 'audio source')
+                audio_url = audio_el.get_attribute("src")
+                if audio_url:
+                    print(f"  [CAPTCHA] Audio element URL: {audio_url}")
+                    break
+            except:
+                pass
+        time.sleep(2)
+    else:
+        print("  [CAPTCHA] Could not find audio URL")
+        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/captcha_audio.png")
+        driver.switch_to.default_content()
+        return False
+    
+    # Download audio file
+    tmp_dir = tempfile.mkdtemp()
+    audio_path = os.path.join(tmp_dir, "captcha.mp3")
+    wav_path = os.path.join(tmp_dir, "captcha.wav")
+    
+    try:
+        print(f"  [CAPTCHA] Downloading audio...")
+        urllib.request.urlretrieve(audio_url, audio_path)
+        
+        # Convert to WAV
+        print(f"  [CAPTCHA] Converting to WAV...")
+        audio = AudioSegment.from_mp3(audio_path)
+        audio.export(wav_path, format="wav")
+        
+        # Transcribe
+        print(f"  [CAPTCHA] Transcribing...")
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+        
+        # Try Google speech recognition
+        try:
+            text = recognizer.recognize_google(audio_data)
+            print(f"  [CAPTCHA] Transcribed: '{text}'")
+        except sr.UnknownValueError:
+            print("  [CAPTCHA] Could not understand audio")
+            # Try with different settings
+            recognizer.energy_threshold = 300
+            with sr.AudioFile(wav_path) as source:
+                audio_data = recognizer.record(source, duration=10)
+            try:
+                text = recognizer.recognize_google(audio_data)
+                print(f"  [CAPTCHA] Retry transcribed: '{text}'")
+            except:
+                print("  [CAPTCHA] Speech recognition failed")
+                driver.switch_to.default_content()
+                return False
+        except sr.RequestError as e:
+            print(f"  [CAPTCHA] Speech recognition service error: {e}")
+            driver.switch_to.default_content()
+            return False
+        
+        # Enter the answer
+        print(f"  [CAPTCHA] Entering answer: '{text}'")
+        try:
+            input_field = driver.find_element(By.CSS_SELECTOR, '#audio-response')
+            input_field.clear()
+            input_field.send_keys(text.lower().strip())
+            time.sleep(1)
+        except:
+            try:
+                input_field = driver.find_element(By.CSS_SELECTOR, 'input[type="text"]')
+                input_field.clear()
+                input_field.send_keys(text.lower().strip())
+                time.sleep(1)
+            except Exception as e:
+                print(f"  [CAPTCHA] Could not find input field: {e}")
+                driver.switch_to.default_content()
+                return False
+        
+        # Click verify
+        try:
+            verify_btn = driver.find_element(By.CSS_SELECTOR, '#recaptcha-verify-button')
+            verify_btn.click()
+            print("  [CAPTCHA] Clicked verify")
+        except:
+            try:
+                verify_btn = driver.find_element(By.XPATH, '//button[contains(text(),"Verify")]')
+                verify_btn.click()
+            except:
+                print("  [CAPTCHA] Could not find verify button")
+        
