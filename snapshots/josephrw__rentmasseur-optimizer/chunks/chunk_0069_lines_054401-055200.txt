@@ -1,519 +1,222 @@
-    def detect_block(self) -> Optional[str]:
-        txt = self.page_text().lower()
-        url = (self.driver.current_url or "").lower()
-        needles = [
-            ("captcha", "captcha_detected"),
-            ("crowdsec", "crowdsec_detected"),
-            ("access forbidden", "access_forbidden"),
-            ("verify you are human", "human_verification"),
-            ("unusual traffic", "traffic_challenge"),
-            ("too many requests", "rate_limited"),
-        ]
-        for needle, reason in needles:
-            if needle in txt or needle in url:
-                return reason
-        return None
+                            r["reviewer"],
+                        )
+                    )
+                else:
+                    db.execute(
+                        "INSERT INTO clients (username, first_found_on, review_count, cities_found, masseurs_reviewed, sample_review, first_seen, last_seen) VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+                        (
+                            r["reviewer"],
+                            masseur,
+                            city,
+                            masseur,
+                            r["text"][:200],
+                            now_iso(),
+                            now_iso(),
+                        )
+                    )
 
-    # ── Handlers ──────────────────────────────────────────────────────
-
-    def run_health_check(self):
-        try:
-            r = requests.get(f"{LOCAL_CP_URL}/api/health", timeout=10)
-            self.receipts.write("health_check", "pass", {
-                "status_code": r.status_code,
-                "body_hash": sha256_text(r.text),
-                "body_preview": r.text[:500],
-            })
+            db.commit()
         except Exception as e:
-            self.receipts.write("health_check", "fail", {"error": str(e)})
+            print(f"  DB error for {masseur}: {e}")
 
-    def run_metrics_ingest(self):
-        payload = {
-            "source": "ci_selenium",
-            "event": "proof_metric",
-            "ts": int(time.time()),
-            "value": 1,
-        }
-        try:
-            r = requests.post(f"{LOCAL_CP_URL}/api/metrics/ingest", json=payload, timeout=10)
-            self.receipts.write("metrics_ingest", "pass", {
-                "status_code": r.status_code,
-                "response_hash": sha256_text(r.text),
-            })
-        except Exception as e:
-            self.receipts.write("metrics_ingest", "fail", {"error": str(e)})
+        # Progress
+        elapsed = time.time() - start_time
+        rate = processed / elapsed if elapsed > 0 else 0
+        remaining = total_pending - processed
+        eta = remaining / rate if rate > 0 else 0
+        print(f"  [{processed}/{total_pending}] {masseur}: {len(reviewers)} reviewers | "
+              f"{total_reviewers} total | {elapsed:.0f}s | ETA {eta:.0f}s")
 
-    def run_local_dashboard_snapshot(self):
-        self._ensure_driver()
-        try:
-            self.driver.get(LOCAL_CP_URL)
-            time.sleep(2)
-            shot = self.screenshot("local_dashboard")
-            title = self.driver.title
-            body = self.page_text()[:2000]
-            self.receipts.write("local_dashboard_snapshot", "pass", {
-                "title": title,
-                "body_hash": sha256_text(body),
-                "screenshot": shot,
-            })
-        except Exception as e:
-            self.receipts.write("local_dashboard_snapshot", "fail", {"error": str(e)})
+        time.sleep(delay)
 
-    def run_bio_candidate_generate(self):
-        try:
-            r = requests.post(
-                f"{LOCAL_CP_URL}/api/run/ga-rl",
-                headers={"Authorization": f"Bearer {os.getenv('ADMIN_TOKEN', '')}"},
-                timeout=120,
-            )
-            self.receipts.write("bio_candidate_generate", "pass", {
-                "status_code": r.status_code,
-                "response_hash": sha256_text(r.text),
-                "response_preview": r.text[:1000],
-            })
-        except Exception as e:
-            self.receipts.write("bio_candidate_generate", "fail", {"error": str(e)})
+    print(f"\n  Done: {processed} masseurs, {total_reviewers} reviewers extracted")
+    return total_reviewers
 
-    def run_bio_candidate_preview(self):
-        try:
-            r = requests.get(f"{LOCAL_CP_URL}/api/candidates", timeout=10)
-            self.receipts.write("bio_candidate_preview", "pass", {
-                "status_code": r.status_code,
-                "candidate_count": len(r.json()) if r.headers.get("content-type", "").startswith("application/json") else 0,
-                "response_hash": sha256_text(r.text),
-            })
-        except Exception as e:
-            self.receipts.write("bio_candidate_preview", "fail", {"error": str(e)})
 
-    def run_live_login_readonly(self):
-        self._ensure_driver()
-        username = os.getenv("RM_USERNAME") or os.getenv("RM_USER")
-        password = os.getenv("RM_PASSWORD") or os.getenv("RM_PASS")
+def stage_transform_load(db: sqlite3.Connection):
+    """Stage 3: Transform + export."""
+    print(f"\n{'='*60}")
+    print(f"STAGE 3: Transform & Export")
+    print(f"{'='*60}")
 
-        if not username or not password:
-            self.receipts.write("live_login_readonly", "skipped", {
-                "reason": "missing_credentials"
-            })
-            return
+    # Stats
+    total_masseurs = db.execute("SELECT COUNT(*) FROM masseurs").fetchone()[0]
+    done_masseurs = db.execute("SELECT COUNT(*) FROM masseurs WHERE status='done'").fetchone()[0]
+    total_reviews = db.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+    total_clients = db.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
 
-        try:
-            self.driver.get(f"{BASE_URL}/login")
-            time.sleep(3)
-            shot = self.screenshot("login_page")
+    print(f"  Masseurs: {total_masseurs} ({done_masseurs} scraped)")
+    print(f"  Reviews: {total_reviews}")
+    print(f"  Unique clients: {total_clients}")
 
-            block = self.detect_block()
-            if block:
-                self.receipts.write("live_login_readonly", "blocked", {
-                    "reason": block,
-                    "screenshot": shot,
-                })
-                return
+    # Export clients to JSON
+    clients = db.execute("SELECT * FROM clients ORDER BY review_count DESC").fetchall()
+    clients_json = [dict(c) for c in clients]
+    json_path = ARTIFACTS / "clients.json"
+    json_path.write_text(json.dumps(clients_json, indent=2, default=str), encoding="utf-8")
+    print(f"  JSON: {json_path}")
 
-            self.receipts.write("live_login_readonly", "manual_required", {
-                "reason": "login selectors must be confirmed manually before CI login is enabled",
-                "screenshot": shot,
-            })
-        except Exception as e:
-            self.receipts.write("live_login_readonly", "fail", {"error": str(e)})
+    # Export to CSV
+    csv_path = ARTIFACTS / "clients.csv"
+    with csv_path.open("w") as f:
+        f.write("username,review_count,first_found_on,cities_found,masseurs_reviewed,first_seen,last_seen,sample_review\n")
+        for c in clients:
+            row = dict(c)
+            f.write(f'"{row["username"]}",{row["review_count"]},"{row["first_found_on"]}",'
+                    f'"{row["cities_found"] or ""}","{row["masseurs_reviewed"] or ""}",'
+                    f'"{row["first_seen"]}","{row["last_seen"]}",'
+                    f'"{(row["sample_review"] or "").replace(chr(34), chr(39))[:200]}"\n')
+    print(f"  CSV: {csv_path}")
 
-    def run_dashboard_snapshot(self):
-        self._ensure_driver()
-        try:
-            self.driver.get(f"{BASE_URL}/settings")
-            time.sleep(4)
-            shot = self.screenshot("dashboard")
-            block = self.detect_block()
-            if block:
-                self.receipts.write("dashboard_snapshot", "blocked", {
-                    "reason": block, "screenshot": shot,
-                })
-                return
-            txt = self.page_text()
-            self.receipts.write("dashboard_snapshot", "pass", {
-                "title": self.driver.title,
-                "text_len": len(txt),
-                "body_hash": sha256_text(txt[:2000]),
-                "screenshot": shot,
-                "signals": {
-                    "availability": "availability" in txt.lower(),
-                    "profile": "profile" in txt.lower(),
-                    "statistics": "statistics" in txt.lower() or "views" in txt.lower(),
-                    "messages": "messages" in txt.lower() or "mailbox" in txt.lower(),
-                },
-            })
-        except Exception as e:
-            self.receipts.write("dashboard_snapshot", "fail", {"error": str(e)})
+    # Export client usernames only
+    txt_path = ARTIFACTS / "client_usernames.txt"
+    txt_path.write_text("\n".join(c["username"] for c in clients), encoding="utf-8")
+    print(f"  Usernames: {txt_path}")
 
-    def run_availability_read(self):
-        self._ensure_driver()
-        try:
-            self.driver.get(f"{BASE_URL}/settings?availability=1")
-            time.sleep(4)
-            shot = self.screenshot("availability")
-            block = self.detect_block()
-            if block:
-                self.receipts.write("availability_read", "blocked", {
-                    "reason": block, "screenshot": shot,
-                })
-                return
-            txt = self.page_text()
-            self.receipts.write("availability_read", "pass", {
-                "text_len": len(txt),
-                "available_present": "available" in txt.lower(),
-                "screenshot": shot,
-            })
-        except Exception as e:
-            self.receipts.write("availability_read", "fail", {"error": str(e)})
+    # Print top clients
+    if clients:
+        print(f"\n--- Top 20 NY Client Profiles ---")
+        for c in clients[:20]:
+            print(f"  {c['username']:25s} | reviews={c['review_count']:2d} | cities={c['cities_found'] or '?'}")
 
-    def run_bio_field_detect(self):
-        self._ensure_driver()
-        try:
-            self.driver.get(f"{BASE_URL}/settings/about")
-            time.sleep(4)
-            shot = self.screenshot("bio_field_detect")
-            block = self.detect_block()
-            if block:
-                self.receipts.write("bio_field_detect", "blocked", {
-                    "reason": block, "screenshot": shot,
-                })
-                return
 
-            selectors_found = {}
-            for label, sels in {
-                "textarea": ["textarea[name*='description' i]", "textarea[name*='bio' i]", "textarea"],
-                "contenteditable": ["[contenteditable='true']"],
-                "save_button": ["button[type='submit']"],
-            }.items():
-                for sel in sels:
-                    try:
-                        els = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                        if els and any(e.is_displayed() for e in els):
-                            selectors_found[label] = sel
-                            break
-                    except Exception:
-                        continue
+# ── Status ───────────────────────────────────────────────────────────
 
-            # Save selector proof for approved_mutation mode
-            debug_dir = Path("debug")
-            debug_dir.mkdir(exist_ok=True)
-            proof_path = debug_dir / "bio_apply_live_selectors.json"
-            proof_path.write_text(json.dumps(selectors_found, indent=2), encoding="utf-8")
+def show_status(db: sqlite3.Connection):
+    total = db.execute("SELECT COUNT(*) FROM masseurs").fetchone()[0]
+    done = db.execute("SELECT COUNT(*) FROM masseurs WHERE status='done'").fetchone()[0]
+    pending = db.execute("SELECT COUNT(*) FROM masseurs WHERE status='pending'").fetchone()[0]
+    errors = db.execute("SELECT COUNT(*) FROM masseurs WHERE status='error'").fetchone()[0]
+    reviews = db.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+    clients = db.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
 
-            self.receipts.write("bio_field_detect", "pass", {
-                "screenshot": shot,
-                "selectors_found": selectors_found,
-                "selector_proof": str(proof_path),
-            })
-        except Exception as e:
-            self.receipts.write("bio_field_detect", "fail", {"error": str(e)})
+    print(f"\nRM Client Mining Pipeline Status")
+    print(f"{'='*40}")
+    print(f"  DB: {DB_PATH}")
+    print(f"  Masseurs: {total} total")
+    print(f"    Done: {done}")
+    print(f"    Pending: {pending}")
+    print(f"    Errors: {errors}")
+    print(f"  Reviews: {reviews}")
+    print(f"  Unique clients: {clients}")
 
-    def run_extension_popup_smoke(self):
-        self._ensure_driver()
-        try:
-            popup_path = Path("popup.html").resolve()
-            self.driver.get(f"file://{popup_path}")
-            time.sleep(2)
-            shot = self.screenshot("extension_popup")
-            title = self.driver.title
-            self.receipts.write("extension_popup_smoke", "pass", {
-                "title": title,
-                "screenshot": shot,
-            })
-        except Exception as e:
-            self.receipts.write("extension_popup_smoke", "fail", {"error": str(e)})
+    if total > 0:
+        pct = done / total * 100
+        print(f"  Progress: {pct:.1f}%")
 
-    def run_extension_content_script_smoke(self):
-        self._ensure_driver()
-        try:
-            self.driver.get(BASE_URL)
-            time.sleep(3)
-            shot = self.screenshot("extension_content_script")
-            self.receipts.write("extension_content_script_smoke", "pass", {
-                "url": self.driver.current_url,
-                "screenshot": shot,
-            })
-        except Exception as e:
-            self.receipts.write("extension_content_script_smoke", "fail", {"error": str(e)})
+    # Per-city breakdown
+    print(f"\n  Per-city:")
+    rows = db.execute("SELECT city, COUNT(*) as n, SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) as done FROM masseurs GROUP BY city ORDER BY n DESC").fetchall()
+    for r in rows:
+        print(f"    {r['city']:20s} {r['done']}/{r['n']}")
 
-    # ── Approved mutation handlers ────────────────────────────────────
 
-    def run_bio_apply_live(self, candidate_file: str = "", approval_token: str = ""):
-        if not self.gate.verify_approval_token(approval_token):
-            self.receipts.write("bio_apply_live", "blocked", {
-                "reason": "approval_token_mismatch_or_missing"
-            })
-            return
-        if not self.gate.check_selector_proof("bio_apply_live"):
-            self.receipts.write("bio_apply_live", "blocked", {
-                "reason": "no_selector_proof_run_bio_field_detect_first"
-            })
-            return
-        candidate = self.gate.load_candidate(candidate_file)
-        if not candidate:
-            self.receipts.write("bio_apply_live", "blocked", {
-                "reason": "no_candidate_file"
-            })
-            return
-
-        bio_text = candidate.get("bio", "")
-        if len(bio_text) < 40 or len(bio_text) > 3000:
-            self.receipts.write("bio_apply_live", "blocked", {
-                "reason": "bio_length_out_of_bounds",
-                "length": len(bio_text),
-            })
-            return
-
-        risky = ["escort", "happy ending", "nude", "naked", "sex", "guaranteed cure"]
-        if any(x in bio_text.lower() for x in risky):
-            self.receipts.write("bio_apply_live", "blocked", {
-                "reason": "bio_failed_local_policy_filter"
-            })
-            return
-
-        self._ensure_driver()
-        try:
-            self.driver.get(f"{BASE_URL}/settings/about")
-            time.sleep(4)
-            before_shot = self.screenshot("bio_before")
-
-            block = self.detect_block()
-            if block:
-                self.receipts.write("bio_apply_live", "blocked", {
-                    "reason": block, "screenshot": before_shot,
-                })
-                return
-
-            field = None
-            for sel in ["textarea[name*='description' i]", "textarea[name*='bio' i]", "textarea", "[contenteditable='true']"]:
-                try:
-                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                    for el in els:
-                        if el.is_displayed():
-                            field = el
-                            break
-                except Exception:
-                    continue
-                if field:
-                    break
-
-            if not field:
-                self.receipts.write("bio_apply_live", "fail", {
-                    "reason": "bio_field_not_found",
-                    "screenshot": before_shot,
-                })
-                return
-
-            tag = field.tag_name.lower()
-            if tag == "textarea":
-                field.clear()
-                field.send_keys(bio_text)
-            else:
-                self.driver.execute_script(
-                    "arguments[0].innerText = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles:true}));",
-                    field, bio_text,
-                )
-
-            time.sleep(1)
-            after_fill_shot = self.screenshot("bio_after_fill")
-
-            saved = False
-            for sel in ["button[type='submit']"]:
-                try:
-                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                    for el in els:
-                        if el.is_displayed() and el.is_enabled():
-                            self.driver.execute_script("arguments[0].click();", el)
-                            saved = True
-                            break
-                except Exception:
-                    continue
-                if saved:
-                    break
-
-            time.sleep(4)
-            after_shot = self.screenshot("bio_after_save")
-            block = self.detect_block()
-
-            self.receipts.write("bio_apply_live", "pass" if saved and not block else "fail", {
-                "clicked_save": saved,
-                "bio_chars": len(bio_text),
-                "before_screenshot": before_shot,
-                "after_fill_screenshot": after_fill_shot,
-                "after_screenshot": after_shot,
-                "block_detected": block,
-            })
-        except Exception as e:
-            self.receipts.write("bio_apply_live", "fail", {"error": str(e)})
-
-    def run_availability_set_live(self, candidate_file: str = "", approval_token: str = ""):
-        if not self.gate.verify_approval_token(approval_token):
-            self.receipts.write("availability_set_live", "blocked", {
-                "reason": "approval_token_mismatch_or_missing"
-            })
-            return
-
-        self._ensure_driver()
-        try:
-            self.driver.get(f"{BASE_URL}/settings?availability=1")
-            time.sleep(4)
-            before_shot = self.screenshot("availability_before")
-
-            block = self.detect_block()
-            if block:
-                self.receipts.write("availability_set_live", "blocked", {
-                    "reason": block, "screenshot": before_shot,
-                })
-                return
-
-            clicked = False
-            for sel in ["label", "button"]:
-                try:
-                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                    for el in els:
-                        txt = (el.text or "").lower()
-                        if "available" in txt and el.is_displayed():
-                            self.driver.execute_script("arguments[0].click();", el)
-                            clicked = True
-                            break
-                except Exception:
-                    continue
-                if clicked:
-                    break
-
-            time.sleep(1)
-            saved = False
-            for sel in ["button[type='submit']"]:
-                try:
-                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                    for el in els:
-                        if el.is_displayed() and el.is_enabled():
-                            self.driver.execute_script("arguments[0].click();", el)
-                            saved = True
-                            break
-                except Exception:
-                    continue
-                if saved:
-                    break
-
-            time.sleep(3)
-            after_shot = self.screenshot("availability_after")
-            block = self.detect_block()
-
-            self.receipts.write("availability_set_live", "pass" if clicked and saved and not block else "fail", {
-                "clicked_available": clicked,
-                "clicked_save": saved,
-                "before_screenshot": before_shot,
-                "after_screenshot": after_shot,
-                "block_detected": block,
-            })
-        except Exception as e:
-            self.receipts.write("availability_set_live", "fail", {"error": str(e)})
-
-    # ── Dispatcher ────────────────────────────────────────────────────
-
-    HANDLERS = {
-        "health_check": "run_health_check",
-        "metrics_ingest": "run_metrics_ingest",
-        "local_dashboard_snapshot": "run_local_dashboard_snapshot",
-        "bio_candidate_generate": "run_bio_candidate_generate",
-        "bio_candidate_preview": "run_bio_candidate_preview",
-        "live_login_readonly": "run_live_login_readonly",
-        "dashboard_snapshot": "run_dashboard_snapshot",
-        "availability_read": "run_availability_read",
-        "bio_field_detect": "run_bio_field_detect",
-        "extension_popup_smoke": "run_extension_popup_smoke",
-        "extension_content_script_smoke": "run_extension_content_script_smoke",
-        "bio_apply_live": "run_bio_apply_live",
-        "availability_set_live": "run_availability_set_live",
-    }
-
-    def run_function(self, name: str, cfg: dict, candidate_file: str = "", approval_token: str = ""):
-        self.functions_run.append(name)
-
-        block_reason = self.gate.is_blocked(name, cfg)
-        if block_reason:
-            self.receipts.write(name, "blocked", {"reason": block_reason})
-            return
-
-        handler_name = self.HANDLERS.get(name)
-        if not handler_name:
-            self.receipts.write(name, "skipped", {"reason": "no_handler_implemented"})
-            return
-
-        handler = getattr(self, handler_name)
-        try:
-            if name in ("bio_apply_live", "availability_set_live"):
-                handler(candidate_file=candidate_file, approval_token=approval_token)
-            else:
-                handler()
-        except Exception as e:
-            self.receipts.write(name, "fail", {"error": str(e)})
-
-        time.sleep(float(os.getenv("RM_ACTION_PAUSE_SECONDS", "2.0")))
-
-    def close(self):
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-            self.driver = None
-
+# ── Main ─────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="RM CI/CD Selenium Automator")
-    parser.add_argument("--registry", required=True, help="Path to function_registry.yml")
-    parser.add_argument("--mode", default="proof", choices=["proof", "live_readonly", "approved_mutation"])
-    parser.add_argument("--artifacts", default="artifacts")
-    parser.add_argument("--function", default="all_safe", help="Function name or 'all_safe'")
-    parser.add_argument("--candidate-file", default="", help="Approved candidate JSON for mutations")
-    parser.add_argument("--approval-token", default="", help="ADMIN_TOKEN for approved_mutation mode")
+    parser = argparse.ArgumentParser(description="RM Client Conversion Mining ETL")
+    parser.add_argument("--resume", action="store_true", help="Resume from existing DB")
+    parser.add_argument("--status", action="store_true", help="Show pipeline status")
+    parser.add_argument("--export", action="store_true", help="Export only, no scraping")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel browser tabs")
+    parser.add_argument("--delay", type=float, default=1.5, help="Delay between visits (seconds)")
+    parser.add_argument("--headed", action="store_true", help="Show browser (default: headless)")
     args = parser.parse_args()
 
-    artifacts = Path(args.artifacts)
-    artifacts.mkdir(parents=True, exist_ok=True)
-    registry_path = Path(args.registry)
+    db = get_db()
 
-    automator = RMSeleniumAutomator(args.mode, artifacts, registry_path)
+    if args.status:
+        show_status(db)
+        return
 
-    try:
-        functions = automator.registry.get("functions", {})
+    if args.export:
+        stage_transform_load(db)
+        return
 
-        if args.function == "all_safe":
-            run_list = [(name, cfg) for name, cfg in functions.items() if cfg.get("allowed_in_ci", False)]
+    username = os.getenv("RM_USER") or os.getenv("RENTMASSEUR_USER") or ""
+    password = os.getenv("RM_PASS") or os.getenv("RENTMASSEUR_PASS") or ""
+
+    print(f"\nRM Client Conversion Mining ETL Pipeline")
+    print(f"{'='*60}")
+    print(f"  Workers: {args.workers}")
+    print(f"  Delay: {args.delay}s")
+    print(f"  Resume: {args.resume}")
+    print(f"  DB: {DB_PATH}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=not args.headed,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+
+        storage_state = Path(".rm_storage_state.json")
+        ctx_kwargs = {
+            "viewport": {"width": 1440, "height": 1200},
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        }
+        if storage_state.exists():
+            ctx_kwargs["storage_state"] = str(storage_state)
+            print("  Using saved storage state")
+
+        context = browser.new_context(**ctx_kwargs)
+        page = context.new_page()
+
+        # Verify session
+        page.goto(f"{BASE_URL}/settings", wait_until="networkidle", timeout=30000)
+        time.sleep(2)
+
+        if "/login" in page.url:
+            if username and password:
+                print("  Logging in...")
+                try:
+                    page.goto(f"{BASE_URL}/login", wait_until="networkidle", timeout=30000)
+                    time.sleep(2)
+                    email_el = page.query_selector("input#email") or page.query_selector("input[name='email']")
+                    pass_el = page.query_selector("input#password") or page.query_selector("input[type='password']")
+                    if email_el and pass_el:
+                        email_el.fill(username)
+                        pass_el.fill(password)
+                        time.sleep(0.5)
+                        btn = page.query_selector("button:has-text('LOGIN')") or page.query_selector("button[type='submit']")
+                        if btn and btn.is_visible():
+                            btn.click()
+                        else:
+                            pass_el.press("Enter")
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                        time.sleep(3)
+                        context.storage_state(path=str(storage_state))
+                        print(f"  Login OK — {page.url}")
+                except Exception as e:
+                    print(f"  Login error: {e}")
+            else:
+                print("  No credentials — running as public")
+
+        # Stage 1: Extract masseurs (unless resuming with all already found)
+        if not args.resume:
+            stage_extract_masseurs(page, db)
         else:
-            cfg = functions.get(args.function)
-            if not cfg:
-                print(json.dumps({"error": f"unknown_function: {args.function}"}), file=sys.stderr)
-                sys.exit(2)
-            run_list = [(args.function, cfg)]
+            total = db.execute("SELECT COUNT(*) FROM masseurs").fetchone()[0]
+            if total == 0:
+                print("  No masseurs in DB — running full extract")
+                stage_extract_masseurs(page, db)
+            else:
+                print(f"  Resuming with {total} masseurs already in DB")
 
-        for name, cfg in run_list:
-            automator.run_function(
-                name, cfg,
-                candidate_file=args.candidate_file,
-                approval_token=args.approval_token,
-            )
+        # Stage 2: Extract reviews sequentially
+        stage_extract_reviews(page, db, workers=args.workers, delay=args.delay)
 
-    finally:
-        automator.close()
+        browser.close()
 
-    # Build report
-    report_path = build_report(
-        artifacts / "receipts", artifacts, args.mode, automator.functions_run
-    )
+    # Stage 3: Transform + export
+    stage_transform_load(db)
 
-    # Print summary
-    ledger_valid = automator.receipts.verify()
-    print(json.dumps({
-        "mode": args.mode,
-        "functions_run": automator.functions_run,
-        "ledger_valid": ledger_valid,
-        "report": str(report_path),
-        "artifacts": str(artifacts),
-    }, indent=2))
+    # Final status
+    show_status(db)
 
-    sys.exit(0 if ledger_valid else 1)
+    db_set(db, "last_run", now_iso())
+    db.close()
+
+    print(f"\nPipeline complete. Use --status to check progress, --export to re-export.")
 
 
 if __name__ == "__main__":
@@ -521,280 +224,577 @@ if __name__ == "__main__":
 
 ```
 
-imac_relay.py:
+function_registry.yml:
 ```
-"""iMac manual relay helpers.
+functions:
+  health_check:
+    type: read
+    target: local_control_plane
+    allowed_in_ci: true
 
-This module prepares reviewable local handoffs for the operator. It does not
-transmit messages. Use it to copy approved drafts into the Mac workflow after
-human review.
-"""
+  dashboard_snapshot:
+    type: read
+    target: rentmasseur_account
+    allowed_in_ci: true
+    requires_login: true
+
+  availability_read:
+    type: read
+    target: rentmasseur_account
+    allowed_in_ci: true
+    requires_login: true
+
+  bio_field_detect:
+    type: read
+    target: rentmasseur_profile_settings
+    allowed_in_ci: true
+    requires_login: true
+
+  bio_candidate_generate:
+    type: draft
+    target: local_llm_optimizer
+    allowed_in_ci: true
+
+  bio_candidate_preview:
+    type: draft
+    target: local_control_plane
+    allowed_in_ci: true
+
+  bio_apply_live:
+    type: mutation
+    target: rentmasseur_profile_settings
+    allowed_in_ci: false
+    requires_manual_approval: true
+
+  availability_set_live:
+    type: mutation
+    target: rentmasseur_account
+    allowed_in_ci: false
+    requires_manual_approval: true
+
+  metrics_ingest:
+    type: write_local
+    target: local_control_plane
+    allowed_in_ci: true
+
+  extension_popup_smoke:
+    type: browser_extension
+    target: chrome_extension
+    allowed_in_ci: true
+
+  extension_content_script_smoke:
+    type: browser_extension
+    target: rentmasseur_profile_page
+    allowed_in_ci: true
+
+```
+
+receipt_ledger.py:
+```
+"""SHA-chained JSONL receipt ledger for tamper-evident audit trail."""
 
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+import json
+import time
 from pathlib import Path
-from typing import Any
-
-from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
-from .receipts import write_receipt
+from typing import Optional
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+class ReceiptLedger:
+    def __init__(self, root: Path):
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.ledger_path = self.root / "ledger.jsonl"
+        self.entries: list[dict] = []
+        if self.ledger_path.exists():
+            for line in self.ledger_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    try:
+                        self.entries.append(json.loads(line))
+                    except Exception:
+                        pass
 
+    def _prev_hash(self) -> str:
+        return self.entries[-1].get("hash", "0" * 64) if self.entries else "0" * 64
 
-def handle_hash(handle: str) -> str:
-    return hashlib.sha256(handle.strip().lower().encode("utf-8")).hexdigest()
+    @staticmethod
+    def _sha256(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
-
-def open_conversation_record(record_key: str, client_handle: str | None = None, channel: str = "imessage", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
-    init_db(db_path)
-    now = utc_now()
-    h = handle_hash(client_handle) if client_handle else None
-    with connect(db_path) as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO client_conversations(visitor_key, channel, client_handle_hash, status, created_at, updated_at)
-            VALUES (?, ?, ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """,
-            (record_key, channel, h),
+    def write(self, action: str, status: str, data: dict) -> Path:
+        payload = {
+            "index": len(self.entries),
+            "ts": int(time.time()),
+            "prev_hash": self._prev_hash(),
+            "action": action,
+            "status": status,
+            "data": data,
+        }
+        body = json.dumps(
+            {k: v for k, v in payload.items() if k != "hash"},
+            sort_keys=True,
+            default=str,
         )
-        conversation_id = int(cur.lastrowid)
-        conn.commit()
-    receipt = write_receipt("conversation_opened", "conversation", str(conversation_id), {"record_key": record_key, "channel": channel, "has_handle": bool(client_handle), "opened_at": now}, db_path=db_path)
-    return {"conversation_id": conversation_id, "record_key": record_key, "channel": channel, "receipt_hash": receipt["payload_hash"]}
+        payload["hash"] = self._sha256(body)
+        self.entries.append(payload)
 
+        with self.ledger_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
 
-def log_conversation_event(conversation_id: int, direction: str, body: str, event_at: str | None = None, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
-    if direction not in {"inbound", "outbound", "note"}:
-        raise ValueError("direction must be inbound, outbound, or note")
-    init_db(db_path)
-    now = event_at or utc_now()
-    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    preview = body[:120]
-    with connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO conversation_events(conversation_id, direction, body_hash, body_preview, event_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (conversation_id, direction, body_hash, preview, now),
-        )
-        if direction == "inbound":
-            conn.execute("UPDATE client_conversations SET last_inbound_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (now, conversation_id))
-        elif direction == "outbound":
-            conn.execute("UPDATE client_conversations SET last_outbound_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (now, conversation_id))
-        conn.commit()
-    receipt = write_receipt("conversation_event", "conversation", str(conversation_id), {"direction": direction, "body_hash": body_hash, "event_at": now}, db_path=db_path)
-    return {"conversation_id": conversation_id, "direction": direction, "body_hash": body_hash, "receipt_hash": receipt["payload_hash"]}
+        safe_action = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in action)[:60]
+        receipt_path = self.root / f"{payload['index']:05d}_{safe_action}_{status}.json"
+        receipt_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        return receipt_path
 
-
-def export_manual_handoff(draft_id: int, output_dir: str = "data/imac_handoffs", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
-    """Export an approved draft as a local text file for manual Mac review."""
-    init_db(db_path)
-    with connect(db_path) as conn:
-        row = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
-    if not row:
-        raise ValueError(f"draft not found: {draft_id}")
-    if row["status"] != "approved":
-        raise ValueError("draft must be approved before handoff export")
-
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"draft_{draft_id}.txt"
-    path.write_text(row["body"], encoding="utf-8")
-    receipt = write_receipt("manual_handoff_exported", "draft", str(draft_id), {"path": str(path), "channel": row["channel"]}, db_path=db_path)
-    return {"draft_id": draft_id, "path": str(path), "receipt_hash": receipt["payload_hash"]}
-
-
-def list_conversations(status: str = "active", db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
-    init_db(db_path)
-    with connect(db_path) as conn:
-        rows = conn.execute("SELECT * FROM client_conversations WHERE status = ? ORDER BY updated_at DESC", (status,)).fetchall()
-    return rows_to_dicts(rows)
+    def verify(self) -> bool:
+        prev = "0" * 64
+        for entry in self.entries:
+            if entry.get("prev_hash") != prev:
+                return False
+            body = json.dumps(
+                {k: v for k, v in entry.items() if k != "hash"},
+                sort_keys=True,
+                default=str,
+            )
+            if self._sha256(body) != entry.get("hash"):
+                return False
+            prev = entry["hash"]
+        return True
 
 ```
 
-__init__.py:
+approval_gate.py:
 ```
-"""Provider Growth CRM for owner-operated profile workflows.
-
-Compliance boundary: this package stores local engagement records, content
-versions, manual draft queue items, policy decisions, outbox states, KPI events,
-conversation receipts, and audit receipts for accounts the operator owns or is
-authorized to manage. It does not bypass access controls or transmit messages
-without explicit human approval.
-"""
-
-__all__ = [
-    "db",
-    "receipts",
-    "engagement",
-    "drafts",
-    "policy",
-    "outbox",
-    "kpi",
-    "profile_content",
-    "experiments",
-    "imac_relay",
-]
-
-```
-
-drafts.py:
-```
-"""Manual draft queue.
-
-Drafts are suggestions for human review. This module never transmits outbound
-content. The operator must approve and perform any outbound action separately.
-"""
+"""Approval gate — blocks live mutations unless manually approved with token + candidate."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+import json
+import os
+from pathlib import Path
+from typing import Optional
 
-from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
-from .receipts import write_receipt
 
-TEMPLATES: dict[str, str] = {
-    "soft_checkin": "Hi {name}, thanks for checking in. I have a little availability coming up. Want me to send the current window?",
-    "same_day": "Hi {name}, I may have same-day availability. Send me your preferred time window and I will confirm what is realistic.",
-    "weekend": "Hi {name}, I am organizing the weekend schedule now. If you are considering a session, send your ideal day and time window.",
-    "content_followup": "Hi {name}, I updated my profile notes with a little more detail. Happy to answer any question before you book.",
+BLOCKED_IN_CI = {
+    "bio_apply_live",
+    "availability_set_live",
+    "send_message",
+    "mass_message",
+    "profile_scrape",
+    "captcha_bypass",
+    "anti_bot_bypass",
+    "fake_availability_loop",
 }
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+class ApprovalGate:
+    def __init__(self, mode: str):
+        self.mode = mode
 
+    def is_blocked(self, function_name: str, function_config: dict) -> Optional[str]:
+        ftype = function_config.get("type", "")
+        allowed_in_ci = function_config.get("allowed_in_ci", False)
+        requires_approval = function_config.get("requires_manual_approval", False)
 
-def render_template(template_name: str, name: str = "there") -> str:
-    if template_name not in TEMPLATES:
-        raise ValueError(f"unknown template: {template_name}")
-    return TEMPLATES[template_name].format(name=name or "there")
+        if function_name in BLOCKED_IN_CI:
+            if self.mode != "approved_mutation":
+                return "live_mutation_blocked_outside_approved_mutation_mode"
 
+        if ftype == "mutation" and self.mode != "approved_mutation":
+            return "mutation_requires_approved_mutation_mode"
 
-def create_draft(record_key: str, template_name: str, name: str = "there", channel: str = "manual", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
-    init_db(db_path)
-    body = render_template(template_name, name=name)
-    with connect(db_path) as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO message_drafts(visitor_key, template_name, body, channel, status, approval_required)
-            VALUES (?, ?, ?, ?, 'draft', 1)
-            """,
-            (record_key, template_name, body, channel),
-        )
-        draft_id = int(cur.lastrowid)
-        conn.commit()
-    receipt = write_receipt("draft_created", "draft", str(draft_id), {"record_key": record_key, "template": template_name, "channel": channel}, db_path=db_path)
-    return {"draft_id": draft_id, "body": body, "status": "draft", "approval_required": True, "receipt_hash": receipt["payload_hash"]}
+        if not allowed_in_ci and self.mode in ("proof", "live_readonly"):
+            return "function_not_allowed_in_ci_registry"
 
+        if requires_approval and self.mode != "approved_mutation":
+            return "function_requires_manual_approval"
 
-def approve_draft(draft_id: int, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
-    init_db(db_path)
-    now = utc_now()
-    with connect(db_path) as conn:
-        conn.execute("UPDATE message_drafts SET status = 'approved', approved_at = ? WHERE id = ? AND status = 'draft'", (now, draft_id))
-        row = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
-        conn.commit()
-    receipt = write_receipt("draft_approved", "draft", str(draft_id), {"approved_at": now}, db_path=db_path)
-    return {"draft": dict(row) if row else None, "receipt_hash": receipt["payload_hash"]}
+        return None
 
+    def verify_approval_token(self, token: str) -> bool:
+        expected = os.getenv("ADMIN_TOKEN") or os.getenv("RM_APPROVAL_TOKEN") or ""
+        return bool(expected) and token == expected
 
-def list_drafts(status: str = "draft", db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
-    init_db(db_path)
-    with connect(db_path) as conn:
-        rows = conn.execute("SELECT * FROM message_drafts WHERE status = ? ORDER BY created_at DESC", (status,)).fetchall()
-    return rows_to_dicts(rows)
+    def load_candidate(self, candidate_file: str) -> Optional[dict]:
+        path = Path(candidate_file)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def check_selector_proof(self, action: str, proof_dir: str = "debug") -> bool:
+        proof_path = Path(proof_dir) / f"{action}_selectors.json"
+        return proof_path.exists()
 
 ```
 
-db.py:
+playwright_probe.py:
 ```
-"""SQLite schema and helpers for the provider growth CRM."""
+#!/usr/bin/env python3
+"""
+RM API + XPath Playwright Probe — discovers real endpoints and selectors.
+
+What it does:
+  1. Opens RM with Playwright (headed, persistent profile)
+  2. Intercepts all fetch/XHR API calls → logs method, URL, status, body
+  3. Navigates key pages (login, dashboard, availability, about/bio, search, mailbox)
+  4. Discovers XPath selectors for visible form fields and buttons
+  5. Screenshots every page
+  6. Writes JSON receipt with all findings
+
+Usage:
+  python3 rm_ci/playwright_probe.py --headed
+  python3 rm_ci/playwright_probe.py --headed --login  # attempt login with .env creds
+  python3 rm_ci/playwright_probe.py --headed --page about  # probe single page
+"""
 
 from __future__ import annotations
 
-import sqlite3
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Optional
 
-DEFAULT_DB_PATH = "data/provider_growth.sqlite3"
+from playwright.sync_api import sync_playwright, Page, BrowserContext
 
-SCHEMA: tuple[str, ...] = (
-    """
-    CREATE TABLE IF NOT EXISTS visitors (
-        visitor_key TEXT PRIMARY KEY,
-        display_name TEXT,
-        profile_url TEXT,
-        first_seen TEXT NOT NULL,
-        last_seen TEXT NOT NULL,
-        visit_count INTEGER NOT NULL DEFAULT 1,
-        lead_score INTEGER NOT NULL DEFAULT 0,
-        notes TEXT NOT NULL DEFAULT '',
-        status TEXT NOT NULL DEFAULT 'new',
-        do_not_contact INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS visitor_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        visitor_key TEXT NOT NULL,
-        event_type TEXT NOT NULL,
-        source TEXT NOT NULL DEFAULT 'manual',
-        event_at TEXT NOT NULL,
-        metadata_json TEXT NOT NULL DEFAULT '{}',
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(visitor_key) REFERENCES visitors(visitor_key)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS message_drafts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        visitor_key TEXT NOT NULL,
-        template_name TEXT NOT NULL,
-        body TEXT NOT NULL,
-        channel TEXT NOT NULL DEFAULT 'platform',
-        status TEXT NOT NULL DEFAULT 'draft',
-        approval_required INTEGER NOT NULL DEFAULT 1,
-        approved_at TEXT,
-        sent_at TEXT,
-        skipped_reason TEXT,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(visitor_key) REFERENCES visitors(visitor_key)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS client_conversations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        visitor_key TEXT NOT NULL,
-        channel TEXT NOT NULL DEFAULT 'imessage',
-        client_handle_hash TEXT,
-        last_inbound_at TEXT,
-        last_outbound_at TEXT,
-        status TEXT NOT NULL DEFAULT 'active',
-        interest_stage TEXT NOT NULL DEFAULT 'new',
-        revenue_stage TEXT NOT NULL DEFAULT 'unknown',
-        do_not_contact INTEGER NOT NULL DEFAULT 0,
-        notes TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(visitor_key) REFERENCES visitors(visitor_key)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS conversation_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        conversation_id INTEGER NOT NULL,
-        direction TEXT NOT NULL,
-        body_hash TEXT NOT NULL,
-        body_preview TEXT NOT NULL DEFAULT '',
-        event_at TEXT NOT NULL,
-        metadata_json TEXT NOT NULL DEFAULT '{}',
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+BASE_URL = "https://rentmasseur.com"
+ARTIFACTS = Path("artifacts/probe")
+ARTIFACTS.mkdir(parents=True, exist_ok=True)
+(ARTIFACTS / "screenshots").mkdir(exist_ok=True)
+(ARTIFACTS / "api_calls").mkdir(exist_ok=True)
+
+
+PAGES = {
+    "login": {"url": f"{BASE_URL}/login", "needs_login": False},
+    "dashboard": {"url": f"{BASE_URL}/settings", "needs_login": True},
+    "availability": {"url": f"{BASE_URL}/settings?availability=1", "needs_login": True},
+    "about": {"url": f"{BASE_URL}/settings/about", "needs_login": True},
+    "search": {"url": f"{BASE_URL}/search/manhattan-ny", "needs_login": False},
+    "mailbox": {"url": f"{BASE_URL}/mailbox", "needs_login": True},
+    "compose": {"url": f"{BASE_URL}/mailbox/compose", "needs_login": True},
+    "profile": {"url": f"{BASE_URL}/karpathianwolf", "needs_login": False},
+}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_name(s: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_-]', '_', s)[:60]
+
+
+class APIInterceptor:
+    """Captures all API calls during page navigation."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def on_request(self, request):
+        url = request.url
+        # Only capture RM API calls, not third-party
+        if "rentmasseur.com/api" in url or "/api/" in url:
+            self.calls.append({
+                "method": request.method,
+                "url": url,
+                "headers": dict(request.headers),
+                "post_data": request.post_data,
+                "ts": now_iso(),
+            })
+
+    def on_response(self, response):
+        url = response.url
+        if "rentmasseur.com/api" in url or "/api/" in url:
+            # Update last matching call with response info
+            for call in reversed(self.calls):
+                if call["url"] == url and "status" not in call:
+                    call["status"] = response.status
+                    call["status_text"] = response.status_text
+                    try:
+                        body = response.text()
+                        call["response_body"] = body[:2000]
+                        call["response_body_len"] = len(body)
+                    except Exception:
+                        call["response_body"] = None
+                    break
+
+    def save(self, page_name: str):
+        path = ARTIFACTS / "api_calls" / f"{safe_name(page_name)}_api.json"
+        path.write_text(json.dumps(self.calls, indent=2, default=str), encoding="utf-8")
+        return path
+
+
+def discover_xpaths(page: Page) -> dict:
+    """Discover XPath selectors for visible form fields and buttons."""
+    findings = {
+        "inputs": [],
+        "textareas": [],
+        "buttons": [],
+        "links_profile": [],
+        "selects": [],
+        "contenteditable": [],
+    }
+
+    # Inputs
+    for el in page.query_selector_all("input"):
+        try:
+            if not el.is_visible():
+                continue
+            tag = el.evaluate("e => e.tagName.toLowerCase()")
+            itype = el.get_attribute("type") or ""
+            iname = el.get_attribute("name") or ""
+            iid = el.get_attribute("id") or ""
+            iph = el.get_attribute("placeholder") or ""
+            iaria = el.get_attribute("aria-label") or ""
+            ival = el.input_value() if itype not in ("password",) else "***"
+
+            # Build XPath
+            xpath_parts = []
+            if iid:
+                xpath_parts.append(f"@id='{iid}'")
+            if iname:
+                xpath_parts.append(f"@name='{iname}'")
+            if itype:
+                xpath_parts.append(f"@type='{itype}'")
+
+            xpath = f"//input[{ ' and '.join(xpath_parts) }]" if xpath_parts else "//input"
+
+            findings["inputs"].append({
+                "xpath": xpath,
+                "type": itype,
+                "name": iname,
+                "id": iid,
+                "placeholder": iph,
+                "aria_label": iaria,
+                "value_preview": (ival[:50] if ival else ""),
+            })
+        except Exception:
+            continue
+
+    # Textareas
+    for el in page.query_selector_all("textarea"):
+        try:
+            if not el.is_visible():
+                continue
+            iname = el.get_attribute("name") or ""
+            iid = el.get_attribute("id") or ""
+            iph = el.get_attribute("placeholder") or ""
+            iaria = el.get_attribute("aria-label") or ""
+            xpath = f"//textarea[@name='{iname}']" if iname else "//textarea"
+            findings["textareas"].append({
+                "xpath": xpath,
+                "name": iname,
+                "id": iid,
+                "placeholder": iph,
+                "aria_label": iaria,
+            })
+        except Exception:
+            continue
+
+    # Buttons
+    for el in page.query_selector_all("button"):
+        try:
+            if not el.is_visible():
+                continue
+            text = (el.inner_text() or "").strip()[:80]
+            btype = el.get_attribute("type") or ""
+            bclass = el.get_attribute("class") or ""
+            baria = el.get_attribute("aria-label") or ""
+            xpath = f"//button[contains(text(),'{text}')]" if text else "//button"
+            findings["buttons"].append({
+                "xpath": xpath,
+                "text": text,
+                "type": btype,
+                "class": bclass[:100],
+                "aria_label": baria,
+            })
+        except Exception:
+            continue
+
+    # Selects
+    for el in page.query_selector_all("select"):
+        try:
+            if not el.is_visible():
+                continue
+            iname = el.get_attribute("name") or ""
+            iid = el.get_attribute("id") or ""
+            xpath = f"//select[@name='{iname}']" if iname else "//select"
+            findings["selects"].append({
+                "xpath": xpath,
+                "name": iname,
+                "id": iid,
+            })
+        except Exception:
+            continue
+
+    # Contenteditable
+    for el in page.query_selector_all("[contenteditable='true']"):
+        try:
+            if not el.is_visible():
+                continue
+            cclass = el.get_attribute("class") or ""
+            crole = el.get_attribute("role") or ""
+            findings["contenteditable"].append({
+                "xpath": "//*[@contenteditable='true']",
+                "class": cclass[:100],
+                "role": crole,
+            })
+        except Exception:
+            continue
+
+    # Profile links (for search/visitor discovery)
+    for el in page.query_selector_all("a[href]"):
+        try:
+            href = el.get_attribute("href") or ""
+            if href.startswith("/") and not any(x in href for x in [
+                "login", "settings", "search", "blog", "reviews", "interviews",
+                "available", "find-massage", "live-cams", "sitemap", "advertise",
+                "mailbox", "static", "_next", "images", "api", "blogs",
+            ]):
+                parts = href.strip("/").split("/")
+                if parts and parts[0] and len(parts) == 1:
+                    findings["links_profile"].append({
+                        "href": href,
+                        "text": (el.inner_text() or "").strip()[:60],
+                    })
+        except Exception:
+            continue
+
+    return findings
+
+
+def detect_block(page: Page) -> Optional[str]:
+    """Check for CAPTCHA / anti-bot / access blocks."""
+    txt = page.inner_text("body")[:3000].lower()
+    url = page.url.lower()
+    needles = [
+        ("captcha", "captcha_detected"),
+        ("crowdsec", "crowdsec_detected"),
+        ("access forbidden", "access_forbidden"),
+        ("verify you are human", "human_verification"),
+        ("unusual traffic", "traffic_challenge"),
+        ("too many requests", "rate_limited"),
+    ]
+    for needle, reason in needles:
+        if needle in txt or needle in url:
+            return reason
+    return None
+
+
+def attempt_login(page: Page, username: str, password: str) -> bool:
+    """Attempt login using Playwright."""
+    try:
+        page.goto(f"{BASE_URL}/login", wait_until="networkidle", timeout=30000)
+        time.sleep(2)
+
+        block = detect_block(page)
+        if block:
+            print(f"  BLOCKED: {block}")
+            return False
+
+        # Find email/username field
+        email_selectors = [
+            "input[type='email']",
+            "input[name*='email' i]",
+            "input[name*='user' i]",
+            "input[type='text']",
+        ]
+        email_el = None
+        for sel in email_selectors:
+            email_el = page.query_selector(sel)
+            if email_el and email_el.is_visible():
+                break
+            email_el = None
+
+        # Find password field
+        pass_el = page.query_selector("input[type='password']")
+
+        if not email_el or not pass_el:
+            print("  Login form not found")
+            return False
+
+        email_el.fill(username)
+        pass_el.fill(password)
+        time.sleep(0.5)
+
+        # Click submit
+        submit_selectors = [
+            "button[type='submit']",
+            "button:has-text('LOG')",
+            "button:has-text('Log')",
+            "form button",
+        ]
+        for sel in submit_selectors:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                break
+
+        page.wait_for_load_state("networkidle", timeout=15000)
+        time.sleep(3)
+
+        if "/login" in page.url:
+            print("  Login failed — still on login page")
+            return False
+
+        print(f"  Login OK — URL: {page.url}")
+        return True
+
+    except Exception as e:
+        print(f"  Login error: {e}")
+        return False
+
+
+def probe_page(page: Page, page_name: str, page_cfg: dict, logged_in: bool, 
+               interceptor: APIInterceptor) -> dict:
+    """Probe a single page: navigate, capture API, discover XPaths, screenshot."""
+    print(f"\n── Probing: {page_name} ──")
+    print(f"  URL: {page_cfg['url']}")
+
+    result = {
+        "page": page_name,
+        "url": page_cfg["url"],
+        "timestamp": now_iso(),
+        "needs_login": page_cfg["needs_login"],
+        "logged_in": logged_in,
+    }
+
+    # Clear API calls for this page
+    interceptor.calls = []
+
+    try:
+        page.goto(page_cfg["url"], wait_until="networkidle", timeout=30000)
+        time.sleep(3)
+
+        # Detect blocks
+        block = detect_block(page)
+        if block:
+            result["status"] = "blocked"
+            result["block_reason"] = block
+            print(f"  BLOCKED: {block}")
+        else:
+            result["status"] = "ok"
+            result["title"] = page.title()
+            result["final_url"] = page.url
+
+            # Check if redirected to login
+            if page_cfg["needs_login"] and "/login" in page.url:
+                result["status"] = "redirected_to_login"
+                result["note"] = "Page requires login — not authenticated"
+                print(f"  Redirected to login")
+            else:
+                # Discover XPath selectors
+                xpaths = discover_xpaths(page)
+                result["xpaths"] = xpaths
+                print(f"  Found: {len(xpaths['inputs'])} inputs, {len(xpaths['textareas'])} textareas, "
+                      f"{len(xpaths['buttons'])} buttons, {len(xpaths['links_profile'])} profile links")
