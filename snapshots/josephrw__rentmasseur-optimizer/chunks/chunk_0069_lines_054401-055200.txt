@@ -1,3 +1,228 @@
+                                    reviewer = reviewer.get("username") or reviewer.get("name") or ""
+                                if reviewer and reviewer != masseur_username:
+                                    reviewers.append({
+                                        "reviewer": reviewer,
+                                        "masseur": masseur_username,
+                                        "rating": str(item.get("rating") or item.get("stars") or ""),
+                                        "text": (item.get("text") or item.get("comment") or item.get("review") or "")[:300],
+                                        "source": f"nextdata.{key}",
+                                    })
+            except Exception:
+                pass
+
+            # Method 2: DOM links near review context
+            try:
+                links = page.query_selector_all("a[href]")
+                seen = {r["reviewer"] for r in reviewers}
+                for el in links:
+                    href = el.get_attribute("href") or ""
+                    if href.startswith("/") and not any(x in href for x in [
+                        "login", "settings", "search", "blog", "reviews", "interviews",
+                        "available", "find-massage", "live-cams", "sitemap", "advertise",
+                        "mailbox", "static", "_next", "images", "api", "blogs", "404",
+                        "account", "gay-massage", "sponsor", masseur_username,
+                    ]):
+                        parts = href.strip("/").split("/")
+                        if parts and parts[0] and len(parts) == 1 and parts[0] not in seen:
+                            seen.add(parts[0])
+                            reviewers.append({
+                                "reviewer": parts[0],
+                                "masseur": masseur_username,
+                                "rating": "",
+                                "text": "",
+                                "source": "dom_link",
+                            })
+            except Exception:
+                pass
+
+            # Method 3: Text patterns
+            try:
+                body = page.inner_text("body")
+                seen = {r["reviewer"] for r in reviewers}
+                for pattern in [
+                    r"(?:Reviewed by|By:|Review by)\s+([A-Za-z0-9_-]{3,30})",
+                    r"([A-Za-z0-9_-]{3,30})\s+(?:wrote|says|reviewed)",
+                ]:
+                    for m in re.findall(pattern, body):
+                        if m and m != masseur_username and m.lower() not in [
+                            "search", "login", "sign", "available", "massage", "book"
+                        ] and m not in seen:
+                            seen.add(m)
+                            reviewers.append({
+                                "reviewer": m,
+                                "masseur": masseur_username,
+                                "rating": "",
+                                "text": "",
+                                "source": "text_pattern",
+                            })
+            except Exception:
+                pass
+
+            if reviewers:
+                break
+
+        except Exception:
+            continue
+
+    return reviewers
+
+
+# ── Worker for parallel review scraping ───────────────────────────────
+
+def review_worker(
+    worker_id: int,
+    context: BrowserContext,
+    work_queue: Queue,
+    results_queue: Queue,
+    delay: float = 1.5,
+):
+    """Worker that processes masseur usernames from queue, scrapes reviews."""
+    page = context.new_page()
+    processed = 0
+
+    while True:
+        try:
+            masseur = work_queue.get_nowait()
+        except Empty:
+            break
+
+        if masseur is None:
+            break
+
+        username = masseur["username"]
+        city = masseur.get("city", "")
+
+        try:
+            reviewers = extract_reviewers(page, username)
+            results_queue.put({
+                "masseur": username,
+                "city": city,
+                "reviewers": reviewers,
+                "worker": worker_id,
+                "ok": True,
+            })
+            processed += 1
+            print(f"  [W{worker_id}] {username}: {len(reviewers)} reviewers")
+        except Exception as e:
+            results_queue.put({
+                "masseur": username,
+                "city": city,
+                "reviewers": [],
+                "worker": worker_id,
+                "ok": False,
+                "error": str(e),
+            })
+            print(f"  [W{worker_id}] {username}: ERROR {e}")
+
+        time.sleep(delay)
+
+    try:
+        page.close()
+    except Exception:
+        pass
+    print(f"  [W{worker_id}] Done — {processed} masseurs processed")
+
+
+# ── Pipeline stages ──────────────────────────────────────────────────
+
+def stage_extract_masseurs(page: Page, db: sqlite3.Connection) -> int:
+    """Stage 1: Search NY cities, discover masseurs, store in DB."""
+    print(f"\n{'='*60}")
+    print(f"STAGE 1: Extract masseurs from NY search")
+    print(f"{'='*60}")
+
+    total_new = 0
+    for city in NY_CITIES:
+        print(f"\n  Searching {city}...")
+        masseurs = extract_masseurs(page, city)
+
+        for m in masseurs:
+            try:
+                db.execute(
+                    "INSERT OR IGNORE INTO masseurs (username, city, href, discovered_at, status) VALUES (?, ?, ?, ?, 'pending')",
+                    (m["username"], m["city"], m["href"], now_iso())
+                )
+                if db.total_changes > 0:
+                    total_new += 1
+            except Exception:
+                pass
+        db.commit()
+        print(f"    Found {len(masseurs)} masseurs ({total_new} new total)")
+        time.sleep(1)
+
+    total = db.execute("SELECT COUNT(*) FROM masseurs").fetchone()[0]
+    print(f"\n  Total masseurs in DB: {total} ({total_new} new this run)")
+    return total
+
+
+def stage_extract_reviews(
+    page: Page,
+    db: sqlite3.Connection,
+    workers: int = 4,
+    delay: float = 1.5,
+) -> int:
+    """Stage 2: Scrape reviews from each masseur sequentially."""
+    print(f"\n{'='*60}")
+    print(f"STAGE 2: Extract reviews (sequential, {delay}s delay)")
+    print(f"{'='*60}")
+
+    pending = db.execute("SELECT username, city FROM masseurs WHERE status='pending' ORDER BY city").fetchall()
+    total_pending = len(pending)
+    print(f"  Pending masseurs: {total_pending}")
+
+    if total_pending == 0:
+        print("  Nothing to do — all masseurs processed")
+        return 0
+
+    processed = 0
+    total_reviewers = 0
+    start_time = time.time()
+
+    for row in pending:
+        masseur = row["username"]
+        city = row["city"]
+
+        try:
+            reviewers = extract_reviewers(page, masseur)
+            ok = True
+        except Exception as e:
+            reviewers = []
+            ok = False
+            print(f"  ERROR {masseur}: {e}")
+
+        processed += 1
+        total_reviewers += len(reviewers)
+
+        # Update DB
+        try:
+            db.execute(
+                "UPDATE masseurs SET reviews_scraped=1, review_count=?, status=? WHERE username=?",
+                (len(reviewers), "done" if ok else "error", masseur)
+            )
+
+            for r in reviewers:
+                db.execute(
+                    "INSERT OR IGNORE INTO reviews (reviewer, masseur, rating, review_text, source, scraped_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (r["reviewer"], r["masseur"], r["rating"], r["text"], r["source"], now_iso())
+                )
+
+                existing = db.execute("SELECT * FROM clients WHERE username=?", (r["reviewer"],)).fetchone()
+                if existing:
+                    masseurs_list = existing["masseurs_reviewed"] or ""
+                    masseurs_set = set(masseurs_list.split(",") if masseurs_list else [])
+                    masseurs_set.add(masseur)
+
+                    cities_list = existing["cities_found"] or ""
+                    cities_set = set(cities_list.split(",") if cities_list else [])
+                    cities_set.add(city)
+
+                    db.execute(
+                        "UPDATE clients SET review_count=?, masseurs_reviewed=?, cities_found=?, last_seen=? WHERE username=?",
+                        (
+                            existing["review_count"] + 1,
+                            ",".join(sorted(masseurs_set)),
+                            ",".join(sorted(cities_set)),
+                            now_iso(),
                             r["reviewer"],
                         )
                     )
@@ -573,228 +798,3 @@ def discover_xpaths(page: Page) -> dict:
                 "xpath": xpath,
                 "type": itype,
                 "name": iname,
-                "id": iid,
-                "placeholder": iph,
-                "aria_label": iaria,
-                "value_preview": (ival[:50] if ival else ""),
-            })
-        except Exception:
-            continue
-
-    # Textareas
-    for el in page.query_selector_all("textarea"):
-        try:
-            if not el.is_visible():
-                continue
-            iname = el.get_attribute("name") or ""
-            iid = el.get_attribute("id") or ""
-            iph = el.get_attribute("placeholder") or ""
-            iaria = el.get_attribute("aria-label") or ""
-            xpath = f"//textarea[@name='{iname}']" if iname else "//textarea"
-            findings["textareas"].append({
-                "xpath": xpath,
-                "name": iname,
-                "id": iid,
-                "placeholder": iph,
-                "aria_label": iaria,
-            })
-        except Exception:
-            continue
-
-    # Buttons
-    for el in page.query_selector_all("button"):
-        try:
-            if not el.is_visible():
-                continue
-            text = (el.inner_text() or "").strip()[:80]
-            btype = el.get_attribute("type") or ""
-            bclass = el.get_attribute("class") or ""
-            baria = el.get_attribute("aria-label") or ""
-            xpath = f"//button[contains(text(),'{text}')]" if text else "//button"
-            findings["buttons"].append({
-                "xpath": xpath,
-                "text": text,
-                "type": btype,
-                "class": bclass[:100],
-                "aria_label": baria,
-            })
-        except Exception:
-            continue
-
-    # Selects
-    for el in page.query_selector_all("select"):
-        try:
-            if not el.is_visible():
-                continue
-            iname = el.get_attribute("name") or ""
-            iid = el.get_attribute("id") or ""
-            xpath = f"//select[@name='{iname}']" if iname else "//select"
-            findings["selects"].append({
-                "xpath": xpath,
-                "name": iname,
-                "id": iid,
-            })
-        except Exception:
-            continue
-
-    # Contenteditable
-    for el in page.query_selector_all("[contenteditable='true']"):
-        try:
-            if not el.is_visible():
-                continue
-            cclass = el.get_attribute("class") or ""
-            crole = el.get_attribute("role") or ""
-            findings["contenteditable"].append({
-                "xpath": "//*[@contenteditable='true']",
-                "class": cclass[:100],
-                "role": crole,
-            })
-        except Exception:
-            continue
-
-    # Profile links (for search/visitor discovery)
-    for el in page.query_selector_all("a[href]"):
-        try:
-            href = el.get_attribute("href") or ""
-            if href.startswith("/") and not any(x in href for x in [
-                "login", "settings", "search", "blog", "reviews", "interviews",
-                "available", "find-massage", "live-cams", "sitemap", "advertise",
-                "mailbox", "static", "_next", "images", "api", "blogs",
-            ]):
-                parts = href.strip("/").split("/")
-                if parts and parts[0] and len(parts) == 1:
-                    findings["links_profile"].append({
-                        "href": href,
-                        "text": (el.inner_text() or "").strip()[:60],
-                    })
-        except Exception:
-            continue
-
-    return findings
-
-
-def detect_block(page: Page) -> Optional[str]:
-    """Check for CAPTCHA / anti-bot / access blocks."""
-    txt = page.inner_text("body")[:3000].lower()
-    url = page.url.lower()
-    needles = [
-        ("captcha", "captcha_detected"),
-        ("crowdsec", "crowdsec_detected"),
-        ("access forbidden", "access_forbidden"),
-        ("verify you are human", "human_verification"),
-        ("unusual traffic", "traffic_challenge"),
-        ("too many requests", "rate_limited"),
-    ]
-    for needle, reason in needles:
-        if needle in txt or needle in url:
-            return reason
-    return None
-
-
-def attempt_login(page: Page, username: str, password: str) -> bool:
-    """Attempt login using Playwright."""
-    try:
-        page.goto(f"{BASE_URL}/login", wait_until="networkidle", timeout=30000)
-        time.sleep(2)
-
-        block = detect_block(page)
-        if block:
-            print(f"  BLOCKED: {block}")
-            return False
-
-        # Find email/username field
-        email_selectors = [
-            "input[type='email']",
-            "input[name*='email' i]",
-            "input[name*='user' i]",
-            "input[type='text']",
-        ]
-        email_el = None
-        for sel in email_selectors:
-            email_el = page.query_selector(sel)
-            if email_el and email_el.is_visible():
-                break
-            email_el = None
-
-        # Find password field
-        pass_el = page.query_selector("input[type='password']")
-
-        if not email_el or not pass_el:
-            print("  Login form not found")
-            return False
-
-        email_el.fill(username)
-        pass_el.fill(password)
-        time.sleep(0.5)
-
-        # Click submit
-        submit_selectors = [
-            "button[type='submit']",
-            "button:has-text('LOG')",
-            "button:has-text('Log')",
-            "form button",
-        ]
-        for sel in submit_selectors:
-            btn = page.query_selector(sel)
-            if btn and btn.is_visible():
-                btn.click()
-                break
-
-        page.wait_for_load_state("networkidle", timeout=15000)
-        time.sleep(3)
-
-        if "/login" in page.url:
-            print("  Login failed — still on login page")
-            return False
-
-        print(f"  Login OK — URL: {page.url}")
-        return True
-
-    except Exception as e:
-        print(f"  Login error: {e}")
-        return False
-
-
-def probe_page(page: Page, page_name: str, page_cfg: dict, logged_in: bool, 
-               interceptor: APIInterceptor) -> dict:
-    """Probe a single page: navigate, capture API, discover XPaths, screenshot."""
-    print(f"\n── Probing: {page_name} ──")
-    print(f"  URL: {page_cfg['url']}")
-
-    result = {
-        "page": page_name,
-        "url": page_cfg["url"],
-        "timestamp": now_iso(),
-        "needs_login": page_cfg["needs_login"],
-        "logged_in": logged_in,
-    }
-
-    # Clear API calls for this page
-    interceptor.calls = []
-
-    try:
-        page.goto(page_cfg["url"], wait_until="networkidle", timeout=30000)
-        time.sleep(3)
-
-        # Detect blocks
-        block = detect_block(page)
-        if block:
-            result["status"] = "blocked"
-            result["block_reason"] = block
-            print(f"  BLOCKED: {block}")
-        else:
-            result["status"] = "ok"
-            result["title"] = page.title()
-            result["final_url"] = page.url
-
-            # Check if redirected to login
-            if page_cfg["needs_login"] and "/login" in page.url:
-                result["status"] = "redirected_to_login"
-                result["note"] = "Page requires login — not authenticated"
-                print(f"  Redirected to login")
-            else:
-                # Discover XPath selectors
-                xpaths = discover_xpaths(page)
-                result["xpaths"] = xpaths
-                print(f"  Found: {len(xpaths['inputs'])} inputs, {len(xpaths['textareas'])} textareas, "
-                      f"{len(xpaths['buttons'])} buttons, {len(xpaths['links_profile'])} profile links")

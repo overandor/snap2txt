@@ -1,3 +1,228 @@
+def set_policy(key: str, value: str, description: str = "", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO policy_rules(key, value, description, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, description=excluded.description, updated_at=CURRENT_TIMESTAMP
+            """,
+            (key, value, description),
+        )
+        conn.commit()
+    receipt = write_receipt("policy_updated", "policy", key, {"key": key, "value": value, "description": description}, db_path=db_path)
+    return {"key": key, "value": value, "receipt_hash": receipt["payload_hash"]}
+
+
+def evaluate_draft(draft_id: int, db_path: str = DEFAULT_DB_PATH) -> PolicyDecision:
+    """Return whether a draft is allowed to enter the manual handoff outbox."""
+    init_db(db_path)
+    policy = get_policy(db_path)
+    with connect(db_path) as conn:
+        draft = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        if not draft:
+            return PolicyDecision(False, "blocked", "draft_not_found")
+        record = conn.execute("SELECT * FROM visitors WHERE visitor_key = ?", (draft["visitor_key"],)).fetchone()
+        if not record:
+            return PolicyDecision(False, "blocked", "record_not_found")
+        conversation = conn.execute(
+            "SELECT * FROM client_conversations WHERE visitor_key = ? ORDER BY updated_at DESC LIMIT 1",
+            (draft["visitor_key"],),
+        ).fetchone()
+
+    if bool(record["do_not_contact"]):
+        return PolicyDecision(False, "blocked", "record_marked_do_not_contact")
+    if conversation and bool(conversation["do_not_contact"]):
+        return PolicyDecision(False, "blocked", "conversation_marked_do_not_contact")
+    if policy.get("manual_approval_required", "true").lower() == "true" and draft["status"] != "approved":
+        return PolicyDecision(False, "needs_approval", "draft_requires_human_approval")
+    if draft["status"] in {"exported", "sent", "skipped"}:
+        return PolicyDecision(False, "blocked", f"draft_already_{draft['status']}")
+
+    # This is intentionally conservative: quiet hours only affect handoff timing,
+    # not content generation. Real timezone scheduling belongs in a later adapter.
+    now_hour = datetime.now().hour
+    start = int(policy.get("quiet_hours_start", "21"))
+    end = int(policy.get("quiet_hours_end", "8"))
+    if start > end and (now_hour >= start or now_hour < end):
+        return PolicyDecision(False, "defer", "quiet_hours_active")
+
+    return PolicyDecision(True, "allowed", "approved_for_manual_handoff")
+
+
+def evaluate_and_receipt(draft_id: int, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    decision = evaluate_draft(draft_id, db_path=db_path)
+    receipt = write_receipt("policy_decision", "draft", str(draft_id), decision.to_dict(), db_path=db_path)
+    out = decision.to_dict()
+    out["receipt_hash"] = receipt["payload_hash"]
+    return out
+
+```
+
+receipts.py:
+```
+"""Audit receipts for owner-operated growth workflows."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db
+
+DEFAULT_RECEIPT_LOG = "data/provider_growth_receipts.jsonl"
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def stable_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_payload(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()
+
+
+def write_receipt(
+    receipt_type: str,
+    entity_type: str,
+    entity_id: str,
+    payload: dict[str, Any],
+    db_path: str = DEFAULT_DB_PATH,
+    receipt_log: str = DEFAULT_RECEIPT_LOG,
+) -> dict[str, Any]:
+    """Persist a JSON receipt to SQLite and JSONL."""
+    init_db(db_path)
+    enriched = {
+        "receipt_type": receipt_type,
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "created_at": utc_now(),
+        "payload": payload,
+    }
+    payload_hash = sha256_payload(enriched)
+    enriched["payload_hash"] = payload_hash
+
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO receipts(receipt_type, entity_type, entity_id, payload_hash, payload_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (receipt_type, entity_type, entity_id, payload_hash, stable_json(enriched)),
+        )
+        conn.commit()
+
+    log_path = Path(receipt_log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(enriched, ensure_ascii=False, sort_keys=True) + "\n")
+    return enriched
+
+```
+
+profile_content.py:
+```
+"""Profile content versioning and experiment labels."""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
+
+VALID_FIELDS = {"bio", "blog", "interview", "availability_note", "headline"}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def add_version(field_name: str, label: str, content: str, reason: str = "", status: str = "draft", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    if field_name not in VALID_FIELDS:
+        raise ValueError(f"field_name must be one of {sorted(VALID_FIELDS)}")
+    init_db(db_path)
+    h = content_hash(content)
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO profile_versions(field_name, label, content_hash, content, reason, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (field_name, label, h, content, reason, status),
+        )
+        version_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("profile_version_created", "profile_version", str(version_id), {"field_name": field_name, "label": label, "content_hash": h, "reason": reason, "status": status}, db_path=db_path)
+    return {"version_id": version_id, "field_name": field_name, "label": label, "content_hash": h, "status": status, "receipt_hash": receipt["payload_hash"]}
+
+
+def activate_version(version_id: int, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM profile_versions WHERE id = ?", (version_id,)).fetchone()
+        if not row:
+            raise ValueError(f"version not found: {version_id}")
+        conn.execute("UPDATE profile_versions SET status = 'retired', retired_at = ? WHERE field_name = ? AND status = 'active'", (now, row["field_name"]))
+        conn.execute("UPDATE profile_versions SET status = 'active', activated_at = ? WHERE id = ?", (now, version_id))
+        conn.commit()
+    receipt = write_receipt("profile_version_activated", "profile_version", str(version_id), {"activated_at": now, "field_name": row["field_name"], "label": row["label"]}, db_path=db_path)
+    return {"version_id": version_id, "status": "active", "activated_at": now, "receipt_hash": receipt["payload_hash"]}
+
+
+def list_versions(field_name: str | None = None, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        if field_name:
+            rows = conn.execute("SELECT * FROM profile_versions WHERE field_name = ? ORDER BY created_at DESC", (field_name,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM profile_versions ORDER BY created_at DESC").fetchall()
+    return rows_to_dicts(rows)
+
+```
+
+experiments.py:
+```
+"""Simple conversion experiment metrics."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def add_snapshot(
+    profile_version_label: str | None = None,
+    profile_views: int = 0,
+    repeat_visitors: int = 0,
+    contact_actions: int = 0,
+    inbound_messages: int = 0,
+    booking_requests: int = 0,
+    metadata: dict[str, Any] | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    init_db(db_path)
     now = utc_now()
     with connect(db_path) as conn:
         cur = conn.execute(
@@ -314,9 +539,9 @@ hf_report.json:
   "availability_enforced": true,
   "automated_login": true,
   "availability_updated": true,
-  "timestamp": "2026-07-26T18:06:49.214011Z",
+  "timestamp": "2026-07-27T00:04:41.316526Z",
   "reason": "set_24_7"
-},"content_counts":{"bios":0,"receipts":1332},"live_profile_update_allowed":false,"timestamp":"2026-07-27T00:04:42Z"}
+},"content_counts":{"bios":0,"receipts":1399},"live_profile_update_allowed":false,"timestamp":"2026-07-27T06:32:12Z"}
 ```
 
 mass_analysis_20260626.md:
@@ -417,7 +642,7 @@ experiment_ledger.json:
 live_metrics.json:
 ```
 {
-  "timestamp": "2026-07-27T00:04:41.316954Z",
+  "timestamp": "2026-07-27T06:32:10.440145Z",
   "source": "requests_whosawme",
   "profile_views": 15,
   "unique_visitors": 15,
@@ -542,15 +767,15 @@ metrics_summary.json:
 {
   "status": "ok",
   "total_ingested": 1,
-  "latest_timestamp": "2026-07-27T00:04:41.316954Z",
+  "latest_timestamp": "2026-07-27T06:32:10.440145Z",
   "latest_metrics": {
-    "timestamp": "2026-07-27T00:04:41.316954Z",
+    "timestamp": "2026-07-27T06:32:10.440145Z",
     "source": "requests_whosawme",
     "profile_views": 15,
     "unique_visitors": 15,
     "repeat_visitors": 0
   },
-  "processed_at": "2026-07-27T00:04:43.107998+00:00"
+  "processed_at": "2026-07-27T06:32:12.414005+00:00"
 }
 ```
 
@@ -573,228 +798,3 @@ The following metrics indicate our content production for the week:
 
 #### Strategy Coverage
 Our strategy coverage for the week is lacking, with **no strategies** implemented or covered. This is an area that requires immediate attention to ensure our marketing efforts are aligned with business goals.
-
-#### Recommendations for Next Week
-To improve our marketing efforts, we recommend the following for the upcoming week:
-1. **Publish at least 2 blog posts** focusing on the benefits of massage therapy and tips for maintaining a healthy lifestyle.
-2. **Create and schedule 5 social media posts** to engage with our audience and promote our services.
-3. **Conduct SEO keyword research** to identify relevant terms and phrases to optimize our website and content.
-4. **Develop 2 email templates** for newsletters and promotional emails to our subscribers.
-5. **Collect competitor data** to analyze their marketing strategies and identify areas for improvement.
-
-#### Action Items
-To implement the above recommendations, the following action items are assigned:
-1. Content Team: Create and publish blog posts, social media posts, and email templates.
-2. SEO Specialist: Conduct keyword research and optimize our website and content accordingly.
-3. Marketing Analyst: Collect competitor data and analyze their marketing strategies.
-4. Social Media Manager: Schedule social media posts and engage with our audience.
-5. Management: Review and approve all content and marketing materials to ensure they align with our business goals and brand voice.
-
-By following these recommendations and action items, we can improve our content production, strategy coverage, and overall marketing efforts to drive more traffic and sales for our Manhattan massage therapy business.
-```
-
-competitor_bios.json:
-```
-[]
-```
-
-api_map_sanitized.json:
-```
-{
-  "endpoints": [
-    {
-      "name": "dashboard",
-      "method": "GET",
-      "path": "/api/v1/account/dashboard",
-      "auth": "required",
-      "safe_for_runtime": true
-    },
-    {
-      "name": "availability",
-      "method": "PUT",
-      "path": "/api/v1/account/dashboard/availability",
-      "auth": "required",
-      "safe_for_runtime": "manual_approved_only"
-    },
-    {
-      "name": "settings_about",
-      "method": "PUT",
-      "path": "/api/v1/settings/about",
-      "auth": "required",
-      "safe_for_runtime": "approved_profile_edit_only"
-    },
-    {
-      "name": "settings_blog",
-      "method": "GET",
-      "path": "/api/v1/settings/blog",
-      "auth": "required",
-      "safe_for_runtime": true
-    },
-    {
-      "name": "settings_interview",
-      "method": "GET",
-      "path": "/api/v1/settings/interview",
-      "auth": "required",
-      "safe_for_runtime": true
-    },
-    {
-      "name": "whosawme",
-      "method": "GET",
-      "path": "/api/v1/settings/whosawme",
-      "auth": "required",
-      "safe_for_runtime": true
-    }
-  ],
-  "headers": "redacted",
-  "cookies": "redacted",
-  "tokens": "redacted"
-}
-
-```
-
-telemetry_latest.json:
-```
-{
-  "id": 244,
-  "ts": "2026-07-25T18:43:41.297299+00:00",
-  "views": null,
-  "contact_clicks": null,
-  "visits": null,
-  "bookmarks": null,
-  "new_emails": null,
-  "is_ad_hidden": null,
-  "available": null,
-  "availability_remaining": null,
-  "headline": null,
-  "description_len": null,
-  "city": "manhattan-ny",
-  "search_position": null,
-  "search_available_position": null,
-  "search_total": 0,
-  "search_available_total": 0
-}
-```
-
-weekly_report_20260720.md:
-```
-# Weekly Report — 2026-07-13 to 2026-07-20
-
-## Stats
-
-```json
-{
-  "period": "2026-07-13 to 2026-07-20",
-  "bios": 0,
-  "blog_posts": 0,
-  "interview_questions": 0,
-  "social_posts": 0,
-  "email_templates": 0,
-  "seo_keywords": 0,
-  "mass_analyses": 0,
-  "competitor_data": false,
-  "strategies_covered": []
-}
-```
-```
-
-20260628_off_the_grid_life.md:
-```
-## Q1: What's the most unlikely place you've ever given a massage, and did you get any weird looks?
-**A:** Ah, that would be on a friend's sailboat in the Hudson River. Let's just say I had to get creative with the whole "finding your center" thing while balancing on a rocking boat. The people on the nearby boats probably thought we were performing some sort of bizarre, New Age ritual. Book with me, and I promise not to make you chant any sailors' shanties... unless you want me to, of course!
-
-## Q2: As a massage therapist, have you ever had a client fall asleep on the table, and if so, how did you take it?
-**A:** All. The. Time. I mean, it's the ultimate compliment, right? I'm like the massage whisperer – "Come for the knots, stay for the nap." But seriously, it's a great indicator that I'm doing something right. When you book with me, don't worry if you doze off; I'll just quietly finish the massage and let you wake up feeling refreshed... and hopefully not with drool on the table.
-
-## Q3: What's the craziest request you've ever received from a client, and did you indulge them?
-**A:** Well, there was this one person who asked if I could play the harmonica during the massage to "enhance the experience." I mean, who am I to deny someone's inner bluesman? It was... an interesting session, but hey, if it works for them, I'm game. Book with me, and I promise to leave my harmonica at home – unless you specifically ask for it, that is.
-
-## Q4: If you could give a massage to any historical figure, who would it be and why?
-**A:** That's a great question! I think I'd choose Albert Einstein. Can you imagine the knots that guy must have had from thinking about relativity all day? I'd love to help him work out some of that theoretical tension. If you're feeling like a genius with a few knots of your own, book a session with me and let's get your mind (and body) expanded.
-
-## Q5: What's the best way to prepare for a massage, and do you have any pre-massage rituals you recommend?
-**A:** Ah, preparation is key! I always tell my clients to come hydrated, wear comfy clothes (or not – we'll get you draped up either way), and leave their worries at the door. As for pre-massage rituals, I recommend taking a few deep breaths, listening to some calming music, and reminding yourself that you're about to treat yourself to some amazing "me time." Book with me, and I'll take care of the rest.
-
-## Q6: Have you ever had a client who was so relaxed during the massage that they started to levitate, and if so, how did you handle it?
-**A:** (laughs) Okay, maybe not levitate, but I've had clients so relaxed they've forgotten where they are or what day it is. It's my superpower – making people forget their worries and just melt into the table. If you're ready to experience some serious relaxation, book a session with me and let's see if we can't achieve liftoff... or at least a really great nap.
-
-## Q7: What's the most important thing you've learned from your clients over the years, and how has it impacted your practice?
-**A:** I think the most important thing I've learned is that everyone's body is different, and what works for one person might not work for another. It's all about listening to each client's unique needs and tailoring the massage to what they need in that moment. When you book with me, you can expect a fully customized experience that's all about you – no cookie-cutter massages here!
-
-## Q8: Can you tell us about a particularly memorable client success story, and what made it so special?
-**A:** There was this one client who came in with chronic back pain that had been plaguing her for months. After a few sessions, she reported a significant reduction in pain and was even able to start exercising again. What made it really special, though, was when she came in for a follow-up appointment and told me that the massages had helped her feel confident enough to start her own business. It's moments like those that remind me why I love doing what I do. Book with me, and let's see if we can't achieve some life-changing results of your own!
-
-## Q9: If you could switch lives with any other professional for a day, who would it be and why?
-**A:** That's a fun one! I think I'd choose to be a professional hammock tester. Can you imagine getting paid to lounge around in hammocks all day? It sounds like the ultimate relaxation job. Of course, I'd still want to sneak in a few massages on the side – priorities, you know! When you book with me, you can expect a little slice of hammock-like bliss, minus the actual hammock (unless you bring your own – I'm open to it).
-
-## Q10: What's the best advice you can give to someone who's never had a massage before, and how can they prepare for their first session?
-**A:** If you're new to massage, my advice would be to just relax (ha!) and go with it. Don't worry if you're not sure what to expect – I'll guide you through the whole process and make sure you feel comfortable and at ease. As for preparation, just show up with an open mind and a willingness to let go of some tension. Trust me, you won't regret it. Ready to take the plunge? Book your first massage with me today and let's get you on the path to relaxation nirvana! Call now to schedule your appointment: 555-555-5555.
-```
-
-20260629_morning_routine.md:
-```
-## Q1: What's the most embarrassing thing that's happened to you during a morning massage session? 
-**A:** Honestly, I once accidentally knocked over a bottle of oil and it spilled all over the client's fancy watch. Let's just say it was a 'stroke' of bad luck. But hey, at least their muscles were relaxed! Book a session with me and I promise not to 'oil' the waters.
-
-## Q2: How do you like your coffee, and do you think a good cup can replace a morning massage? 
-**A:** I take my coffee black, just like my sense of humor. But seriously, while coffee can give you a temporary boost, it can't compare to the long-term rejuvenation a morning massage provides. Trust me, I've tried to 'buzz' my way through tough days, but a massage is the real 'perk'.
-
-## Q3: What's the craziest morning routine you've ever heard from a client? 
-**A:** One client told me they start their day by singing 'I Will Survive' at the top of their lungs while doing yoga. I'm not sure what's more impressive, their vocal range or their downward-facing dog. Either way, I'm happy to help them 'survive' the morning with a soothing massage. Book now and let's get this day started!
-
-## Q4: Do you have a go-to morning playlist for your massage sessions? 
-**A:** Absolutely! I've got a playlist that's all about 'kneading' the right vibes. From classical to chill electronic, I've got the tunes to ease you into the day. But let's be real, the best soundtrack is the sound of your muscles relaxing. Book a session and let the music (and massage) move you!
-
-## Q5: What's the biggest misconception people have about morning massages? 
-**A:** That they're only for pampering or special occasions. Newsflash: your body deserves a little TLC every day, especially in the morning! Think of it as a daily 'wake-up' call for your muscles. Book a regular morning massage and start your day feeling like a brand new person.
-
-## Q6: Can you share a ridiculous morning habit you have, and how it helps you prepare for a day of massages? 
-**A:** Okay, I'll confess: I start my day by doing a little 'massage-themed' dance in front of the mirror. It's all about getting those endorphins pumping and my hands ready to 'knead' some relaxation into my clients. Don't worry, I won't make you watch me dance... unless you book a session and ask nicely!
-
-## Q7: How do you handle morning grumpiness in your clients (or yourself)? 
-**A:** Let's face it, mornings can be tough. But I've got just the thing to turn that frown upside down: a warm smile, a soothing voice, and some expertly applied pressure. Trust me, by the end of the session, you'll be skipping out of here like a kid on a sugar high. Book now and let's kick those grumps to the curb!
-
-## Q8: What's the best morning massage tip you can give to our readers? 
-**A:** Don't be afraid to get a little 'hands-on' with your own morning routine! Take a few minutes each day to stretch, breathe, and show your body some love. And of course, book a regular massage to keep those muscles happy and healthy. Your body (and mind) will thank you.
-
-## Q9: Have you ever had a client fall asleep during a morning massage? 
-**A:** Oh, it's happened more times than I can count! But hey, that's just a testament to how relaxing my massages are, right? In all seriousness, it's not uncommon for clients to drift off into dreamland, especially during a morning session. Don't worry, I won't take it personally – I'll just take it as a sign that I'm doing my job right!
-
-## Q10: What's the one thing you wish everyone knew about the benefits of morning massages? 
-**A:** That it's not just about feeling good – it's about setting yourself up for a day of productivity, energy, and overall wellness. By incorporating a morning massage into your routine, you're investing in your mind, body, and spirit. So why not give it a try? Book a session with me today and start your day off on the right foot (or should I say, the right massage table?)! Call now to schedule your appointment: 555-555-5555!
-```
-
-20260723_travel_adventure.md:
-```
-## Q1: What's the most exotic massage technique you've learned from your travels, and can you use it on a client who's never left New York City?
-**A:** Ah, I've got a mean "Thai Twist" that'll transport you to the beaches of Phuket without leaving Manhattan. Trust me, after an hour on my table, you'll be convinced you've found your inner calm in a bustling city – and you won't even need a passport!
-
-## Q2: As a travel enthusiast, how do you ensure your massage skills stay sharp while exploring the world?
-**A:** Let's just say I've had my fair share of "research" massages around the globe. I once had a massage in Tokyo that was so good, it inspired me to create my own signature technique – the "Tokyo Bliss." Book a session, and I'll show you what I mean!
-
-## Q3: What's the craziest travel story you have, and how does it relate to your massage work?
-**A:** I once got lost in the Amazon rainforest and had to rely on the kindness of locals to find my way back. It taught me the value of being present and adaptable – skills I use every day to tailor my massages to each client's unique needs. Come get lost in relaxation with me!
-
-## Q4: Can you recommend a travel destination that's perfect for a relaxing getaway, and will you give me a massage to prep me for the trip?
-**A:** Have you considered Bali? The beaches, the food, the yoga... it's the ultimate relaxation haven! And, of course, I'd be happy to give you a pre-trip massage to get you in the right mindset. Book a session, and let's get you island-ready!
-
-## Q5: How do you balance your love of travel with your massage practice in Manhattan?
-**A:** To be honest, it's a challenge, but I've learned to bring the world to my clients instead! I incorporate techniques and inspiration from my travels into every massage. So, even if you can't jet off to Paris, I can bring a taste of it to you – complete with a soothing French accent, if you'd like!
-
-## Q6: What's the most common travel-related stress you see in your clients, and how do you help them relax?
-**A:** It's usually the pre-trip jitters or post-trip blues. To combat that, I offer a special "Traveler's Relief" massage, complete with a calming essential oil blend and a healthy dose of massage magic. Book a session, and let's get you travel-ready – or help you unwind after a long journey!
-
-## Q7: Have you ever had a client who was so relaxed after a massage that they forgot they were in Manhattan?
-**A:** (laughs) Actually, yes! It was a client who'd just returned from a long trip and was feeling particularly frazzled. After the massage, she opened her eyes and asked, "Where am I?" I told her, "You're in Manhattan, but your worries are definitely somewhere else!" Want to experience that level of relaxation for yourself?
-
-## Q8: Can you create a customized massage plan for a client who's training for a marathon or trekking adventure?
-**A:** Absolutely! As an outdoorsy guy myself, I understand the importance of proper preparation and recovery. I'll work with you to create a personalized massage plan that'll get you ready for your next big adventure – and help you recover from it, too!
-
-## Q9: What's the best travel tip you've learned from your massage clients, and how does it relate to your work?
-**A:** One client taught me the importance of "being present" while traveling – taking in the sights, sounds, and smells of a new place. I apply that same principle to my massage work, focusing on the present moment to give each client the most tailored and relaxing experience possible. Want to experience it for yourself?
-
-## Q10: Last question: what's the best way for a client to book a massage appointment with you, and can you guarantee they'll feel like they're on a mini-vacation?
-**A:** (smirks) Well, I can promise you'll feel like you're in good hands! To book, simply give me a call or visit my website. And, as for that mini-vacation feeling... let's just say I've got the skills and the passion to transport you to a state of deep relaxation, no matter where your travels take you. So, what are you waiting for? Call me now to schedule your appointment and get ready to escape the hustle and bustle of Manhattan – if only for an hour! (917) 123-4567 – I look forward to kneading you into relaxation!
-```
-
-20260630_off_the_grid_life.md:
-```
