@@ -1,800 +1,800 @@
-                                    break
-            except Exception:
-                pass
-
-            if visitors:
-                break  # Found visitors, stop trying other URLs
-
-        except Exception as e:
-            print(f"  Error: {e}")
-            continue
-
-    return visitors
-
-
-def check_profile_is_masseur(page: Page, username: str) -> dict:
-    """Visit a profile and determine if it's a masseur or client."""
-    result = {
-        "username": username,
-        "is_masseur": False,
-        "location": "",
-        "is_ny": False,
-        "profile_text": "",
-        "screenshot": "",
-        "error": None,
-    }
-
-    try:
-        url = f"{BASE_URL}/{username}"
-        page.goto(url, wait_until="networkidle", timeout=20000)
-        time.sleep(2)
-
-        block = detect_block(page)
-        if block:
-            result["error"] = f"blocked:{block}"
-            return result
-
-        if "/404" in page.url or "/login" in page.url:
-            result["error"] = f"redirected:{page.url}"
-            return result
-
-        result["screenshot"] = screenshot(page, f"profile_{safe_name(username)}")
-
-        # Get page text
-        body_text = page.inner_text("body")[:3000]
-        result["profile_text"] = body_text[:500]
-
-        # Check if masseur — masseur profiles have "Book Now", "Available", massage rates, etc.
-        masseur_signals = ["book now", "available now", "massage", "rates", "incall", "outcall",
-                          "modalities", "session", "booking", "schedule"]
-        masseur_score = sum(1 for s in masseur_signals if s in body_text.lower())
-        result["is_masseur"] = masseur_score >= 3
-
-        # Extract location
-        try:
-            nd_text = page.evaluate("() => { const el = document.getElementById('__NEXT_DATA__'); return el ? el.textContent : null; }")
-            if nd_text:
-                nd = json.loads(nd_text)
-                props = nd.get("props", {}).get("pageProps", {})
-                user = props.get("user", props.get("masseur", props.get("profile", {})))
-                if isinstance(user, dict):
-                    location = user.get("location") or user.get("city") or ""
-                    state = user.get("state") or ""
-                    country = user.get("country") or ""
-                    search_city = user.get("searchCity") or ""
-                    result["location"] = f"{location}, {state} {country}".strip(", ")
-                    result["is_ny"] = is_ny_location(result["location"]) or is_ny_location(search_city)
-                    # Check isMasseur flag if present
-                    if "isMasseur" in user:
-                        result["is_masseur"] = bool(user["isMasseur"])
-                    elif "role" in user:
-                        result["is_masseur"] = user.get("role") == "masseur"
-        except Exception:
-            pass
-
-        # Fallback: check location from page text
-        if not result["location"]:
-            for line in body_text.split("\n"):
-                if any(kw in line.lower() for kw in NY_KEYWORDS):
-                    result["location"] = line.strip()[:100]
-                    result["is_ny"] = True
-                    break
-
-    except Exception as e:
-        result["error"] = str(e)
-
-    return result
-
-
-def main():
-    username = os.getenv("RM_USER") or os.getenv("RENTMASSEUR_USER") or ""
-    password = os.getenv("RM_PASS") or os.getenv("RENTMASSEUR_PASS") or ""
-
-    if not username or not password:
-        print("!! Set RM_USER and RM_PASS env vars")
-        return
-
-    print(f"\n=== RM NY Client Profile Mining ===")
-    print(f"  Account: {username}")
-    print(f"  Target: NY non-masseur client profiles")
-
-    all_visitors = []
-    ny_clients = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=False,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-
-        storage_state = Path(".rm_storage_state.json")
-        ctx_kwargs = {
-            "viewport": {"width": 1440, "height": 1200},
-            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        }
-
-        # Try to reuse saved session
-        if storage_state.exists():
-            ctx_kwargs["storage_state"] = str(storage_state)
-            print("  Using saved storage state")
-
-        context = browser.new_context(**ctx_kwargs)
-        page = context.new_page()
-
-        # Check if session is still valid
-        page.goto(f"{BASE_URL}/settings", wait_until="networkidle", timeout=30000)
-        time.sleep(2)
-
-        if "/login" in page.url:
-            print("  Session expired — re-logging in")
-            logged_in = attempt_login(page, context, username, password)
-            if not logged_in:
-                print("!! Login failed — aborting")
-                browser.close()
-                return
-        else:
-            print("  Session valid — already logged in")
-
-        # Step 1: Scrape "Who Saw Me" visitors
-        print(f"\n--- Step 1: Scraping Who Saw Me ---")
-        visitors = scrape_who_saw_me(page)
-        all_visitors.extend(visitors)
-        print(f"\n  Total visitors found: {len(visitors)}")
-
-        # Step 2: Also check dashboard API for visitor data
-        print(f"\n--- Step 2: Checking dashboard API ---")
-        try:
-            # Intercept API responses
-            api_responses = []
-
-            def on_response(response):
-                url = response.url
-                if "rentmasseur.com/api" in url:
-                    try:
-                        body = response.text()
-                        api_responses.append({
-                            "url": url.replace(BASE_URL, ""),
-                            "status": response.status,
-                            "body_preview": body[:1000],
-                            "body_len": len(body),
-                        })
-                    except Exception:
-                        pass
-
-            page.on("response", on_response)
-
-            page.goto(f"{BASE_URL}/settings", wait_until="networkidle", timeout=30000)
-            time.sleep(3)
-
-            # Save API responses
-            api_path = ARTIFACTS / "dashboard_api_responses.json"
-            api_path.write_text(json.dumps(api_responses, indent=2, default=str), encoding="utf-8")
-            print(f"  Captured {len(api_responses)} API responses → {api_path}")
-
-            # Check __NEXT_DATA__ on dashboard for visitor info
-            try:
-                nd_text = page.evaluate("() => { const el = document.getElementById('__NEXT_DATA__'); return el ? el.textContent : null; }")
-                if nd_text:
-                    nd = json.loads(nd_text)
-                    props = nd.get("props", {}).get("pageProps", {})
-                    nd_path = ARTIFACTS / "dashboard_next_data.json"
-                    # Save full next data for analysis
-                    nd_path.write_text(json.dumps(props, indent=2, default=str)[:50000], encoding="utf-8")
-                    print(f"  Dashboard __NEXT_DATA__ keys: {list(props.keys())}")
-                    print(f"  Saved to: {nd_path}")
-
-                    # Look for visitor-related data
-                    for key in props:
-                        val = props[key]
-                        if isinstance(val, dict):
-                            for subkey in ["visitors", "whoSawMe", "whoViewed", "views", "recentVisitors", "profileViews"]:
-                                if subkey in val:
-                                    print(f"  Found {key}.{subkey}!")
-                                    data = val[subkey]
-                                    if isinstance(data, list):
-                                        for item in data:
-                                            uname = item.get("username") or item.get("user") or ""
-                                            if uname and uname not in {v["username"] for v in all_visitors}:
-                                                all_visitors.append({
-                                                    "username": uname,
-                                                    "location": item.get("location", ""),
-                                                    "source": f"dashboard.{key}.{subkey}",
-                                                    "raw": item,
-                                                })
-            except Exception as e:
-                print(f"  Dashboard __NEXT_DATA__ error: {e}")
-
-        except Exception as e:
-            print(f"  Dashboard API error: {e}")
-
-        # Step 3: Visit each visitor profile to check if masseur or client + NY
-        print(f"\n--- Step 3: Checking {len(all_visitors)} visitor profiles ---")
-        checked = []
-        for i, visitor in enumerate(all_visitors):
-            uname = visitor["username"]
-            print(f"\n  [{i+1}/{len(all_visitors)}] Checking: {uname}")
-
-            profile_info = check_profile_is_masseur(page, uname)
-            profile_info["source"] = visitor.get("source", "")
-            checked.append(profile_info)
-
-            if profile_info["is_masseur"]:
-                print(f"    → MASSEUR (skipping)")
-            else:
-                print(f"    → CLIENT")
-                if profile_info["is_ny"]:
-                    print(f"    → NY CLIENT ✓")
-                    ny_clients.append(profile_info)
-                else:
-                    print(f"    → Location: {profile_info['location']}")
-
-            if profile_info.get("error"):
-                print(f"    → Error: {profile_info['error']}")
-
-            # Rate limit
-            time.sleep(2)
-
-        browser.close()
-
-    # Step 4: Save results
-    print(f"\n=== Results ===")
-    print(f"  Total visitors found: {len(all_visitors)}")
-    print(f"  Profiles checked: {len(checked)}")
-    print(f"  Masseurs: {sum(1 for c in checked if c['is_masseur'])}")
-    print(f"  Clients: {sum(1 for c in checked if not c['is_masseur'])}")
-    print(f"  NY clients: {len(ny_clients)}")
-
-    # Save all results
-    results = {
-        "timestamp": now_iso(),
-        "account": username,
-        "summary": {
-            "total_visitors": len(all_visitors),
-            "profiles_checked": len(checked),
-            "masseurs": sum(1 for c in checked if c["is_masseur"]),
-            "clients": sum(1 for c in checked if not c["is_masseur"]),
-            "ny_clients": len(ny_clients),
+          'Content-Type': 'application/json',
+          ...(HF_TOKEN ? { Authorization: `Bearer ${HF_TOKEN}` } : {}),
         },
-        "all_visitors": all_visitors,
-        "checked_profiles": checked,
-        "ny_clients": ny_clients,
+        body: JSON.stringify(enriched),
+      });
     }
 
-    results_path = ARTIFACTS / "ny_client_mining_results.json"
-    results_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
-    print(f"\n  Results: {results_path}")
-    print(f"  Screenshots: {SCREENSHOTS}/")
-
-    # Print NY clients
-    if ny_clients:
-        print(f"\n--- NY Client Profiles ---")
-        for c in ny_clients:
-            print(f"  {c['username']:25s} | {c['location'][:50]}")
-    else:
-        print(f"\n  No NY clients found — may need to check more visitors or different pages")
-
-
-if __name__ == "__main__":
-    main()
+    // Also store in Vercel KV or just return
+    return res.status(200).json({
+      status: 'collected',
+      payload: enriched,
+      hf_forwarded: Boolean(HF_SPACE_URL),
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
 
 ```
 
-rm_playwright_probe.py:
+report.js:
 ```
-#!/usr/bin/env python3
+/*
+ * Vercel Serverless Function: /api/report
+ * Returns the full RentMasseur OS report from the HF Space backend.
+ */
+
+export default async function handler(req, res) {
+  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
+  try {
+    if (!HF_SPACE_URL) {
+      return res.status(200).json({ note: 'HF_SPACE_URL not set' });
+    }
+    const resp = await fetch(`${HF_SPACE_URL}/api/os/report`);
+    const data = await resp.json();
+    return res.status(200).json(data);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+```
+
+competitors.js:
+```
+/*
+ * Vercel Serverless Function: /api/competitors
+ * Fetches competitor intelligence from the HF Space OS backend.
+ */
+
+export default async function handler(req, res) {
+  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
+  try {
+    if (!HF_SPACE_URL) {
+      return res.status(200).json({ competitors: [], note: 'HF_SPACE_URL not set' });
+    }
+    const resp = await fetch(`${HF_SPACE_URL}/api/os/competitors`);
+    const data = await resp.json();
+    return res.status(200).json(data);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+```
+
+bios.js:
+```
+/*
+ * Vercel Serverless Function: /api/bios
+ * Returns top-scoring bio candidates from the HF Space OS backend.
+ */
+
+export default async function handler(req, res) {
+  const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
+  try {
+    if (!HF_SPACE_URL) {
+      return res.status(200).json({ bios: [], note: 'HF_SPACE_URL not set' });
+    }
+    const resp = await fetch(`${HF_SPACE_URL}/api/os/bios`);
+    const data = await resp.json();
+    return res.status(200).json(data);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+```
+
+__init__.py:
+```
+"""Provider Growth CRM for owner-operated profile workflows.
+
+Compliance boundary: this package stores local engagement records, content
+versions, manual draft queue items, policy decisions, outbox states, KPI events,
+conversation receipts, and audit receipts for accounts the operator owns or is
+authorized to manage. It does not bypass access controls or transmit messages
+without explicit human approval.
 """
-RM Playwright Probe v2 — hardened, secret-redacting, authenticated read-only.
 
-Pipeline:
-  public probe → authenticated read-only probe → selector registry →
-  endpoint registry (redacted) → function registry (generated) → receipts
+__all__ = [
+    "db",
+    "receipts",
+    "engagement",
+    "drafts",
+    "policy",
+    "outbox",
+    "kpi",
+    "profile_content",
+    "experiments",
+    "imac_relay",
+]
 
-Safety:
-  - Never stores cookies/tokens in artifacts
-  - Redacts all secrets from API endpoint logs
-  - Stops on CAPTCHA/CrowdSec/rate limit/2FA — no bypass
-  - Never submits forms, never clicks save, never sends messages
-  - storageState saved locally only, never uploaded as artifact
+```
 
-Usage:
-  # Public probe (safe, no creds)
-  python probes/rm_playwright_probe.py --mode public
+experiments.py:
+```
+"""Simple conversion experiment metrics."""
 
-  # Authenticated read-only (creds from shell env)
-  export RM_USER="your_email"
-  export RM_PASS="your_password"
-  python probes/rm_playwright_probe.py --mode authenticated-readonly --login
+from __future__ import annotations
 
-  # Single page
-  python probes/rm_playwright_probe.py --mode authenticated-readonly --login --page dashboard
+import json
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def add_snapshot(
+    profile_version_label: str | None = None,
+    profile_views: int = 0,
+    repeat_visitors: int = 0,
+    contact_actions: int = 0,
+    inbound_messages: int = 0,
+    booking_requests: int = 0,
+    metadata: dict[str, Any] | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO metrics_snapshots(snapshot_at, profile_version_label, profile_views, repeat_visitors, contact_actions, inbound_messages, booking_requests, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (now, profile_version_label, profile_views, repeat_visitors, contact_actions, inbound_messages, booking_requests, json.dumps(metadata or {}, sort_keys=True)),
+        )
+        snapshot_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("metrics_snapshot", "metrics_snapshot", str(snapshot_id), {"snapshot_at": now, "profile_version_label": profile_version_label}, db_path=db_path)
+    return {"snapshot_id": snapshot_id, "snapshot_at": now, "receipt_hash": receipt["payload_hash"]}
+
+
+def summarize_by_version(db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+              COALESCE(profile_version_label, 'unlabeled') AS profile_version_label,
+              COUNT(*) AS snapshots,
+              SUM(profile_views) AS profile_views,
+              SUM(repeat_visitors) AS repeat_visitors,
+              SUM(contact_actions) AS contact_actions,
+              SUM(inbound_messages) AS inbound_messages,
+              SUM(booking_requests) AS booking_requests
+            FROM metrics_snapshots
+            GROUP BY COALESCE(profile_version_label, 'unlabeled')
+            ORDER BY booking_requests DESC, inbound_messages DESC, contact_actions DESC
+            """
+        ).fetchall()
+    out = rows_to_dicts(rows)
+    for row in out:
+        views = row.get("profile_views") or 0
+        contacts = row.get("contact_actions") or 0
+        bookings = row.get("booking_requests") or 0
+        row["contact_rate"] = round(contacts / views, 4) if views else 0.0
+        row["booking_rate"] = round(bookings / views, 4) if views else 0.0
+    return out
+
+```
+
+drafts.py:
+```
+"""Manual draft queue.
+
+Drafts are suggestions for human review. This module never transmits outbound
+content. The operator must approve and perform any outbound action separately.
 """
 
 from __future__ import annotations
 
-import argparse
-import hashlib
-import json
-import os
-import re
-import sys
-import time
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
+from typing import Any
 
-from playwright.sync_api import sync_playwright, Page, BrowserContext
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
 
-
-BASE_URL = "https://rentmasseur.com"
-ARTIFACTS = Path("artifacts/probe")
-SCREENSHOTS = ARTIFACTS / "screenshots"
-API_DIR = ARTIFACTS / "api_calls"
-STORAGE_STATE = Path(".rm_storage_state.json")  # local only, gitignored, never uploaded
-
-for d in (ARTIFACTS, SCREENSHOTS, API_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
-
-# ── Pages ─────────────────────────────────────────────────────────────
-
-PAGES_PUBLIC = {
-    "login_page_probe": {"url": f"{BASE_URL}/login", "needs_login": False},
-    "public_profile_probe": {"url": f"{BASE_URL}/karpathianwolf", "needs_login": False},
-    "search_probe": {"url": f"{BASE_URL}/search/manhattan-ny", "needs_login": False},
-}
-
-PAGES_AUTHENTICATED = {
-    "dashboard_read": {"url": f"{BASE_URL}/settings", "needs_login": True},
-    "availability_read": {"url": f"{BASE_URL}/settings?availability=1", "needs_login": True},
-    "about_profile_read": {"url": f"{BASE_URL}/settings/about", "needs_login": True},
-    "bio_field_detect": {"url": f"{BASE_URL}/settings/about", "needs_login": True},
-    "stats_read": {"url": f"{BASE_URL}/settings/stats", "needs_login": True},
-    "mailbox_page_detect": {"url": f"{BASE_URL}/mailbox", "needs_login": True},
-    "compose_form_detect": {"url": f"{BASE_URL}/mailbox/compose", "needs_login": True},
-    "settings_page_detect": {"url": f"{BASE_URL}/settings/profile", "needs_login": True},
-    "logout_detect": {"url": f"{BASE_URL}/settings", "needs_login": True, "find_logout": True},
+TEMPLATES: dict[str, str] = {
+    "soft_checkin": "Hi {name}, thanks for checking in. I have a little availability coming up. Want me to send the current window?",
+    "same_day": "Hi {name}, I may have same-day availability. Send me your preferred time window and I will confirm what is realistic.",
+    "weekend": "Hi {name}, I am organizing the weekend schedule now. If you are considering a session, send your ideal day and time window.",
+    "content_followup": "Hi {name}, I updated my profile notes with a little more detail. Happy to answer any question before you book.",
 }
 
 
-# ── Secret redaction ─────────────────────────────────────────────────
-
-REDACT_HEADER_KEYS = {
-    "cookie", "set-cookie", "authorization", "bearer",
-    "x-csrf-token", "x-csrf", "csrf",
-}
-
-REDACT_BODY_KEYS = {
-    "csrf", "password", "email", "session", "token",
-    "accesstoken", "refreshtoken", "auth",
-}
-
-REDACT_BODY_PATTERNS = [
-    (re.compile(r'"csrf"\s*:\s*"[^"]*"'), '"csrf":"[REDACTED]"'),
-    (re.compile(r'"password"\s*:\s*"[^"]*"'), '"password":"[REDACTED]"'),
-    (re.compile(r'"email"\s*:\s*"[^"]*"'), '"email":"[REDACTED]"'),
-    (re.compile(r'"token"\s*:\s*"[^"]*"'), '"token":"[REDACTED]"'),
-    (re.compile(r'"accessToken"\s*:\s*"[^"]*"'), '"accessToken":"[REDACTED]"'),
-    (re.compile(r'"refreshToken"\s*:\s*"[^"]*"'), '"refreshToken":"[REDACTED]"'),
-    (re.compile(r'"session"\s*:\s*"[^"]*"'), '"session":"[REDACTED]"'),
-]
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def redact_headers(headers: dict) -> dict:
-    out = {}
-    for k, v in headers.items():
-        if k.lower() in REDACT_HEADER_KEYS:
-            out[k] = "[REDACTED]"
+def render_template(template_name: str, name: str = "there") -> str:
+    if template_name not in TEMPLATES:
+        raise ValueError(f"unknown template: {template_name}")
+    return TEMPLATES[template_name].format(name=name or "there")
+
+
+def create_draft(record_key: str, template_name: str, name: str = "there", channel: str = "manual", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    body = render_template(template_name, name=name)
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO message_drafts(visitor_key, template_name, body, channel, status, approval_required)
+            VALUES (?, ?, ?, ?, 'draft', 1)
+            """,
+            (record_key, template_name, body, channel),
+        )
+        draft_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("draft_created", "draft", str(draft_id), {"record_key": record_key, "template": template_name, "channel": channel}, db_path=db_path)
+    return {"draft_id": draft_id, "body": body, "status": "draft", "approval_required": True, "receipt_hash": receipt["payload_hash"]}
+
+
+def approve_draft(draft_id: int, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    with connect(db_path) as conn:
+        conn.execute("UPDATE message_drafts SET status = 'approved', approved_at = ? WHERE id = ? AND status = 'draft'", (now, draft_id))
+        row = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        conn.commit()
+    receipt = write_receipt("draft_approved", "draft", str(draft_id), {"approved_at": now}, db_path=db_path)
+    return {"draft": dict(row) if row else None, "receipt_hash": receipt["payload_hash"]}
+
+
+def list_drafts(status: str = "draft", db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM message_drafts WHERE status = ? ORDER BY created_at DESC", (status,)).fetchall()
+    return rows_to_dicts(rows)
+
+```
+
+profile_content.py:
+```
+"""Profile content versioning and experiment labels."""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
+
+VALID_FIELDS = {"bio", "blog", "interview", "availability_note", "headline"}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def add_version(field_name: str, label: str, content: str, reason: str = "", status: str = "draft", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    if field_name not in VALID_FIELDS:
+        raise ValueError(f"field_name must be one of {sorted(VALID_FIELDS)}")
+    init_db(db_path)
+    h = content_hash(content)
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO profile_versions(field_name, label, content_hash, content, reason, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (field_name, label, h, content, reason, status),
+        )
+        version_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("profile_version_created", "profile_version", str(version_id), {"field_name": field_name, "label": label, "content_hash": h, "reason": reason, "status": status}, db_path=db_path)
+    return {"version_id": version_id, "field_name": field_name, "label": label, "content_hash": h, "status": status, "receipt_hash": receipt["payload_hash"]}
+
+
+def activate_version(version_id: int, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM profile_versions WHERE id = ?", (version_id,)).fetchone()
+        if not row:
+            raise ValueError(f"version not found: {version_id}")
+        conn.execute("UPDATE profile_versions SET status = 'retired', retired_at = ? WHERE field_name = ? AND status = 'active'", (now, row["field_name"]))
+        conn.execute("UPDATE profile_versions SET status = 'active', activated_at = ? WHERE id = ?", (now, version_id))
+        conn.commit()
+    receipt = write_receipt("profile_version_activated", "profile_version", str(version_id), {"activated_at": now, "field_name": row["field_name"], "label": row["label"]}, db_path=db_path)
+    return {"version_id": version_id, "status": "active", "activated_at": now, "receipt_hash": receipt["payload_hash"]}
+
+
+def list_versions(field_name: str | None = None, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        if field_name:
+            rows = conn.execute("SELECT * FROM profile_versions WHERE field_name = ? ORDER BY created_at DESC", (field_name,)).fetchall()
         else:
-            out[k] = v
+            rows = conn.execute("SELECT * FROM profile_versions ORDER BY created_at DESC").fetchall()
+    return rows_to_dicts(rows)
+
+```
+
+policy.py:
+```
+"""Policy gate for provider growth operations.
+
+The policy gate decides whether an approved draft may be exported for manual
+handoff. It never sends messages. It only returns allow/block decisions with
+reasons and receipts.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db
+from .receipts import write_receipt
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    allowed: bool
+    decision: str
+    reason: str
+    next_action_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "allowed": self.allowed,
+            "decision": self.decision,
+            "reason": self.reason,
+            "next_action_at": self.next_action_at,
+        }
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def get_policy(db_path: str = DEFAULT_DB_PATH) -> dict[str, str]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT key, value FROM policy_rules").fetchall()
+    return {row["key"]: row["value"] for row in rows}
+
+
+def set_policy(key: str, value: str, description: str = "", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO policy_rules(key, value, description, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, description=excluded.description, updated_at=CURRENT_TIMESTAMP
+            """,
+            (key, value, description),
+        )
+        conn.commit()
+    receipt = write_receipt("policy_updated", "policy", key, {"key": key, "value": value, "description": description}, db_path=db_path)
+    return {"key": key, "value": value, "receipt_hash": receipt["payload_hash"]}
+
+
+def evaluate_draft(draft_id: int, db_path: str = DEFAULT_DB_PATH) -> PolicyDecision:
+    """Return whether a draft is allowed to enter the manual handoff outbox."""
+    init_db(db_path)
+    policy = get_policy(db_path)
+    with connect(db_path) as conn:
+        draft = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        if not draft:
+            return PolicyDecision(False, "blocked", "draft_not_found")
+        record = conn.execute("SELECT * FROM visitors WHERE visitor_key = ?", (draft["visitor_key"],)).fetchone()
+        if not record:
+            return PolicyDecision(False, "blocked", "record_not_found")
+        conversation = conn.execute(
+            "SELECT * FROM client_conversations WHERE visitor_key = ? ORDER BY updated_at DESC LIMIT 1",
+            (draft["visitor_key"],),
+        ).fetchone()
+
+    if bool(record["do_not_contact"]):
+        return PolicyDecision(False, "blocked", "record_marked_do_not_contact")
+    if conversation and bool(conversation["do_not_contact"]):
+        return PolicyDecision(False, "blocked", "conversation_marked_do_not_contact")
+    if policy.get("manual_approval_required", "true").lower() == "true" and draft["status"] != "approved":
+        return PolicyDecision(False, "needs_approval", "draft_requires_human_approval")
+    if draft["status"] in {"exported", "sent", "skipped"}:
+        return PolicyDecision(False, "blocked", f"draft_already_{draft['status']}")
+
+    # This is intentionally conservative: quiet hours only affect handoff timing,
+    # not content generation. Real timezone scheduling belongs in a later adapter.
+    now_hour = datetime.now().hour
+    start = int(policy.get("quiet_hours_start", "21"))
+    end = int(policy.get("quiet_hours_end", "8"))
+    if start > end and (now_hour >= start or now_hour < end):
+        return PolicyDecision(False, "defer", "quiet_hours_active")
+
+    return PolicyDecision(True, "allowed", "approved_for_manual_handoff")
+
+
+def evaluate_and_receipt(draft_id: int, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    decision = evaluate_draft(draft_id, db_path=db_path)
+    receipt = write_receipt("policy_decision", "draft", str(draft_id), decision.to_dict(), db_path=db_path)
+    out = decision.to_dict()
+    out["receipt_hash"] = receipt["payload_hash"]
     return out
 
+```
 
-def redact_body(text: str) -> str:
-    for pattern, replacement in REDACT_BODY_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
+imac_relay.py:
+```
+"""iMac manual relay helpers.
 
+This module prepares reviewable local handoffs for the operator. It does not
+transmit messages. Use it to copy approved drafts into the Mac workflow after
+human review.
+"""
 
-def body_keys(text: str) -> list[str]:
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            return list(data.keys())
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            return list(data[0].keys())
-    except Exception:
-        pass
-    return []
+from __future__ import annotations
 
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-def sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
-
-
-# ── Block detection ──────────────────────────────────────────────────
-
-BLOCK_NEEDLES = [
-    ("captcha", "captcha_detected"),
-    ("crowdsec", "crowdsec_detected"),
-    ("access forbidden", "access_forbidden"),
-    ("verify you are human", "human_verification"),
-    ("unusual traffic", "traffic_challenge"),
-    ("too many requests", "rate_limited"),
-    ("two-factor", "two_factor_required"),
-    ("2fa", "two_factor_required"),
-    ("suspicious login", "suspicious_login"),
-    ("password reset", "password_reset_prompt"),
-]
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
 
 
-def detect_block(page: Page) -> Optional[str]:
-    try:
-        txt = page.inner_text("body")[:3000].lower()
-    except Exception:
-        txt = ""
-    url = (page.url or "").lower()
-    for needle, reason in BLOCK_NEEDLES:
-        if needle in txt or needle in url:
-            return reason
-    return None
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-# ── XPath discovery ──────────────────────────────────────────────────
+def handle_hash(handle: str) -> str:
+    return hashlib.sha256(handle.strip().lower().encode("utf-8")).hexdigest()
 
-def discover_xpaths(page: Page) -> dict:
-    findings = {
-        "inputs": [],
-        "textareas": [],
-        "buttons": [],
-        "selects": [],
-        "contenteditable": [],
-        "links_profile": [],
+
+def open_conversation_record(record_key: str, client_handle: str | None = None, channel: str = "imessage", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    h = handle_hash(client_handle) if client_handle else None
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO client_conversations(visitor_key, channel, client_handle_hash, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (record_key, channel, h),
+        )
+        conversation_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("conversation_opened", "conversation", str(conversation_id), {"record_key": record_key, "channel": channel, "has_handle": bool(client_handle), "opened_at": now}, db_path=db_path)
+    return {"conversation_id": conversation_id, "record_key": record_key, "channel": channel, "receipt_hash": receipt["payload_hash"]}
+
+
+def log_conversation_event(conversation_id: int, direction: str, body: str, event_at: str | None = None, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    if direction not in {"inbound", "outbound", "note"}:
+        raise ValueError("direction must be inbound, outbound, or note")
+    init_db(db_path)
+    now = event_at or utc_now()
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    preview = body[:120]
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversation_events(conversation_id, direction, body_hash, body_preview, event_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (conversation_id, direction, body_hash, preview, now),
+        )
+        if direction == "inbound":
+            conn.execute("UPDATE client_conversations SET last_inbound_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (now, conversation_id))
+        elif direction == "outbound":
+            conn.execute("UPDATE client_conversations SET last_outbound_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (now, conversation_id))
+        conn.commit()
+    receipt = write_receipt("conversation_event", "conversation", str(conversation_id), {"direction": direction, "body_hash": body_hash, "event_at": now}, db_path=db_path)
+    return {"conversation_id": conversation_id, "direction": direction, "body_hash": body_hash, "receipt_hash": receipt["payload_hash"]}
+
+
+def export_manual_handoff(draft_id: int, output_dir: str = "data/imac_handoffs", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    """Export an approved draft as a local text file for manual Mac review."""
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+    if not row:
+        raise ValueError(f"draft not found: {draft_id}")
+    if row["status"] != "approved":
+        raise ValueError("draft must be approved before handoff export")
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"draft_{draft_id}.txt"
+    path.write_text(row["body"], encoding="utf-8")
+    receipt = write_receipt("manual_handoff_exported", "draft", str(draft_id), {"path": str(path), "channel": row["channel"]}, db_path=db_path)
+    return {"draft_id": draft_id, "path": str(path), "receipt_hash": receipt["payload_hash"]}
+
+
+def list_conversations(status: str = "active", db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM client_conversations WHERE status = ? ORDER BY updated_at DESC", (status,)).fetchall()
+    return rows_to_dicts(rows)
+
+```
+
+engagement.py:
+```
+"""Manual engagement records for authorized account operations.
+
+All records are operator-entered or imported from sources the operator is
+authorized to use. This module does not collect hidden data or perform outbound
+actions.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def record_key(identifier: str) -> str:
+    return hashlib.sha256(identifier.strip().lower().encode("utf-8")).hexdigest()[:24]
+
+
+def score_record(repeat_count: int = 1, recent: bool = True, cooldown: bool = False, blocked: bool = False) -> int:
+    score = 0
+    if repeat_count >= 2:
+        score += 3
+    if repeat_count >= 3:
+        score += 2
+    if recent:
+        score += 2
+    if cooldown:
+        score -= 5
+    if blocked:
+        score -= 100
+    return score
+
+
+def upsert_record(identifier: str, display_name: str | None = None, source: str = "manual", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    key = record_key(identifier)
+    with connect(db_path) as conn:
+        existing = conn.execute("SELECT * FROM visitors WHERE visitor_key = ?", (key,)).fetchone()
+        if existing:
+            count = int(existing["visit_count"]) + 1
+            score = score_record(count, recent=True, blocked=bool(existing["do_not_contact"]))
+            conn.execute(
+                "UPDATE visitors SET display_name = COALESCE(?, display_name), last_seen = ?, visit_count = ?, lead_score = ?, updated_at = CURRENT_TIMESTAMP WHERE visitor_key = ?",
+                (display_name, now, count, score, key),
+            )
+        else:
+            count = 1
+            score = score_record(count, recent=True)
+            conn.execute(
+                "INSERT INTO visitors(visitor_key, display_name, profile_url, first_seen, last_seen, visit_count, lead_score) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (key, display_name, identifier, now, now, count, score),
+            )
+        conn.execute(
+            "INSERT INTO visitor_events(visitor_key, event_type, source, event_at, metadata_json) VALUES (?, ?, ?, ?, '{}')",
+            (key, "manual_record", source, now),
+        )
+        conn.commit()
+    receipt = write_receipt("engagement_record", "record", key, {"source": source, "at": now}, db_path=db_path)
+    return {"record_key": key, "repeat_count": count, "score": score, "receipt_hash": receipt["payload_hash"]}
+
+
+def list_priority_records(min_score: int = 3, limit: int = 25, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT visitor_key AS record_key, display_name, last_seen, visit_count AS repeat_count, lead_score AS score, status FROM visitors WHERE lead_score >= ? AND do_not_contact = 0 ORDER BY lead_score DESC, last_seen DESC LIMIT ?",
+            (min_score, limit),
+        ).fetchall()
+    return rows_to_dicts(rows)
+
+```
+
+outbox.py:
+```
+"""Manual outbox state machine.
+
+The outbox is a queue of approved drafts ready for human review and local
+handoff. It does not send messages.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .policy import evaluate_draft
+from .receipts import write_receipt
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def enqueue_draft(draft_id: int, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    decision = evaluate_draft(draft_id, db_path=db_path)
+    with connect(db_path) as conn:
+        draft = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (draft_id,)).fetchone()
+        if not draft:
+            raise ValueError(f"draft not found: {draft_id}")
+        cur = conn.execute(
+            """
+            INSERT INTO outbox_items(draft_id, visitor_key, channel, state, policy_decision, policy_reason, next_action_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                draft_id,
+                draft["visitor_key"],
+                draft["channel"],
+                "ready" if decision.allowed else "blocked",
+                decision.decision,
+                decision.reason,
+                decision.next_action_at,
+            ),
+        )
+        outbox_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("outbox_enqueued", "outbox", str(outbox_id), {"draft_id": draft_id, "decision": decision.to_dict()}, db_path=db_path)
+    return {"outbox_id": outbox_id, "state": "ready" if decision.allowed else "blocked", "policy": decision.to_dict(), "receipt_hash": receipt["payload_hash"]}
+
+
+def export_ready_item(outbox_id: int, output_dir: str = "data/manual_outbox", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        item = conn.execute("SELECT * FROM outbox_items WHERE id = ?", (outbox_id,)).fetchone()
+        if not item:
+            raise ValueError(f"outbox item not found: {outbox_id}")
+        if item["state"] != "ready":
+            raise ValueError(f"outbox item must be ready, got {item['state']}")
+        draft = conn.execute("SELECT * FROM message_drafts WHERE id = ?", (item["draft_id"],)).fetchone()
+        if not draft:
+            raise ValueError("linked draft not found")
+
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"outbox_{outbox_id}_draft_{item['draft_id']}.txt"
+        path.write_text(draft["body"], encoding="utf-8")
+        conn.execute(
+            "UPDATE outbox_items SET state = 'exported', exported_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (str(path), outbox_id),
+        )
+        conn.execute(
+            "UPDATE message_drafts SET status = 'exported' WHERE id = ?",
+            (item["draft_id"],),
+        )
+        conn.commit()
+    receipt = write_receipt("outbox_exported", "outbox", str(outbox_id), {"path": str(path)}, db_path=db_path)
+    return {"outbox_id": outbox_id, "path": str(path), "receipt_hash": receipt["payload_hash"]}
+
+
+def mark_completed(outbox_id: int, outcome: str = "manual_completed", db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    if outcome not in {"manual_completed", "skipped", "failed"}:
+        raise ValueError("outcome must be manual_completed, skipped, or failed")
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute("UPDATE outbox_items SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (outcome, outbox_id))
+        conn.commit()
+    receipt = write_receipt("outbox_completed", "outbox", str(outbox_id), {"outcome": outcome, "at": utc_now()}, db_path=db_path)
+    return {"outbox_id": outbox_id, "state": outcome, "receipt_hash": receipt["payload_hash"]}
+
+
+def list_outbox(state: str | None = None, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        if state:
+            rows = conn.execute("SELECT * FROM outbox_items WHERE state = ? ORDER BY created_at DESC", (state,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM outbox_items ORDER BY created_at DESC").fetchall()
+    return rows_to_dicts(rows)
+
+```
+
+kpi.py:
+```
+"""Revenue liquidity and funnel KPIs."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from .db import DEFAULT_DB_PATH, connect, init_db, rows_to_dicts
+from .receipts import write_receipt
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def add_revenue_event(
+    event_type: str,
+    amount_cents: int = 0,
+    visitor_key: str | None = None,
+    currency: str = "USD",
+    source: str = "manual",
+    notes: str = "",
+    db_path: str = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    if event_type not in {"inquiry", "quote", "booking_request", "confirmed_booking", "completed_booking", "cancelled"}:
+        raise ValueError("unsupported revenue event type")
+    init_db(db_path)
+    now = utc_now()
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO revenue_events(visitor_key, event_type, amount_cents, currency, event_at, source, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (visitor_key, event_type, amount_cents, currency, now, source, notes),
+        )
+        event_id = int(cur.lastrowid)
+        conn.commit()
+    receipt = write_receipt("revenue_event", "revenue_event", str(event_id), {"event_type": event_type, "amount_cents": amount_cents, "currency": currency, "at": now}, db_path=db_path)
+    return {"event_id": event_id, "event_type": event_type, "amount_cents": amount_cents, "receipt_hash": receipt["payload_hash"]}
+
+
+def revenue_summary(db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        events = rows_to_dicts(conn.execute("SELECT * FROM revenue_events ORDER BY event_at DESC").fetchall())
+        outbox = rows_to_dicts(conn.execute("SELECT state, COUNT(*) AS count FROM outbox_items GROUP BY state").fetchall())
+        drafts = rows_to_dicts(conn.execute("SELECT status, COUNT(*) AS count FROM message_drafts GROUP BY status").fetchall())
+        snapshots = rows_to_dicts(conn.execute("SELECT SUM(profile_views) AS views, SUM(contact_actions) AS contacts, SUM(inbound_messages) AS inbound, SUM(booking_requests) AS bookings FROM metrics_snapshots").fetchall())
+
+    totals: dict[str, int] = {}
+    amount_confirmed = 0
+    amount_completed = 0
+    for ev in events:
+        totals[ev["event_type"]] = totals.get(ev["event_type"], 0) + 1
+        if ev["event_type"] == "confirmed_booking":
+            amount_confirmed += int(ev["amount_cents"])
+        if ev["event_type"] == "completed_booking":
+            amount_completed += int(ev["amount_cents"])
+
+    snap = snapshots[0] if snapshots else {"views": 0, "contacts": 0, "inbound": 0, "bookings": 0}
+    views = snap.get("views") or 0
+    bookings = snap.get("bookings") or 0
+    contacts = snap.get("contacts") or 0
+
+    return {
+        "events_by_type": totals,
+        "confirmed_pipeline_usd": round(amount_confirmed / 100, 2),
+        "completed_revenue_usd": round(amount_completed / 100, 2),
+        "outbox_by_state": {row["state"]: row["count"] for row in outbox},
+        "drafts_by_status": {row["status"]: row["count"] for row in drafts},
+        "views": views,
+        "contacts": contacts,
+        "booking_requests": bookings,
+        "contact_rate": round(contacts / views, 4) if views else 0.0,
+        "booking_request_rate": round(bookings / views, 4) if views else 0.0,
     }
 
-    for el in page.query_selector_all("input"):
-        try:
-            if not el.is_visible():
-                continue
-            itype = el.get_attribute("type") or ""
-            iname = el.get_attribute("name") or ""
-            iid = el.get_attribute("id") or ""
-            iph = el.get_attribute("placeholder") or ""
-            iaria = el.get_attribute("aria-label") or ""
-            parts = []
-            if iid: parts.append(f"@id='{iid}'")
-            if iname: parts.append(f"@name='{iname}'")
-            if itype: parts.append(f"@type='{itype}'")
-            xpath = f"//input[{ ' and '.join(parts) }]" if parts else "//input"
-            findings["inputs"].append({
-                "xpath": xpath, "type": itype, "name": iname,
-                "id": iid, "placeholder": iph, "aria_label": iaria,
-            })
-        except Exception:
-            continue
+```
 
-    for el in page.query_selector_all("textarea"):
-        try:
-            if not el.is_visible():
-                continue
-            iname = el.get_attribute("name") or ""
-            iid = el.get_attribute("id") or ""
-            iph = el.get_attribute("placeholder") or ""
-            iaria = el.get_attribute("aria-label") or ""
-            xpath = f"//textarea[@name='{iname}']" if iname else "//textarea"
-            findings["textareas"].append({
-                "xpath": xpath, "name": iname, "id": iid,
-                "placeholder": iph, "aria_label": iaria,
-            })
-        except Exception:
-            continue
+receipts.py:
+```
+"""Audit receipts for owner-operated growth workflows."""
 
-    for el in page.query_selector_all("button"):
-        try:
-            if not el.is_visible():
-                continue
-            text = (el.inner_text() or "").strip()[:80]
-            btype = el.get_attribute("type") or ""
-            bclass = el.get_attribute("class") or ""
-            baria = el.get_attribute("aria-label") or ""
-            # Skip cookie consent buttons
-            if "ACCEPT ALL" in text:
-                continue
-            xpath = f"//button[contains(text(),'{text}')]" if text else "//button"
-            findings["buttons"].append({
-                "xpath": xpath, "text": text, "type": btype,
-                "class": bclass[:100], "aria_label": baria,
-            })
-        except Exception:
-            continue
-
-    for el in page.query_selector_all("select"):
-        try:
-            if not el.is_visible():
-                continue
-            iname = el.get_attribute("name") or ""
-            iid = el.get_attribute("id") or ""
-            xpath = f"//select[@name='{iname}']" if iname else "//select"
-            findings["selects"].append({"xpath": xpath, "name": iname, "id": iid})
-        except Exception:
-            continue
-
-    for el in page.query_selector_all("[contenteditable='true']"):
-        try:
-            if not el.is_visible():
-                continue
-            cclass = el.get_attribute("class") or ""
-            crole = el.get_attribute("role") or ""
-            findings["contenteditable"].append({
-                "xpath": "//*[@contenteditable='true']",
-                "class": cclass[:100], "role": crole,
-            })
-        except Exception:
-            continue
-
-    for el in page.query_selector_all("a[href]"):
-        try:
-            href = el.get_attribute("href") or ""
-            if href.startswith("/") and not any(x in href for x in [
-                "login", "settings", "search", "blog", "reviews", "interviews",
-                "available", "find-massage", "live-cams", "sitemap", "advertise",
-                "mailbox", "static", "_next", "images", "api", "blogs", "404",
-            ]):
-                parts = href.strip("/").split("/")
-                if parts and parts[0] and len(parts) == 1:
-                    findings["links_profile"].append({
-                        "href": href,
-                        "text": (el.inner_text() or "").strip()[:60],
-                    })
-        except Exception:
-            continue
-
-    return findings
-
-
-# ── API interceptor with redaction ───────────────────────────────────
-
-class APIInterceptor:
-    def __init__(self, redact: bool = True):
-        self.calls: list[dict] = []
-        self.redact = redact
-
-    def on_request(self, request):
-        url = request.url
-        if "rentmasseur.com/api" not in url and "/api/" not in url:
-            return
-        entry = {
-            "method": request.method,
-            "url": url,
-            "url_path": url.replace(BASE_URL, ""),
-            "request_headers_redacted": self.redact,
-            "post_data": None,
-        }
-        if self.redact:
-            entry["request_headers"] = redact_headers(dict(request.headers))
-            pd = request.post_data
-            if pd:
-                entry["post_data"] = redact_body(pd)
-        else:
-            entry["request_headers"] = dict(request.headers)
-            entry["post_data"] = request.post_data
-        self.calls.append(entry)
-
-    def on_response(self, response):
-        url = response.url
-        if "rentmasseur.com/api" not in url and "/api/" not in url:
-            return
-        for call in reversed(self.calls):
-            if call["url"] == url and "status" not in call:
-                call["status"] = response.status
-                call["status_text"] = response.status_text
-                try:
-                    body = response.text()
-                    call["response_body_hash"] = f"sha256:{sha256(body)}"
-                    call["response_body_len"] = len(body)
-                    if self.redact:
-                        redacted = redact_body(body[:2000])
-                        call["response_preview"] = redacted
-                        call["response_keys"] = body_keys(body)
-                    else:
-                        call["response_preview"] = body[:2000]
-                        call["response_keys"] = body_keys(body)
-                except Exception:
-                    call["response_body_hash"] = None
-                    call["response_preview"] = None
-                break
-
-    def save(self, page_name: str) -> Path:
-        safe = re.sub(r'[^A-Za-z0-9_-]', '_', page_name)[:60]
-        path = API_DIR / f"{safe}_api.json"
-        path.write_text(json.dumps(self.calls, indent=2, default=str), encoding="utf-8")
-        return path
-
-
-# ── Login ────────────────────────────────────────────────────────────
-
-def attempt_login(page: Page, context: BrowserContext, username: str, password: str) -> tuple[bool, Optional[str]]:
-    """Attempt login. Returns (success, block_reason)."""
-    try:
-        page.goto(f"{BASE_URL}/login", wait_until="networkidle", timeout=30000)
-        time.sleep(2)
-
-        block = detect_block(page)
-        if block:
-            return False, block
-
-        email_el = page.query_selector("input#email") or page.query_selector("input[name='email']")
-        pass_el = page.query_selector("input#password") or page.query_selector("input[type='password']")
-
-        if not email_el or not pass_el:
-            return False, "login_form_not_found"
-
-        email_el.fill(username)
-        pass_el.fill(password)
-        time.sleep(0.5)
-
-        # Click LOGIN button
-        login_btn = page.query_selector("button:has-text('LOGIN')")
-        if not login_btn:
-            login_btn = page.query_selector("button[type='submit']")
-        if login_btn and login_btn.is_visible():
-            login_btn.click()
-        else:
-            pass_el.press("Enter")
-
-        page.wait_for_load_state("networkidle", timeout=15000)
-        time.sleep(3)
-
-        # Check for blocks post-login
-        block = detect_block(page)
-        if block:
-            return False, block
-
-        if "/login" in page.url:
-            return False, "login_failed_still_on_login_page"
-
-        # Save storage state locally (never uploaded as artifact)
-        context.storage_state(path=str(STORAGE_STATE))
-        return True, None
-
-    except Exception as e:
-        return False, f"login_error: {e}"
-
-
-# ── Function registry generator ──────────────────────────────────────
-
-def generate_function_registry(probe_results: list[dict]) -> dict:
-    """Generate function_registry.generated.yml from probe results."""
-    functions = {}
-
-    for r in probe_results:
-        name = r["page"]
-        status = r.get("status", "unknown")
-        xpaths = r.get("xpaths", {})
-        api_calls = r.get("api_calls", [])
-
-        if r.get("needs_login"):
-            mode = "authenticated"
-            allowed_in_ci = "manual_only"
-        else:
-            mode = "public"
-            allowed_in_ci = True
-
-        ftype = "read"
-        requires_approval = False
-
-        # Detect if page has form fields that could be mutated
-        has_form = bool(xpaths.get("textareas") or xpaths.get("contenteditable"))
-        has_submit = any("save" in b.get("text", "").lower() or "submit" in b.get("text", "").lower()
-                        for b in xpaths.get("buttons", []))
-
-        if has_form and has_submit and r.get("needs_login"):
-            ftype = "read"  # still read — we're detecting, not submitting
-            # Add a corresponding _save_live mutation function
-            mutation_name = name.replace("_detect", "_save_live").replace("_read", "_save_live")
-            if mutation_name != name:
-                functions[mutation_name] = {
-                    "mode": "authenticated",
-                    "type": "mutation",
-                    "allowed_in_ci": False,
-                    "requires_manual_approval": True,
-                    "discovered_on": name,
-                }
-
-        # Detect mailbox compose
-        if "compose" in name:
-            functions["mailbox_send"] = {
-                "mode": "authenticated",
-                "type": "mutation",
-                "allowed_in_ci": False,
-                "disabled": True,
-            }
-
-        functions[name] = {
-            "mode": mode,
-            "type": ftype,
-            "allowed_in_ci": allowed_in_ci,
-            "url": r.get("final_url", r["url"]),
-            "selectors_found": {
-                "inputs": len(xpaths.get("inputs", [])),
-                "textareas": len(xpaths.get("textareas", [])),
-                "buttons": len(xpaths.get("buttons", [])),
-                "selects": len(xpaths.get("selects", [])),
-                "contenteditable": len(xpaths.get("contenteditable", [])),
-            },
-            "api_endpoints": len(api_calls),
-            "screenshot": bool(r.get("screenshot")),
-            "status": status,
-        }
-
-    # Always include blocked functions
-    functions["captcha_bypass"] = {"mode": "blocked", "type": "blocked", "allowed_in_ci": False, "disabled": True}
-    functions["anti_bot_bypass"] = {"mode": "blocked", "type": "blocked", "allowed_in_ci": False, "disabled": True}
-    functions["mass_message"] = {"mode": "blocked", "type": "blocked", "allowed_in_ci": False, "disabled": True}
-    functions["fake_availability_loop"] = {"mode": "blocked", "type": "blocked", "allowed_in_ci": False, "disabled": True}
-
-    return {"functions": functions}
-
-
-def write_yaml(data: dict, path: Path):
-    """Write dict as YAML (simple serializer, no external dep needed)."""
-    lines = []
-    lines.append("# Auto-generated from Playwright probe — do not edit manually.")
-    lines.append(f"# Generated: {now_iso()}")
-    lines.append("")
-    lines.append("functions:")
-    for name, cfg in data.get("functions", {}).items():
-        lines.append(f"  {name}:")
-        for k, v in cfg.items():
-            if isinstance(v, bool):
-                lines.append(f"    {k}: {str(v).lower()}")
-            elif isinstance(v, (int, float)):
-                lines.append(f"    {k}: {v}")
-            elif isinstance(v, str):
-                lines.append(f'    {k}: "{v}"')
-            elif isinstance(v, dict):
-                lines.append(f"    {k}:")
-                for kk, vv in v.items():
-                    if isinstance(vv, bool):
-                        lines.append(f"      {kk}: {str(vv).lower()}")
-                    else:
-                        lines.append(f"      {kk}: {vv}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-# ── Utility ──────────────────────────────────────────────────────────
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def safe_name(s: str) -> str:
-    return re.sub(r'[^A-Za-z0-9_-]', '_', s)[:60]
-
-
-# ── Probe page ───────────────────────────────────────────────────────
-
-def probe_page(page: Page, page_name: str, page_cfg: dict, logged_in: bool,
-               interceptor: APIInterceptor) -> dict:
-    print(f"\n── Probing: {page_name} ──")
-    print(f"  URL: {page_cfg['url']}")
-
-    result = {
-        "page": page_name,
-        "url": page_cfg["url"],
-        "timestamp": now_iso(),
-        "needs_login": page_cfg["needs_login"],
-        "logged_in": logged_in,
-    }
-
-    interceptor.calls = []
-
-    try:
-        page.goto(page_cfg["url"], wait_until="networkidle", timeout=30000)
-        time.sleep(3)
-
-        # Dismiss cookie consent if present
-        try:
-            accept_btn = page.query_selector("button:has-text('ACCEPT ALL')")
-            if accept_btn and accept_btn.is_visible():
-                accept_btn.click()
-                time.sleep(1)
+from __future__ import annotations

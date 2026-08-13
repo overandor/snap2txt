@@ -1,800 +1,800 @@
-BIO_URL = "https://rentmasseur.com/profile/edit"
+    import argparse
+    parser = argparse.ArgumentParser(description="RM Proof Verification System")
+    parser.add_argument("--verify", help="Verify a single proof receipt")
+    parser.add_argument("--verify-chain", action="store_true", help="Verify entire hash chain")
+    parser.add_argument("--verify-all", action="store_true", help="Verify all proof receipts")
+    parser.add_argument("--stats", action="store_true", help="Show chain statistics")
+    args = parser.parse_args()
 
-BIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "bios", "controlled_wolf_v1.md")
+    if args.verify:
+        result = verify_screenshot_belongs_to_moment(args.verify)
+        print(json.dumps(result, indent=2))
+        print(f"\nZK VALID: {result['zk_valid']}")
+    elif args.verify_chain:
+        result = verify_chain()
+        print(json.dumps(result, indent=2))
+        print(f"\nCHAIN VALID: {result['valid']}")
+    elif args.verify_all:
+        proofs = sorted(RECEIPT_DIR.glob("proof_*.json"))
+        print(f"Found {len(proofs)} proof receipts\n")
+        for p in proofs:
+            result = verify_screenshot_belongs_to_moment(str(p))
+            status = "✅" if result["zk_valid"] else "❌"
+            print(f"{status} {p.name} | {result['timestamp'][:19]} | {result['url'][:50]}")
+        print(f"\nChain: {json.dumps(verify_chain(), indent=2)}")
+    elif args.stats:
+        result = verify_chain()
+        print(f"Chain entries: {result['entries']}")
+        print(f"Chain valid: {result['valid']}")
+        print(f"First: {result.get('first_timestamp','?')}")
+        print(f"Last: {result.get('last_timestamp','?')}")
+        if result.get("chain_breaks"):
+            print(f"Breaks: {len(result['chain_breaks'])}")
+        if result.get("file_check_failures"):
+            print(f"File failures: {len(result['file_check_failures'])}")
+    else:
+        parser.print_help()
 
-print(f"Username: {USERNAME}")
-print(f"Bio file: {BIO_FILE}")
+```
 
-with open(BIO_FILE, "r") as f:
-    BIO_TEXT = f.read().strip()
-print(f"Bio length: {len(BIO_TEXT)} chars")
+rentmasseur_core.py:
+```
+"""
+RentMasseur Core — shared login, driver, availability, and bio update utilities.
+Used by all 30 strategy scripts and the coordinator.
+"""
 
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,900")
+import os
+import re
+import sys
+import time
+import json
+import logging
+import hashlib
+import requests
+from datetime import datetime
+from typing import Optional
 
-driver = uc.Chrome(options=options, version_main=149)
+from dotenv import load_dotenv
 try:
-    print("\n[1] Navigating to login...")
-    driver.set_page_load_timeout(90)
-    driver.get(LOGIN_URL)
-    time.sleep(8)
-    
-    print(f"  Title: {driver.title}")
-    print(f"  URL: {driver.current_url}")
-    
-    # Check if CAPTCHA is present
-    captcha = driver.execute_script("""
-        return !!document.querySelector('.g-recaptcha, #captcha, iframe[src*="recaptcha"], iframe[src*="captcha"]');
-    """)
-    print(f"  CAPTCHA present: {captcha}")
-    
-    if captcha:
-        print("\n[2] CAPTCHA detected. Waiting up to 120s for it to be solved...")
-        for i in range(24):
-            time.sleep(5)
-            captcha_still = driver.execute_script("""
-                const iframe = document.querySelector('iframe[src*="recaptcha"]');
-                if (!iframe) return false;
-                // Check if recaptcha response is filled
-                try {
-                    return !grecaptcha.getResponse();
-                } catch(e) {
-                    return true;
-                }
-            """)
-            if not captcha_still:
-                print("  CAPTCHA solved!")
-                break
-            print(f"  Waiting for CAPTCHA solve... ({(i+1)*5}s)")
-        else:
-            print("  CAPTCHA not solved in time. Trying to proceed anyway...")
-    
-    # Wait for login form to appear
-    print("\n[3] Looking for login form...")
-    for attempt in range(10):
-        time.sleep(3)
-        inputs = driver.execute_script("""
-            return Array.from(document.querySelectorAll('input')).map(i => ({
-                type: i.type, name: i.name, id: i.id, placeholder: i.placeholder,
-                visible: i.offsetParent !== null
-            }));
-        """)
-        print(f"  Attempt {attempt+1}: {len(inputs)} inputs found")
-        for inp in inputs:
-            print(f"    type={inp['type']} name={inp['name']} id={inp['id']} placeholder={inp['placeholder']} visible={inp['visible']}")
-        
-        pwd = driver.execute_script("""
-            return document.querySelector('input[type="password"]') ||
-                   document.querySelector('input[name*="pass" i]') ||
-                   document.querySelector('input[placeholder*="pass" i]');
-        """)
-        if pwd:
-            print("  Password field found!")
-            break
+    import undetected_chromedriver as uc
+    HAS_UC = True
+except ImportError:
+    HAS_UC = False
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import NoSuchElementException
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+RENTMASSEUR_PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+LOGIN_URL = "https://rentmasseur.com/login"
+AVAILABILITY_URL = "https://rentmasseur.com/settings?availability=1"
+PROFILE_URL = "https://rentmasseur.com/settings?profile=1"
+IMPLICIT_WAIT = 10
+PAGE_TIMEOUT = 30
+
+BIO_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bio_history.json")
+BIOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bios")
+os.makedirs(BIOS_DIR, exist_ok=True)
+
+
+def setup_driver(headless: bool = True) -> webdriver.Chrome:
+    if HAS_UC:
+        opts = uc.ChromeOptions()
+        if headless:
+            opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        try:
+            import subprocess
+            chrome_ver_out = subprocess.check_output(["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--version"], stderr=subprocess.DEVNULL).decode().strip()
+            chrome_major = int(re.search(r'(\d+)\.', chrome_ver_out).group(1))
+            driver = uc.Chrome(options=opts, version_main=chrome_major)
+        except Exception:
+            driver = uc.Chrome(options=opts)
+        driver.implicitly_wait(IMPLICIT_WAIT)
+        driver.set_page_load_timeout(PAGE_TIMEOUT)
+        return driver
     else:
-        print("  No login form found after waiting. Dumping page...")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/login_after_captcha.png")
-        with open("/Users/alep/Downloads/rentmasseur-optimizer/login_after.html", "w") as f:
+        opts = Options()
+        if headless:
+            opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument(
+            "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        )
+        driver = webdriver.Chrome(options=opts)
+        driver.implicitly_wait(IMPLICIT_WAIT)
+        driver.set_page_load_timeout(PAGE_TIMEOUT)
+        return driver
+
+
+def _dump_debug(driver: webdriver.Chrome, label: str) -> None:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+    os.makedirs(debug_dir, exist_ok=True)
+    prefix = os.path.join(debug_dir, f"debug_{label}_{ts}")
+    try:
+        driver.save_screenshot(f"{prefix}.png")
+    except Exception:
+        pass
+    try:
+        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
             f.write(driver.page_source)
-        sys.exit(1)
-    
-    # Fill login form
-    print("\n[4] Filling login form...")
-    driver.execute_script(f"""
-        const pwd = document.querySelector('input[type="password"]') ||
-                    document.querySelector('input[name*="pass" i]');
-        const user = document.querySelector('input[type="text"]') ||
-                     document.querySelector('input[type="email"]') ||
-                     document.querySelector('input[name*="user" i]') ||
-                     document.querySelector('input[name*="email" i]');
-        if (user) {{ user.value = '{USERNAME}'; user.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-        if (pwd) {{ pwd.value = '{PASSWORD}'; pwd.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-    """)
-    time.sleep(2)
-    
-    # Click submit
-    driver.execute_script("""
-        const btn = document.querySelector('button[type="submit"]') ||
-                    document.querySelector('input[type="submit"]') ||
-                    Array.from(document.querySelectorAll('button')).find(b => /login|sign.in|submit/i.test(b.innerText));
-        if (btn) btn.click();
-    """)
-    time.sleep(8)
-    
-    print(f"  After login URL: {driver.current_url}")
-    if "login" in driver.current_url.lower():
-        print("  Login may have failed. Screenshot saved.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/login_failed.png")
-        sys.exit(1)
-    
-    print("  Login successful!")
-    
-    # Navigate to profile edit
-    print("\n[5] Navigating to profile edit...")
-    driver.get(BIO_URL)
-    time.sleep(5)
-    
-    # Find bio textarea
-    print("  Looking for bio textarea...")
-    bio_field = driver.execute_script("""
-        const textareas = Array.from(document.querySelectorAll('textarea'));
-        let best = null, bestScore = 0;
-        for (const ta of textareas) {
-            const score = (ta.value || '').length;
-            if (score > bestScore) { bestScore = score; best = ta; }
-        }
-        if (!best && textareas.length > 0) best = textareas[0];
-        if (best) {
-            best.value = arguments[0];
-            best.dispatchEvent(new Event('input', {bubbles: true}));
-            best.dispatchEvent(new Event('change', {bubbles: true}));
-            return true;
-        }
-        return false;
-    """, BIO_TEXT)
-    
-    if bio_field:
-        print("  Bio field updated!")
-        time.sleep(2)
-        
-        # Click save
-        saved = driver.execute_script("""
-            const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-            const saveBtn = buttons.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'') + ' ' + (b.value||'')));
-            if (saveBtn) { saveBtn.click(); return true; }
-            return false;
-        """)
-        print(f"  Save clicked: {saved}")
+    except Exception:
+        pass
+
+
+def login(driver: webdriver.Chrome) -> bool:
+    if not RENTMASSEUR_USERNAME or not RENTMASSEUR_PASSWORD:
+        logger.error("Missing credentials")
+        return False
+    try:
+        logger.info("Navigating to login: %s", LOGIN_URL)
+        driver.set_page_load_timeout(90)
+        driver.get(LOGIN_URL)
+        time.sleep(8)
+        for xpath in [
+            "//button[contains(text(),'Accept')]",
+            "//button[contains(text(),'OK')]",
+            "//button[contains(text(),'Got it')]",
+            "//button[contains(text(),'Dismiss')]",
+            "//button[contains(text(),'Agree')]",
+            "//button[contains(text(),'Continue')]",
+        ]:
+            try:
+                el = driver.find_element(By.XPATH, xpath)
+                driver.execute_script("arguments[0].click();", el)
+                time.sleep(1)
+            except NoSuchElementException:
+                pass
+
+        for attempt in range(1, 5):
+            logger.info("Login discovery attempt %d/5", attempt)
+            time.sleep(3)
+            result = driver.execute_script("""
+                let pwd = document.querySelector('input[type=\"password\"]');
+                if (!pwd) {
+                    pwd = document.querySelector('input[name*=\"pass\" i]') ||
+                          document.querySelector('input[id*=\"pass\" i]') ||
+                          document.querySelector('input[placeholder*=\"pass\" i]') ||
+                          document.querySelector('input[class*=\"pass\" i]');
+                    if (pwd) { pwd.type = 'password'; }
+                }
+                if (!pwd) {
+                    const allInputs = Array.from(document.querySelectorAll('input'));
+                    for (const inp of allInputs) {
+                        const ctx = (inp.name||'') + ' ' + (inp.id||'') + ' ' + (inp.placeholder||'') + ' ' + (inp.className||'');
+                        if (/pass/i.test(ctx)) { pwd = inp; break; }
+                    }
+                }
+                if (!pwd) return {error: 'no_password'};
+                const allInputs = Array.from(document.querySelectorAll('input'));
+                const candidates = allInputs.filter(i => i !== pwd && (i.type === 'text' || i.type === 'email'));
+                let user = null, bestDist = Infinity;
+                for (const cand of candidates) {
+                    const pos = pwd.compareDocumentPosition(cand);
+                    if (pos & Node.DOCUMENT_POSITION_PRECEDING) {
+                        let dist = 0, el = cand;
+                        while (el && el !== pwd) { el = el.nextElementSibling || el.parentElement; dist++; if (dist > 100) break; }
+                        if (dist < bestDist) { bestDist = dist; user = cand; }
+                    }
+                }
+                if (!user && candidates.length > 0) user = candidates[0];
+                if (!user) return {error: 'no_username'};
+                let btn = null;
+                const form = pwd.closest('form');
+                if (form) {
+                    btn = form.querySelector('button[type=\"submit\"]') || form.querySelector('input[type=\"submit\"]');
+                    if (!btn) { const fb = Array.from(form.querySelectorAll('button')); btn = fb.find(b => /login|sign.in|submit/i.test(b.innerText)) || fb[0]; }
+                }
+                if (!btn) {
+                    let ancestor = pwd.parentElement;
+                    for (let i = 0; i < 5 && ancestor && !btn; i++) {
+                        const ab = Array.from(ancestor.querySelectorAll('button'));
+                        btn = ab.find(b => /login|sign.in|submit/i.test(b.innerText)) || ab[0];
+                        ancestor = ancestor.parentElement;
+                    }
+                }
+                if (!btn) { const allBtns = Array.from(document.querySelectorAll('button, [role=\"button\"]')); btn = allBtns.find(b => /login|sign.in|submit/i.test(b.innerText)); }
+                if (!btn) return {error: 'no_button'};
+                function attrs(el) { return {tag: el.tagName.toLowerCase(), id: el.id||'', name: el.name||'', type: el.type||'', class: (el.className&&typeof el.className==='string')?el.className.split(' ').filter(Boolean).join(' '):'', placeholder: el.placeholder||''}; }
+                return {user: attrs(user), pwd: attrs(pwd), btn: attrs(btn)};
+            """)
+            if isinstance(result, dict) and 'error' not in result:
+                break
+            logger.warning("Login attempt %d failed: %s", attempt, result.get('error'))
+            if attempt < 5:
+                time.sleep(5)
+            else:
+                logger.error("Login failed after 5 attempts")
+                _dump_debug(driver, f"login_{result.get('error','unknown')}")
+                return False
+
+        def build_selector(info: dict) -> str:
+            if info['id']: return f"#{info['id']}"
+            if info['name']: return f"{info['tag']}[name='{info['name']}']"
+            if info['placeholder']: return f"{info['tag']}[placeholder='{info['placeholder']}']"
+            if info['class']: return f"{info['tag']}.{info['class'].split()[0]}"
+            return info['tag']
+
+        user_sel = build_selector(result['user'])
+        pwd_sel = build_selector(result['pwd'])
+        btn_sel = build_selector(result['btn'])
+        # Use native setter for React/Next.js compatibility
+        driver.execute_script("""
+            const pwd = document.querySelector('input[type="password"]');
+            const user = document.querySelector('input[type="text"], input[type="email"]');
+            const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
+            if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
+        """, RENTMASSEUR_USERNAME, RENTMASSEUR_PASSWORD)
+        time.sleep(1)
+        # Submit via Enter key on password field
+        try:
+            pwd_el = driver.find_element(By.CSS_SELECTOR, 'input[type="password"]')
+            pwd_el.send_keys(Keys.ENTER)
+        except Exception:
+            driver.execute_script("""
+                const btn = document.querySelector('button[type="submit"]') ||
+                            Array.from(document.querySelectorAll('button')).find(b => /login|sign|submit/i.test(b.innerText));
+                if (btn) btn.click();
+            """)
         time.sleep(5)
-        print("\n  BIO DEPLOYED SUCCESSFULLY!")
-    else:
-        print("  No textarea found. Screenshot saved.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/profile_edit.png")
-    
-finally:
-    driver.quit()
-    print("\nDone.")
+        if LOGIN_URL not in driver.current_url:
+            logger.info("Login successful -> %s", driver.current_url)
+            return True
+        err = driver.execute_script("const el = document.querySelector('[role=alert], .error, .form-error'); return el ? el.innerText : '';")
+        if err:
+            logger.error("Login error: %s", err.strip())
+        _dump_debug(driver, "login_failed")
+        return False
+    except Exception as e:
+        logger.error("Login exception: %s", e)
+        _dump_debug(driver, "login_exception")
+        return False
+
+
+def set_availability_24_7(driver: webdriver.Chrome) -> bool:
+    try:
+        logger.info("Setting availability: %s", AVAILABILITY_URL)
+        driver.get(AVAILABILITY_URL)
+        time.sleep(3)
+        ok = driver.execute_script("""
+            const selects = Array.from(document.querySelectorAll('select'));
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const statusSelect = selects.find(s => {
+                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
+                return opts.includes('available') || opts.includes('not set');
+            });
+            if (!statusSelect) return {error: 'no_status_select'};
+            const availOpt = Array.from(statusSelect.options).find(
+                o => o.text.toLowerCase().includes('available') && !o.text.toLowerCase().includes('not')
+            );
+            if (availOpt) { statusSelect.value = availOpt.value; statusSelect.dispatchEvent(new Event('change', {bubbles: true})); }
+            const timeSelect = selects.find(s => {
+                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
+                return opts.some(t => t.includes('hour') || t.includes('minute'));
+            });
+            if (timeSelect) {
+                const durationOpts = Array.from(timeSelect.options).filter(o => /\\d/.test(o.text));
+                if (durationOpts.length > 0) {
+                    const longest = durationOpts[durationOpts.length - 1];
+                    timeSelect.value = longest.value;
+                    timeSelect.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+            }
+            const setBtn = buttons.find(b => /set|save|apply/i.test(b.innerText));
+            if (!setBtn) return {error: 'no_set_button'};
+            setBtn.click();
+            return {ok: true};
+        """)
+        if isinstance(ok, dict) and ok.get('error'):
+            logger.error("Availability failed: %s", ok['error'])
+            _dump_debug(driver, f"availability_{ok['error']}")
+            return False
+        logger.info("Availability set successfully")
+        time.sleep(2)
+        return True
+    except Exception as e:
+        logger.error("Availability exception: %s", e)
+        return False
+
+
+def _load_bio_history() -> list:
+    if os.path.exists(BIO_HISTORY_FILE):
+        try:
+            with open(BIO_HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def _save_bio_history(history: list) -> None:
+    try:
+        with open(BIO_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history[-50:], f, indent=2)
+    except Exception as e:
+        logger.warning("Failed to save bio history: %s", e)
+
+
+def _bio_hash(bio: str) -> str:
+    return hashlib.md5(bio.strip().lower().encode()).hexdigest()[:12]
+
+
+def groq_generate_bio(strategy_name: str, strategy_prompt: str, current_bio: Optional[str]) -> Optional[str]:
+    if not GROQ_API_KEY:
+        logger.error("No GROQ_API_KEY")
+        return None
+    history = _load_bio_history()
+    used_hashes = {entry.get("hash", "") for entry in history}
+    system_base = (
+        "You are an elite copywriter for massage therapy profiles. "
+        "Each bio must be under 300 words, magnetic, SEO-friendly, and conversion-optimized. "
+        "Avoid explicit content. Include keywords: massage, therapeutic, deep tissue, relaxation, session, Manhattan. "
+        "Always end with a subtle call-to-action."
+    )
+    context = f"\nCurrent bio:\n---\n{current_bio}\n---\n" if current_bio and current_bio.strip() else ""
+    user_prompt = (
+        f"{context}"
+        f"Strategy: {strategy_name}\n"
+        f"Instructions: {strategy_prompt}\n"
+        f"Now write ONLY the bio text. No labels, no quotes, no explanation. Just the bio."
+    )
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_base},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.9,
+                "max_tokens": 600,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        bio = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
+        h = _bio_hash(bio)
+        if h in used_hashes:
+            logger.info("Skipping duplicate bio strategy=%s", strategy_name)
+            return None
+        history.append({
+            "timestamp": datetime.now().isoformat(),
+            "strategy": strategy_name,
+            "hash": h,
+            "chars": len(bio),
+            "bio_preview": bio[:120],
+        })
+        _save_bio_history(history)
+        _save_bio_to_file(strategy_name, bio)
+        logger.info("Generated bio: strategy=%s chars=%d", strategy_name, len(bio))
+        return bio
+    except Exception as e:
+        logger.error("Groq API error for %s: %s", strategy_name, e)
+        return None
+
+
+def _save_bio_to_file(strategy_name: str, bio: str) -> None:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"bio_{strategy_name}_{ts}.txt"
+    filepath = os.path.join(BIOS_DIR, filename)
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(bio)
+        logger.info("Bio saved to file: %s", filepath)
+    except Exception as e:
+        logger.warning("Failed to save bio to file: %s", e)
+
+
+def update_bio(driver: webdriver.Chrome, new_bio: str) -> bool:
+    try:
+        urls_to_try = [
+            "https://rentmasseur.com/settings/about",
+            PROFILE_URL,
+            "https://rentmasseur.com/settings?bio=1",
+            "https://rentmasseur.com/settings",
+            "https://rentmasseur.com/profile/edit",
+            f"https://rentmasseur.com/{RENTMASSEUR_USERNAME}/edit",
+        ]
+        for url in urls_to_try:
+            logger.info("Trying profile settings: %s", url)
+            driver.get(url)
+            time.sleep(3)
+            result = driver.execute_script("""
+                const textareas = Array.from(document.querySelectorAll('textarea'));
+                const editables = Array.from(document.querySelectorAll('[contenteditable=\"true\"]'));
+                const inputs = Array.from(document.querySelectorAll('input[type=\"text\"]'));
+                function scoreBio(el, isTextarea) {
+                    const clues = ['bio','about','description','profile','intro','summary'];
+                    const text = (el.placeholder+' '+el.name+' '+(el.id||'')+' '+(el.getAttribute('aria-label')||'')).toLowerCase();
+                    let score=0;
+                    for (const c of clues) if (text.includes(c)) score+=3;
+                    if (isTextarea) score+=5;
+                    const val=el.value||el.innerText||'';
+                    if (val.length>30) score+=2; if (val.length>100) score+=3;
+                    return score;
+                }
+                let best=null, bestScore=-1;
+                for (const el of textareas) { const s=scoreBio(el,true); if (s>bestScore){bestScore=s; best=el;} }
+                for (const el of editables) { const s=scoreBio(el,false); if (s>bestScore){bestScore=s; best=el;} }
+                if (!best && inputs.length>0) { for (const el of inputs){const s=scoreBio(el,false); if(s>bestScore){bestScore=s;best=el;}} }
+                if (!best) return {error:'no_bio_field'};
+                const current=best.value||best.innerText||'';
+                return {
+                    tag:best.tagName.toLowerCase(), id:best.id||'', name:best.name||'',
+                    class:(best.className&&typeof best.className==='string')?best.className.split(' ').filter(Boolean).join(' '):'',
+                    placeholder:best.placeholder||'', contenteditable:best.getAttribute('contenteditable')||'',
+                    current:current.slice(0,500),
+                    selector:best.tagName.toLowerCase()+(best.id?'#'+best.id:'')+(best.name?'[name=\"'+best.name+'\"]':''),
+                };
+            """)
+            if isinstance(result, dict) and result.get('error'):
+                logger.info("No bio field at %s, trying next...", url)
+                continue
+            logger.info("Found bio field: %s", result.get('selector'))
+            current_bio = result.get('current', '')
+            logger.info("Current bio preview: %s...", current_bio[:80])
+            return result, current_bio
+        logger.error("Bio field not found on any settings page")
+        _dump_debug(driver, "bio_not_found")
+        return None
+    except Exception as e:
+        logger.error("Bio update exception: %s", e)
+        _dump_debug(driver, "bio_exception")
+        return None
+
+
+def save_bio_field(driver: webdriver.Chrome, result: dict, new_bio: str) -> bool:
+    try:
+        sel = result['selector']
+        if result.get('contenteditable') == 'true':
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            driver.execute_script("arguments[0].innerText = arguments[1];", el, new_bio)
+            driver.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles: true}));", el)
+        else:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            el.clear()
+            el.send_keys(new_bio)
+        save_ok = driver.execute_script("""
+            const buttons = Array.from(document.querySelectorAll('button, input[type=\"submit\"], a[role=\"button\"]'));
+            let saveBtn = buttons.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'')+' '+(b.value||'')+' '+(b.textContent||'')));
+            if (!saveBtn) {
+                const form = document.querySelector('textarea')?.closest('form');
+                if (form) { const fb=Array.from(form.querySelectorAll('button, input[type=\"submit\"]')); saveBtn=fb.find(b=>/save|update|submit|apply|confirm/i.test((b.innerText||'')+' '+(b.value||''))); }
+            }
+            if (!saveBtn) return {error:'no_save_button'};
+            saveBtn.click();
+            return {ok:true};
+        """)
+        if isinstance(save_ok, dict) and save_ok.get('error'):
+            logger.error("Save button not found: %s", save_ok['error'])
+            _dump_debug(driver, "bio_no_save")
+            return False
+        logger.info("Bio updated and saved")
+        time.sleep(2)
+        return True
+    except Exception as e:
+        logger.error("Save bio exception: %s", e)
+        return False
 
 ```
 
-rotator_engine.js:
+popup.js:
 ```
-/**
- * RentMasseur Rotator Engine — JavaScript
- * 
- * Unified rotation engine for bios, photos, prices, interviews, and blog posts.
- * Uses RL feedback (views, clicks, calls) to decide what to rotate and when.
- * Integrates with the Chrome extension for real-time optimization.
- * 
- * Usage in extension:
- *   const rotator = new RotatorEngine({ serverUrl: 'http://localhost:3000' });
- *   await rotator.init();
- *   const nextBio = await rotator.getNextBio();
- *   const nextPrice = await rotator.getNextPrice();
- */
+document.getElementById('saveBtn').addEventListener('click', () => {
+  const url = document.getElementById('serverUrl').value.trim();
+  chrome.storage.local.set({ bookingServerUrl: url }, () => {
+    const status = document.getElementById('status');
+    status.textContent = 'Saved!';
+    status.className = 'status ok';
+    setTimeout(() => { status.textContent = ''; status.className = 'status'; }, 1500);
+  });
+});
 
-class RotatorEngine {
-  constructor(config = {}) {
-    this.serverUrl = config.serverUrl || 'http://localhost:3000';
-    this.rlState = null;
-    this.rotationRules = {
-      bio: { maxAgeHours: 24, minRewardThreshold: 5, rotateIfStale: true },
-      photo: { maxAgeHours: 48, minRewardThreshold: 3, rotateIfStale: true },
-      price: { maxAgeHours: 12, minRewardThreshold: 8, rotateIfStale: false },
-      interview: { maxAgeHours: 72, minRewardThreshold: 2, rotateIfStale: true },
-      blog: { maxAgeHours: 48, minRewardThreshold: 4, rotateIfStale: true },
-    };
-    this.rewardWeights = {
-      views: 1, email_clicks: 5, phone_clicks: 10, booking_inquiries: 50,
-      favorites: 3, messages: 8,
-    };
+document.getElementById('openBookings').addEventListener('click', () => {
+  chrome.storage.local.get('bookingServerUrl', (data) => {
+    const url = data.bookingServerUrl || 'http://localhost:3000';
+    chrome.tabs.create({ url });
+  });
+});
+
+// Load saved URL on open
+chrome.storage.local.get('bookingServerUrl', (data) => {
+  if (data.bookingServerUrl) {
+    document.getElementById('serverUrl').value = data.bookingServerUrl;
   }
-
-  async init() {
-    await this.loadRLState();
-    return this;
-  }
-
-  async loadRLState() {
-    try {
-      const resp = await fetch(`${this.serverUrl}/api/rl/state`);
-      if (resp.ok) {
-        this.rlState = await resp.json();
-        return this.rlState;
-      }
-    } catch (e) {
-      console.warn('Could not load RL state from server, using local');
-    }
-    this.rlState = this._defaultState();
-    return this.rlState;
-  }
-
-  _defaultState() {
-    return {
-      bios: {}, photos: {}, prices: {}, interviews: {}, blogs: {},
-      current: { bio: null, photo: null, price: null, interview: null, blog: null },
-      rotations: { bio: 0, photo: 0, price: 0, interview: 0, blog: 0 },
-      history: [],
-    };
-  }
-
-  calculateReward(stats, ageHours) {
-    let reward = 0;
-    for (const [key, weight] of Object.entries(this.rewardWeights)) {
-      reward += (stats[key] || 0) * weight;
-    }
-    reward -= (ageHours / 24) * 0.5; // stale penalty
-    return Math.round(reward * 100) / 100;
-  }
-
-  shouldRotate(type, currentEntry, ageHours, deltaReward) {
-    const rules = this.rotationRules[type];
-    if (!rules) return false;
-
-    if (rules.rotateIfStale && ageHours >= rules.maxAgeHours) {
-      return { rotate: true, reason: `stale (${ageHours.toFixed(1)}h >= ${rules.maxAgeHours}h)` };
-    }
-    if (ageHours >= rules.maxAgeHours / 2 && deltaReward < rules.minRewardThreshold) {
-      return { rotate: true, reason: `low reward (${deltaReward} < ${rules.minRewardThreshold} in ${ageHours.toFixed(1)}h)` };
-    }
-    if (ageHours >= 6 && deltaReward === 0) {
-      return { rotate: true, reason: 'zero engagement for 6+ hours' };
-    }
-    return { rotate: false, reason: 'performing well' };
-  }
-
-  pickNext(items, type) {
-    const entries = Object.entries(items);
-    if (entries.length === 0) return null;
-
-    // Sort by: least times used, then highest historical reward
-    entries.sort((a, b) => {
-      const aUses = a[1].timesUsed || 0;
-      const bUses = b[1].timesUsed || 0;
-      if (aUses !== bUses) return aUses - bUses;
-      const aReward = a[1].totalReward || 0;
-      const bReward = b[1].totalReward || 0;
-      return bReward - aReward;
-    });
-
-    return entries[0];
-  }
-
-  async getNextBio() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.bios, 'bio');
-  }
-
-  async getNextPrice() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.prices, 'price');
-  }
-
-  async getNextPhoto() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.photos, 'photo');
-  }
-
-  async getNextInterview() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.interviews, 'interview');
-  }
-
-  async getNextBlog() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.blogs, 'blog');
-  }
-
-  registerRotation(type, id, content, metadata = {}) {
-    if (!this.rlState) this.rlState = this._defaultState();
-
-    const store = this.rlState[type + 's'] || {};
-    const prevId = this.rlState.current[type];
-    if (prevId && store[prevId]) {
-      store[prevId].endTime = new Date().toISOString();
-    }
-
-    store[id] = {
-      content: content.slice(0, 500),
-      ...metadata,
-      startTime: new Date().toISOString(),
-      totalReward: 0,
-      deltaReward: 0,
-      lastStats: {},
-      timesUsed: (store[id]?.timesUsed || 0) + 1,
-    };
-
-    this.rlState[type + 's'] = store;
-    this.rlState.current[type] = id;
-    this.rlState.rotations[type] = (this.rlState.rotations[type] || 0) + 1;
-
-    this.rlState.history.push({
-      timestamp: new Date().toISOString(),
-      type, id, action: 'rotate',
-    });
-
-    return this.rlState;
-  }
-
-  updateReward(type, id, stats) {
-    if (!this.rlState) return;
-    const store = this.rlState[type + 's'];
-    if (!store || !store[id]) return;
-
-    const entry = store[id];
-    const prevStats = entry.lastStats || {};
-    const delta = {};
-    for (const key of Object.keys(this.rewardWeights)) {
-      delta[key] = Math.max(0, (stats[key] || 0) - (prevStats[key] || 0));
-    }
-
-    const ageHours = entry.startTime
-      ? (Date.now() - new Date(entry.startTime).getTime()) / 3600000
-      : 0;
-
-    const deltaReward = this.calculateReward(delta, ageHours);
-    entry.deltaReward = deltaReward;
-    entry.totalReward = (entry.totalReward || 0) + deltaReward;
-    entry.lastStats = stats;
-    entry.ageHours = Math.round(ageHours * 100) / 100;
-
-    this.rlState.history.push({
-      timestamp: new Date().toISOString(),
-      type, id, action: 'reward',
-      deltaReward, totalReward: entry.totalReward,
-    });
-
-    return entry;
-  }
-
-  getTopPerformers(type, n = 5) {
-    if (!this.rlState) return [];
-    const store = this.rlState[type + 's'] || {};
-    return Object.entries(store)
-      .sort((a, b) => (b[1].totalReward || 0) - (a[1].totalReward || 0))
-      .slice(0, n);
-  }
-
-  getReport() {
-    if (!this.rlState) return 'No RL state loaded';
-    const lines = ['=== ROTATOR ENGINE REPORT ==='];
-    for (const type of ['bio', 'photo', 'price', 'interview', 'blog']) {
-      const store = this.rlState[type + 's'] || {};
-      const rotations = this.rlState.rotations[type] || 0;
-      const current = this.rlState.current[type];
-      lines.push(`\n${type.toUpperCase()}: ${rotations} rotations, current=${current}`);
-      const top = this.getTopPerformers(type, 3);
-      for (const [id, data] of top) {
-        lines.push(`  ${id}: reward=${data.totalReward || 0}, uses=${data.timesUsed || 0}`);
-      }
-    }
-    return lines.join('\n');
-  }
-
-  async saveState() {
-    try {
-      await fetch(`${this.serverUrl}/api/rl/state`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(this.rlState),
-      });
-    } catch (e) {
-      console.warn('Could not save RL state to server');
-    }
-  }
-}
-
-// Price rotation strategies
-const PRICE_STRATEGIES = [
-  { name: 'premium_peak', desc: 'High price during peak hours (evening/weekend)', base: 250, variance: 30 },
-  { name: 'off_peak_deal', desc: 'Lower price for off-peak slots', base: 180, variance: 20 },
-  { name: 'new_client_special', desc: 'First-time client discount', base: 150, variance: 15 },
-  { name: 'loyalty_rate', desc: 'Returning client rate', base: 200, variance: 10 },
-  { name: 'late_night_premium', desc: 'After-hours premium', base: 300, variance: 50 },
-  { name: 'lunch_express', desc: 'Quick session lunch special', base: 120, variance: 10 },
-  { name: 'weekend_warrior', desc: 'Weekend athletic recovery', base: 220, variance: 25 },
-  { name: 'holiday_special', desc: 'Holiday seasonal rate', base: 200, variance: 40 },
-  { name: 'last_minute', desc: 'Same-day booking discount', base: 170, variance: 15 },
-  { name: 'package_deal', desc: 'Multi-session package rate', base: 190, variance: 20 },
-];
-
-function generatePrice(strategy, hour, dayOfWeek) {
-  const s = strategy || PRICE_STRATEGIES[0];
-  let price = s.base;
-
-  // Peak hours: 6pm-11pm
-  if (hour >= 18 && hour <= 23) price += s.variance * 0.5;
-  // Late night: midnight-4am
-  if (hour >= 0 && hour <= 4) price += s.variance * 0.8;
-  // Weekend premium
-  if (dayOfWeek === 0 || dayOfWeek === 6) price += s.variance * 0.3;
-  // Add small random variance
-  price += Math.round((Math.random() - 0.5) * s.variance * 0.2);
-
-  return Math.max(80, Math.round(price));
-}
-
-// Export for Node.js and browser
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { RotatorEngine, PRICE_STRATEGIES, generatePrice };
-}
-if (typeof window !== 'undefined') {
-  window.RotatorEngine = RotatorEngine;
-  window.PRICE_STRATEGIES = PRICE_STRATEGIES;
-  window.generatePrice = generatePrice;
-}
+});
 
 ```
 
-make-icons.js:
+requirements.txt:
 ```
-const fs = require('fs');
-const zlib = require('zlib');
-
-function crc32(buf) {
-  const table = new Uint32Array(256);
-  for (let i = 0; i < 256; i++) {
-    let c = i;
-    for (let j = 0; j < 8; j++) {
-      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-    }
-    table[i] = c >>> 0;
-  }
-  let c = 0xFFFFFFFF;
-  for (let i = 0; i < buf.length; i++) {
-    c = table[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
-  }
-  return (c ^ 0xFFFFFFFF) >>> 0;
-}
-
-function makePng(size, r, g, b, filename) {
-  const sig = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-  
-  // IHDR
-  const ihdrData = Buffer.alloc(13);
-  ihdrData.writeUInt32BE(size, 0);
-  ihdrData.writeUInt32BE(size, 4);
-  ihdrData[8] = 8;  // bit depth
-  ihdrData[9] = 6;  // color type RGBA
-  ihdrData[10] = 0; // compression
-  ihdrData[11] = 0; // filter
-  ihdrData[12] = 0; // interlace
-  const ihdrType = Buffer.from('IHDR');
-  const ihdrCrc = crc32(Buffer.concat([ihdrType, ihdrData]));
-  const ihdr = Buffer.concat([Buffer.from([0,0,0,13]), ihdrType, ihdrData, Buffer.alloc(4)]);
-  ihdr.writeUInt32BE(ihdrCrc, 17);
-  
-  // Raw image data
-  const rowLen = 1 + size * 4;
-  const raw = Buffer.alloc(size * rowLen);
-  for (let y = 0; y < size; y++) {
-    raw[y * rowLen] = 0; // filter byte
-    for (let x = 0; x < size; x++) {
-      const idx = y * rowLen + 1 + x * 4;
-      raw[idx] = r;
-      raw[idx + 1] = g;
-      raw[idx + 2] = b;
-      raw[idx + 3] = 255;
-    }
-  }
-  
-  const compressed = zlib.deflateSync(raw);
-  const idatType = Buffer.from('IDAT');
-  const idatCrc = crc32(Buffer.concat([idatType, compressed]));
-  const idatLen = Buffer.alloc(4);
-  idatLen.writeUInt32BE(compressed.length, 0);
-  const idatCrcBuf = Buffer.alloc(4);
-  idatCrcBuf.writeUInt32BE(idatCrc, 0);
-  const idat = Buffer.concat([idatLen, idatType, compressed, idatCrcBuf]);
-  
-  // IEND
-  const iendType = Buffer.from('IEND');
-  const iendCrc = crc32(iendType);
-  const iend = Buffer.concat([Buffer.from([0,0,0,0]), iendType, Buffer.alloc(4)]);
-  iend.writeUInt32BE(iendCrc, 8);
-  
-  const png = Buffer.concat([sig, ihdr, idat, iend]);
-  fs.writeFileSync(filename, png);
-}
-
-const base = '/Users/alep/Downloads/02_AI_Agents/rentmasseur-extension';
-// Accent color: #cc8b4a = 204, 139, 74
-makePng(16,  204, 139, 74, `${base}/icon16.png`);
-makePng(48,  204, 139, 74, `${base}/icon48.png`);
-makePng(128, 204, 139, 74, `${base}/icon128.png`);
-
-fs.writeFileSync(`${base}/icons_done.txt`, 'done');
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+selenium>=4.15.0
+undetected-chromedriver>=3.5.0
+python-dotenv>=1.0.0
+playwright>=1.40.0
+huggingface-hub>=0.19.0
+gradio>=4.0.0
+httpx>=0.25.0
+pydantic>=2.0.0
 
 ```
 
-rotator_engine.cpp:
+.dockerignore:
 ```
-/*
- * RentMasseur Rotator Engine — C++ Native
- * High-performance rotation engine for bios, photos, prices, interviews, blogs.
- * RL feedback loop with reward calculation. 10x faster than Python equivalent.
- *
- * Build: g++ -O3 -std=c++17 -o rotator_engine rotator_engine.cpp -lcurl
- * Run:   ./rotator_engine --rotate bio
- *        ./rotator_engine --report
- *        ./rotator_engine --reward bio photo_001 '{"views":150,"phone_clicks":12}'
- */
+.git
+.github
+.env
+*.env
+session.json
+cookies*.json
+api_map.json
+api_map.raw.json
+*.sqlite
+*.db
+*.zip
+__pycache__/
+*.pyc
+.DS_Store
+__MACOSX/
+rm_traffic/
+data/batch/
+content/batch/
+content/generated/
+*bios_1m*.jsonl
+*bios_v2_1m*.jsonl
+*bios_30k*.jsonl
+*.pkl
+debug/
+demo_server.log
+demo_server.pid
 
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <map>
-#include <unordered_map>
-#include <algorithm>
-#include <chrono>
-#include <ctime>
-#include <iomanip>
-#include <random>
-#include <memory>
-#include <cmath>
-#include <cstdlib>
+```
 
-using json_val = std::string;
+bio_ab_tester.py:
+```
+#!/usr/bin/env python3
+"""Bio A/B testing engine — generates multiple bio variants, scores them
+against competitors, and only uploads the verified winner.
 
-struct RewardWeights {
-    int views = 1;
-    int email_clicks = 5;
-    int phone_clicks = 10;
-    int booking_inquiries = 50;
-    int favorites = 3;
-    int messages = 8;
-};
+Process:
+1. Scrape top competitor bios from RentMasseur
+2. Generate 30 bio variants via Groq
+3. Score each bio against competitors on: CTA strength, urgency, SEO keywords,
+   emotional hook, uniqueness, length, phone-call conversion potential
+4. A/B test: split into pairs, have Groq pick winner of each pair
+5. Final winner must beat ALL competitor bios
+6. Only upload if winner scores higher than current bio
 
-struct RotationRule {
-    int max_age_hours;
-    int min_reward_threshold;
-    bool rotate_if_stale;
-};
+Usage:
+    python3 bio_ab_tester.py
+    python3 bio_ab_tester.py --dry-run
+    python3 bio_ab_tester.py --competitors-only
+"""
 
-struct RotationItem {
-    std::string id;
-    std::string content;
-    std::string strategy;
-    std::string start_time;
-    std::string end_time;
-    double total_reward = 0;
-    double delta_reward = 0;
-    int times_used = 0;
-    double age_hours = 0;
-    std::map<std::string, int> last_stats;
-    std::map<std::string, int> delta_stats;
-};
+import argparse
+import json
+import os
+import sys
+import glob
+import time
+import random
+import logging
+from datetime import datetime, timezone
+from typing import Optional
 
-struct RLState {
-    std::map<std::string, std::map<std::string, RotationItem>> stores;
-    std::map<std::string, std::string> current;
-    std::map<std::string, int> rotations;
-    std::vector<std::string> history;
-};
+import requests
+from dotenv import load_dotenv
 
-// --- Utilities ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 
-static std::string iso_timestamp() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
-    return std::string(buf);
-}
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
 
-static double hours_since(const std::string& iso_time) {
-    if (iso_time.empty()) return 0;
-    // Simple parse: extract hours from ISO timestamp difference
-    // For production, use proper date parsing
-    std::time_t now = std::time(nullptr);
-    // Approximate: parse the timestamp
-    struct std::tm tm = {};
-    std::istringstream ss(iso_time);
-    ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
-    std::time_t then = std::mktime(&tm);
-    return std::difftime(now, then) / 3600.0;
-}
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+RENTMASSEUR_PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
 
-static std::string read_file(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) return "";
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+BIOS_DIR = os.path.join(CONTENT_DIR, "bios")
+AB_TEST_DIR = os.path.join(CONTENT_DIR, "ab_tests")
+COMPETITOR_BIOS_PATH = os.path.join(CONTENT_DIR, "competitor_bios.json")
 
-static void write_file(const std::string& path, const std::string& content) {
-    std::ofstream f(path);
-    if (f) f << content;
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
 
-// Simple JSON-ish serialization for state
-static std::string serialize_state(const RLState& state) {
-    std::ostringstream ss;
-    ss << "{\n";
-    ss << "  \"stores\": {\n";
-    bool first_store = true;
-    for (const auto& [type, store] : state.stores) {
-        if (!first_store) ss << ",\n";
-        first_store = false;
-        ss << "    \"" << type << "\": {\n";
-        bool first_item = true;
-        for (const auto& [id, item] : store) {
-            if (!first_item) ss << ",\n";
-            first_item = false;
-            ss << "      \"" << id << "\": {\n";
-            ss << "        \"content\": \"" << item.content.substr(0, 200) << "\",\n";
-            ss << "        \"strategy\": \"" << item.strategy << "\",\n";
-            ss << "        \"total_reward\": " << item.total_reward << ",\n";
-            ss << "        \"delta_reward\": " << item.delta_reward << ",\n";
-            ss << "        \"times_used\": " << item.times_used << ",\n";
-            ss << "        \"age_hours\": " << item.age_hours << "\n";
-            ss << "      }";
-        }
-        ss << "\n    }";
-    }
-    ss << "\n  },\n";
-    ss << "  \"current\": {\n";
-    bool first_cur = true;
-    for (const auto& [type, id] : state.current) {
-        if (!first_cur) ss << ",\n";
-        first_cur = false;
-        ss << "    \"" << type << "\": \"" << id << "\"";
-    }
-    ss << "\n  },\n";
-    ss << "  \"rotations\": {\n";
-    bool first_rot = true;
-    for (const auto& [type, count] : state.rotations) {
-        if (!first_rot) ss << ",\n";
-        first_rot = false;
-        ss << "    \"" << type << "\": " << count;
-    }
-    ss << "\n  }\n";
-    ss << "}\n";
-    return ss.str();
-}
+COMPETITOR_URLS = [
+    "https://rentmasseur.com/Preston_Banks",
+    "https://rentmasseur.com/Tonyxxxx",
+    "https://rentmasseur.com/MickeyCuteBoy",
+    "https://rentmasseur.com/ExoticYoungGuy",
+    "https://rentmasseur.com/MassageByMike",
+    "https://rentmasseur.com/NYCBodywork",
+    "https://rentmasseur.com/ManhattanTouch",
+    "https://rentmasseur.com/RelaxWithRyan",
+    "https://rentmasseur.com/HealingHandsNYC",
+    "https://rentmasseur.com/PremiumMassage",
+]
 
-// --- Core Engine ---
+STRATEGIES = [
+    ("sensory_luxury", "Luxurious sensory experience, premium oils, candlelight"),
+    ("therapeutic_expert", "Clinical therapeutic massage, pain relief, certifications"),
+    ("mystery_desire", "Mysterious, alluring, teases the experience"),
+    ("local_hustle", "Manhattan local vibe, neighborhood energy, approachable"),
+    ("transformation_story", "Story-based, stress-to-relief transformation"),
+    ("night_owl", "Late-night availability, after-hours, private evening sessions"),
+    ("athlete_recovery", "Gym-goers, pre/post-workout, muscle recovery"),
+    ("ceo_executive", "Executive wellness, CEO stress relief, premium"),
+    ("spiritual_healer", "Holistic, energy work, chakras, mindfulness"),
+    ("traveler_companion", "Out-of-town visitors, jet lag, hotel-friendly"),
+    ("medical_referral", "Doctor-recommended, clinical back pain, sciatica"),
+    ("artist_soul", "Creative artistic approach, massage as art"),
+    ("discrete_confidential", "Absolute privacy, VIP clients, judgment-free"),
+    ("first_timer", "Welcoming newcomers, gentle introduction"),
+    ("seasonal_special", "Seasonal themes, winter warmth, summer cool-down"),
+    ("couples_duo", "Couples, partners, duet sessions, romantic bonding"),
+    ("bodybuilder_therapy", "Heavy lifters, deep pressure, fascia release"),
+    ("yoga_fusion", "Yoga + massage, stretching, flexibility"),
+    ("luxury_concierge", "White-glove in-home/hotel service, elite concierge"),
+    ("recovery_addiction", "Sober wellness, recovery support, healthy coping"),
+    ("military_veteran", "Veteran-friendly, service member respect, PT recovery"),
+    ("lgbtq_pride", "Inclusive pride-forward, safe space, community"),
+    ("senior_gentle", "Senior-friendly, gentle touch, mobility, arthritis"),
+    ("office_relief", "Desk job recovery, neck pain, carpal tunnel"),
+    ("dancer_flexibility", "Dancers/performers, flexibility, injury prevention"),
+    ("meditation_guide", "Guided meditation + massage, mindfulness, breath"),
+    ("hot_stone_specialist", "Hot stone specialty, heat therapy, deep relaxation"),
+    ("quick_lunch", "Express 30-45 min lunch-break massage, fast, effective"),
+    ("birthday_gift", "Gift-worthy special occasion, treat yourself"),
+    ("weekly_ritual", "Recurring weekly maintenance, body upkeep"),
+]
 
-class RotatorEngine {
-private:
-    RLState state;
-    RewardWeights weights;
-    std::map<std::string, RotationRule> rules;
-    std::string state_path;
-    std::mt19937 rng;
 
-public:
-    RotatorEngine(const std::string& content_dir) : state_path(content_dir + "/rl_state.json") {
-        rules["bio"] = {24, 5, true};
-        rules["photo"] = {48, 3, true};
-        rules["price"] = {12, 8, false};
-        rules["interview"] = {72, 2, true};
-        rules["blog"] = {48, 4, true};
-        rng.seed(std::random_device()());
-        load_state();
-    }
+def _groq_chat(system_prompt: str, user_prompt: str, max_tokens: int = 800, retries: int = 3) -> Optional[str]:
+    if not GROQ_API_KEY:
+        logger.error("No GROQ_API_KEY")
+        return None
+    for attempt in range(retries):
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.9,
+                    "max_tokens": max_tokens,
+                },
+                timeout=90,
+            )
+            if resp.status_code == 429:
+                wait = 5 * (attempt + 1)
+                logger.warning("Groq rate limited, waiting %ds", wait)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.error("Groq API error: %s", e)
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+    return None
 
-    void load_state() {
-        std::string raw = read_file(state_path);
-        if (raw.empty()) return;
-        // Minimal parse — in production use nlohmann/json
-        // For now, state starts empty and gets populated at runtime
-    }
 
-    void save_state() {
-        write_file(state_path, serialize_state(state));
-    }
+def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> Optional[dict]:
+    raw = _groq_chat(system_prompt, user_prompt, max_tokens=max_tokens)
+    if not raw:
+        return None
+    try:
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse Groq JSON: %s", raw[:200])
+        return None
 
-    double calculate_reward(const std::map<std::string, int>& stats, double age_hours) {
-        double reward = 0;
-        reward += stats.count("views") ? stats.at("views") * weights.views : 0;
-        reward += stats.count("email_clicks") ? stats.at("email_clicks") * weights.email_clicks : 0;
-        reward += stats.count("phone_clicks") ? stats.at("phone_clicks") * weights.phone_clicks : 0;
-        reward += stats.count("booking_inquiries") ? stats.at("booking_inquiries") * weights.booking_inquiries : 0;
-        reward += stats.count("favorites") ? stats.at("favorites") * weights.favorites : 0;
-        reward += stats.count("messages") ? stats.at("messages") * weights.messages : 0;
-        reward -= (age_hours / 24.0) * 0.5;
-        return std::round(reward * 100.0) / 100.0;
-    }
 
-    struct RotateDecision {
-        bool rotate;
-        std::string reason;
-    };
+def scrape_competitor_bios() -> list:
+    """Scrape bios from top competitor profiles."""
+    logger.info("=== Scraping competitor bios ===")
+    competitor_bios = []
 
-    RotateDecision should_rotate(const std::string& type, double age_hours, double delta_reward) {
-        auto it = rules.find(type);
-        if (it == rules.end()) return {false, "unknown type"};
+    for url in COMPETITOR_URLS:
+        try:
+            headers = {"User-Agent": USER_AGENT, "Referer": "https://rentmasseur.com/"}
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                logger.warning("Failed to fetch %s: %d", url, resp.status_code)
+                continue
+            html = resp.text
+            if "captcha" in html.lower() or "crowdsec" in html.lower():
+                logger.warning("Captcha on %s, skipping", url)
+                continue
 
-        const auto& rule = it->second;
-        if (rule.rotate_if_stale && age_hours >= rule.max_age_hours)
-            return {true, "stale (" + std::to_string((int)age_hours) + "h >= " + std::to_string(rule.max_age_hours) + "h)"};
-        if (age_hours >= rule.max_age_hours / 2 && delta_reward < rule.min_reward_threshold)
-            return {true, "low reward (" + std::to_string((int)delta_reward) + " < " + std::to_string(rule.min_reward_threshold) + ")"};
-        if (age_hours >= 6 && delta_reward == 0)
-            return {true, "zero engagement 6h+"};
-        return {false, "performing well"};
-    }
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
 
-    std::pair<std::string, RotationItem*> pick_next(const std::string& type) {
-        auto store_it = state.stores.find(type);
-        if (store_it == state.stores.end() || store_it->second.empty())
-            return {"", nullptr};
+            name = None
+            h1 = soup.find("h1")
+            if h1:
+                name = h1.get_text(strip=True)
 
-        auto& store = store_it->second;
-        std::vector<std::pair<std::string, RotationItem*>> items;
-        for (auto& [id, item] : store) {
-            items.emplace_back(id, &item);
-        }
+            bio = None
+            for selector in [".bio", ".about", ".description", ".profile-bio", "[data-field='bio']", "textarea"]:
+                el = soup.select_one(selector)
+                if el:
+                    bio = el.get_text(strip=True)
+                    break
+            if not bio:
+                page_text = soup.get_text()
+                for marker in ["About me:", "About:", "Bio:"]:
+                    if marker in page_text:
+                        start = page_text.index(marker) + len(marker)
+                        bio = page_text[start:start + 1000].strip()
+                        break
 
-        std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
-            if (a.second->times_used != b.second->times_used)
-                return a.second->times_used < b.second->times_used;
-            return a.second->total_reward > b.second->total_reward;
-        });
+            if bio and len(bio) > 20:
+                competitor_bios.append({
+                    "url": url,
+                    "name": name or url.split("/")[-1],
+                    "bio": bio[:2000],
+                    "bio_length": len(bio),
+                    "scraped_at": datetime.now(timezone.utc).isoformat(),
+                })
+                logger.info("Scraped %s: %d chars", name or url, len(bio))
+            time.sleep(2)
+        except Exception as e:
+            logger.warning("Error scraping %s: %s", url, e)
 
-        return items[0];
-    }
+    with open(COMPETITOR_BIOS_PATH, "w", encoding="utf-8") as f:
+        json.dump(competitor_bios, f, indent=2)
+    logger.info("Saved %d competitor bios to %s", len(competitor_bios), COMPETITOR_BIOS_PATH)
+    return competitor_bios
 
-    void register_rotation(const std::string& type, const std::string& id,
-                          const std::string& content, const std::string& strategy) {
-        auto& store = state.stores[type];
-        auto cur_it = state.current.find(type);
-        if (cur_it != state.current.end() && store.count(cur_it->second)) {
-            store[cur_it->second].end_time = iso_timestamp();
-        }
 
-        auto& item = store[id];
-        item.id = id;
-        item.content = content.substr(0, 500);
-        item.strategy = strategy;
-        item.start_time = iso_timestamp();
-        item.total_reward = 0;
-        item.delta_reward = 0;
-        item.times_used++;
-        item.age_hours = 0;
-
-        state.current[type] = id;
-        state.rotations[type]++;
-
-        save_state();
-    }
-
-    void update_reward(const std::string& type, const std::string& id,
-                       const std::map<std::string, int>& stats) {
-        auto store_it = state.stores.find(type);
-        if (store_it == state.stores.end()) return;
-        auto item_it = store_it->second.find(id);
-        if (item_it == store_it->second.end()) return;
-
-        auto& item = item_it->second;
-        std::map<std::string, int> delta;
-        for (const auto& [key, weight] : std::map<std::string, int>{{"views",1},{"email_clicks",5},{"phone_clicks",10},{"booking_inquiries",50},{"favorites",3},{"messages",8}}) {
-            int prev = item.last_stats.count(key) ? item.last_stats[key] : 0;
-            delta[key] = std::max(0, stats.count(key) ? stats.at(key) - prev : 0);
-        }
-
-        double age = hours_since(item.start_time);
-        double dr = calculate_reward(delta, age);
-        item.delta_reward = dr;
-        item.total_reward += dr;
-        item.last_stats = stats;
-        item.age_hours = age;
-
-        save_state();
-    }
-
-    std::vector<std::pair<std::string, double>> top_performers(const std::string& type, int n = 5) {
-        auto store_it = state.stores.find(type);
-        if (store_it == state.stores.end()) return {};
-
-        std::vector<std::pair<std::string, double>> result;
-        for (const auto& [id, item] : store_it->second) {
-            result.emplace_back(id, item.total_reward);
-        }
-        std::sort(result.begin(), result.end(),
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
-        if ((int)result.size() > n) result.resize(n);
+def generate_bio_variants() -> list:
+    """Generate 30 bio variants optimized for phone calls."""
+    logger.info("=== Generating 30 bio variants ===")
+    os.makedirs(BIOS_DIR, exist_ok=True)
