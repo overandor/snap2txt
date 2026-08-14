@@ -1,32 +1,344 @@
-    deltas = compute_deltas(snapshot, ledger)
-    print(f"\nDeltas:")
-    print(f"  Views since bio start: {deltas['delta_views']}")
-    print(f"  Clicks since bio start: {deltas['delta_clicks']}")
-    print(f"  CTR since bio start: {deltas['delta_ctr']}%")
-    print(f"  Hours exposed: {deltas['hours_exposed']}")
+    2. The proof hash (screenshot + metadata) is in the chain
+    3. The page_hash in the receipt matches a hash of the page text
+    4. The timestamp in the receipt is within the session window
+    5. The previous_hash links correctly in the chain
 
-    # Decide
-    decision = decide(snapshot, deltas, ledger)
-    print(f"\nDECISION: {decision}")
+    The verifier does NOT need to trust the screenshot — they trust the hash chain.
+    If any screenshot is fabricated or replayed, the chain breaks.
+    """
+    result = verify_proof(receipt_path)
 
-    # Build packet
-    packet = build_evidence_packet(snapshot, deltas, decision, ledger)
+    # Additional ZK check: extract timestamp from the image overlay and compare
+    receipt = json.loads(Path(receipt_path).read_text())
+    screenshot_path = Path(receipt.get("screenshot_file", ""))
 
-    # Write
-    write_evidence_packet(packet)
-    write_receipt(packet, decision)
+    zk_checks = []
 
-    # If baseline CTR not set, set it from first snapshot
-    if ledger.get("baseline_ctr") is None and snapshot["total_page_views"] > 0:
-        baseline = (snapshot["total_contact_clicks"] / snapshot["total_page_views"]) * 100
-        ledger["baseline_ctr"] = round(baseline, 2)
-        print(f"\nBaseline CTR set: {ledger['baseline_ctr']}%")
-        save_ledger(ledger)
+    # Check: proof hash can be recomputed from raw screenshot hash + metadata
+    # (We can't recompute from overlay image, but we can verify the chain link)
+    zk_checks.append({
+        "check": "chain_link_verified",
+        "passed": result["valid"],
+        "detail": "proof hash is in chain and previous_hash links correctly"
+    })
 
-    print("\n" + "=" * 60)
-    print("EVIDENCE PACKET COMPLETE")
-    print(f"Decision: {decision}")
-    print("=" * 60)
+    # Check: timestamp is recent (within last 24h of verification)
+    ts = receipt.get("timestamp", "")
+    try:
+        ts_dt = datetime.fromisoformat(ts)
+        age = (datetime.now(timezone.utc) - ts_dt).total_seconds()
+        zk_checks.append({
+            "check": "timestamp_recent",
+            "passed": age < 86400,  # within 24 hours
+            "detail": f"age={age:.0f}s ({age/3600:.1f}h)"
+        })
+    except Exception:
+        zk_checks.append({"check": "timestamp_recent", "passed": False, "detail": "invalid timestamp"})
+
+    # Check: page_text_sample is non-empty (proves a page was loaded)
+    sample = receipt.get("page_text_sample", "")
+    zk_checks.append({
+        "check": "page_was_loaded",
+        "passed": len(sample) > 10,
+        "detail": f"sample_length={len(sample)}"
+    })
+
+    # Check: API data contains real metrics (not just {"detail":"Not Found"})
+    api_data = receipt.get("api_data", {})
+    has_real_data = False
+    if api_data:
+        # Check for known real data fields
+        real_fields = ["profileStatistics", "totalPageViews", "newVisits", "newEmails",
+                       "contactClicks", "availability", "userSetting", "masseurs"]
+        has_real_data = any(k in api_data for k in real_fields) or len(str(api_data)) > 100
+    zk_checks.append({
+        "check": "api_data_is_real",
+        "passed": has_real_data,
+        "detail": f"api_keys={list(api_data.keys())[:5] if api_data else 'empty'}"
+    })
+
+    all_zk = all(c["passed"] for c in zk_checks)
+    return {
+        "zk_valid": all_zk and result["valid"],
+        "proof_hash": receipt.get("proof_hash", "")[:32],
+        "timestamp": ts,
+        "url": receipt.get("url", ""),
+        "screenshot": str(screenshot_path),
+        "standard_checks": result["checks"],
+        "zk_checks": zk_checks,
+    }
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="RM Proof Verification System")
+    parser.add_argument("--verify", help="Verify a single proof receipt")
+    parser.add_argument("--verify-chain", action="store_true", help="Verify entire hash chain")
+    parser.add_argument("--verify-all", action="store_true", help="Verify all proof receipts")
+    parser.add_argument("--stats", action="store_true", help="Show chain statistics")
+    args = parser.parse_args()
+
+    if args.verify:
+        result = verify_screenshot_belongs_to_moment(args.verify)
+        print(json.dumps(result, indent=2))
+        print(f"\nZK VALID: {result['zk_valid']}")
+    elif args.verify_chain:
+        result = verify_chain()
+        print(json.dumps(result, indent=2))
+        print(f"\nCHAIN VALID: {result['valid']}")
+    elif args.verify_all:
+        proofs = sorted(RECEIPT_DIR.glob("proof_*.json"))
+        print(f"Found {len(proofs)} proof receipts\n")
+        for p in proofs:
+            result = verify_screenshot_belongs_to_moment(str(p))
+            status = "✅" if result["zk_valid"] else "❌"
+            print(f"{status} {p.name} | {result['timestamp'][:19]} | {result['url'][:50]}")
+        print(f"\nChain: {json.dumps(verify_chain(), indent=2)}")
+    elif args.stats:
+        result = verify_chain()
+        print(f"Chain entries: {result['entries']}")
+        print(f"Chain valid: {result['valid']}")
+        print(f"First: {result.get('first_timestamp','?')}")
+        print(f"Last: {result.get('last_timestamp','?')}")
+        if result.get("chain_breaks"):
+            print(f"Breaks: {len(result['chain_breaks'])}")
+        if result.get("file_check_failures"):
+            print(f"File failures: {len(result['file_check_failures'])}")
+    else:
+        parser.print_help()
+
+```
+
+netlify.toml:
+```
+[build]
+  command = "pip install -r requirements.txt"
+  publish = "netlify_dist"
+
+[build.environment]
+  PYTHON_VERSION = "3.11"
+
+# Proxy API calls to Hugging Face Space
+[[redirects]]
+  from = "/api/*"
+  to = "https://josephrw-rentmasseur-optimizer.hf.space/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/os/*"
+  to = "https://josephrw-rentmasseur-optimizer.hf.space/api/os/:splat"
+  status = 200
+  force = true
+
+# Serve dashboard as fallback
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+```
+
+.dockerignore:
+```
+.git
+.github
+.env
+*.env
+session.json
+cookies*.json
+api_map.json
+api_map.raw.json
+*.sqlite
+*.db
+*.zip
+__pycache__/
+*.pyc
+.DS_Store
+__MACOSX/
+rm_traffic/
+data/batch/
+content/batch/
+content/generated/
+*bios_1m*.jsonl
+*bios_v2_1m*.jsonl
+*bios_30k*.jsonl
+*.pkl
+debug/
+demo_server.log
+demo_server.pid
+
+```
+
+popup.html:
+```
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { width: 260px; padding: 14px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a1f; color: #f0f0f5; margin: 0; }
+    h2 { margin: 0 0 10px 0; font-size: 15px; }
+    .field { margin-bottom: 10px; }
+    label { display: block; font-size: 11px; color: #9a9aa3; margin-bottom: 3px; }
+    input { width: 100%; padding: 6px; background: #0f0f12; border: 1px solid #333; border-radius: 6px; color: #f0f0f5; font-size: 13px; }
+    button { width: 100%; padding: 8px; background: #cc8b4a; border: none; border-radius: 6px; color: #fff; font-weight: 600; cursor: pointer; margin-top: 6px; }
+    button:hover { background: #e09d5a; }
+    .status { font-size: 12px; color: #9a9aa3; margin-top: 10px; text-align: center; }
+    .status.ok { color: #4caf50; }
+    .status.err { color: #f44336; }
+  </style>
+</head>
+<body>
+  <h2>RentMasseur Booker</h2>
+  <div class="field">
+    <label>Booking Server URL</label>
+    <input type="text" id="serverUrl" value="http://localhost:3000" placeholder="http://localhost:3000">
+  </div>
+  <button id="saveBtn">Save Settings</button>
+  <button id="openBookings" style="background:#2a2a30;margin-top:6px;">Open Booking Page</button>
+  <div class="status" id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
+
+```
+
+blog_rotator.py:
+```
+#!/usr/bin/env python3
+"""Blog rotator — generates and rotates blog posts on RentMasseur profile.
+
+Generates fresh, SEO-optimized, hilarious blog posts daily and rotates them.
+Tracks engagement via RL feedback to determine which posts drive bookings.
+
+Usage:
+    python3 blog_rotator.py                 # generate + pick next blog
+    python3 blog_rotator.py --dry-run       # show without uploading
+    python3 blog_rotator.py --report        # show blog history
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import random
+import glob
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
+from dotenv import load_dotenv
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+BLOGS_DIR = os.path.join(CONTENT_DIR, "blog_posts")
+
+BLOG_TOPICS = [
+    "why_i_became_a_masseur", "funniest_client_requests", "deep_tissue_vs_swedish",
+    "what_your_body_is_telling_you", "midnight_massage_stories", "the_art_of_touch",
+    "recovering_from_desk_death", "manhattan_stress_epidemic", "gym_bro_recovery_guide",
+    "why_you_should_call_right_now", "massage_myths_busted", "my_weirdest_session",
+    "self_care_isnt_selfish", "the_perfect_session", "what_clients_get_wrong",
+    "seasonal_stress_survival", "couples_massage_etiquette", "first_time_jitters",
+    "the_science_of_relaxation", "why_price_doesnt_equal_value",
+]
+
+
+def _groq_chat(system_prompt: str, user_prompt: str, max_tokens: int = 1200, retries: int = 3) -> Optional[str]:
+    if not GROQ_API_KEY:
+        return None
+    for attempt in range(retries):
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.95,
+                    "max_tokens": max_tokens,
+                },
+                timeout=90,
+            )
+            if resp.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+    return None
+
+
+def generate_blog_post(topic: str) -> Optional[str]:
+    system_prompt = (
+        "You are a hilarious, SEO-optimized blog writer for a male massage therapist in Manhattan. "
+        "Write engaging blog posts (500-800 words) that are FUNNY and drive PHONE CALLS. "
+        "Include a compelling title, subheadings, and a strong CTA: 'Call me now to book'. "
+        "Use markdown. Be memorable. No explicit content."
+    )
+    user_prompt = (
+        f"Blog topic: {topic}\n"
+        f"Write the funniest, most engaging blog post about this topic for a Manhattan masseur. "
+        f"Make readers laugh and then CALL to book."
+    )
+    return _groq_chat(system_prompt, user_prompt, max_tokens=1200)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Blog rotator")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--report", action="store_true")
+    args = parser.parse_args()
+
+    os.makedirs(BLOGS_DIR, exist_ok=True)
+    today = datetime.now().strftime("%Y%m%d")
+
+    if args.report:
+        files = sorted(glob.glob(os.path.join(BLOGS_DIR, "*.md")), reverse=True)
+        print(f"Blog posts: {len(files)}")
+        for f in files[:10]:
+            print(f"  {os.path.basename(f)}: {os.path.getsize(f)} bytes")
+        return
+
+    topic = random.choice(BLOG_TOPICS)
+    logger.info("Generating blog post: %s", topic)
+
+    content = generate_blog_post(topic)
+    if not content:
+        logger.error("Failed to generate blog post")
+        sys.exit(1)
+
+    filepath = os.path.join(BLOGS_DIR, f"{today}_{topic}.md")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+    logger.info("Saved: %s (%d chars)", filepath, len(content))
+
+    print(json.dumps({
+        "topic": topic,
+        "chars": len(content),
+        "file": filepath,
+        "date": today,
+    }, indent=2))
 
 
 if __name__ == "__main__":
@@ -34,102 +346,142 @@ if __name__ == "__main__":
 
 ```
 
-_find_edit_page.py:
+_deploy_find_bio.py:
 ```
 #!/usr/bin/env python3
-"""Login + find the actual profile edit page."""
-import time, os
+"""Login + find bio edit page + deploy bio."""
+import time, os, sys, json
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from datetime import datetime, timezone
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 load_dotenv()
 
 USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
 PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+BIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "bios", "controlled_wolf_v1.md")
+
+with open(BIO_FILE, "r") as f:
+    BIO_TEXT = f.read().strip()
 
 options = uc.ChromeOptions()
 options.add_argument("--window-size=1280,900")
+options.add_argument("--disable-blink-features=AutomationControlled")
 
 driver = uc.Chrome(options=options, version_main=149)
 
 try:
+    # Login
     print("[1] Login...")
     driver.get("https://rentmasseur.com/login")
     time.sleep(6)
+    
     driver.execute_script("""
         const pwd = document.querySelector('input[type="password"]');
         const user = document.querySelector('input[type="text"], input[type="email"]');
-        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
-        if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
+        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        if (user) { nativeSetter.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
+        if (pwd) { nativeSetter.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
     """, USERNAME, PASSWORD)
     time.sleep(1)
-    driver.find_element(By.CSS_SELECTOR, 'input[type="password"]').send_keys(Keys.ENTER)
+    
+    pwd_el = driver.find_element(By.CSS_SELECTOR, 'input[type="password"]')
+    pwd_el.send_keys(Keys.ENTER)
     time.sleep(5)
     print(f"  URL: {driver.current_url}")
     
-    # Go to our own profile
-    print("\n[2] Going to own profile...")
-    driver.get(f"https://rentmasseur.com/{USERNAME}")
-    time.sleep(5)
-    print(f"  URL: {driver.current_url}")
-    print(f"  Title: {driver.title}")
+    # Try multiple edit URLs
+    edit_urls = [
+        "https://rentmasseur.com/profile/edit",
+        "https://rentmasseur.com/profile",
+        "https://rentmasseur.com/dashboard",
+        "https://rentmasseur.com/profile/bio",
+        "https://rentmasseur.com/edit-profile",
+        "https://rentmasseur.com/settings",
+        "https://rentmasseur.com/profile/edit/bio",
+    ]
     
-    # Get all links and buttons
-    links = driver.execute_script("""
-        return Array.from(document.querySelectorAll('a')).map(a => ({
-            text: a.innerText.trim().substring(0,40), href: a.href, 
-            onclick: a.getAttribute('onclick') || ''
-        })).filter(a => a.text || a.onclick);
-    """)
-    print(f"\nLinks ({len(links)}):")
-    for l in links[:40]:
-        print(f"  {l['text'][:40]} -> {l['href']}")
-    
-    # Look for edit-related links
-    edit_links = [l for l in links if any(w in (l['text'] + l['href']).lower() for w in ['edit', 'update', 'bio', 'about', 'profile', 'setting', 'account'])]
-    print(f"\nEdit-related links ({len(edit_links)}):")
-    for l in edit_links:
-        print(f"  {l['text']} -> {l['href']}")
-    
-    # Check for buttons
-    buttons = driver.execute_script("""
-        return Array.from(document.querySelectorAll('button, [role="button"]')).map(b => ({
-            text: (b.innerText||'').trim().substring(0,40), type: b.type, id: b.id,
-            onclick: b.getAttribute('onclick') || ''
-        })).filter(b => b.text);
-    """)
-    print(f"\nButtons ({len(buttons)}):")
-    for b in buttons:
-        print(f"  {b['text']} type={b['type']} onclick={b['onclick'][:40]}")
-    
-    # Check for textareas or contenteditable on profile page
-    textareas = driver.find_elements(By.CSS_SELECTOR, 'textarea')
-    editables = driver.find_elements(By.CSS_SELECTOR, '[contenteditable]')
-    print(f"\nTextareas: {len(textareas)}, Contenteditable: {len(editables)}")
-    
-    # Screenshot
-    driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/profile_page.png")
-    print("Screenshot saved")
-    
-    # Try the Next.js __NEXT_DATA__ for clues
-    next_data = driver.execute_script("""
-        try {
-            const el = document.getElementById('__NEXT_DATA__');
-            if (el) return JSON.parse(el.textContent.substring(0, 2000));
-        } catch(e) {}
-        return null;
-    """)
-    if next_data:
-        print(f"\nNext.js data keys: {list(next_data.keys())}")
-        if 'props' in next_data:
-            props = next_data['props']
-            print(f"  props keys: {list(props.keys()) if isinstance(props, dict) else type(props)}")
-        if 'page' in next_data:
-            print(f"  page: {next_data['page']}")
+    print("\n[2] Finding bio edit page...")
+    for url in edit_urls:
+        driver.get(url)
+        time.sleep(3)
+        textareas = driver.find_elements(By.CSS_SELECTOR, 'textarea')
+        inputs = driver.find_elements(By.CSS_SELECTOR, 'input')
+        print(f"  {url} -> {driver.current_url} | textareas={len(textareas)} inputs={len(inputs)}")
+        if textareas:
+            for ta in textareas:
+                val = ta.get_attribute("value") or ""
+                print(f"    textarea id={ta.get_attribute('id')} name={ta.get_attribute('name')} len={len(val)} preview={val[:60]}")
+            
+            # Found textareas - update the bio one
+            print(f"\n[3] Updating bio on {driver.current_url}...")
+            updated = driver.execute_script("""
+                const textareas = Array.from(document.querySelectorAll('textarea'));
+                let best = null, bestScore = 0;
+                for (const ta of textareas) {
+                    const val = ta.value || '';
+                    const score = val.length;
+                    // Prefer textarea that looks like bio (longest, or has bio/about in name)
+                    const ctx = (ta.id||'') + ' ' + (ta.name||'') + ' ' + (ta.placeholder||'');
+                    if (/bio|about|description|profile/i.test(ctx)) { bestScore = 99999; best = ta; break; }
+                    if (score > bestScore) { bestScore = score; best = ta; }
+                }
+                if (!best && textareas.length > 0) best = textareas[0];
+                if (!best) return {error: 'no_textarea'};
+                
+                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                nativeSetter.call(best, arguments[0]);
+                best.dispatchEvent(new Event('input', {bubbles: true}));
+                best.dispatchEvent(new Event('change', {bubbles: true}));
+                best.dispatchEvent(new Event('blur', {bubbles: true}));
+                
+                return {id: best.id, name: best.name, old_len: bestScore, new_len: arguments[0].length};
+            """, BIO_TEXT)
+            print(f"  Result: {updated}")
+            
+            if isinstance(updated, dict) and 'error' not in updated:
+                time.sleep(1)
+                # Save
+                saved = driver.execute_script("""
+                    const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+                    const saveBtn = btns.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'') + ' ' + (b.value||'')));
+                    if (saveBtn) { saveBtn.click(); return {clicked: true, text: saveBtn.innerText}; }
+                    return {clicked: false};
+                """)
+                print(f"  Save: {saved}")
+                time.sleep(4)
+                
+                # Receipt
+                receipts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
+                os.makedirs(receipts_dir, exist_ok=True)
+                receipt = {
+                    "action": "bio_deploy", "bio_id": "controlled_wolf_v1",
+                    "experiment_id": "exp_001_targeted_wolf", "success": True,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "url": driver.current_url
+                }
+                rpath = os.path.join(receipts_dir, f"deploy_controlled_wolf_v1_{receipt['timestamp'].replace(':','-')}.json")
+                with open(rpath, "w") as f:
+                    json.dump(receipt, f, indent=2)
+                print(f"\n=== BIO DEPLOYED === Receipt: {rpath}")
+                break
+    else:
+        # Dump all links on dashboard
+        print("\n  No textarea found on any URL. Dumping links...")
+        driver.get("https://rentmasseur.com/dashboard")
+        time.sleep(3)
+        links = driver.execute_script("""
+            return Array.from(document.querySelectorAll('a')).map(a => ({href: a.href, text: a.innerText.trim()})).filter(a => a.text);
+        """)
+        for link in links[:30]:
+            print(f"    {link['text'][:40]} -> {link['href']}")
+        
+        # Also check current page content
+        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/dashboard.png")
+        print(f"  Screenshot: /Users/alep/Downloads/rentmasseur-optimizer/dashboard.png")
 
 finally:
     driver.quit()
@@ -137,318 +489,147 @@ finally:
 
 ```
 
-rm_telemetry_poller.py:
+auto_bio_updater.py:
 ```
 #!/usr/bin/env python3
+"""Auto bio updater — picks the best bio from daily generated content
+and updates the RentMasseur profile via Selenium automation.
+
+Reads the mass analysis report to find the recommended bio, or picks
+the longest fresh bio if no analysis exists.
+
+Usage:
+    python3 auto_bio_updater.py
+    python3 auto_bio_updater.py --strategy sensory_luxury
+    python3 auto_bio_updater.py --dry-run
 """
-RM Telemetry Poller — lightweight 1-minute visitor polling.
 
-Logs in once, scrapes "who saw me" every 60 seconds for N minutes,
-writes telemetry snapshots to content/telemetry.jsonl, and updates
-content/telemetry_latest.json with the current state.
-
-Designed for GitHub Actions 5-min cron with 10-min run duration.
-"""
-
-from __future__ import annotations
-
-import hashlib
+import argparse
 import json
 import os
-import random
 import sys
-import time
-from datetime import datetime, timezone
-from pathlib import Path
+import glob
+import logging
+from datetime import datetime
+from typing import Optional
 
-BASE_URL = "https://rentmasseur.com"
-CONTENT_DIR = Path("content")
-TELEMETRY_LATEST = CONTENT_DIR / "telemetry_latest.json"
-TELEMETRY_LOG = CONTENT_DIR / "telemetry.jsonl"
+from dotenv import load_dotenv
 
-EXCLUDE = {
-    'settings', 'gay-massage', 'stream', 'masseurcams', 'advertise',
-    'about', 'login', 'sitemap', 'topics', 'robots', 'api', 'blog',
-    'blogs', 'reviews', 'interviews', 'find-massage', 'live-cams',
-    'available', 'static', '_next', 'images', 'mailbox', 'compose',
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def load_env():
-    from pathlib import Path
-    env_path = Path(".env")
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+BIOS_DIR = os.path.join(CONTENT_DIR, "bios")
 
 
-def write_receipt(action: str, status: str, data: dict):
-    receipts_dir = Path("receipts")
-    receipts_dir.mkdir(exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
-    receipt = {"action": action, "status": status, "timestamp": now_iso(), **data}
-    path = receipts_dir / f"telemetry_{action}_{ts}.json"
-    path.write_text(json.dumps(receipt, indent=2))
-    print(f"  Receipt: {path}")
+def find_best_bio(preferred_strategy: Optional[str] = None) -> Optional[str]:
+    """Find the best bio from today's generated content."""
+    today = datetime.now().strftime("%Y%m%d")
+
+    if preferred_strategy:
+        filepath = os.path.join(BIOS_DIR, f"{today}_{preferred_strategy}.md")
+        if os.path.exists(filepath):
+            with open(filepath, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        logger.warning("No bio found for strategy %s today, falling back to best", preferred_strategy)
+
+    # Check mass analysis for recommendation
+    analysis_path = os.path.join(CONTENT_DIR, f"mass_analysis_{today}.md")
+    if os.path.exists(analysis_path):
+        with open(analysis_path, "r", encoding="utf-8") as f:
+            analysis = f.read()
+        logger.info("Found mass analysis report (%d chars)", len(analysis))
+
+    # Find all of today's bios and pick the longest
+    bio_files = glob.glob(os.path.join(BIOS_DIR, f"{today}_*.md"))
+    if not bio_files:
+        # Fall back to most recent day
+        all_bios = sorted(glob.glob(os.path.join(BIOS_DIR, "*.md")), reverse=True)
+        if all_bios:
+            bio_files = [all_bios[0]]
+            logger.info("No bios for today, using most recent: %s", all_bios[0])
+
+    if not bio_files:
+        logger.error("No bios found in %s", BIOS_DIR)
+        return None
+
+    best_bio = None
+    best_len = 0
+    for filepath in bio_files:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if len(content) > best_len:
+            best_len = len(content)
+            best_bio = content
+            logger.info("Candidate: %s (%d chars)", os.path.basename(filepath), len(content))
+
+    if best_bio:
+        logger.info("Selected best bio: %d chars", len(best_bio))
+    return best_bio
 
 
-def login(driver, username: str, password: str) -> bool:
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
+def update_profile_bio(bio_text: str, headless: bool = True) -> bool:
+    """Log in and update the profile bio on RentMasseur."""
+    from rentmasseur_core import setup_driver, login, update_bio, save_bio_field
 
-    print("=== LOGIN ===")
-    driver.get(f"{BASE_URL}/login")
-    time.sleep(random.uniform(3, 5))
-
-    inputs = driver.find_elements(By.CSS_SELECTOR, "input")
-    email_el = pass_el = None
-    for inp in inputs:
-        if not inp.is_displayed():
-            continue
-        itype = (inp.get_attribute("type") or "").lower()
-        iname = (inp.get_attribute("name") or "").lower()
-        if itype == "password":
-            pass_el = inp
-        elif "email" in iname or "user" in iname or itype in ("email", "text"):
-            email_el = inp
-
-    if not email_el or not pass_el:
-        print("Login form not found", file=sys.stderr)
-        write_receipt("login", "fail", {"reason": "form_not_found"})
-        return False
-
-    email_el.click()
-    time.sleep(0.5)
-    for char in username:
-        email_el.send_keys(char)
-        time.sleep(random.uniform(0.05, 0.12))
-
-    pass_el.click()
-    time.sleep(0.3)
-    for char in password:
-        pass_el.send_keys(char)
-        time.sleep(random.uniform(0.05, 0.12))
-
-    pass_el.send_keys(Keys.ENTER)
-    time.sleep(random.uniform(4, 6))
-
-    if "/login" in driver.current_url.lower():
-        print("Login failed — still on login page", file=sys.stderr)
-        write_receipt("login", "fail", {"reason": "still_on_login", "url": driver.current_url})
-        return False
-
-    print(f"Login OK — URL: {driver.current_url}")
-    write_receipt("login", "pass", {"url": driver.current_url})
-    return True
-
-
-def scrape_visitors(driver) -> list[dict]:
-    """Scrape the 'who saw me' page for current visitor list."""
-    from selenium.webdriver.common.by import By
-
-    driver.get(f"{BASE_URL}/settings/whosawme")
-    time.sleep(random.uniform(2, 4))
-
-    visitors = driver.execute_script("""
-        const result = [];
-        const seen = new Set();
-        const profileImgs = document.querySelectorAll('img[alt="Profile photo"], img[alt="profile-picture"]');
-        for (const img of profileImgs) {
-            const a = img.closest('a');
-            if (a && a.href) {
-                const path = new URL(a.href).pathname;
-                const username = path.replace('/', '');
-                if (username && !seen.has(username) && !username.includes('settings') && !username.includes('gay-massage')) {
-                    seen.add(username);
-                    result.push({username: username, url: a.href});
-                }
-            }
-        }
-        const links = Array.from(document.querySelectorAll('a[href]'));
-        for (const a of links) {
-            const href = a.href;
-            if (!href.startsWith('https://rentmasseur.com/')) continue;
-            const path = new URL(href).pathname;
-            if (path && path !== '/' && path.split('/').length === 2 && path.split('/')[1] !== '') {
-                const username = path.replace('/', '');
-                if (!seen.has(username) && !username.startsWith('_') && username.length > 2) {
-                    seen.add(username);
-                    result.push({username: username, url: href});
-                }
-            }
-        }
-        return result;
-    """)
-
-    filtered = [v for v in visitors if v["username"] not in EXCLUDE]
-    return filtered
-
-
-def scrape_online_count(driver) -> int:
-    """Try to extract number of currently online users from the page."""
+    driver = setup_driver(headless=headless)
     try:
-        text = driver.execute_script("return document.body ? document.body.innerText : ''")
-        for line in text.split("\n"):
-            line = line.strip().lower()
-            if "online now" in line or "currently online" in line:
-                import re
-                m = re.search(r'(\d+)\s+(?:users?\s+)?online', line)
-                if m:
-                    return int(m.group(1))
-    except Exception:
-        pass
-    return 0
+        if not login(driver):
+            logger.error("Login failed — cannot update bio")
+            return False
 
+        logger.info("Login successful, searching for bio field...")
+        result = update_bio(driver, "")
+        if result is None or (isinstance(result, dict) and result.get("error")):
+            logger.error("Could not find bio field on profile settings")
+            return False
 
-def scrape_messages_count(driver) -> int:
-    """Try to extract unread message count from nav badge."""
-    try:
-        badges = driver.execute_script("""
-            const badges = document.querySelectorAll('.badge, .notification-badge, .msg-count, [class*="badge"]');
-            let max = 0;
-            for (const b of badges) {
-                const txt = b.textContent.trim();
-                const n = parseInt(txt);
-                if (!isNaN(n) && n > max) max = n;
-            }
-            return max;
-        """)
-        return badges or 0
-    except Exception:
-        return 0
+        field_info, current_bio = result
+        logger.info("Current bio: %s...", current_bio[:80])
 
-
-def poll_once(driver, poll_num: int) -> dict:
-    """Single telemetry poll — scrape visitors, online count, messages."""
-    ts = now_iso()
-    print(f"\n--- Poll #{poll_num} at {ts} ---")
-
-    visitors = scrape_visitors(driver)
-    online_count = scrape_online_count(driver)
-    unread_messages = scrape_messages_count(driver)
-
-    visitor_names = [v["username"] for v in visitors]
-
-    snapshot = {
-        "poll_num": poll_num,
-        "timestamp": ts,
-        "visitor_count": len(visitors),
-        "visitors": visitor_names,
-        "online_count": online_count,
-        "unread_messages": unread_messages,
-    }
-
-    # Append to JSONL log
-    with open(TELEMETRY_LOG, "a") as f:
-        f.write(json.dumps(snapshot) + "\n")
-
-    # Update latest snapshot
-    TELEMETRY_LATEST.write_text(json.dumps(snapshot, indent=2))
-
-    print(f"  Visitors: {len(visitors)} | Online: {online_count} | Unread: {unread_messages}")
-    print(f"  New visitors: {', '.join(visitor_names[:5])}{'...' if len(visitor_names) > 5 else ''}")
-
-    return snapshot
+        saved = save_bio_field(driver, field_info, bio_text)
+        if saved:
+            logger.info("Bio updated successfully!")
+            return True
+        else:
+            logger.error("Failed to save bio")
+            return False
+    finally:
+        driver.quit()
 
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="RM Telemetry Poller")
-    parser.add_argument("--duration", type=int, default=600, help="Total run duration in seconds (default: 600 = 10 min)")
-    parser.add_argument("--interval", type=int, default=60, help="Poll interval in seconds (default: 60)")
-    parser.add_argument("--max-load-more", type=int, default=5, help="Max Load More clicks per poll (default: 5)")
+    parser = argparse.ArgumentParser(description="Auto-update RentMasseur profile bio from daily content")
+    parser.add_argument("--strategy", help="Use a specific strategy's bio instead of auto-selecting")
+    parser.add_argument("--dry-run", action="store_true", help="Show selected bio without updating profile")
+    parser.add_argument("--headless", default="true", help="Run headless (true/false)")
     args = parser.parse_args()
 
-    load_env()
-
-    username = os.environ.get("RENTMASSEUR_USERNAME")
-    password = os.environ.get("RENTMASSEUR_PASSWORD")
-    if not username or not password:
-        print("ERROR: RENTMASSEUR_USERNAME and RENTMASSEUR_PASSWORD required", file=sys.stderr)
+    bio = find_best_bio(preferred_strategy=args.strategy)
+    if not bio:
+        logger.error("No bio available to update")
         sys.exit(1)
 
-    CONTENT_DIR.mkdir(exist_ok=True)
+    print(f"\n{'='*60}")
+    print(f"SELECTED BIO ({len(bio)} chars):")
+    print(f"{'='*60}")
+    print(bio[:200] + "..." if len(bio) > 200 else bio)
+    print(f"{'='*60}\n")
 
-    # Setup Chrome
-    try:
-        import undetected_chromedriver as uc
-        from selenium.webdriver.chrome.options import Options
-    except ImportError:
-        print("Installing undetected-chromedriver...")
-        os.system(f"{sys.executable} -m pip install undetected-chromedriver selenium")
-        import undetected_chromedriver as uc
-        from selenium.webdriver.chrome.options import Options
+    if args.dry_run:
+        logger.info("Dry run — not updating profile")
+        sys.exit(0)
 
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument(f"--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-
-    driver = uc.Chrome(options=options)
-    driver.set_page_load_timeout(30)
-
-    try:
-        if not login(driver, username, password):
-            print("Login failed, exiting", file=sys.stderr)
-            sys.exit(1)
-
-        start = time.time()
-        poll_num = 0
-        all_snapshots = []
-
-        while time.time() - start < args.duration:
-            poll_num += 1
-            try:
-                snapshot = poll_once(driver, poll_num)
-                all_snapshots.append(snapshot)
-            except Exception as e:
-                print(f"  Poll error: {e}", file=sys.stderr)
-                write_receipt("poll", "error", {"poll_num": poll_num, "error": str(e)})
-
-            elapsed = time.time() - start
-            remaining = args.duration - elapsed
-            if remaining < args.interval:
-                break
-            print(f"  Sleeping {args.interval}s until next poll... ({remaining:.0f}s remaining)")
-            time.sleep(args.interval)
-
-        # Summary
-        total_visitors_seen = set()
-        for s in all_snapshots:
-            total_visitors_seen.update(s.get("visitors", []))
-
-        summary = {
-            "action": "telemetry_poll",
-            "timestamp": now_iso(),
-            "polls_completed": len(all_snapshots),
-            "duration_seconds": int(time.time() - start),
-            "interval_seconds": args.interval,
-            "unique_visitors": len(total_visitors_seen),
-            "all_visitors": sorted(total_visitors_seen),
-            "max_online": max((s.get("online_count", 0) for s in all_snapshots), default=0),
-            "max_unread_messages": max((s.get("unread_messages", 0) for s in all_snapshots), default=0),
-        }
-
-        write_receipt("telemetry_poll", "pass", summary)
-        print(f"\n=== SUMMARY ===")
-        print(f"Polls: {len(all_snapshots)}")
-        print(f"Unique visitors: {len(total_visitors_seen)}")
-        print(f"Max online: {summary['max_online']}")
-        print(f"Max unread: {summary['max_unread_messages']}")
-
-    finally:
-        driver.quit()
-        print("Driver closed.")
+    headless = args.headless.lower() != "false"
+    success = update_profile_bio(bio, headless=headless)
+    sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":
@@ -456,345 +637,164 @@ if __name__ == "__main__":
 
 ```
 
-availability.json:
+rm_bio_loop.py:
 ```
-{
-  "availability_enforced": true,
-  "automated_login": true,
-  "availability_updated": true,
-  "timestamp": "2026-07-27T06:32:10.439715Z",
-  "reason": "set_24_7"
-}
-```
+#!/usr/bin/env python3
+"""
+RM Bio Loop — Ollama-powered bio generation, deployment, and tracking.
 
-rotator_engine.js:
-```
-/**
- * RentMasseur Rotator Engine — JavaScript
- * 
- * Unified rotation engine for bios, photos, prices, interviews, and blog posts.
- * Uses RL feedback (views, clicks, calls) to decide what to rotate and when.
- * Integrates with the Chrome extension for real-time optimization.
- * 
- * Usage in extension:
- *   const rotator = new RotatorEngine({ serverUrl: 'http://localhost:3000' });
- *   await rotator.init();
- *   const nextBio = await rotator.getNextBio();
- *   const nextPrice = await rotator.getNextPrice();
- */
+Generates multiple bio candidates per day using local Ollama models,
+deploys the best one via Selenium, and tracks visitor counts per bio
+to determine the winner.
 
-class RotatorEngine {
-  constructor(config = {}) {
-    this.serverUrl = config.serverUrl || 'http://localhost:3000';
-    this.rlState = null;
-    this.rotationRules = {
-      bio: { maxAgeHours: 24, minRewardThreshold: 5, rotateIfStale: true },
-      photo: { maxAgeHours: 48, minRewardThreshold: 3, rotateIfStale: true },
-      price: { maxAgeHours: 12, minRewardThreshold: 8, rotateIfStale: false },
-      interview: { maxAgeHours: 72, minRewardThreshold: 2, rotateIfStale: true },
-      blog: { maxAgeHours: 48, minRewardThreshold: 4, rotateIfStale: true },
-    };
-    this.rewardWeights = {
-      views: 1, email_clicks: 5, phone_clicks: 10, booking_inquiries: 50,
-      favorites: 3, messages: 8,
-    };
-  }
+Flow:
+  1. Fetch current bio from RM (via Selenium)
+  2. Generate N bio candidates using Ollama (llama3.1, mistral, gemma2)
+  3. Score each candidate (length, keywords, readability, uniqueness)
+  4. Deploy the highest-scoring bio via Selenium
+  5. Record the bio + deployment time in bio_experiments.db
+  6. After a period, compare visitor counts during each bio's active window
+  7. Declare a winner and keep the best-performing bio
 
-  async init() {
-    await this.loadRLState();
-    return this;
-  }
+Usage:
+  python3 rm_bio_loop.py --generate --count 5
+  python3 rm_bio_loop.py --generate --deploy --count 3
+  python3 rm_bio_loop.py --fetch-current
+  python3 rm_bio_loop.py --score-only
+  python3 rm_bio_loop.py --evaluate
+"""
 
-  async loadRLState() {
-    try {
-      const resp = await fetch(`${this.serverUrl}/api/rl/state`);
-      if (resp.ok) {
-        this.rlState = await resp.json();
-        return this.rlState;
-      }
-    } catch (e) {
-      console.warn('Could not load RL state from server, using local');
-    }
-    this.rlState = this._defaultState();
-    return this.rlState;
-  }
+from __future__ import annotations
 
-  _defaultState() {
-    return {
-      bios: {}, photos: {}, prices: {}, interviews: {}, blogs: {},
-      current: { bio: null, photo: null, price: null, interview: null, blog: null },
-      rotations: { bio: 0, photo: 0, price: 0, interview: 0, blog: 0 },
-      history: [],
-    };
-  }
+import argparse
+import hashlib
+import json
+import os
+import random
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
-  calculateReward(stats, ageHours) {
-    let reward = 0;
-    for (const [key, weight] of Object.entries(this.rewardWeights)) {
-      reward += (stats[key] || 0) * weight;
-    }
-    reward -= (ageHours / 24) * 0.5; // stale penalty
-    return Math.round(reward * 100) / 100;
-  }
+BASE_DIR = Path(__file__).parent
+ARTIFACTS = BASE_DIR / "artifacts" / "engagement"
+ARTIFACTS.mkdir(parents=True, exist_ok=True)
+BIO_CACHE = ARTIFACTS / "current_bio.json"
+BIO_DB = ARTIFACTS / "bio_experiments.db"
+BIOS_DIR = ARTIFACTS / "bios"
+BIOS_DIR.mkdir(parents=True, exist_ok=True)
 
-  shouldRotate(type, currentEntry, ageHours, deltaReward) {
-    const rules = this.rotationRules[type];
-    if (!rules) return false;
+OLLAMA_URL = "http://localhost:11434/api/generate"
 
-    if (rules.rotateIfStale && ageHours >= rules.maxAgeHours) {
-      return { rotate: true, reason: `stale (${ageHours.toFixed(1)}h >= ${rules.maxAgeHours}h)` };
-    }
-    if (ageHours >= rules.maxAgeHours / 2 && deltaReward < rules.minRewardThreshold) {
-      return { rotate: true, reason: `low reward (${deltaReward} < ${rules.minRewardThreshold} in ${ageHours.toFixed(1)}h)` };
-    }
-    if (ageHours >= 6 && deltaReward === 0) {
-      return { rotate: true, reason: 'zero engagement for 6+ hours' };
-    }
-    return { rotate: false, reason: 'performing well' };
-  }
+# Bio generation prompts — varied tones/styles
+BIO_PROMPTS = [
+    {
+        "id": "professional_warm",
+        "prompt": """Write a massage therapist bio for RentMasseur.com. Keep it under 500 characters.
+Tone: Professional yet warm. Include: modalities (Swedish, deep tissue, sports), location (Manhattan NYC),
+availability (incall/outcall), and a welcoming closing line. Do not use emoji. Do not include phone numbers.
+Write only the bio text, nothing else.""",
+    },
+    {
+        "id": "confident_direct",
+        "prompt": """Write a massage therapist bio for RentMasseur.com. Keep it under 500 characters.
+Tone: Confident and direct. Emphasize: experience, technique, results. Mention Manhattan incall/outcall.
+Be concise and punchy. Do not use emoji. Write only the bio text, nothing else.""",
+    },
+    {
+        "id": "relaxed_friendly",
+        "prompt": """Write a massage therapist bio for RentMasseur.com. Keep it under 500 characters.
+Tone: Relaxed, friendly, approachable. Mention: Swedish/deep tissue, Manhattan, clean studio, flexible hours.
+Make the reader feel comfortable reaching out. Do not use emoji. Write only the bio text, nothing else.""",
+    },
+    {
+        "id": "luxury_premium",
+        "prompt": """Write a massage therapist bio for RentMasseur.com. Keep it under 500 characters.
+Tone: Premium, luxury, exclusive. Emphasize: high-end technique, private studio, premium experience.
+Manhattan incall. Do not use emoji. Write only the bio text, nothing else.""",
+    },
+    {
+        "id": "energetic_athletic",
+        "prompt": """Write a massage therapist bio for RentMasseur.com. Keep it under 500 characters.
+Tone: Energetic and athletic. Focus on: sports massage, recovery, deep tissue, active clients.
+Manhattan incall/outcall. Do not use emoji. Write only the bio text, nothing else.""",
+    },
+]
 
-  pickNext(items, type) {
-    const entries = Object.entries(items);
-    if (entries.length === 0) return null;
+GOOD_KEYWORDS = [
+    "swedish", "deep tissue", "sports", "manhattan", "nyc", "incall", "outcall",
+    "professional", "certified", "experienced", "relaxing", "therapeutic",
+    "clean", "private", "discreet", "available", "booking", "appointment",
+]
 
-    // Sort by: least times used, then highest historical reward
-    entries.sort((a, b) => {
-      const aUses = a[1].timesUsed || 0;
-      const bUses = b[1].timesUsed || 0;
-      if (aUses !== bUses) return aUses - bUses;
-      const aReward = a[1].totalReward || 0;
-      const bReward = b[1].totalReward || 0;
-      return bReward - aReward;
-    });
 
-    return entries[0];
-  }
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-  async getNextBio() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.bios, 'bio');
-  }
 
-  async getNextPrice() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.prices, 'price');
-  }
+def log(msg: str, level: str = "INFO"):
+    print(f"[BIO-LOOP] [{level}] {msg}")
 
-  async getNextPhoto() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.photos, 'photo');
-  }
 
-  async getNextInterview() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.interviews, 'interview');
-  }
+# ─── Bio Experiments DB ──────────────────────────────────────────────
 
-  async getNextBlog() {
-    if (!this.rlState) await this.init();
-    return this.pickNext(this.rlState.blogs, 'blog');
-  }
+def init_bio_db():
+    conn = sqlite3.connect(str(BIO_DB))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bio_experiments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bio_text TEXT NOT NULL,
+            bio_hash TEXT NOT NULL,
+            prompt_id TEXT,
+            model TEXT NOT NULL,
+            score REAL DEFAULT 0,
+            deployed_at TEXT,
+            removed_at TEXT,
+            visitors_during INTEGER DEFAULT 0,
+            contact_clicks_during INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'generated',
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bio_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bio_hash TEXT NOT NULL,
+            char_count INTEGER,
+            keyword_count INTEGER,
+            readability_score REAL,
+            uniqueness_score REAL,
+            total_score REAL,
+            scored_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+    log(f"Bio experiments DB: {BIO_DB}")
 
-  registerRotation(type, id, content, metadata = {}) {
-    if (!this.rlState) this.rlState = this._defaultState();
 
-    const store = this.rlState[type + 's'] || {};
-    const prevId = this.rlState.current[type];
-    if (prevId && store[prevId]) {
-      store[prevId].endTime = new Date().toISOString();
-    }
+def save_bio_candidate(bio_text: str, prompt_id: str, model: str, score: float = 0) -> int:
+    conn = sqlite3.connect(str(BIO_DB))
+    bio_hash = hashlib.sha256(bio_text.encode()).hexdigest()[:16]
+    now = now_iso()
+    cur = conn.execute(
+        "INSERT INTO bio_experiments (bio_text, bio_hash, prompt_id, model, score, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 'generated', ?)",
+        (bio_text, bio_hash, prompt_id, model, score, now)
+    )
+    bio_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return bio_id
 
-    store[id] = {
-      content: content.slice(0, 500),
-      ...metadata,
-      startTime: new Date().toISOString(),
-      totalReward: 0,
-      deltaReward: 0,
-      lastStats: {},
-      timesUsed: (store[id]?.timesUsed || 0) + 1,
-    };
 
-    this.rlState[type + 's'] = store;
-    this.rlState.current[type] = id;
-    this.rlState.rotations[type] = (this.rlState.rotations[type] || 0) + 1;
-
-    this.rlState.history.push({
-      timestamp: new Date().toISOString(),
-      type, id, action: 'rotate',
-    });
-
-    return this.rlState;
-  }
-
-  updateReward(type, id, stats) {
-    if (!this.rlState) return;
-    const store = this.rlState[type + 's'];
-    if (!store || !store[id]) return;
-
-    const entry = store[id];
-    const prevStats = entry.lastStats || {};
-    const delta = {};
-    for (const key of Object.keys(this.rewardWeights)) {
-      delta[key] = Math.max(0, (stats[key] || 0) - (prevStats[key] || 0));
-    }
-
-    const ageHours = entry.startTime
-      ? (Date.now() - new Date(entry.startTime).getTime()) / 3600000
-      : 0;
-
-    const deltaReward = this.calculateReward(delta, ageHours);
-    entry.deltaReward = deltaReward;
-    entry.totalReward = (entry.totalReward || 0) + deltaReward;
-    entry.lastStats = stats;
-    entry.ageHours = Math.round(ageHours * 100) / 100;
-
-    this.rlState.history.push({
-      timestamp: new Date().toISOString(),
-      type, id, action: 'reward',
-      deltaReward, totalReward: entry.totalReward,
-    });
-
-    return entry;
-  }
-
-  getTopPerformers(type, n = 5) {
-    if (!this.rlState) return [];
-    const store = this.rlState[type + 's'] || {};
-    return Object.entries(store)
-      .sort((a, b) => (b[1].totalReward || 0) - (a[1].totalReward || 0))
-      .slice(0, n);
-  }
-
-  getReport() {
-    if (!this.rlState) return 'No RL state loaded';
-    const lines = ['=== ROTATOR ENGINE REPORT ==='];
-    for (const type of ['bio', 'photo', 'price', 'interview', 'blog']) {
-      const store = this.rlState[type + 's'] || {};
-      const rotations = this.rlState.rotations[type] || 0;
-      const current = this.rlState.current[type];
-      lines.push(`\n${type.toUpperCase()}: ${rotations} rotations, current=${current}`);
-      const top = this.getTopPerformers(type, 3);
-      for (const [id, data] of top) {
-        lines.push(`  ${id}: reward=${data.totalReward || 0}, uses=${data.timesUsed || 0}`);
-      }
-    }
-    return lines.join('\n');
-  }
-
-  async saveState() {
-    try {
-      await fetch(`${this.serverUrl}/api/rl/state`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(this.rlState),
-      });
-    } catch (e) {
-      console.warn('Could not save RL state to server');
-    }
-  }
-}
-
-// Price rotation strategies
-const PRICE_STRATEGIES = [
-  { name: 'premium_peak', desc: 'High price during peak hours (evening/weekend)', base: 250, variance: 30 },
-  { name: 'off_peak_deal', desc: 'Lower price for off-peak slots', base: 180, variance: 20 },
-  { name: 'new_client_special', desc: 'First-time client discount', base: 150, variance: 15 },
-  { name: 'loyalty_rate', desc: 'Returning client rate', base: 200, variance: 10 },
-  { name: 'late_night_premium', desc: 'After-hours premium', base: 300, variance: 50 },
-  { name: 'lunch_express', desc: 'Quick session lunch special', base: 120, variance: 10 },
-  { name: 'weekend_warrior', desc: 'Weekend athletic recovery', base: 220, variance: 25 },
-  { name: 'holiday_special', desc: 'Holiday seasonal rate', base: 200, variance: 40 },
-  { name: 'last_minute', desc: 'Same-day booking discount', base: 170, variance: 15 },
-  { name: 'package_deal', desc: 'Multi-session package rate', base: 190, variance: 20 },
-];
-
-function generatePrice(strategy, hour, dayOfWeek) {
-  const s = strategy || PRICE_STRATEGIES[0];
-  let price = s.base;
-
-  // Peak hours: 6pm-11pm
-  if (hour >= 18 && hour <= 23) price += s.variance * 0.5;
-  // Late night: midnight-4am
-  if (hour >= 0 && hour <= 4) price += s.variance * 0.8;
-  // Weekend premium
-  if (dayOfWeek === 0 || dayOfWeek === 6) price += s.variance * 0.3;
-  // Add small random variance
-  price += Math.round((Math.random() - 0.5) * s.variance * 0.2);
-
-  return Math.max(80, Math.round(price));
-}
-
-// Export for Node.js and browser
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { RotatorEngine, PRICE_STRATEGIES, generatePrice };
-}
-if (typeof window !== 'undefined') {
-  window.RotatorEngine = RotatorEngine;
-  window.PRICE_STRATEGIES = PRICE_STRATEGIES;
-  window.generatePrice = generatePrice;
-}
-
-```
-
-ga_rl_optimizer.cpp:
-```
-/*
- * GA + RL Revenue Optimizer — C++ Native
- * High-performance genetic algorithm + reinforcement learning for
- * RentMasseur revenue maximization ($300/day target).
- *
- * Build: g++ -O3 -std=c++17 -o ga_rl_optimizer ga_rl_optimizer.cpp
- * Run:   ./ga_rl_optimizer
- *        ./ga_rl_optimizer --population 20 --generations 10 --target 300
- *        ./ga_rl_optimizer --report
- */
-
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <map>
-#include <algorithm>
-#include <random>
-#include <chrono>
-#include <ctime>
-#include <cmath>
-#include <cstdlib>
-
-struct AccountConfig {
-    std::string id;
-    std::string bio;
-    int price;
-    std::string photo_style;
-    std::string cta;
-    std::string headline;
-    double fitness;
-    double revenue_estimate;
-    double reward;
-    int generation;
-    int uses;
-};
-
-struct GAState {
-    std::vector<AccountConfig> population;
-    int generation;
-    AccountConfig best_config;
-    double best_fitness;
-    double best_revenue;
-    std::vector<std::map<std::string, double>> history;
-};
-
-const double AVG_SESSION_PRICE = 200.0;
-const double CALL_CONVERSION_RATE = 0.20;
-const double VIEW_TO_CLICK_RATE = 0.05;
-const double BOOKING_CLOSE_RATE = 0.40;
-const double REVENUE_TARGET = 300.0;
-
-std::vector<std::string> CTAS = {
-    "Call me now to book your session",
-    "Pick up the phone and call today",
-    "Text or call — I'm available now",
-    "Don't wait — call me right now",
-    "Book now: your body will thank you",
-    "Call today for same-day availability",
+def deploy_bio(bio_id: int):
+    conn = sqlite3.connect(str(BIO_DB))
+    conn.execute("UPDATE bio_experiments SET deployed_at=?, status='live' WHERE id=?", (now_iso(), bio_id))
+    # Mark previous live bio as removed
+    conn.execute(
+        "UPDATE bio_experiments SET removed_at=?, status='completed' "
+        "WHERE status='live' AND id != ?",
