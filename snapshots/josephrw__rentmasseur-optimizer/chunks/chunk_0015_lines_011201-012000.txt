@@ -1,8 +1,181 @@
-    logger.info("PIPELINE COMPLETE in %.1fs", elapsed)
-    logger.info("=" * 60)
-    logger.info("Receipts: %d (chain valid: %s)", ledger.summary()["total_receipts"], ledger.summary()["chain_valid"])
-    logger.info("Output: %s", PIPELINE_DIR)
-    print(json.dumps(summary, indent=2, default=str))
+        with open(live_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+        logger.info("Wrote metrics to %s and %s", ingest_path, live_path)
+    except Exception as e:
+        logger.error("Failed to scrape profile metrics: %s", e)
+    return metrics
+
+
+def set_availability_24_7(driver: webdriver.Chrome) -> bool:
+    """Navigate to availability settings and enable 24/7 availability."""
+    try:
+        logger.info("Navigating to availability settings: %s", AVAILABILITY_URL)
+        driver.set_page_load_timeout(90)
+        driver.get(AVAILABILITY_URL)
+
+        # Wait for SPA to render — use increasing delays with retry
+        for wait_round in range(1, 5):
+            time.sleep(10 + (wait_round * 5))  # 15s, 20s, 25s, 30s
+            logger.info("Availability page wait round %d — checking for controls...", wait_round)
+
+            # Dismiss any popups that could block the availability controls
+            dismiss_popups(driver)
+
+            # Check if selects OR custom dropdowns have rendered
+            select_count = driver.execute_script("return document.querySelectorAll('select').length;") or 0
+            button_count = driver.execute_script("return document.querySelectorAll('button').length;") or 0
+            dropdown_count = driver.execute_script("return document.querySelectorAll('[class*=\"dropdown\"], [class*=\"select\"], [role=\"listbox\"], [role=\"combobox\"]').length;") or 0
+            link_count = driver.execute_script("return document.querySelectorAll('a').length;") or 0
+            logger.info("Page has %d selects, %d buttons, %d dropdowns, %d links", select_count, button_count, dropdown_count, link_count)
+
+            if select_count > 0 or dropdown_count > 0:
+                break
+
+            if wait_round < 4:
+                logger.warning("No selects/dropdowns found yet — waiting longer for SPA to render")
+                _dump_debug(driver, f"availability_no_selects_round{wait_round}")
+
+        # Do everything in JS since the two selects share identical classes
+        ok = driver.execute_script("""
+            const selects = Array.from(document.querySelectorAll('select'));
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const allText = document.body ? document.body.innerText.slice(0, 3000) : '';
+            
+            // Find availability status select (options contain 'Available' / 'Not Set')
+            const statusSelect = selects.find(s => {
+                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
+                return opts.includes('available') || opts.includes('not set');
+            });
+            if (!statusSelect) return {error: 'no_status_select', select_count: selects.length, button_count: buttons.length, page_text: allText};
+            
+            // Select 'Available' (skip 'Not Available')
+            const availOpt = Array.from(statusSelect.options).find(
+                o => o.text.toLowerCase().includes('available') && !o.text.toLowerCase().includes('not')
+            );
+            if (availOpt) {
+                statusSelect.value = availOpt.value;
+                statusSelect.dispatchEvent(new Event('change', {bubbles: true}));
+            }
+            
+            // Find time select (options contain 'Hour' or 'Minutes')
+            const timeSelect = selects.find(s => {
+                const opts = Array.from(s.options).map(o => o.text.toLowerCase());
+                return opts.some(t => t.includes('hour') || t.includes('minute'));
+            });
+            if (timeSelect) {
+                // Pick the longest duration (last option that contains a number)
+                const durationOpts = Array.from(timeSelect.options).filter(
+                    o => /\\d/.test(o.text)
+                );
+                if (durationOpts.length > 0) {
+                    const longest = durationOpts[durationOpts.length - 1];
+                    timeSelect.value = longest.value;
+                    timeSelect.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+            }
+            
+            // Find and click SET button
+            const setBtn = buttons.find(b => /set|save|apply/i.test(b.innerText));
+            if (!setBtn) return {error: 'no_set_button', button_texts: buttons.map(b => b.innerText.slice(0, 30))};
+            setBtn.click();
+            
+            return {ok: true};
+        """)
+        
+        if isinstance(ok, dict) and ok.get('error'):
+            logger.error("Availability JS automation failed: %s", ok)
+            scan_page(driver)
+            _dump_debug(driver, f"availability_{ok['error']}")
+            return False
+        
+        logger.info("Availability set via JS automation")
+        time.sleep(3)
+        return True
+        
+    except TimeoutException:
+        logger.error("Availability page timed out")
+        _dump_debug(driver, "availability_timeout")
+        return False
+    except WebDriverException as e:
+        logger.error("WebDriver error setting availability: %s", e)
+        return False
+
+
+def run_once(headless: bool = True) -> bool:
+    """Execute a single availability check-and-set cycle."""
+    driver: Optional[webdriver.Chrome] = None
+    try:
+        driver = setup_driver(headless=headless)
+        # Try brute_force_login first (more robust for SPAs), fall back to login()
+        if not brute_force_login(driver, max_retries=3):
+            logger.warning("Brute-force login failed, trying alternate login method")
+            if not login(driver):
+                _write_availability_json(False, "login_failed")
+                return False
+        success = set_availability_24_7(driver)
+        _write_availability_json(success, "set_24_7" if success else "set_failed")
+        if success:
+            scrape_profile_metrics(driver)
+        return success
+    except Exception as e:
+        logger.error("Unexpected error: %s", e)
+        _write_availability_json(False, f"exception: {e}")
+        return False
+    finally:
+        if driver:
+            driver.quit()
+
+
+def _write_availability_json(success: bool, reason: str) -> None:
+    """Write availability.json so the workflow can commit it."""
+    import json
+    data = {
+        "availability_enforced": success,
+        "automated_login": True,
+        "availability_updated": success,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "reason": reason,
+    }
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "availability.json")
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info("Wrote availability.json: %s", json.dumps(data))
+    except Exception as e:
+        logger.error("Failed to write availability.json: %s", e)
+
+
+def main() -> None:
+    """Run the availability keeper in a loop or once for CI/CD."""
+    parser = argparse.ArgumentParser(description="Keep RentMasseur availability set to 24/7")
+    parser.add_argument("--once", action="store_true", help="Run a single check and exit (for CI/CD)")
+    parser.add_argument("--headless", default="true", help="Run headless (true/false)")
+    parser.add_argument("--interval", type=int, default=CHECK_INTERVAL_MINUTES, help="Loop interval in minutes")
+    args = parser.parse_args()
+
+    headless = args.headless.lower() != "false"
+
+    if args.once:
+        logger.info("Running single availability check")
+        success = run_once(headless=headless)
+        sys.exit(0 if success else 1)
+
+    run_count = 0
+    logger.info("Starting RentMasseur 24/7 availability keeper")
+    logger.info("Check interval: %d minutes", args.interval)
+
+    while True:
+        run_count += 1
+        logger.info("--- Run #%d at %s ---", run_count, datetime.now().isoformat())
+        success = run_once(headless=headless)
+        if success:
+            logger.info("Run #%d completed successfully", run_count)
+        else:
+            logger.error("Run #%d failed", run_count)
+
+        sleep_seconds = args.interval * 60
+        logger.info("Sleeping for %d minutes...", args.interval)
+        time.sleep(sleep_seconds)
 
 
 if __name__ == "__main__":
@@ -10,395 +183,40 @@ if __name__ == "__main__":
 
 ```
 
-gen_icons.py:
-```
-from PIL import Image, ImageDraw
-import sys
-
-for size in [16, 48, 128]:
-    img = Image.new('RGBA', (size, size), (26, 26, 31, 255))
-    d = ImageDraw.Draw(img)
-    pad = size // 6
-    d.rounded_rectangle([pad, pad, size-pad, size-pad], radius=size//8, fill=(204, 139, 74, 255))
-    cx, cy = size // 2, size // 2
-    r = size // 5
-    d.ellipse([cx-r, cy-r, cx+r, cy+r], fill=(255, 255, 255, 255))
-    img.save(f'/Users/alep/Downloads/02_AI_Agents/rentmasseur-extension/icon{size}.png')
-
-print('Icons generated')
-
-```
-
-_deploy_bio_captcha.py:
+rl_feedback.py:
 ```
 #!/usr/bin/env python3
-"""
-Login + deploy bio with CAPTCHA solving.
+"""Reinforcement Learning feedback loop for RentMasseur profile optimization.
 
-Strategy:
-1. Use undetected-chromedriver to avoid bot detection
-2. Click reCAPTCHA checkbox iframe
-3. If image challenge appears, use OpenCV + heuristics to solve
-4. If can't solve, wait for manual intervention with visible browser
-"""
-import time, os, sys, json, base64, io
-import undetected_chromedriver as uc
-from dotenv import load_dotenv
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-import cv2
-import numpy as np
-from PIL import Image
+Tracks profile views, email clicks, phone calls, and booking inquiries per bio variant.
+Uses reward signals to decide which bios to keep, retire, or promote.
 
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv()
+Reward function:
+  reward = (views * 1) + (email_clicks * 5) + (phone_clicks * 10) + (bookings * 50)
+  penalty = (bio_age_days * -0.5)  # stale bios decay
 
-USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
-LOGIN_URL = "https://rentmasseur.com/login"
-BIO_URL = "https://rentmasseur.com/profile/edit"
-
-BIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "bios", "controlled_wolf_v1.md")
-
-with open(BIO_FILE, "r") as f:
-    BIO_TEXT = f.read().strip()
-
-print(f"Username: {USERNAME}")
-print(f"Bio length: {len(BIO_TEXT)} chars")
-
-
-def click_recaptcha_checkbox(driver):
-    """Click the reCAPTCHA 'I'm not a robot' checkbox."""
-    try:
-        # Find the reCAPTCHA iframe
-        frames = driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="recaptcha"]')
-        for frame in frames:
-            src = frame.get_attribute("src") or ""
-            if "anchor" in src:
-                driver.switch_to.frame(frame)
-                time.sleep(1)
-                checkbox = driver.find_element(By.CSS_SELECTOR, '#recaptcha-anchor')
-                if checkbox:
-                    checkbox.click()
-                    print("  Clicked reCAPTCHA checkbox")
-                    time.sleep(3)
-                    # Check if it passed
-                    aria = checkbox.get_attribute("aria-checked")
-                    print(f"  Checkbox aria-checked: {aria}")
-                    driver.switch_to.default_content()
-                    return aria == "true"
-                driver.switch_to.default_content()
-        print("  No reCAPTCHA anchor iframe found")
-        return False
-    except Exception as e:
-        print(f"  Error clicking checkbox: {e}")
-        driver.switch_to.default_content()
-        return False
-
-
-def solve_image_challenge(driver):
-    """Attempt to solve reCAPTCHA image challenge using OpenCV."""
-    try:
-        # Switch to the challenge iframe (bframe)
-        frames = driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="bframe"]')
-        if not frames:
-            print("  No challenge iframe found")
-            return False
-        
-        driver.switch_to.frame(frames[0])
-        time.sleep(2)
-        
-        # Get the challenge instructions
-        try:
-            instruction_el = driver.find_element(By.CSS_SELECTOR, '.rc-imageselect-instructions')
-            instruction = instruction_el.text.lower()
-            print(f"  Challenge: {instruction}")
-        except:
-            instruction = ""
-        
-        # Take screenshot of the challenge
-        challenge_img = driver.find_element(By.CSS_SELECTOR, '#rc-imageselect-target')
-        png = challenge_img.screenshot_as_png
-        img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
-        
-        # Save for debugging
-        debug_path = "/Users/alep/Downloads/rentmasseur-optimizer/captcha_challenge.png"
-        cv2.imwrite(debug_path, img)
-        print(f"  Challenge image saved: {debug_path}")
-        
-        # Get grid info (usually 3x3 or 4x4)
-        grid_cells = driver.find_elements(By.CSS_SELECTOR, '#rc-imageselect-target td')
-        print(f"  Grid cells: {len(grid_cells)}")
-        
-        # Try to detect objects in each cell
-        # Simple approach: look for distinct visual features
-        h, w = img.shape[:2]
-        grid_size = int(np.sqrt(len(grid_cells)))
-        cell_h, cell_w = h // grid_size, w // grid_size
-        
-        # For each cell, compute edge density and color variance
-        # This is a heuristic - real solution would use a trained classifier
-        clicked = 0
-        for i, cell in enumerate(grid_cells):
-            row, col = i // grid_size, i % grid_size
-            cell_img = img[row*cell_h:(row+1)*cell_h, col*cell_w:(col+1)*cell_w]
-            
-            # Compute features
-            gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY)
-            edges = cv2.Canny(gray, 50, 150)
-            edge_density = np.mean(edges > 0)
-            
-            # Color variance (objects tend to have more color variation)
-            color_std = np.std(cell_img)
-            
-            print(f"    Cell [{row},{col}]: edge_density={edge_density:.3f} color_std={color_std:.1f}")
-            
-            # Heuristic: click cells with high visual activity
-            # This is NOT reliable - real solution needs YOLO/CNN
-            if edge_density > 0.05 and color_std > 30:
-                try:
-                    cell.click()
-                    clicked += 1
-                    time.sleep(0.5)
-                except:
-                    pass
-        
-        print(f"  Clicked {clicked} cells")
-        driver.switch_to.default_content()
-        
-        # Click verify button
-        if clicked > 0:
-            time.sleep(2)
-            driver.switch_to.frame(frames[0])
-            try:
-                verify_btn = driver.find_element(By.CSS_SELECTOR, '#recaptcha-verify-button')
-                verify_btn.click()
-                print("  Clicked verify button")
-            except:
-                pass
-            driver.switch_to.default_content()
-            time.sleep(3)
-            return True
-        return False
-    except Exception as e:
-        print(f"  Error solving challenge: {e}")
-        driver.switch_to.default_content()
-        return False
-
-
-def check_captcha_solved(driver):
-    """Check if reCAPTCHA has been solved."""
-    try:
-        result = driver.execute_script("""
-            try {
-                return grecaptcha && grecaptcha.getResponse().length > 0;
-            } catch(e) {
-                return false;
-            }
-        """)
-        return result
-    except:
-        return False
-
-
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,900")
-# Add some stealth options
-options.add_argument("--disable-blink-features=AutomationControlled")
-options.add_argument("--disable-features=IsolateOrigins,site-per-process")
-
-driver = uc.Chrome(options=options, version_main=149)
-
-try:
-    print("\n[1] Navigating to login...")
-    driver.set_page_load_timeout(90)
-    driver.get(LOGIN_URL)
-    time.sleep(8)
-    
-    print(f"  Title: {driver.title}")
-    print(f"  URL: {driver.current_url}")
-    
-    # Step 2: Try to solve CAPTCHA
-    print("\n[2] Attempting CAPTCHA solve...")
-    
-    # First try: click the checkbox
-    solved = click_recaptcha_checkbox(driver)
-    
-    if not solved:
-        # Check if image challenge appeared
-        time.sleep(3)
-        print("  Checkbox didn't pass. Checking for image challenge...")
-        solved = solve_image_challenge(driver)
-    
-    if not solved:
-        # Wait and retry
-        print("  Retrying in 5s...")
-        time.sleep(5)
-        solved = click_recaptcha_checkbox(driver)
-        if not solved:
-            solved = solve_image_challenge(driver)
-    
-    # Final check
-    time.sleep(3)
-    captcha_solved = check_captcha_solved(driver)
-    print(f"  CAPTCHA solved: {captcha_solved}")
-    
-    if not captcha_solved:
-        print("  Could not solve CAPTCHA automatically.")
-        print("  Waiting 60s - solve it manually in the browser window if visible...")
-        for i in range(12):
-            time.sleep(5)
-            if check_captcha_solved(driver):
-                captcha_solved = True
-                print("  CAPTCHA solved (manually or delayed)!")
-                break
-            print(f"  Waiting... ({(i+1)*5}s)")
-    
-    if not captcha_solved:
-        print("  CAPTCHA not solved. Exiting.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/captcha_final.png")
-        sys.exit(1)
-    
-    # Step 3: Wait for login form
-    print("\n[3] Looking for login form...")
-    for attempt in range(10):
-        time.sleep(3)
-        pwd = driver.execute_script("""
-            return document.querySelector('input[type="password"]') ||
-                   document.querySelector('input[name*="pass" i]') ||
-                   document.querySelector('input[placeholder*="pass" i]');
-        """)
-        if pwd:
-            print("  Password field found!")
-            break
-        print(f"  Attempt {attempt+1}: no password field yet...")
-    else:
-        print("  No login form found.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/no_login_form.png")
-        sys.exit(1)
-    
-    # Step 4: Fill and submit login
-    print("\n[4] Filling login form...")
-    driver.execute_script(f"""
-        const pwd = document.querySelector('input[type="password"]') ||
-                    document.querySelector('input[name*="pass" i]');
-        const user = document.querySelector('input[type="text"]') ||
-                     document.querySelector('input[type="email"]') ||
-                     document.querySelector('input[name*="user" i]') ||
-                     document.querySelector('input[name*="email" i]');
-        if (user) {{ user.value = '{USERNAME}'; user.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-        if (pwd) {{ pwd.value = '{PASSWORD}'; pwd.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-    """)
-    time.sleep(2)
-    
-    driver.execute_script("""
-        const btn = document.querySelector('button[type="submit"]') ||
-                    document.querySelector('input[type="submit"]') ||
-                    Array.from(document.querySelectorAll('button')).find(b => /login|sign.in|submit/i.test(b.innerText));
-        if (btn) btn.click();
-    """)
-    time.sleep(8)
-    
-    print(f"  After login URL: {driver.current_url}")
-    if "login" in driver.current_url.lower():
-        print("  Login may have failed.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/login_failed.png")
-        sys.exit(1)
-    
-    print("  Login successful!")
-    
-    # Step 5: Navigate to profile edit and update bio
-    print("\n[5] Navigating to profile edit...")
-    driver.get(BIO_URL)
-    time.sleep(5)
-    
-    bio_field = driver.execute_script("""
-        const textareas = Array.from(document.querySelectorAll('textarea'));
-        let best = null, bestScore = 0;
-        for (const ta of textareas) {
-            const score = (ta.value || '').length;
-            if (score > bestScore) { bestScore = score; best = ta; }
-        }
-        if (!best && textareas.length > 0) best = textareas[0];
-        if (best) {
-            best.value = arguments[0];
-            best.dispatchEvent(new Event('input', {bubbles: true}));
-            best.dispatchEvent(new Event('change', {bubbles: true}));
-            return true;
-        }
-        return false;
-    """, BIO_TEXT)
-    
-    if bio_field:
-        print("  Bio field updated!")
-        time.sleep(2)
-        saved = driver.execute_script("""
-            const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-            const saveBtn = buttons.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'') + ' ' + (b.value||'')));
-            if (saveBtn) { saveBtn.click(); return true; }
-            return false;
-        """)
-        print(f"  Save clicked: {saved}")
-        time.sleep(5)
-        print("\n  BIO DEPLOYED SUCCESSFULLY!")
-        
-        # Write receipt
-        import json
-        from datetime import datetime, timezone
-        receipts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
-        os.makedirs(receipts_dir, exist_ok=True)
-        receipt = {
-            "action": "bio_deploy",
-            "bio_id": "controlled_wolf_v1",
-            "experiment_id": "exp_001_targeted_wolf",
-            "success": True,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "notes": "deployed via undetected-chromedriver with captcha solving"
-        }
-        rpath = os.path.join(receipts_dir, f"deploy_controlled_wolf_v1_{receipt['timestamp'].replace(':','-')}.json")
-        with open(rpath, "w") as f:
-            json.dump(receipt, f, indent=2)
-        print(f"  Receipt: {rpath}")
-    else:
-        print("  No textarea found.")
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/profile_edit.png")
-
-finally:
-    driver.quit()
-    print("\nDone.")
-
-```
-
-competitor_scraper.py:
-```
-#!/usr/bin/env python3
-"""Competitor scraper — scrapes top RentMasseur profiles for competitive analysis.
-
-Fetches public profile pages and extracts: name, location, rate, bio text,
-availability status, and photo count. Uses Playwright for browser-based scraping
-to bypass anti-bot measures.
+The system scrapes profile stats from RentMasseur, correlates them to the active bio,
+and updates the RL state. Bios that underperform are retired. Top performers are reused
+and mutated by the LLM for variation.
 
 Usage:
-    python3 competitor_scraper.py
-    python3 competitor_scraper.py --urls https://rentmasseur.com/User1 https://rentmasseur.com/User2
-    python3 competitor_scraper.py --output competitor_data.json
+    python3 rl_feedback.py                    # collect stats and update rewards
+    python3 rl_feedback.py --report           # show reward history
+    python3 rl_feedback.py --reset            # reset RL state
 """
 
 import argparse
 import json
 import os
 import sys
-import re
 import time
+import random
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
-from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
 logging.basicConfig(
     level=logging.INFO,
@@ -407,199 +225,424 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content", "competitor_data.json")
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+RENTMASSEUR_USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
+RENTMASSEUR_PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+
 CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+RL_STATE_PATH = os.path.join(CONTENT_DIR, "rl_state.json")
+RL_HISTORY_PATH = os.path.join(CONTENT_DIR, "rl_history.json")
+PROFILE_URL = "https://rentmasseur.com/settings/stats"
+DASHBOARD_URL = "https://rentmasseur.com/dashboard"
 
-DEFAULT_COMPETITORS = [
-    "https://rentmasseur.com/Preston_Banks",
-    "https://rentmasseur.com/Tonyxxxx",
-    "https://rentmasseur.com/MickeyCuteBoy",
-    "https://rentmasseur.com/ExoticYoungGuy",
-]
-
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
-)
+REWARD_WEIGHTS = {
+    "views": 1,
+    "email_clicks": 5,
+    "phone_clicks": 10,
+    "booking_inquiries": 50,
+    "favorites": 3,
+    "messages": 8,
+}
 
 
-def fetch_with_playwright(url: str, timeout: int = 30) -> Optional[str]:
-    """Fetch a page using Playwright browser automation."""
+def _groq_chat(system_prompt: str, user_prompt: str, max_tokens: int = 800, retries: int = 3) -> Optional[str]:
+    if not GROQ_API_KEY:
+        return None
+    for attempt in range(retries):
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.9,
+                    "max_tokens": max_tokens,
+                },
+                timeout=90,
+            )
+            if resp.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+    return None
+
+
+def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int = 800) -> Optional[dict]:
+    raw = _groq_chat(system_prompt, user_prompt, max_tokens=max_tokens)
+    if not raw:
+        return None
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-    except ImportError:
-        logger.error("Playwright not installed. Run: pip install playwright && playwright install chromium")
-        return None
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=USER_AGENT)
-            page = context.new_page()
-            page.goto(url, timeout=timeout * 1000)
-            page.wait_for_load_state("networkidle", timeout=timeout * 1000)
-            time.sleep(3)
-            html = page.content()
-            browser.close()
-            return html
-    except PlaywrightTimeoutError:
-        logger.warning("Playwright timeout for %s", url)
-        return None
-    except Exception as e:
-        logger.error("Playwright error for %s: %s", url, e)
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw)
+    except json.JSONDecodeError:
         return None
 
 
-def fetch_with_requests(url: str, timeout: int = 20) -> Optional[str]:
-    """Fetch a page using requests with browser-like headers."""
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://rentmasseur.com/",
+def _load_rl_state() -> dict:
+    if os.path.exists(RL_STATE_PATH):
+        try:
+            with open(RL_STATE_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "bios": {},
+        "current_bio_id": None,
+        "current_bio_start": None,
+        "total_rotations": 0,
+        "best_bio_id": None,
+        "best_reward": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _save_rl_state(state: dict):
+    os.makedirs(CONTENT_DIR, exist_ok=True)
+    with open(RL_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _load_history() -> list:
+    if os.path.exists(RL_HISTORY_PATH):
+        try:
+            with open(RL_HISTORY_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def _save_history(history: list):
+    os.makedirs(CONTENT_DIR, exist_ok=True)
+    with open(RL_HISTORY_PATH, "w") as f:
+        json.dump(history[-500:], f, indent=2)
+
+
+def scrape_profile_stats() -> dict:
+    """Scrape profile view/click stats from RentMasseur dashboard."""
     try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        return resp.text
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+        driver = webdriver.Chrome(options=options)
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+
+        try:
+            from rentmasseur_core import login
+            if not login(driver):
+                logger.error("Login failed for stats scraping")
+                return {}
+
+            driver.get(DASHBOARD_URL)
+            time.sleep(5)
+
+            stats = {
+                "scraped_at": datetime.now(timezone.utc).isoformat(),
+                "views": 0,
+                "email_clicks": 0,
+                "phone_clicks": 0,
+                "booking_inquiries": 0,
+                "favorites": 0,
+                "messages": 0,
+            }
+
+            page_text = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+            page_html = driver.execute_script("return document.documentElement ? document.documentElement.outerHTML : '';") or ""
+
+            import re
+            patterns = {
+                "views": [r"(\d+)\s*(?:profile\s*)?views?", r"views?:\s*(\d+)", r"(\d+)\s*views"],
+                "email_clicks": [r"(\d+)\s*email\s*(?:clicks?|opens?)", r"email:\s*(\d+)", r"(\d+)\s*email"],
+                "phone_clicks": [r"(\d+)\s*phone\s*(?:clicks?|calls?)", r"phone:\s*(\d+)", r"(\d+)\s*phone"],
+                "booking_inquiries": [r"(\d+)\s*(?:booking|inquir|appoint)", r"bookings?:\s*(\d+)"],
+                "favorites": [r"(\d+)\s*(?:favorit|likes?|saves?)", r"favorites?:\s*(\d+)"],
+                "messages": [r"(\d+)\s*messages?", r"messages?:\s*(\d+)"],
+            }
+
+            for key, patterns_list in patterns.items():
+                for pattern in patterns_list:
+                    match = re.search(pattern, page_text, re.IGNORECASE)
+                    if match:
+                        stats[key] = int(match.group(1))
+                        break
+
+            logger.info("Scraped stats: %s", json.dumps(stats))
+            return stats
+
+        finally:
+            driver.quit()
     except Exception as e:
-        logger.warning("requests failed for %s: %s", url, e)
-        return None
+        logger.error("Stats scraping error: %s", e)
+        return {}
 
 
-def extract_profile_data(html: str, url: str) -> dict:
-    """Extract profile data from HTML."""
-    soup = BeautifulSoup(html, "html.parser")
-    data = {
-        "url": url,
-        "scraped_at": datetime.now(timezone.utc).isoformat(),
-        "name": None,
-        "location": None,
-        "rate": None,
-        "availability": None,
-        "bio_text": None,
-        "photo_count": 0,
-        "services": [],
-        "phone": None,
+def calculate_reward(stats: dict, bio_age_days: float) -> float:
+    """Calculate reward score from stats."""
+    reward = 0
+    for key, weight in REWARD_WEIGHTS.items():
+        reward += stats.get(key, 0) * weight
+    reward -= bio_age_days * 0.5  # stale bio penalty
+    return round(reward, 2)
+
+
+def update_rl_state(stats: dict) -> dict:
+    """Update RL state with new stats and calculate reward for current bio."""
+    state = _load_rl_state()
+    current_bio_id = state.get("current_bio_id")
+
+    if not current_bio_id:
+        logger.warning("No current bio ID in RL state — nothing to reward")
+        return state
+
+    bio_entry = state["bios"].get(current_bio_id, {})
+    previous_stats = bio_entry.get("last_stats", {})
+    bio_start = state.get("current_bio_start")
+
+    if bio_start:
+        bio_age = (datetime.now(timezone.utc) - datetime.fromisoformat(bio_start)).total_seconds() / 86400
+    else:
+        bio_age = 0
+
+    # Delta stats (new since last check)
+    delta = {key: max(0, stats.get(key, 0) - previous_stats.get(key, 0)) for key in REWARD_WEIGHTS}
+    delta_reward = calculate_reward(delta, bio_age)
+
+    # Update bio entry
+    bio_entry["last_stats"] = stats
+    bio_entry["total_reward"] = bio_entry.get("total_reward", 0) + delta_reward
+    bio_entry["delta_reward"] = delta_reward
+    bio_entry["delta_stats"] = delta
+    bio_entry["last_updated"] = datetime.now(timezone.utc).isoformat()
+    bio_entry["age_days"] = round(bio_age, 2)
+    state["bios"][current_bio_id] = bio_entry
+
+    # Track best bio
+    if bio_entry["total_reward"] > state.get("best_reward", 0):
+        state["best_bio_id"] = current_bio_id
+        state["best_reward"] = bio_entry["total_reward"]
+
+    # Log to history
+    history = _load_history()
+    history.append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "bio_id": current_bio_id,
+        "delta_stats": delta,
+        "delta_reward": delta_reward,
+        "total_reward": bio_entry["total_reward"],
+        "bio_age_days": round(bio_age, 2),
+    })
+    _save_history(history)
+
+    logger.info("Bio %s: delta_reward=%.2f, total_reward=%.2f (age: %.1f days)",
+                current_bio_id, delta_reward, bio_entry["total_reward"], bio_age)
+
+    # Decision: should we rotate?
+    should_rotate = False
+    reason = ""
+
+    if bio_age >= 3.0:
+        should_rotate = True
+        reason = "bio_age >= 3 days"
+    elif bio_age >= 1.0 and delta_reward < 5:
+        should_rotate = True
+        reason = "low reward (delta < 5 in 1+ day)"
+    elif bio_age >= 0.5 and delta_reward == 0 and sum(delta.values()) == 0:
+        should_rotate = True
+        reason = "zero engagement in 12+ hours"
+
+    state["should_rotate"] = should_rotate
+    state["rotate_reason"] = reason
+
+    if should_rotate:
+        logger.info("Rotation triggered: %s", reason)
+
+    _save_rl_state(state)
+    return state
+
+
+def register_new_bio(bio_id: str, bio_text: str, strategy: str, source: str = "generated"):
+    """Register a new bio in the RL state."""
+    state = _load_rl_state()
+
+    # Finalize previous bio
+    prev_id = state.get("current_bio_id")
+    if prev_id and prev_id in state.get("bios", {}):
+        state["bios"][prev_id]["end_time"] = datetime.now(timezone.utc).isoformat()
+
+    state["current_bio_id"] = bio_id
+    state["current_bio_start"] = datetime.now(timezone.utc).isoformat()
+    state["total_rotations"] = state.get("total_rotations", 0) + 1
+
+    state["bios"][bio_id] = {
+        "bio_text": bio_text[:500],
+        "strategy": strategy,
+        "source": source,
+        "start_time": datetime.now(timezone.utc).isoformat(),
+        "total_reward": 0,
+        "delta_reward": 0,
+        "last_stats": {},
+        "age_days": 0,
     }
 
-    # Try to extract name from h1 or title
-    h1 = soup.find("h1")
-    if h1:
-        data["name"] = h1.get_text(strip=True)
-    if not data["name"]:
-        title = soup.find("title")
-        if title:
-            name_match = re.search(r"^(.+?)\s*[-|]", title.get_text())
-            if name_match:
-                data["name"] = name_match.group(1).strip()
-
-    # Extract location
-    for selector in [".location", ".profile-location", "[data-field='location']"]:
-        el = soup.select_one(selector)
-        if el:
-            data["location"] = el.get_text(strip=True)
-            break
-
-    # Extract rate
-    for selector in [".rate", ".price", "[data-field='rate']"]:
-        el = soup.select_one(selector)
-        if el:
-            data["rate"] = el.get_text(strip=True)
-            break
-
-    # Extract bio text
-    for selector in [".bio", ".about", ".description", ".profile-bio", "[data-field='bio']"]:
-        el = soup.select_one(selector)
-        if el:
-            data["bio_text"] = el.get_text(strip=True)[:1000]
-            break
-
-    # Extract availability
-    for selector in [".availability", ".status", ".badge"]:
-        el = soup.select_one(selector)
-        if el:
-            data["availability"] = el.get_text(strip=True)
-            break
-
-    # Count photos
-    photos = soup.select("img[src*='profile'], img[src*='photo'], img[class*='profile']")
-    data["photo_count"] = len(photos)
-
-    # Extract services from text
-    page_text = soup.get_text().lower()
-    service_keywords = [
-        "deep tissue", "swedish", "hot stone", "sports massage", "trigger point",
-        "aromatherapy", "reflexology", "shiatsu", "thai massage", "prenatal",
-        "couples massage", "lymphatic drainage", "myofascial release", "craniosacral",
-        "reiki", "chair massage", "corporate massage", "mobile massage",
-    ]
-    for kw in service_keywords:
-        if kw in page_text:
-            data["services"].append(kw)
-
-    return data
+    _save_rl_state(state)
+    logger.info("Registered new bio: %s (strategy: %s, rotation #%d)",
+                bio_id, strategy, state["total_rotations"])
 
 
-def scrape_competitors(urls: list, output_path: str) -> list:
-    """Scrape multiple competitor profiles."""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    results = []
+def get_top_performing_bios(n: int = 5) -> list:
+    """Get top N performing bios by reward."""
+    state = _load_rl_state()
+    bios = state.get("bios", {})
+    sorted_bios = sorted(bios.items(), key=lambda x: x[1].get("total_reward", 0), reverse=True)
+    return sorted_bios[:n]
 
-    for url in urls:
-        logger.info("Scraping: %s", url)
 
-        # Try Playwright first, fall back to requests
-        html = fetch_with_playwright(url)
-        if not html:
-            logger.info("Playwright failed, trying requests...")
-            html = fetch_with_requests(url)
+def get_retired_bios() -> list:
+    """Get bios that should be retired (low reward)."""
+    state = _load_rl_state()
+    bios = state.get("bios", {})
+    retired = []
+    for bio_id, data in bios.items():
+        if data.get("total_reward", 0) < 0 and bio_id != state.get("current_bio_id"):
+            retired.append(bio_id)
+    return retired
 
-        if not html:
-            logger.error("Failed to fetch %s", url)
-            results.append({"url": url, "error": "fetch_failed", "scraped_at": datetime.now(timezone.utc).isoformat()})
-            continue
 
-        # Check for captcha
-        if "captcha" in html.lower() or "crowdsec" in html.lower():
-            logger.warning("Captcha detected for %s", url)
-            results.append({"url": url, "error": "captcha_blocked", "scraped_at": datetime.now(timezone.utc).isoformat()})
-            continue
+def generate_mutated_bio(top_bio_text: str, strategy: str) -> Optional[str]:
+    """Generate a mutated version of a top-performing bio using LLM."""
+    system_prompt = (
+        "You are a hilarious, magnetic copywriter for RentMasseur. "
+        "Take the given top-performing bio and create a FUNNIER, MORE COMPELLING version. "
+        "Rules:\n"
+        "1. Keep what works (CTA, urgency, keywords) but make it FUNNIER\n"
+        "2. Add humor — clients call masseurs who make them smile\n"
+        "3. Must still drive PHONE CALLS — end with 'Call me now'\n"
+        "4. Under 250 words\n"
+        "5. No explicit content\n"
+        "6. Be memorable — stand out from every boring masseur bio\n"
+        "Write ONLY the bio text."
+    )
+    user_prompt = (
+        f"Top-performing bio (reward: high):\n{top_bio_text}\n\n"
+        f"Strategy: {strategy}\n"
+        f"Make it HILARIOUS and even more phone-call-driving. Mutate it."
+    )
+    return _groq_chat(system_prompt, user_prompt, max_tokens=600)
 
-        data = extract_profile_data(html, url)
-        results.append(data)
-        logger.info("Extracted: name=%s, location=%s, rate=%s, services=%d",
-                     data["name"], data["location"], data["rate"], len(data["services"]))
 
-        time.sleep(2)
+def generate_hilarious_bio(strategy: str, strategy_desc: str, context: str = "") -> Optional[str]:
+    """Generate a hilarious, phone-call-driving bio."""
+    system_prompt = (
+        "You are the funniest, most magnetic copywriter on RentMasseur. "
+        "Write bios that make clients LAUGH and then CALL. "
+        "Rules:\n"
+        "1. Be genuinely funny — not cringe, not try-hard, naturally hilarious\n"
+        "2. Humor styles: self-deprecating, witty observations, playful exaggeration\n"
+        "3. MUST end with a phone-call CTA: 'Call me now' or 'Pick up the phone'\n"
+        "4. Include urgency: 'available now', 'today', 'don't wait'\n"
+        "5. SEO keywords: massage, Manhattan, deep tissue, therapeutic\n"
+        "6. Under 250 words\n"
+        "7. No explicit content\n"
+        "8. Make them remember you and CALL\n"
+        "Write ONLY the bio text."
+    )
+    user_prompt = (
+        f"Strategy: {strategy}\n"
+        f"Angle: {strategy_desc}\n"
+        f"Context: {context}\n"
+        f"Write the funniest, most phone-call-driving bio ever for a male masseur in Manhattan."
+    )
+    return _groq_chat(system_prompt, user_prompt, max_tokens=600)
 
-    # Save results
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-    logger.info("Saved %d profiles to %s", len(results), output_path)
 
-    return results
+def report() -> str:
+    """Generate a human-readable RL report."""
+    state = _load_rl_state()
+    history = _load_history()
+
+    lines = ["=" * 60, "RL FEEDBACK REPORT", "=" * 60]
+    lines.append(f"Total rotations: {state.get('total_rotations', 0)}")
+    lines.append(f"Current bio: {state.get('current_bio_id', 'none')}")
+    lines.append(f"Best bio: {state.get('best_bio_id', 'none')} (reward: {state.get('best_reward', 0)})")
+    lines.append("")
+
+    lines.append("TOP 5 PERFORMING BIOS:")
+    for bio_id, data in get_top_performing_bios(5):
+        lines.append(f"  {bio_id}: reward={data.get('total_reward', 0)}, "
+                      f"strategy={data.get('strategy', '?')}, "
+                      f"age={data.get('age_days', 0)}d")
+
+    lines.append("")
+    lines.append(f"History entries: {len(history)}")
+    if history:
+        recent = history[-5:]
+        lines.append("RECENT REWARDS:")
+        for h in recent:
+            lines.append(f"  {h['timestamp']}: bio={h['bio_id']}, "
+                          f"delta={h['delta_reward']}, total={h['total_reward']}")
+
+    return "\n".join(lines)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape RentMasseur competitor profiles")
-    parser.add_argument("--urls", nargs="*", default=DEFAULT_COMPETITORS, help="Profile URLs to scrape")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output JSON path")
+    parser = argparse.ArgumentParser(description="RL feedback loop for RentMasseur")
+    parser.add_argument("--report", action="store_true", help="Show RL report")
+    parser.add_argument("--reset", action="store_true", help="Reset RL state")
+    parser.add_argument("--collect", action="store_true", help="Collect stats and update rewards")
     args = parser.parse_args()
 
-    results = scrape_competitors(args.urls, args.output)
+    if args.reset:
+        _save_rl_state({"bios": {}, "current_bio_id": None, "total_rotations": 0, "created_at": datetime.now(timezone.utc).isoformat()})
+        logger.info("RL state reset")
+        return
 
-    successful = [r for r in results if "error" not in r]
-    failed = [r for r in results if "error" in r]
-    logger.info("=== Scraping complete: %d success, %d failed ===", len(successful), len(failed))
+    if args.report:
+        print(report())
+        return
 
-    if successful:
-        avg_services = sum(len(r.get("services", [])) for r in successful) / len(successful)
-        logger.info("Average services listed: %.1f", avg_services)
-        logger.info("Profiles with photos: %d/%d", sum(1 for r in successful if r.get("photo_count", 0) > 0), len(successful))
+    # Default: collect stats
+    logger.info("Collecting profile stats...")
+    stats = scrape_profile_stats()
+    if not stats:
+        logger.error("Failed to collect stats")
+        sys.exit(1)
 
-    print(json.dumps({"total": len(results), "success": len(successful), "failed": len(failed)}, indent=2))
+    state = update_rl_state(stats)
+    print(json.dumps({
+        "stats": stats,
+        "should_rotate": state.get("should_rotate", False),
+        "rotate_reason": state.get("rotate_reason", ""),
+        "current_bio": state.get("current_bio_id"),
+        "total_reward": state["bios"].get(state.get("current_bio_id", ""), {}).get("total_reward", 0),
+    }, indent=2))
 
 
 if __name__ == "__main__":
@@ -607,194 +650,151 @@ if __name__ == "__main__":
 
 ```
 
-make_icons.py:
-```
-import struct, zlib, os
-
-def make_png(size, color, filename):
-    # Simple solid color PNG generator
-    sig = b'\x89PNG\r\n\x1a\n'
-    
-    # IHDR: width, height, bit depth, color type, compression, filter, interlace
-    ihdr_data = struct.pack('>IIBBBBB', size, size, 8, 6, 0, 0, 0)  # 8-bit RGBA
-    ihdr = struct.pack('>I', len(ihdr_data)) + b'IHDR' + ihdr_data
-    ihdr += struct.pack('>I', zlib.crc32(b'IHDR' + ihdr_data) & 0xffffffff)
-    
-    # Image data: each row starts with filter byte 0, then RGBA pixels
-    raw = b''
-    for _ in range(size):
-        raw += b'\x00'  # filter byte
-        for _ in range(size):
-            raw += bytes(color)
-    
-    compressed = zlib.compress(raw)
-    idat = struct.pack('>I', len(compressed)) + b'IDAT' + compressed
-    idat += struct.pack('>I', zlib.crc32(b'IDAT' + compressed) & 0xffffffff)
-    
-    # IEND
-    iend = struct.pack('>I', 0) + b'IEND'
-    iend += struct.pack('>I', zlib.crc32(b'IEND') & 0xffffffff)
-    
-    with open(filename, 'wb') as f:
-        f.write(sig + ihdr + idat + iend)
-
-base = '/Users/alep/Downloads/02_AI_Agents/rentmasseur-extension'
-# Dark bg (#1a1a1f = 26,26,31), accent (#cc8b4a = 204,139,74), white center
-make_png(16,  (204, 139, 74, 255), os.path.join(base, 'icon16.png'))
-make_png(48,  (204, 139, 74, 255), os.path.join(base, 'icon48.png'))
-make_png(128, (204, 139, 74, 255), os.path.join(base, 'icon128.png'))
-print('done')
-
-```
-
-_set_availability.py:
+ga_rl_optimizer.py:
 ```
 #!/usr/bin/env python3
-"""Set availability to 24/7 via undetected-chromedriver."""
-import time, os, json
-import undetected_chromedriver as uc
-from dotenv import load_dotenv
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
+"""GA + RL LLM optimizer for RentMasseur revenue maximization.
+
+Goal: generate $300/day through optimized bios, prices, photos, and CTAs.
+
+Combines:
+- Genetic Algorithm: population of account configurations, selection, crossover, mutation
+- Reinforcement Learning: reward = revenue estimate from clicks/calls/bookings
+- LLM: generates mutations and new variants
+- Live Selenium: applies winning configurations to RentMasseur profile
+
+Revenue model:
+  revenue = (views * view_to_click_rate * avg_click_value) +
+            (phone_clicks * call_conversion_rate * avg_session_price) +
+            (booking_inquiries * avg_session_price)
+
+Default: 5% click rate, 20% call conversion, $200 avg session, $300/day target.
+
+Usage:
+    python3 ga_rl_optimizer.py
+    python3 ga_rl_optimizer.py --population 20 --generations 10 --target 300
+    python3 ga_rl_optimizer.py --apply-winner  # apply best config to profile
+    python3 ga_rl_optimizer.py --report
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import random
+import logging
 from datetime import datetime, timezone
+from typing import Optional
+
+import requests
+from dotenv import load_dotenv
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 load_dotenv()
 
-USERNAME = os.getenv("RENTMASSEUR_USERNAME", "")
-PASSWORD = os.getenv("RENTMASSEUR_PASSWORD", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("grpw", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+REBRANDLY_LINK = os.getenv("REBRANDLY_LINK", "https://rebrand.ly/your-booking-link")
 
-options = uc.ChromeOptions()
-options.add_argument("--window-size=1280,900")
-options.add_argument("--disable-blink-features=AutomationControlled")
+CONTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content")
+GA_STATE_PATH = os.path.join(CONTENT_DIR, "ga_rl_state.json")
 
-driver = uc.Chrome(options=options, version_main=149)
+# Revenue constants
+AVG_SESSION_PRICE = 200
+CALL_CONVERSION_RATE = 0.20
+VIEW_TO_CLICK_RATE = 0.05
+BOOKING_CLOSE_RATE = 0.40
+REVENUE_TARGET = 300
 
-try:
-    print("[1] Login...")
-    driver.get("https://rentmasseur.com/login")
-    time.sleep(6)
-    driver.execute_script("""
-        const pwd = document.querySelector('input[type="password"]');
-        const user = document.querySelector('input[type="text"], input[type="email"]');
-        const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        if (user) { ns.call(user, arguments[0]); user.dispatchEvent(new Event('input', {bubbles: true})); }
-        if (pwd) { ns.call(pwd, arguments[1]); pwd.dispatchEvent(new Event('input', {bubbles: true})); }
-    """, USERNAME, PASSWORD)
-    time.sleep(1)
-    driver.find_element(By.CSS_SELECTOR, 'input[type="password"]').send_keys(Keys.ENTER)
-    time.sleep(5)
-    print(f"  URL: {driver.current_url}")
-    
-    print("\n[2] Setting availability...")
-    driver.get("https://rentmasseur.com/settings/travels")
-    time.sleep(5)
-    
-    # Find availability controls
-    info = driver.execute_script("""
-        const r = {selects: [], buttons: [], inputs: [], textareas: []};
-        document.querySelectorAll('select').forEach(s => {
-            r.selects.push({id: s.id, name: s.name, options: Array.from(s.options).map(o => o.text).join('|'), value: s.value});
-        });
-        document.querySelectorAll('button').forEach(b => r.buttons.push({text: b.innerText.trim(), type: b.type, id: b.id}));
-        document.querySelectorAll('input').forEach(i => r.inputs.push({type: i.type, id: i.id, name: i.name, value: (i.value||'').substring(0,30), checked: i.checked}));
-        document.querySelectorAll('textarea').forEach(t => r.textareas.push({id: t.id, name: t.name, value: (t.value||'').substring(0,50)}));
-        return r;
-    """)
-    
-    print(f"  Selects: {len(info['selects'])}")
-    for s in info['selects']:
-        print(f"    id={s['id']} name={s['name']} value={s['value']} options={s['options'][:80]}")
-    print(f"  Buttons: {len(info['buttons'])}")
-    for b in info['buttons']:
-        print(f"    {b['text']} type={b['type']}")
-    print(f"  Inputs: {len(info['inputs'])}")
-    for i in info['inputs']:
-        print(f"    type={i['type']} id={i['id']} name={i['name']} value={i['value']} checked={i['checked']}")
-    
-    # Try to set availability
-    set_result = driver.execute_script("""
-        // Look for availability select or radio
-        const selects = Array.from(document.querySelectorAll('select'));
-        const availSelect = selects.find(s => {
-            const opts = Array.from(s.options).map(o => o.text.toLowerCase());
-            return opts.some(o => o.includes('available'));
-        });
-        
-        if (availSelect) {
-            const availOpt = Array.from(availSelect.options).find(o => 
-                o.text.toLowerCase().includes('available') && !o.text.toLowerCase().includes('not'));
-            if (availOpt) {
-                availSelect.value = availOpt.value;
-                availSelect.dispatchEvent(new Event('change', {bubbles: true}));
-                return {method: 'select', value: availOpt.text};
-            }
+REWARD_WEIGHTS = {
+    "views": 1,
+    "email_clicks": 5,
+    "phone_clicks": 10,
+    "booking_inquiries": 50,
+    "favorites": 3,
+    "messages": 8,
+}
+
+
+def _groq_chat(system_prompt: str, user_prompt: str, max_tokens: int = 800, retries: int = 3) -> Optional[str]:
+    if not GROQ_API_KEY:
+        logger.error("No GROQ_API_KEY")
+        return None
+    for attempt in range(retries):
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.95,
+                    "max_tokens": max_tokens,
+                },
+                timeout=90,
+            )
+            if resp.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.error("Groq API error: %s", e)
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+    return None
+
+
+class AccountConfig:
+    """One individual in the GA population — a complete account configuration."""
+
+    def __init__(self, bio=None, price=None, photo_style=None, cta=None, headline=None):
+        self.bio = bio or ""
+        self.price = price or 200
+        self.photo_style = photo_style or "professional"
+        self.cta = cta or "Call me now to book your session"
+        self.headline = headline or "Elite Male Masseur in Manhattan"
+        self.fitness = 0
+        self.revenue_estimate = 0
+        self.reward = 0
+        self.id = f"cfg_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{random.randint(1000,9999)}"
+        self.generation = 0
+        self.uses = 0
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "bio": self.bio[:200],
+            "price": self.price,
+            "photo_style": self.photo_style,
+            "cta": self.cta,
+            "headline": self.headline,
+            "fitness": self.fitness,
+            "revenue_estimate": self.revenue_estimate,
+            "reward": self.reward,
+            "generation": self.generation,
+            "uses": self.uses,
         }
-        
-        // Look for radio buttons
-        const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
-        const availRadio = radios.find(r => /avail/i.test(r.name + r.id + (r.value||'')));
-        if (availRadio) {
-            availRadio.click();
-            return {method: 'radio', value: availRadio.value};
-        }
-        
-        // Look for toggle/checkbox
-        const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
-        const availCheckbox = checkboxes.find(c => /avail/i.test(c.name + c.id));
-        if (availCheckbox && !availCheckbox.checked) {
-            availCheckbox.click();
-            return {method: 'checkbox', checked: true};
-        }
-        
-        return {error: 'no_availability_control'};
-    """)
-    print(f"\n  Set result: {set_result}")
-    
-    if 'error' not in set_result:
-        time.sleep(1)
-        # Save
-        saved = driver.execute_script("""
-            const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-            const sb = btns.find(b => /save|update|submit|apply|confirm/i.test((b.innerText||'')+' '+(b.value||'')));
-            if (sb) { sb.click(); return {ok: true, text: sb.innerText}; }
-            return {ok: false};
-        """)
-        print(f"  Save: {saved}")
-        time.sleep(3)
-        
-        # Write receipt
-        receipts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts")
-        os.makedirs(receipts_dir, exist_ok=True)
-        receipt = {"action": "set_availability", "status": "available_24_7", "success": True, "timestamp": datetime.now(timezone.utc).isoformat(), "method": "undetected-chromedriver"}
-        rpath = os.path.join(receipts_dir, f"availability_{receipt['timestamp'].replace(':','-')}.json")
-        with open(rpath, "w") as f:
-            json.dump(receipt, f, indent=2)
-        print(f"\n=== AVAILABILITY SET === Receipt: {rpath}")
-    else:
-        # Try the travels page or other settings pages
-        print("  Trying /settings page directly...")
-        driver.get("https://rentmasseur.com/settings")
-        time.sleep(4)
-        driver.save_screenshot("/Users/alep/Downloads/rentmasseur-optimizer/settings_avail.png")
-        
-        # Check for availability toggle on main settings
-        toggles = driver.execute_script("""
-            return Array.from(document.querySelectorAll('input[type="checkbox"], .toggle, .switch, [role="switch"]')).map(e => ({
-                type: e.type, id: e.id, name: e.name, checked: e.checked, 
-                label: e.closest('label') ? e.closest('label').innerText : (e.parentElement ? e.parentElement.innerText : '')
-            }));
-        """)
-        print(f"  Toggles: {len(toggles)}")
-        for t in toggles:
-            print(f"    {t}")
 
-finally:
-    driver.quit()
-    print("\nDone.")
-
-```
-
-.env.example:
-```
-# RentMasseur automation credentials (used by optimizer / availability keeper)
+    @classmethod
+    def from_dict(cls, d):
+        c = cls(
+            bio=d.get("bio", ""),
+            price=d.get("price", 200),
+            photo_style=d.get("photo_style", "professional"),
+            cta=d.get("cta", "Call me now to book your session"),
+            headline=d.get("headline", "Elite Male Masseur in Manhattan"),
+        )
+        c.id = d.get("id", c.id)
+        c.fitness = d.get("fitness", 0)
